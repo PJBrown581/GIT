@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxMap xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TTBLineTable</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     Table map to handle <c>SalesLine</c> and <c>InventTransferLine</c> records uniformly when it comes to TTB processing.
+/// </summary>
+public class TTBLineTable extends common
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Sets the wine and proof gallons accordingly.
+    /// </summary>
+    public void setQuantities()
+    {
+        TTBItemAlcoholTypeView  itemAlcohol = TTBItemAlcoholTypeView::findItem(this.ItemId);
+
+        if (itemAlcohol)
+        {
+            boolean convert2wine    = itemAlcohol.AlcoholType == TTBAlcoholType::CDA || itemAlcohol.AlcoholType == TTBAlcoholType::SDA;
+            boolean convert2proof   = itemAlcohol.AlcoholType == TTBAlcoholType::PURE;
+
+            if (convert2wine || convert2proof)
+            {
+                TTBWineGallon   wineGallon  = TTBUtilHelper::convert2WineGallon(this.Qty, this.UnitId, this.ItemId);
+
+                if (convert2wine)
+                {
+                    this.WineGallon = wineGallon;
+                }
+                else
+                {
+                        this.ProofGallon = decRound(TTBUtilHelper::convertWineGallon2Proof(wineGallon, itemAlcohol.Proof), UnitOfMeasure::findBySymbol('EA').DecimalPrecision  );
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>modifiedField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Modified field event.
+    /// </summary>
+    /// <param name = "_fieldId">
+    ///     ID of the database field that was modified.
+    /// </param>
+    public void modifiedField(FieldId _fieldId)
+    {
+        switch (_fieldId)
+        {
+            case fieldNum(TTBLineTable, Qty):
+                this.TTBLineTable::setQuantities();
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Validates a line item against the specified permit.
+    /// </summary>
+    /// <param name = "_permitKey">
+    ///     A permit record ID to validate against.
+    /// </param>
+    /// <param name = "_setQuantities">
+    ///     Determines if the wine and proof gallons are to be set before validation.
+    /// </param>
+    /// <returns>
+    ///     true, if valid; otherwise, false.
+    /// </returns>
+    public boolean validate(TTBPermitKey _permitKey, boolean _setQuantities = true)
+    {
+        boolean valid = true;
+
+        if (_setQuantities)
+        {
+            this.TTBLineTable::setQuantities();
+        }
+
+        if (this.TTBLineTable::isPermitRequired())
+        {
+            TTBPermitManager    permitManager   = TTBPermitManager::newPermit(_permitKey);
+            boolean             forceQtyCheck   = this.TableId == tableNum(InventTransferLine) || permitManager.permitTable().PermitType == TTBPermitType::DSP;
+            TTBGallon           qty             = this.ProofGallon ? this.ProofGallon : this.WineGallon;
+
+            // Pass a quantity of zero so that the relevant inventory transaction quantities only are validated.
+            valid = _permitKey ? TTBAlcoholValidator::validateItem(this.ItemId, forceQtyCheck ? qty : 0, _permitKey) : checkFailed("@GGI:PermitIsRequired");
+
+            if (valid)
+            {
+                if (permitManager.permitTable().PermitType == TTBPermitType::DSP)
+                {
+                    InventLocationId inventLocationId = InventDim::find(this.InventDimId).InventLocationId;
+
+                    switch (this.TableId)
+                    {
+                        case tableNum(InventTransferLine):
+                            if (permitManager.permitDSPAddress(inventLocationId).InventLocationIdFrom != inventLocationId)
+                            {
+                                valid = checkFailed(strFmt("@GGI:InvalidPermitForWarehouse", permitManager.permitTable().PermitId, inventLocationId));
+                            }
+                            break;
+                        case tableNum(SalesLine):
+                            SalesLine salesLine = SalesLine::findRecId(this.RecId);
+
+                            valid = permitManager.isPostalAddressValid(salesLine.DeliveryPostalAddress);
+                            break;
+                    }
+                }
+            }
+        }
+
+        return valid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isPermitRequired</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines if a permit is required for the current line.
+    /// </summary>
+    /// <returns>
+    ///     true, if a permit is required; otherwise, false.
+    /// </returns>
+    public boolean isPermitRequired()
+    {
+        TTBItemAlcoholTypeView  itemAlcoholType = TTBItemAlcoholTypeView::findItem(this.ItemId);
+
+        return itemAlcoholType.AlcoholType == TTBAlcoholType::PURE || itemAlcoholType.AlcoholType == TTBAlcoholType::SDA;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Validates the specified field on the current line.
+    /// </summary>
+    /// <param name = "_fieldId">
+    ///     Field number of the field to validate.
+    /// </param>
+    /// <param name = "_permitKey">
+    ///     The associated permit. Optional.
+    /// </param>
+    /// <returns>
+    ///     true, if the field is valid; otherwise, false.
+    /// </returns>
+    public boolean validateField(FieldId _fieldId, TTBPermitKey _permitKey = 0)
+    {
+        boolean isValid = true;
+
+        switch(_fieldId)
+        {
+            case fieldNum(TTBLineTable, Qty):
+                if (this.TTBLineTable::isPermitRequired())
+                {
+                    if (this.Qty != this.orig().Qty
+                        || this.WineGallon != this.orig().WineGallon
+                        || this.ProofGallon != this.orig().ProofGallon)
+                    {
+                        this.TTBLineTable::setQuantities();
+                    }
+
+                    TTBGallon           gallon              = this.ProofGallon ? this.ProofGallon - this.orig().ProofGallon : this.WineGallon - this.orig().WineGallon;
+                    TTBAlcoholValidator alcoholValidator    = TTBAlcoholValidator::newItem(this.ItemId);
+
+                    alcoholValidator.PermitManager = TTBPermitManager::newPermit(_permitKey);
+                    isValid = _permitKey ? alcoholValidator.isQtyAllowed(gallon) : checkFailed("@GGI:PermitIsRequired");
+                }
+                break;
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateWrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines if the record is valid for writing to the database.
+    /// </summary>
+    /// <param name = "_permitKey">
+    ///     The associated permit. Optional.
+    /// </param>
+    /// <returns>
+    ///     true, if the record is valid; otherwise, false.
+    /// </returns>
+    public boolean validateWrite(TTBPermitKey _permitKey = 0)
+    {
+        return this.TTBLineTable::validateField(fieldNum(TTBLineTable, Qty), _permitKey);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
+	<FieldGroups />
+	<Fields>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldReal">
+			<Name>WineGallon</Name>
+			<ExtendedDataType>TTBWineGallon</ExtendedDataType>
+		</AxMapBaseField>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldReal">
+			<Name>ProofGallon</Name>
+			<ExtendedDataType>TTBProofGallon</ExtendedDataType>
+		</AxMapBaseField>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldString">
+			<Name>ItemId</Name>
+			<ExtendedDataType>ItemId</ExtendedDataType>
+		</AxMapBaseField>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldReal">
+			<Name>Qty</Name>
+			<ExtendedDataType>Qty</ExtendedDataType>
+		</AxMapBaseField>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldString">
+			<Name>UnitId</Name>
+			<ExtendedDataType>UnitOfMeasureSymbol</ExtendedDataType>
+		</AxMapBaseField>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldString">
+			<Name>OrderId</Name>
+			<ExtendedDataType>Num</ExtendedDataType>
+		</AxMapBaseField>
+		<AxMapBaseField xmlns=""
+			i:type="AxMapFieldString">
+			<Name>InventDimId</Name>
+			<ExtendedDataType>InventDimId</ExtendedDataType>
+		</AxMapBaseField>
+	</Fields>
+	<Mappings>
+		<AxTableMapping>
+			<MappingTable>SalesLine</MappingTable>
+			<Connections>
+				<AxTableMappingConnection>
+					<MapField>WineGallon</MapField>
+					<MapFieldTo>TTBWineGallon</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>ProofGallon</MapField>
+					<MapFieldTo>TTBProofGallon</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>ItemId</MapField>
+					<MapFieldTo>ItemId</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>Qty</MapField>
+					<MapFieldTo>SalesQty</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>UnitId</MapField>
+					<MapFieldTo>SalesUnit</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>OrderId</MapField>
+					<MapFieldTo>SalesId</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>InventDimId</MapField>
+					<MapFieldTo>InventDimId</MapFieldTo>
+				</AxTableMappingConnection>
+			</Connections>
+		</AxTableMapping>
+		<AxTableMapping>
+			<MappingTable>InventTransferLine</MappingTable>
+			<Connections>
+				<AxTableMappingConnection>
+					<MapField>WineGallon</MapField>
+					<MapFieldTo>TTBWineGallon</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>ProofGallon</MapField>
+					<MapFieldTo>TTBProofGallon</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>ItemId</MapField>
+					<MapFieldTo>ItemId</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>Qty</MapField>
+					<MapFieldTo>QtyTransfer</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>UnitId</MapField>
+					<MapFieldTo>UnitId</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>OrderId</MapField>
+					<MapFieldTo>TransferId</MapFieldTo>
+				</AxTableMappingConnection>
+				<AxTableMappingConnection>
+					<MapField>InventDimId</MapField>
+					<MapFieldTo>InventDimId</MapFieldTo>
+				</AxTableMappingConnection>
+			</Connections>
+		</AxTableMapping>
+	</Mappings>
+</AxMap>

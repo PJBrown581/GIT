@@ -1,0 +1,1650 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocDataSourceProviderSrsReporting</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics365.LocalizationFramework;
+
+public class DocDataSourceProviderSrsReporting extends DocDataSourceProviderReportingBase
+{
+    // NOTE: There is no packing/unpacking anymore, so these class members will be available in all methods.
+    SRSReportProviderMetadata       reportProviderMetadata;
+    DictClass                       rdpDictClass;
+    SRSReportDataProviderBase       rdpClassInstance;
+    Query                           srsFirstDynamicQuery;
+    Map                             srsParameterMap;    // Map(str _parameterName, SrsReportParameter class instance)
+    RecId                           preProcessedId;
+    guid                            reportRunId;
+    
+    #SRSFramework
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return "@DocentricAX:DefaultDsProvider";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    
+        flavour = DocFlavour::Reporting;
+        reportType = DocReportType::SRSReport;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateParams</Name>
+				<Source><![CDATA[
+    final protected boolean validateParams()
+    {
+        boolean paramsAreValid = super();
+    
+        if (!this.parmParamsReporting().parmReportId())
+        {
+            DocGlobalHelper::handleError('Parameter this.parmParamsReporting().parmReportId() is not set', true, funcName());
+            paramsAreValid = false;
+        }
+        
+        // Validate DataSourceGenerationMode.
+        if (this.parmParams().parmDataSourceGenerationMode() == DocDataSourceGenerationMode::NotSet)
+        {
+            DocGlobalHelper::handleError('Data source generation mode parameter is not set', true, funcName());
+            paramsAreValid = false;
+        }
+        else if (this.parmParams().parmDataSourceGenerationMode() != DocDataSourceGenerationMode::ConfigurableBusinessDocuments &&
+                 this.parmParams().parmDataSourceGenerationMode() != DocDataSourceGenerationMode::SSRS)
+        {
+            DocGlobalHelper::handleError(strFmt('Parameter Data source generation mode (%1) is invalid', this.parmParams().parmDataSourceGenerationMode()), true, funcName());
+            paramsAreValid = false;
+        }
+
+        // Validate SSRS Report Contract.
+        if (this.parmParamsReporting().parmSrsReportContract() == null)
+        {
+            DocGlobalHelper::handleError('Parameter this.parmParamsReporting().parmSrsReportContract() is not set', true, funcName());
+            paramsAreValid = false;
+        }
+    
+        // Validate ER Model Mapping.
+        if (this.parmParams().parmDataSourceGenerationMode() == DocDataSourceGenerationMode::ConfigurableBusinessDocuments)
+        {
+            if (!this.parmParams().parmERModelMappingTable())
+            {
+                DocGlobalHelper::handleError("@DocentricAX3:ERModelMappingNotSetForReport", true, funcName());
+                paramsAreValid = false;
+            }
+
+            if (this.parmParams().parmERModelMappingTable() && !DocParameters::find().EnableCbdDs)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:CannotUseCbdDataSourceWithCbdFeatureTurnedOff", this.parmParams().parmERDataModelTable().Name), true, funcName());
+                paramsAreValid = false;
+            }
+
+            // If the ER Model Mapping is set, and this is the design-time execution (a DDSP is being genarated for the purpose of template designing),
+            // and a different option than DocERModelDataToIncludeInDS::IncludeMappedDataOnly is set for parmERModelDataToInclude(),
+            // then throw an error that this is not supported yet.
+            if (this.parmParams().parmERModelMappingTable() && !this.parmParams().parmIsRuntime() &&
+                this.parmParams().parmERModelDataToIncludeInDS() != DocERModelDataToIncludeInDS::IncludeMappedDataOnly)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX3:ERDataModelDataToIncludeValidationErrorNotSupported", this.parmParams().parmERDataModelTable().Name,
+                    this.parmParams().parmERModelDataToIncludeInDS(), DocERModelDataToIncludeInDS::IncludeMappedDataOnly), true, funcName());
+                paramsAreValid = false;
+            }
+
+            // Add here additional validation...
+        }
+
+        return paramsAreValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDS</Name>
+				<Source><![CDATA[
+    final protected void initDS()
+    {
+        super();
+    
+        // Obtain SRS report provider metadata, RDP class and PreProcessedId,
+        // if the SuppressRDPExecution flag is not set, but only for SSRS reports.
+        // This also includes SSRS+ER based reports (i.e. Configurable Business Documents).
+        if (reportTableActiveReport.ReportUsageType == DocReportUsageType::ClassicSSRS && !reportTableActiveReport.SuppressRDPExecution)
+        {
+            this.obtainSrsReportData();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addSystemInfoSection</Name>
+				<Source><![CDATA[
+    final protected void addSystemInfoSection()
+    {
+        DocReportGroup   reportGroup;
+        XmlAttribute     xmlAtt;
+        XmlElement       xmlSystemInfoReportingElement;
+    
+        reportGroup = DocReportGroup::find(reportTableActiveReport.ReportGroup);
+    
+        super();
+    
+        xmlSystemInfoReportingElement =
+            DocDataSourceProviderHelper::createDsPackageXmlElement(xmlDataSource, DocConstantDSP::XmlSystemInfoReportingElementName);
+        xmlSystemInfoRootElement.appendChild(xmlSystemInfoReportingElement);
+    
+        /* Applicable Attributes - SSRS flavour */
+        // ReportType
+        xmlAtt = DocDataSourceProviderHelper::createDsPackageXmlAttribute(xmlDataSource, 'reportType');
+        xmlAtt.value(int2str(enum2int(DocReportType::SRSReport)));
+        xmlSystemInfoReportingElement.setAttributeNode(xmlAtt);
+    
+        // ReportTypeLabel
+        xmlAtt = DocDataSourceProviderHelper::createDsPackageXmlAttribute(xmlDataSource, 'reportTypeLabel');
+        xmlAtt.value(enum2Value(DocReportType::SRSReport));
+        xmlSystemInfoReportingElement.setAttributeNode(xmlAtt);
+    
+        // ReportId
+        xmlAtt = DocDataSourceProviderHelper::createDsPackageXmlAttribute(xmlDataSource, 'reportId');
+        xmlAtt.value(this.parmParamsReporting().parmReportId());
+        xmlSystemInfoReportingElement.setAttributeNode(xmlAtt);
+    
+        // ReportGroupId
+        xmlAtt = DocDataSourceProviderHelper::createDsPackageXmlAttribute(xmlDataSource, 'reportGroupId');
+        xmlAtt.value(reportGroup.GroupId);
+        xmlSystemInfoReportingElement.setAttributeNode(xmlAtt);
+    
+        // SRSReportName
+        xmlAtt = DocDataSourceProviderHelper::createDsPackageXmlAttribute(xmlDataSource, 'srsReportName');
+        if (reportTableActiveReport.RecId != 0)  // i.e. if (!this.parmParamsReporting().isPrintingSsrsBuiltInDesign())
+        {
+            xmlAtt.value(reportTableActiveReport.SRSReportName);
+        }
+        else
+        {
+            xmlAtt.value(this.parmParamsReporting().parmReportId());
+        }
+        xmlSystemInfoReportingElement.setAttributeNode(xmlAtt);
+
+        // DataSourceType
+        xmlAtt = DocDataSourceProviderHelper::createDsPackageXmlAttribute(xmlDataSource, 'dataSourceType');
+        if (this.parmParams().parmDataSourceGenerationMode() == DocDataSourceGenerationMode::ConfigurableBusinessDocuments)
+        {
+            xmlAtt.value(enum2Symbol(enumNum(DocTemplateDataSourceType), DocTemplateDataSourceType::ERDataModel));
+        }
+        else // if (this.parmParams().parmDataSourceGenerationMode() == DocDataSourceGenerationMode::SSRS)
+        {
+            // Note that for different reportType or DocReportTable.ReportUsageType, we might have different values, e.g. DocTemplateDataSourceType::Custom.
+            xmlAtt.value(enum2Symbol(enumNum(DocTemplateDataSourceType), DocTemplateDataSourceType::SSRS));
+        }
+
+        xmlSystemInfoReportingElement.setAttributeNode(xmlAtt);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addMainDataSection</Name>
+				<Source><![CDATA[
+    final protected void addMainDataSection()
+    {
+        // (1) Prepare recordBuilderMainData.
+        this.addMainDataSectionPre();
+    
+
+        // (2) Add the MainData data section.
+        str errorMsg = strFmt('Error during execution of the generateXmlDataSource() method of the DSP class: %1', classId2Name(classIdGet(this)));
+        str errorMsgCBD = strFmt('Error during execution of the generateXmlDataSourceCBD() method of the DSP class: %1', classId2Name(classIdGet(this)));
+
+        // DocSsrsDataSourceGenerationMode::ConfigurableBusinessDocuments can happen only when DDSP is being generated for reports
+        // which support Configurable Business Documents, based on a special kind of ER Data Models that are built on top SSRS.
+        if (this.parmParams().parmDataSourceGenerationMode() == DocDataSourceGenerationMode::SSRS)
+        {
+            try
+            {
+                // Let derived class to fill the record builder with specific Main Data for desing/populating report.
+                this.generateXmlDataSource(recordBuilderMainData);
+            }
+            catch (Exception::CLRError)
+            {
+                DocGlobalHelper::handleClrException(funcName(), errorMsg);
+            }
+            catch
+            {
+                DocGlobalHelper::handleException(funcName(), errorMsg);
+            }
+        }
+        else if (this.parmParams().parmDataSourceGenerationMode() == DocDataSourceGenerationMode::ConfigurableBusinessDocuments)
+        {
+            try
+            {
+                // Let specialized class to fill the record builder using the assigned ER Data Model Mapping.
+                this.generateXmlDataSourceCBD(recordBuilderMainData);
+            }
+            catch (Exception::CLRError)
+            {
+                DocGlobalHelper::handleClrException(funcName(), errorMsgCbd);
+            }
+            catch
+            {
+                DocGlobalHelper::handleException(funcName(), errorMsgCbd);
+            }
+        }
+        else
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt('Unexpected Data source generation mode (%1) in the method addMainDataSection(). Executing DSP class: %2', 
+                this.parmParams().parmDataSourceGenerationMode(), classId2Name(classIdGet(this))));
+        }
+
+        // (3) Serialize the MainData data section to XML and XSD.
+        this.addMainDataSectionPost();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // WARNING: We need to keep this method, otherwise collecting placeholders for Placeholder list and Email body editor will not work correctly!
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        return super(_reportRunContext, _replaceStandardPlaceholders);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettingsPostActions</Name>
+				<Source><![CDATA[
+    final public void overrideReportRunSettingsPostActions(DocReportRunContext _reportRunContext)
+    {
+        super(_reportRunContext);
+        
+        // Ensure that _reportRunContext.archiveContract() is populated for Print management reports.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Extend/Override this method in order to add additional parameters to the report data source.
+    /// </summary>
+    /// <param name="_recordBuilderParameters">
+    /// Record builder for the Parameters data section.
+    /// </param>
+    protected void addParameters(DocXmlRecordBuilder _recordBuilderParameters)
+    {
+        Map                         parameterMap;
+        MapEnumerator               parameterMapEnumerator;
+        SrsReportParameter          parameter;
+        str                         parameterName, parameterLabelIdOrValue;
+        #PrintMgmtSetup
+    
+    
+        // Add each parameter as a field.
+        parameterMap = this.getParameters();
+        parameterMapEnumerator = parameterMap.getEnumerator();
+        while (parameterMapEnumerator.moveNext())
+        {
+            parameter = parameterMapEnumerator.currentValue();
+            // Skip hidden parameters if needed.
+            if (parameter.hidden() && !reportTableActiveReport.IncludeHiddenParamsInDS)
+            {
+                continue;
+            }
+    
+            // Skip dynamic parameters.
+            if (strEndsWith(parameter.name(), DocConstantDSP::SsrsDynamicParameterSufix))
+            {
+                continue;
+            }
+    
+            // Get parameter label ID or value.
+            parameterLabelIdOrValue = '';
+    
+            if (parameter.prompt() && DocLabelHelper::isLabelIdForDsProvider(parameter.prompt()))
+            {
+                parameterLabelIdOrValue = parameter.prompt();
+            }
+            else if (parameter.captionLabelId() && DocLabelHelper::isLabelIdForDsProvider(parameter.captionLabelId()))
+            {
+                parameterLabelIdOrValue = parameter.captionLabelId();
+            }
+    
+            if (!parameterLabelIdOrValue)
+            {
+                parameterLabelIdOrValue = parameter.prompt();
+            }
+    
+            // Resolve parameter name.
+            parameterName = parameter.name();
+            if (parameterName == #IdentificationTextReportParamName)
+            {
+                parameterName = 'FooterText';
+            }
+    
+            // Add field to the recordBuilderParameters.
+            if (parameter.extendedTypeId())
+            {
+                _recordBuilderParameters.addCalculatedFieldEdt(parameterName, extendedTypeId2name(parameter.extendedTypeId()),
+                                                               parameter.getValueTyped(), parameterLabelIdOrValue);
+            }
+            else if (parameter.enumId())
+            {
+                _recordBuilderParameters.addCalculatedFieldEnum(parameterName, enumId2Name(parameter.enumId()),
+                                                                parameter.getValueTyped(), parameterLabelIdOrValue);
+            }
+            else
+            {
+                _recordBuilderParameters.addCalculatedField(parameterName, parameter.getValueTyped(),
+                                                            parameterLabelIdOrValue);
+            }
+        }
+
+        // Add Original document title if applicable - when Print Management Original or Copy report is being printed.
+        if (paramsReporting.parmOriginalCopyType() != DocPrintMgmtOriginalCopyType::NonPrintMgmtReport)
+        {
+            // Original document title contains either Label ID or Label value (translation),
+            // depending on the report controller implementation of the documentTitle() method.
+            // In the case of Label ID -> resolve it.
+            str documentTitleOriginal_labelIdOrValue = paramsReporting.parmDocumentTitleOriginal();
+            if (DocLabelHelper::isLabelIdForDsProvider(documentTitleOriginal_labelIdOrValue))
+            {
+                documentTitleOriginal_labelIdOrValue = DocLabelHelper::resolveSysLabel(documentTitleOriginal_labelIdOrValue, _recordBuilderParameters.languageId());
+            }
+
+            _recordBuilderParameters.addCalculatedField('DocumentTitleOriginal', documentTitleOriginal_labelIdOrValue, literalStr("@DocentricAX4:DocumentTitleOriginal"));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAllFieldsFromQbds</Name>
+				<Source><![CDATA[
+    final protected void addAllFieldsFromQbds(DocXmlRecord _record, QueryBuildDataSource _qbds, 
+                                              Map _dataSetIncludedFieldsMap = null, Map _dataSetIncludedMethodsMap = null)
+    {
+        try
+        {
+            super(_record, _qbds, _dataSetIncludedFieldsMap, _dataSetIncludedMethodsMap);
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(),
+                strFmt('Error occurred during adding regular or additional fields to the report DDSP from QBDS (%1), i.e. TABLE (%2)', _qbds.name(), tableId2Name(_qbds.table())));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForRdpTableRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Override this method in order to exclude particular fields from the currently
+    /// adding record of the RDP (report data provider) table to the report data source,
+    /// by using the _addingRecord.addAllFieldsExcept() method.
+    /// Extend this method in order to add additional data to the currently adding record.
+    /// Use the methods: _addingRecord.addField(), _addingRecord.addCalculatedFieldXXX(),
+    /// _addingRecord.addDisplayMethod(), etc.
+    /// </summary>
+    /// <param name="_addingRecord">
+    /// Data record in the record tree based on the currently adding RDP record table buffer.
+    /// </param>
+    /// <param name="_rdpTableRecord">
+    /// RDP (report data provider) table record.
+    /// </param>
+    /// <param name="_rdpTableName">
+    /// RDP (report data provider) table name.
+    /// </param>
+    protected void addDataFieldsForRdpTableRecord(DocXmlRecord _addingRecord, Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        // Add all fields of the adding record of the RDP table.
+        _addingRecord.addAllFields();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForRdpTableRecordBase</Name>
+				<Source><![CDATA[
+    private void addDataFieldsForRdpTableRecordBase(DocXmlRecordBuilder _recordBuilder, SRSReportDataTable _dataTable,
+                                                    Common _dataTableRecord, boolean _shouldFieldsBeAdded)
+    {
+        DocXmlRecord    addingRecord;
+        str             addingRecordName;
+        str             rdpTableName;
+        str             errorMsg = 'Error during execution of the overridden addDataFieldsForRdpTableRecord() method';
+    
+        rdpTableName = _dataTable.getTableName();
+    
+        // Skip record if the overridden method of the custom DSP class
+        // for a specific SSRS report returns true.
+        if (this.skipRdpTableRecord(_dataTableRecord, rdpTableName))
+        {
+            return;
+        }
+    
+        // Add record.
+        addingRecord = _recordBuilder.addRecord(_dataTableRecord);
+
+        // In case of the Document branding table, rename the record.
+        if (rdpTableName == tableStr(SysDocuBrandDetailsRegular) || rdpTableName == tableStr(SysDocuBrandDetailsTmp))
+        {
+            addingRecord.setRecordName('DocumentBranding');
+            addingRecord.setRecordLabelId(literalStr("@DocentricAX:DocumentBrandingDetails"));
+        }
+    
+        if (_shouldFieldsBeAdded)
+        {
+            // This is the case in the datasource run-time generation
+            // when the currently selected record of the RDP table buffer (_dataTableRecord)
+            // is not empty, or, in the datasource design-time generation, when the currently
+            // selected record of the RDP table buffer (_dataTableRecord) might be empty.
+    
+            // Give a chance to the custom DSP class for a specific SSRS report
+            // to store some field values into class variables.
+            this.onSelectedRdpTableRecord(_dataTableRecord, rdpTableName);
+    
+            // Give a chance to the custom DSP class for a specific SSRS report
+            // to exclude some fields, to add some additional fields or to rename
+            // particular fields or the adding record itself.
+            addingRecordName = addingRecord.getRecordName();
+
+            try
+            {
+                this.addDataFieldsForRdpTableRecord(addingRecord, _dataTableRecord, rdpTableName);
+            }
+            catch (Exception::CLRError)
+            {
+                DocGlobalHelper::handleClrException(funcName(), errorMsg);
+            }
+            catch
+            {
+                DocGlobalHelper::handleException(funcName(), errorMsg);
+            }
+
+            // Add system fields if needed.
+            if (reportTableActiveReport.IncludeSystemFieldsInDSSRS)
+            {
+                addingRecord.addSystemFields();
+            }
+    
+            // In case that the record name has been changed, goto to the parent record
+            // to cause adding of the new record of the same RDP data table at the same level.
+            // (These are specifics of Record Builder).
+            if (addingRecordName != addingRecord.getRecordName() ||
+               (rdpTableName == tableStr(SysDocuBrandDetailsRegular) || rdpTableName == tableStr(SysDocuBrandDetailsTmp)))
+            {
+                _recordBuilder.goToParentRecord();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>excludeQueriesFromDataSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Override this method to return true if you don't want to include any of report query
+    /// data sets into the data source. Also, in this case, no query gets executed.
+    /// This scenario can be useful when you want to avoid fetching the data through query(ies) and
+    /// to employ custom logic in X++ instead. Implement the generateXmlDataSource() method to build
+    /// the report data source. Query(ies) might be still needed for retrieving the dynamic report
+    /// parameters.
+    /// </summary>
+    /// <returns>
+    /// True, if the report query data sets should be excluded from the report data source.
+    /// </returns>
+    /// <remarks>
+    /// The same effect can be achieved if you implement the generateXmlDataSource() method without
+    /// calling the super() method first. This is true only for query based SSRS reports that are NOT
+    /// RDP based reports at the same time.
+    /// </remarks>
+    protected boolean excludeQueriesFromDataSource()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSourceCBD</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds data to MainData data section of the report data source using
+    /// Configurable Business Documents's specific ER data model mappings.
+    /// </summary>
+    /// <param name="_recordBuilder">
+    /// Record builder of the MainData data section. Enables quick building of XML Data Source tree.
+    /// </param>
+    private void generateXmlDataSourceCBD(DocXmlRecordBuilder _recordBuilder)
+    {
+        // Invoke the generic method to create CBD DDSP.
+        DocDataSourceProviderCBD dataSourceProviderCBD = DocDataSourceProviderCBD::construct(
+            this.parmParams(),
+            this.parmParamsReporting(),
+            this.getSrsReportDataContract(),
+            this.getParameters(),
+            this.getSrsRdpClassRunningInstance(),
+            this.getSrsReportFirstDynamicQuery());
+        if (dataSourceProviderCBD)
+        {
+            // Set the Global Electronic Reporting Label Repository.
+            this.parmLabelRepository().parmGerLabelRepository(dataSourceProviderCBD.parmLabelRepository());
+            // Generate report data source
+            dataSourceProviderCBD.run(_recordBuilder);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds default XML Data Source for an SRS report.
+    /// </summary>
+    /// <param name="_recordBuilder">
+    /// Record builder of the MainData data section. Enables quick building of XML Data Source tree.
+    /// </param>
+    /// <remarks>
+    /// Override this method in order to make structured XML data Source
+    /// that is easier to work with when designing templates, or
+    /// when you develop a new custom SSRS report from scratch without using
+    /// temporary tables and the RDP data provider logic to fill them.
+    /// Extend this method in order to append additional data to the Main data section
+    /// of the report data source.
+    /// </remarks>
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        if (!reportTableActiveReport.SuppressRDPExecution)
+        {
+            // Generate report data source in case that the report is RDP (report data provider) based.
+            if (this.getSrsReportDataContract().parmRdpName())
+            {
+                this.generateXmlDataSourceRDP(_recordBuilder);
+            }
+    
+            // Generate report data source in case that the report is query based but only dynamic query(ies) are used.
+            else if (this.getSrsReportFirstDynamicQuery())
+            {
+                this.generateXmlDataSourceDynamicQueries(_recordBuilder);
+            }
+    
+            // In the current version of Docentric AX static queries are not supported as report data sources.
+            // RDL and report contract don't contain info about static query; in this case we should use the AOT AxReport metadata.
+            // Also, the problem is pairing ranges of static queries with input parameters from report contract.
+            // This info is probably only writen into RDL.
+            else
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:SupportedSsrsReports", DocConstantLicVer::DocentricAxVersion()));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSourceDynamicQueries</Name>
+				<Source><![CDATA[
+    private void generateXmlDataSourceDynamicQueries(DocXmlRecordBuilder _recordBuilder)
+    {
+        MapEnumerator               enumerator;
+        Query                       query;
+        QueryBuildDataSource        qbdsMainDs, qbds;
+        int                         dataSetCount, dataSourceCount;
+        QueryRun                    queryRun;
+        Common                      commonDs;
+        int                         currentDsNo, parentDsNo;
+        DocXmlRecord                currentRecord, parentRecord;
+        Array                       qbdsRecordTypeArray, dsAddedRecordArray;
+        Array                       contextRecordArray;
+        DocQbdsRecordType           currentQbdsRecordType;
+        container                   dataSetNos;
+        int                         dataSetCounter, currentDataSetNo, nextDataSetNo;
+        Map                         dataSetIncludedFieldsMap, dataSetIncludedMethodsMap;
+    
+    
+        /* Helper methods BEGIN */
+        void fillSingleDataSetIncludedFieldsAndMethodsMaps()
+        {
+            try
+            {
+                // Create the maps if the corresponding flags are turned on, or the report is not added to Docentric report setup.
+                if (reportTableActiveReport.RecId == 0 || reportTableActiveReport.IncludeReportDefinedFieldsInDS)
+                {
+                    dataSetIncludedFieldsMap = new Map(Types::String, Types::Class);
+                }
+                if (reportTableActiveReport.RecId == 0 || reportTableActiveReport.IncludeReportDefinedDispMethodsInDS)
+                {
+                    dataSetIncludedMethodsMap = new Map(Types::String, Types::Class);
+                }
+
+                // If no map is created, return.
+                if (dataSetIncludedFieldsMap == null && dataSetIncludedMethodsMap == null)
+                {
+                    return;
+                }
+
+                // If there is more than 1 query, swallow the warning and return.
+                if (this.getSrsReportDataContract().parmQueryContracts().elements() > 1)
+                {
+                    return;
+                }
+
+                // If there is more than 1 data set, swallow the warning and return.
+                enumerator = this.getSrsReportDataContract().parmQueryContracts().getEnumerator();
+                while (enumerator.moveNext())
+                {
+                    query = enumerator.currentValue();
+                    dataSetCount = query.childDataSourceCount();
+                    if (dataSetCount != 1)
+                    {
+                        return;
+                    }
+                }
+
+                // Try filling the maps.
+                str ssrsReportDesignName = this.parmParamsReporting().parmReportId();
+                if (!DocReportingHelper::fillDataSetIncludedFieldsAndMethodsMaps(
+                        ssrsReportDesignName, dataSetIncludedFieldsMap, dataSetIncludedMethodsMap))
+                {
+                    // If an error occurred, swallow the warning and anull the maps.
+                    dataSetIncludedFieldsMap = null;
+                    dataSetIncludedMethodsMap = null;
+                }
+            }
+            catch
+            {
+                // Swallow the exception and anull the maps.
+                dataSetIncludedFieldsMap = null;
+                dataSetIncludedMethodsMap = null;
+            }
+        }
+        
+        void initializeVariablesForDataSetIfDataSetChanged()
+        {
+            int dataSetDataSourceId;
+            boolean dataSetChanged;
+    
+            // Check if the data set is chanded. In that case initialize the needed variables.
+            dataSetChanged = false;
+            for (dataSetCounter = 1; dataSetCounter <= conLen(dataSetNos); dataSetCounter++)
+            {
+                dataSetDataSourceId = conPeek(dataSetNos, dataSetCounter);
+                if (queryRun.changedNo(dataSetDataSourceId))
+                {
+                    contextRecordArray = new Array(Types::Class);
+                    currentDataSetNo = dataSetDataSourceId;
+                    dataSetChanged = true;
+                    break;
+                }
+            }
+    
+            if (dataSetChanged)
+            {
+                dataSetNos = conDel(dataSetNos, 1, 1);
+                if (dataSetNos != conNull())
+                {
+                    nextDataSetNo = conPeek(dataSetNos, 1);
+                }
+                else
+                {
+                    nextDataSetNo = dataSourceCount + 1;
+                }
+            }
+        }
+    
+        void initializeDsAddedRecordArray()
+        {
+            int i;
+    
+            dsAddedRecordArray = new Array(Types::Class);
+            for (i = 1; i <= dataSourceCount; i++)
+            {
+                dsAddedRecordArray.value(i, new Map(Types::Guid, Types::Class));
+            }
+        }
+    
+        boolean isRecordAlreadyAdded(int _dsNo, DocXmlRecord _parentRecord, Common _childRecordCommon)
+        {
+            Set childRecords;
+            Map parentToChildRecords = dsAddedRecordArray.value(_dsNo);
+            boolean ret = false;
+            if (parentToChildRecords.exists(_parentRecord.recordId()))
+            {
+                childRecords = parentToChildRecords.lookup(_parentRecord.recordId());
+                ret = childRecords.in(_childRecordCommon.RecId);
+            }
+            return ret;
+        }
+    
+        void addRecord(int _dsNo, DocXmlRecord _parentRecord, DocXmlRecord _addedChildRecord)
+        {
+            Set childRecords;
+            Map parentToChildRecords = dsAddedRecordArray.value(_dsNo);
+            if (parentToChildRecords.exists(_parentRecord.recordId()))
+            {
+                childRecords = parentToChildRecords.lookup(_parentRecord.recordId());
+            }
+            else
+            {
+                childRecords = new Set(Types::Int64);
+                parentToChildRecords.insert(_parentRecord.recordId(), childRecords);
+            }
+            childRecords.add(_addedChildRecord.recId());
+        }
+        /* Helper methods END */
+    
+    
+        // Check if queries should be included in the report data source.
+        if (this.excludeQueriesFromDataSource())
+        {
+            return;
+        }
+    
+        // Start building XML.
+        _recordBuilder.goToTopRecord();
+
+        // Fill maps with included data fields and display methods if applicable.
+        fillSingleDataSetIncludedFieldsAndMethodsMaps();
+    
+        try
+        {
+            enumerator = this.getSrsReportDataContract().parmQueryContracts().getEnumerator();
+            while (enumerator.moveNext())
+            {
+                query = enumerator.currentValue();
+    
+                //-- Validation.
+                if (query == null)
+                {
+                    DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:DspQueryNotExist", query.name()));
+                }
+                qbdsMainDs = query.dataSourceNo(1);
+                if (qbdsMainDs == null)
+                {
+                    DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:DspQueryNoDataSources", query.name()));
+                }
+    
+                // Check if the number of data sets are > 0.
+                dataSetCount = query.childDataSourceCount();
+                if (dataSetCount == 0)
+                {
+                    DocGlobalHelper::handleException(funcName(), strFmt('There is no data set in the query %1', query.name()));
+                }
+    
+    
+                //-- Initialize variables.
+                qbdsRecordTypeArray = DocQbdsRecordType::buildQbdsRecordTypeArray(query);
+                dataSourceCount = query.dataSourceCount();
+                initializeDsAddedRecordArray();
+                if (dataSetCount == 1)
+                {
+                    contextRecordArray = new Array(Types::Class);
+                    currentDataSetNo = 1;
+                    nextDataSetNo = dataSourceCount + 1;
+                }
+                else
+                {
+                    // Find and store IDs of the main data sources from each data set.
+                    dataSetNos = conNull();
+                    for (dataSetCounter = 1; dataSetCounter <= dataSetCount; dataSetCounter++)
+                    {
+                        dataSetNos = dataSetNos + query.childDataSourceNo(dataSetCounter).id();
+                    }
+                }
+    
+    
+                //-- Execute query.
+                queryRun = new QueryRun(query);
+                while (queryRun.next())
+                {
+                    if (dataSetCount > 1)
+                    {
+                        initializeVariablesForDataSetIfDataSetChanged();
+                    }
+    
+                    // Add record for each of the data sources to the building record tree
+                    // if it has not been already added.
+                    for (currentDsNo = currentDataSetNo; currentDsNo <= nextDataSetNo - 1; currentDsNo++)
+                    {
+                        qbds = query.dataSourceNo(currentDsNo);
+    
+                        // Skip the data source if it is not enabled.
+                        if (!qbds.enabled())
+                        {
+                            continue;
+                        }
+    
+                        // Skip the data source if the join mode is not InnerJoin or OuterJoin.
+                        if (qbds.joinMode() == JoinMode::ExistsJoin ||
+                            qbds.joinMode() == JoinMode::NoExistsJoin)
+                        {
+                            continue;
+                        }
+    
+                        // Reread the underlying table buffer.
+                        // This is needed because of potential adding of display methods and additional data.
+                        commonDs = queryRun.getNo(currentDsNo);
+                        commonDs.checkInvalidFieldAccess(false);
+
+                        if (!qbds.fields().dynamic() &&   // Reread only if the query fields are not dynamic, and
+                            commonDs.RecId != 0 &&        // commonDs.RecId is known (RecId != 0), and
+                            commonDs.RecId != 1010)       // commonDs is not a view with fixed RecId=1010 (e.g. when has GroupBy defined).
+                        {
+                            commonDs.reread();
+                        }
+
+                        // Add record of the current data source if it is not already added.
+                        currentRecord = null;
+                        if (currentDsNo == currentDataSetNo)
+                        {
+                            if (queryRun.changedNo(currentDsNo))
+                            {
+                                if (_recordBuilder.currentRecord().getRecordName() != tableId2name(commonDs.TableId))
+                                {
+                                    _recordBuilder.goToParentRecord();
+                                }
+                                currentRecord = _recordBuilder.addRecord(commonDs);
+                            }
+                        }
+                        else
+                        {
+                            currentQbdsRecordType = qbdsRecordTypeArray.value(currentDsNo);
+                            parentDsNo = currentQbdsRecordType.parentDataSourceNo();
+                            parentRecord = contextRecordArray.value(parentDsNo);
+                            
+                            if (!isRecordAlreadyAdded(currentDsNo, parentRecord, commonDs))
+                               // || queryRun.changedNo(currentDsNo))   
+                               // COMMENT:
+                               // For commonDs having RecId=0 or RecId=1010, isRecordAlreadyAdded() will not work if there are multiple records (one-to-many relation).
+                               // In such cases, queryRun.changedNo() seems to work. This should be tested.
+                            {
+                                currentRecord = parentRecord.addChildRecord(commonDs);
+                                addRecord(currentDsNo, parentRecord, currentRecord);
+                            }
+                        }
+    
+                        // Check if the record is added.
+                        if (currentRecord != null)
+                        {
+                            // Add all fields defined by qbds.
+                            this.addAllFieldsFromQbds(currentRecord, qbds, dataSetIncludedFieldsMap, dataSetIncludedMethodsMap);
+    
+                            // Add system fields if needed.
+                            if (reportTableActiveReport.IncludeSystemFieldsInDSSRS)
+                            {
+                                currentRecord.addSystemFields();
+                            }
+    
+                            // Store the added record in the context record array.
+                            contextRecordArray.value(currentDsNo, currentRecord);
+                        }
+                    }
+                }
+    
+                // Go to the next query.
+                _recordBuilder.goToTopRecord();
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(),
+                strFmt('Error occurred during executing the report query (%1). Query:\n%2', query.name(), query.toString()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isDocumentBrandingRdpTable</Name>
+				<Source><![CDATA[
+    private boolean isDocumentBrandingRdpTable(str _tableName)
+    {
+        // If this is not a document branding table, the method is not applicable. Return false.
+        if (_tableName == tableStr(SysDocuBrandDetailsRegular) || _tableName == tableStr(SysDocuBrandDetailsTmp))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>skipDocumentBrandingRdpTable</Name>
+				<Source><![CDATA[
+    private boolean skipDocumentBrandingRdpTable(str _tableName)
+    {
+        // If this is not a document branding table, the method is not applicable. Return false.
+        if (!this.isDocumentBrandingRdpTable(_tableName))
+        {
+            return false;
+        }
+
+        // This is a document branding table.
+        if (reportTableActiveReport.IncludeDocuBrandingInDSSRS)
+        {
+            // Don't skip the document branding table.
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSourceRDP</Name>
+				<Source><![CDATA[
+    private void generateXmlDataSourceRDP(DocXmlRecordBuilder _recordBuilder)
+    {
+        SetEnumerator                   reportDataTablesSetEnum;
+        SRSReportDataTable              reportDataTable;
+        Common                          reportDataTableRecord;
+        SRSReportName                   srsReportName;
+        Map                             srsReportDsCandidates;
+        boolean                         isDataTableEmpty;
+    
+    
+        if (!this.isRuntime())
+        {
+            srsReportName = DocReportingSetupHelper::getReportName(this.parmParamsReporting().parmReportId());
+            if (!srsReportName)
+            {
+                DocGlobalHelper::handleException('Report name is not set');
+            }
+    
+            srsReportDsCandidates = DocReportingHelper::getSrsReportDsCandidates(srsReportName);
+        }
+    
+        // Start building XML.
+        _recordBuilder.goToTopRecord();
+    
+        reportDataTablesSetEnum = reportProviderMetadata.getReportSchema(rdpClassInstance).getReportDataTables().getEnumerator();
+        while (reportDataTablesSetEnum.moveNext())
+        {
+            reportDataTable = reportDataTablesSetEnum.current();
+
+            // Skip document branding table if needed.
+            if (this.skipDocumentBrandingRdpTable(reportDataTable.getTableName()))
+            {
+                continue;
+            }
+    
+            if (reportProviderMetadata.isPreProcessingRegular() ||
+                reportProviderMetadata.isPreProcessingTempDB())
+            {
+                reportDataTableRecord = this.selectDataTableRecordPreProcessed(reportDataTable);
+            }
+            else
+            {
+                reportDataTableRecord = reportDataTable.getRecord();
+                select reportDataTableRecord;
+            }
+    
+            isDataTableEmpty = true;
+            while (reportDataTableRecord)
+            {
+                // Add the data table record with fields that might be selected by
+                // the overrided addDataFieldsForRdpTableRecord() method.
+                this.addDataFieldsForRdpTableRecordBase(_recordBuilder, reportDataTable, reportDataTableRecord, true);
+    
+                isDataTableEmpty = false;
+    
+                next reportDataTableRecord;
+            }
+    
+            // In case that data table was empty and this is the runtime,
+            // add only the record without any field.
+            if (this.isRuntime() && isDataTableEmpty)
+            {
+                this.addDataFieldsForRdpTableRecordBase(_recordBuilder, reportDataTable, reportDataTableRecord, false);
+            }
+    
+            // In case that data table was empty and this is the designtime, add the record
+            // with fields that might be selected by the overriden addDataFieldsForRdpTableRecord() method.
+            if (!this.isRuntime() && isDataTableEmpty)
+            {
+                if (srsReportDsCandidates.exists(reportDataTable.parmDataSetName()) ||
+                    (this.isDocumentBrandingRdpTable(reportDataTable.getTableName()) && !this.skipDocumentBrandingRdpTable(reportDataTable.getTableName()))
+                   )
+                {
+                    this.addDataFieldsForRdpTableRecordBase(_recordBuilder, reportDataTable, reportDataTableRecord, true);
+                }
+            }
+    
+            _recordBuilder.goToParentRecord();
+        }
+    
+        // If this RDP report class does not have its own query but there is still the first
+        // dynamic query, run all the report queries and add them as parts of the report data source.
+        // Note that this code is a legacy and it's possible that it should be revisited!
+        if (this.getSrsRdpClassRunningInstance().parmQuery() == null  // this info is filled from RDL.
+            && this.getSrsReportFirstDynamicQuery() != null)          // this info is filled from the report contract.
+        {
+            this.generateXmlDataSourceDynamicQueries(_recordBuilder);
+        }
+    
+        _recordBuilder.goToTopRecord();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getParameter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets report parameter for the given name.
+    /// </summary>
+    /// <param name="_parameterName">
+    /// Parameter name.
+    /// </param>
+    /// <returns>
+    /// SrsReportParameter instance representing report parameter, if such
+    /// exists; otherwise returns null.
+    /// </returns>
+    final public SrsReportParameter getParameter(str _parameterName)
+    {
+        Map parameterMap = this.getParameters();
+    
+        if(parameterMap && parameterMap.exists(_parameterName))
+        {
+            return parameterMap.lookup(_parameterName);
+        }
+    
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getParameters</Name>
+				<Source><![CDATA[
+    // Map(str parameterName, SrsReportParameter class instance)
+    final public Map getParameters()
+    {
+        if (srsParameterMap == null)
+        {
+            srsParameterMap = DocReportingHelper::getSrsReportParameters(this.getSrsReportDataContract());
+        }
+    
+        return srsParameterMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPreProcessedId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SRS report PreProcessedId.
+    /// </summary>
+    /// <returns>
+    /// PreProcessedId.
+    /// </returns>
+    final public RecId getPreProcessedId()
+    {
+        return preProcessedId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReportRunId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SRS report ReportRunId.
+    /// </summary>
+    /// <returns>
+    /// ReportRunId.
+    /// </returns>
+    /// <remarks>
+    /// Report run id is a unique identifier given to each report run instance. This is a guid and will be unique across
+    /// all report run instances. Everytime a new <c>SrsReportRunController</c> is created a guid is generated for that
+    /// instance and written to this property as well.
+    /// </remarks>
+    final public guid getReportRunId()
+    {
+        return reportRunId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReportProviderMetadata</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SRS ReportProviderMetadata.
+    /// </summary>
+    /// <returns>
+    /// SRS ReportProviderMetadata.
+    /// </returns>
+    final public SRSReportProviderMetadata getReportProviderMetadata()
+    {
+        return reportProviderMetadata;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSrsRdpClassRunningInstance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SRS RDP class running instance.
+    /// </summary>
+    /// <returns>
+    /// Returns SRS RDP class running instance.
+    /// </returns>
+    final public SRSReportDataProviderBase getSrsRdpClassRunningInstance()
+    {
+        return rdpClassInstance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSrsRdpContract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SRS RDP contract.
+    /// </summary>
+    /// <returns>
+    /// SRS RDP contract.
+    /// </returns>
+    final public Object getSrsRdpContract()
+    {
+        return this.parmParamsReporting().parmSrsReportContract().parmRdpContract();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSrsReportDataContract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SRS report data contract.
+    /// </summary>
+    /// <returns>
+    /// SRS report data contract.
+    /// </returns>
+    final public SrsReportDataContract getSrsReportDataContract()
+    {
+        return this.parmParamsReporting().parmSrsReportContract();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSrsReportFirstDynamicQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the first SRS report dynamic query.
+    /// </summary>
+    /// <returns>
+    /// Returns the first SRS report dynamic query.
+    /// </returns>
+    final public Query getSrsReportFirstDynamicQuery()
+    {
+        return srsFirstDynamicQuery;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSrsReportFirstDynamicQueryRanges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all ranges (List of QueryBuildRange objects) defined for the first SRS report dynamic query.
+    /// Use this method to retrieve the dynamic report parameters defined by the first dynamic query.
+    /// </summary>
+    /// <returns>
+    /// Returns all defined ranges for the first SRS report dynamic query.
+    /// </returns>
+    final public List getSrsReportFirstDynamicQueryRanges()
+    {
+        Query                   dynamicQuery;
+        QueryBuildRange         qbr;
+        QueryBuildDatasource    qbds;
+        int                     rangeNumber, rangeCount, dsCount, dsNumber;
+        List                    qbrList;
+    
+    
+        qbrList = null;
+    
+        dynamicQuery = this.getSrsReportFirstDynamicQuery();
+        if (dynamicQuery)
+        {
+            qbrList = new List(Types::Class);
+            dsCount = dynamicQuery.dataSourceCount();
+            for (dsNumber = 1; dsNumber <= dsCount; dsNumber++)
+            {
+                qbds = dynamicQuery.dataSourceNo(dsNumber);
+                if (qbds.enabled())
+                {
+                    rangeCount = qbds.rangeCount();
+                    for (rangeNumber = 1; rangeNumber <= rangeCount; rangeNumber++)
+                    {
+                        qbr = qbds.range(rangeNumber);
+                        qbrList.addEnd(qbr);
+                    }
+                }
+            }
+        }
+    
+        return qbrList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>placeholderManager</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets Placeholder manager for Standard and Custom placeholders.
+    /// </summary>
+    /// <param name = "_reportRunContext">Report run context</param>
+    /// <param name = "_reinstance">Should DocPlaceholderManager be re-instanced</param>
+    /// <returns>The instance of the DocPlaceholderManager object</returns>
+    final public DocPlaceholderManager placeholderManager(DocReportRunContext _reportRunContext = this.parmParamsReporting().parmReportRunContext(),
+                                                          boolean _reinstance = false)
+    {
+        if (standardAndCustomPlaceholderManager == null || _reinstance)
+        {
+            if (_reportRunContext)
+            {
+                standardAndCustomPlaceholderManager = DocPlaceholderManager::constructWithSrsParameters(
+                    _reportRunContext, this.parmParamsReporting().parmSrsReportContract(), this.getParameters());
+            }
+        }
+
+        return standardAndCustomPlaceholderManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>obtainSrsReportData</Name>
+				<Source><![CDATA[
+    // Obtain SRS report data.
+    private void obtainSrsReportData()
+    {
+        SrsReportDataContract reportContract;
+    
+        reportContract = this.parmParamsReporting().parmSrsReportContract();
+    
+        // Obtain report data in case that the report is RDP (report data provider) based.
+        if (reportContract.parmRdpName())
+        {
+            this.obtainSrsReportDataRDP();
+        }
+    
+        // Obtain first dynamic query in case that the report is query based but only dynamic query(ies) are used.
+        else if (reportContract.parmQueryContracts() && !reportContract.parmQueryContracts().empty())
+        {
+            this.obtainSrsReportFirstDynamicQuery();
+        }
+    
+        // In the current version of Docentric AX static queries are not supported as report data sources.
+        // RDL and report contract don't contain info about static query; in this case we should use the AOT AxReport metadata.
+        // Also, the problem is pairing ranges of static queries with input parameters from report contract.
+        // This info is probably only writen into RDL.
+        else
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:SupportedSsrsReports", DocConstantLicVer::DocentricAxVersion()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>obtainSrsReportDataRDP</Name>
+				<Source><![CDATA[
+    private void obtainSrsReportDataRDP()
+    {
+        SrsReportDataContract           reportContract;
+        QueryName                       dynamicQueryName;
+        Query                           dynamicQuery;
+        MapEnumerator                   queryContractsEnum;
+        
+        
+        reportContract = this.getSrsReportDataContract();
+        if (!reportContract.parmRdpName())
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:SupportedSsrsReports", DocConstantLicVer::DocentricAxVersion()));
+        }
+        if (reportContract.parmReportExecutionInfo() == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'The reportContract.parmReportExecutionInfo() object is not set');
+        }
+
+        // ReportRunId.
+        reportRunId = reportContract.parmReportExecutionInfo().parmReportRunId();
+    
+        // Get report metadata.
+        reportProviderMetadata = SRSReportProviderMetadata::constructWithName(reportContract.parmRdpName());
+    
+        // Instance report RDP class.
+        rdpDictClass = reportProviderMetadata.getRdpDictClass();
+        rdpClassInstance = rdpDictClass.makeObject() as SRSReportDataProviderBase;
+    
+        if (!rdpClassInstance)
+        {
+            DocGlobalHelper::handleException(funcName(), 'RDP class cannot be instanced');
+        }
+    
+        // Set RDP contract.
+        rdpClassInstance.parmDataContract(reportContract.parmRdpContract());
+    
+        // Set Dynamic query.
+        dynamicQueryName = reportProviderMetadata.getQueryName();
+        if (dynamicQueryName && reportContract.parmQueryContracts())
+        {
+            queryContractsEnum = reportContract.parmQueryContracts().getEnumerator();
+            while (queryContractsEnum.moveNext())
+            {
+                dynamicQuery = queryContractsEnum.currentValue();
+                if (dynamicQuery.name() == dynamicQueryName)
+                {
+                    rdpClassInstance.parmQuery(dynamicQuery);
+                    break;
+                }
+            }
+        }
+    
+        // Set dynamic query to be accessible through the getSrsReportFirstDynamicQueryXXX() methods afterwards.
+        if (dynamicQuery != null)
+        {
+            srsFirstDynamicQuery = dynamicQuery;
+        }
+        else
+        {
+            this.obtainSrsReportFirstDynamicQuery();
+        }
+    
+        // If pre-processing is required for the report, set the preProcessedId.
+        if (reportProviderMetadata.isPreProcessingRegular() ||
+            reportProviderMetadata.isPreProcessingTempDB())
+        {
+            preProcessedId = reportContract.parmReportExecutionInfo().parmRdpPreProcessedId();
+    
+            // Execute pre-processing of the report in case it has not been done yet.
+            if (!preProcessedId)
+            {
+                preProcessedId = new SrsReportRunRdpPreProcessService().executeWithContract(reportContract);
+
+                reportContract.parmReportExecutionInfo().parmRdpPreProcessedId(preProcessedId);
+            }
+        }
+        // Otherwise process the report.
+        else
+        {
+            changecompany(this.parmParams().parmCompanyId())
+            {
+                rdpClassInstance.processReport();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>obtainSrsReportFirstDynamicQuery</Name>
+				<Source><![CDATA[
+    private void obtainSrsReportFirstDynamicQuery()
+    {
+        // Set the first query, which is the report dynamic query parameter, to be accessible through the getter afterwards.
+        srsFirstDynamicQuery = DocReportingHelper::getSrsDynamicQueryParameter(this.getSrsReportDataContract());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSelectedRdpTableRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Override this method in order to store particular data fields from the currently
+    /// adding record of the RDP (report data provider) table to the class
+    /// global variables. This way you can use them in the this.generateXmlDataSource()
+    /// method to add additional data, or in this.overrideReportRunSettings() methods to
+    /// replace custom placeholders or change the selected print destination settings.
+    /// </summary>
+    /// <param name="_rdpTableRecord">
+    /// RDP (report data provider) table record.
+    /// </param>
+    /// <param name="_rdpTableName">
+    /// RDP (report data provider) table name.
+    /// </param>
+    protected void onSelectedRdpTableRecord(Common _rdpTableRecord, TableName _rdpTableName)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectDataTableRecordPreProcessed</Name>
+				<Source><![CDATA[
+    private Common selectDataTableRecordPreProcessed(SRSReportDataTable _reportDataTable)
+    {
+        SrsReportPreProcessedDetails                srsReportPreProcessedDetails;
+        container                                   tempDBNamesContainer;
+        int                                         tempDBNamesContainerLen, idx;
+        str                                         aotTempDbName, sqlTempDbName;
+        boolean                                     isSetSqlTempDbName;
+        Common                                      reportDataTableRecord;
+        SysDictTable                                reportDataTableSysDictTable;
+    
+    
+        select firstOnly srsReportPreProcessedDetails
+        where srsReportPreProcessedDetails.RecId == preProcessedId;
+    
+        if (!srsReportPreProcessedDetails)
+        {
+            DocGlobalHelper::handleException(funcName(),
+                strFmt('For report (%1) and PreProcessId (%2) there is no record in the SrsReportPreProcessedDetails table',
+                       this.parmParamsReporting().parmReportId(), preProcessedId));
+        }
+    
+        // Create an empty table buffer.
+        reportDataTableSysDictTable = _reportDataTable.getDictTable();
+        if (reportDataTableSysDictTable == null)
+        {
+            DocGlobalHelper::handleException(funcName(),
+                strFmt('For report (%1) and PreProcessId (%2) sys info about the RDP table is missing',
+                       this.parmParamsReporting().parmReportId(), preProcessedId));
+        }
+        reportDataTableRecord = reportDataTableSysDictTable.makeRecord();
+    
+        // If the report is PreProcessingTempDB, set the existing SQL Server
+        // TempDB table to be used with the table buffer.
+        if (reportProviderMetadata.isPreProcessingTempDB())
+        {
+            tempDBNamesContainer = srsReportPreProcessedDetails.TempDBNames;
+            tempDBNamesContainerLen = conLen(tempDBNamesContainer);
+    
+            if(tempDBNamesContainerLen < 2)
+            {
+                DocGlobalHelper::handleException(funcName(),
+                    strFmt('For SSRS RDP PreProcessed TempDB reports, SrsReportPreProcessedDetails.TempDBNames has to be a container of at least 2 elements. ' +
+                           'For the report (%1) and PreProcessId (%2) this is not the case.',
+                           this.parmParamsReporting().parmReportId(), preProcessedId));
+            }
+            else
+            {
+                isSetSqlTempDbName = false;
+                for(idx = 1; idx <= tempDBNamesContainerLen ; idx += 2)
+                {
+                    // AOT TempDBName, SQL tempDB name
+                    aotTempDbName = conPeek(tempDBNamesContainer, idx);
+                    sqlTempDbName = conPeek(tempDBNamesContainer, idx + 1);
+    
+                    if (_reportDataTable.getTableName() == aotTempDbName)
+                    {
+                        try
+                        {
+                            // Set the SQL tempDB table to be used with the table buffer.
+                            new ExecutePermission().assert();
+                            reportDataTableSysDictTable.callObject(
+                                #TempDBMethodName_UseExisting, reportDataTableRecord, sqlTempDbName);
+                            CodeAccessPermission::revertAssert();
+    
+                            // reportDataTableRecord.useExistingTempDBTable(sqlTempDbName);
+                        }
+                        catch
+                        {
+                            CodeAccessPermission::revertAssert();
+                            DocGlobalHelper::handleException(funcName(),
+                                strFmt('For the report (%1), PreProcessId (%2) and report temporary table (%3), the corresponding SQL Server tempDB table (%4) could not have been used',
+                                       this.parmParamsReporting().parmReportId(), preProcessedId, aotTempDbName, sqlTempDbName));
+                        }
+    
+                        isSetSqlTempDbName = true;
+                        break;
+                    }
+                }
+    
+                if (!isSetSqlTempDbName)
+                {
+                    DocGlobalHelper::handleException(funcName(),
+                        strFmt('For the report (%1) and PreProcessId (%2) there is no entry in the SrsReportPreProcessedDetails.TempDBNames container ' +
+                               'for the report temporary table (%3)',
+                                this.parmParamsReporting().parmReportId(), preProcessedId, _reportDataTable.getTableName()));
+                }
+            }
+        }
+    
+        // Fetch the records from the pre-processed report table.
+        select reportDataTableRecord
+            where reportDataTableRecord.CreatedTransactionId == srsReportPreProcessedDetails.CreatedTransactionId;
+
+        // Exception for certain TempDB tables (e.g. SysDocuBrandDetailsTmp or ChequeTmp) where CreatedTransactionId is not enabled!
+        if (reportDataTableRecord.RecId == 0 && reportProviderMetadata.isPreProcessingTempDB())
+        {
+            select reportDataTableRecord;
+        }
+        
+        // Return.
+        return reportDataTableRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>skipRdpTableRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Override this method to return true in order to skip the currently adding
+    /// record of an RDP (report data provider) table to the report data source.
+    /// </summary>
+    /// <param name="_rdpTableRecord">
+    /// RDP (report data provider) table record.
+    /// </param>
+    /// <param name="_rdpTableName">
+    /// RDP (report data provider) table name.
+    /// </param>
+    /// <returns>
+    /// False if the currently adding record of an RDP should be added.
+    /// </returns>
+    protected boolean skipRdpTableRecord(Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReportDataTableContext</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get report data table context for all types of tables (Regular, InMemory, TempDB, etc.).
+    /// Please read the limitations in the remarks below.
+    /// </summary>
+    /// <param name = "_rdpTableName">RDP (report data provider) table name. Please use tableStr(TableName).</param>
+    /// <returns>RDP (report data provider) table record.</returns>
+    /// <remarks>
+    /// *** HOW TO USE THIS METHOD - LIMITATIONS ***********************************************
+    ///   - For Regular report tables, use this method with:
+    ///     (1) tableBuff = this.getReportDataTableContext(tableStr([reportTableName]));
+    ///     (2) tableBuff = this.getReportDataTableContext(tableStr([reportTableName])).data();
+    ///     (3) tableBuff = this.getReportDataTableContext(tableStr([reportTableName]));
+    ///         while (tableBuff) { ... next tableBuff; }
+    ///     DO NOT USE tableBuff with any SELECT statement because this will reset the cursor query and you will end up
+    ///     dealing with all records from [reportTableName] instead with only those which have been previously selected.
+    ///     Instead, you can perform the following steps:
+    ///       tableBuff = this.getReportDataTableContext(tableStr([reportTableName]));
+    ///       CreatedTransactionId ctId = tableBuff.CreatedTransactionId;
+    ///     Afterwards, you can use ctId in any further selects, for example:
+    ///       while select / select firstonly tableBuff where tableBuff.CreatedTransactionId == ctId &amp;&amp; ...;
+    ///     
+    ///   - For TempDB report tables having the CreatedTransactionId field (e.g. Customer account statement)
+    ///     => the procedure is the same as for Regular tables.
+    ///     
+    ///   - For TempDB report tables without the CreatedTransactionId field (e.g. WHS Bill of lading)
+    ///     => the procedure is the same as for InMemory tables.
+    ///   
+    ///   - For InMemory report tables, use this method without any limitation, for example:
+    ///     tableBuff = this.getReportDataTableContext(tableStr([reportTableName]));
+    ///     while select / select firstOnly tableBuff where ...;
+    /// ****************************************************************************************    
+    /// </remarks>
+    final public Common getReportDataTableContext(TableName _rdpTableName)
+    {
+        Common reportDataTableRecord;
+
+        SetEnumerator reportDataTablesSetEnum = reportProviderMetadata.getReportSchema(rdpClassInstance).getReportDataTables().getEnumerator();
+        while (reportDataTablesSetEnum.moveNext())
+        {
+            SRSReportDataTable reportDataTable = reportDataTablesSetEnum.current();
+
+            // Skip if this is not the requested table.
+            if (reportDataTable.getTableName() != _rdpTableName)
+            {
+                continue;
+            }
+
+            // Retrieve the table buffer pointing to report table records.
+            if (reportProviderMetadata.isPreProcessingRegular() ||
+                reportProviderMetadata.isPreProcessingTempDB())
+            {
+                reportDataTableRecord = this.selectDataTableRecordPreProcessed(reportDataTable);
+            }
+            else
+            {
+                reportDataTableRecord = reportDataTable.getRecord();
+                select reportDataTableRecord;
+            }
+    
+            break;
+        }
+
+        return reportDataTableRecord;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

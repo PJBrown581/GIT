@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SalesUpdateRemainTAS_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(classStr(SalesUpdateRemain))]
+final class SalesUpdateRemainTAS_Extension
+{
+    public boolean sKS_CC_OneTimeCustEnabled;    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SalesUpdateRemain construct()
+    {
+        SalesUpdateRemain sKSSalesUpdateRemain = next construct();
+
+        if (sKSSalesUpdateRemain)
+        {
+            sKSSalesUpdateRemain.parmSKS_CC_OneTimeCustEnabled(
+                SKS_PP_Setup::isCreditCardOneTimeCustLogicEnabled());
+        }
+
+        return sKSSalesUpdateRemain;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_OneTimeCustEnabled</Name>
+				<Source><![CDATA[
+    public boolean parmSKS_CC_OneTimeCustEnabled(
+        boolean _sKS_CC_OneTimeCustEnabled = sKS_CC_OneTimeCustEnabled)
+    {
+        sKS_CC_OneTimeCustEnabled = _sKS_CC_OneTimeCustEnabled;
+        return sKS_CC_OneTimeCustEnabled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDeliverRemainder</Name>
+				<Source><![CDATA[
+    public boolean updateDeliverRemainder(
+        SalesLine      _salesLine,
+        InventQty      _remainSalesPhysical,
+        InventQty      _remainInventPhysical,
+        PdsCWInventQty _cWRemainInventPhysical)
+    {
+        boolean ret = next updateDeliverRemainder(
+            _salesLine,
+            _remainSalesPhysical,
+            _remainInventPhysical,
+            _cWRemainInventPhysical);
+
+        SKS_PP_Setup sksParms = SKS_PP_Setup::find();
+
+        if (ret && _salesLine && sksParms.ModCC == NoYes::Yes)
+        {
+            SalesTable salesTableSKSLoc = _salesLine.SalesTable();
+
+            if (salesTableSKSLoc.SalesStatus == SalesStatus::Invoiced ||
+                salesTableSKSLoc.SalesStatus == SalesStatus::Canceled)
+            {
+                if (salesTableSKSLoc.SKS_CC_InvoiceErrorAfterCapture != SKS_CC_InvoiceErrorAfterCCCaptureSuccess::None)
+                {                    
+                    salesTableSKSLoc.selectForUpdate(true);
+                    ttsbegin;
+                    salesTableSKSLoc.SKS_CC_InvoiceErrorAfterCapture = SKS_CC_InvoiceErrorAfterCCCaptureSuccess::None;
+                    salesTableSKSLoc.doupdate();
+                    ttscommit;
+                    salesTableSKSLoc.reread();
+                }
+
+                if (!(salesTableSKSLoc.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTableSKSLoc)))
+                {
+                    CreditCardAuthTrans creditCardAuthTransSKSLoc;
+                
+                    creditCardAuthTransSKSLoc = CreditCardAuthTrans::findValidPreApproval(salesTableSKSLoc.SalesId);
+                    if (creditCardAuthTransSKSLoc)
+                    {
+                        boolean ok;
+                        try
+                        {
+                            ttsbegin;
+                            ok = CreditCardProcess::doVoidAuth(creditCardAuthTransSKSLoc);
+                            ttscommit;
+                            if (ok)
+                            {
+                                salesTableSKSLoc.reread();
+                            }
+                        }
+                        catch (Exception::Error)
+                        {
+                            ttsabort;
+                            warning(strFmt("@SKS:SKGCCCancelLineVoidErrorMsg", salesTableSKSLoc.SalesId));
+                        }
+                        catch (Exception::CLRError)
+                        {
+                            ttsabort;
+                            warning(strFmt("@SKS:SKGCCCancelLineVoidErrorMsg", salesTableSKSLoc.SalesId));
+                        }
+                    }
+                    else
+                    {
+                        if (sksParms.CCPLEnablePayLinks == NoYes::Yes)
+                        {
+                            SKS_CC_PayLinkQueue payLinkQueue = SKS_CC_PayLinkQueue::getSalesOrderPendingPayLink(salesTableSKSLoc);
+                            if (payLinkQueue)
+                            {
+                                payLinkQueue.cancelPendingPayLink();
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        ttsbegin;
+                        salesTableSKSLoc.voidCreditCardPreauthorize();
+                        ttscommit;
+                        salesTableSKSLoc.reread();
+                    }
+                    catch (Exception::Error)
+                    {
+                        ttsabort;
+                        warning(strFmt("@SKS:SKGCCCancelLineVoidErrorMsg", salesTableSKSLoc.SalesId));
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        ttsabort;
+                        warning(strFmt("@SKS:SKGCCCancelLineVoidErrorMsg", salesTableSKSLoc.SalesId));
+                    }
+
+                    MCRCustPaymTable mcrCustPaymTableSKS;
+                    while select mcrCustPaymTableSKS
+                            where mcrCustPaymTableSKS.RefRecId == salesTableSKSLoc.RecId
+                            && mcrCustPaymTableSKS.RefTableId == tableNum(SalesTable)
+                            && mcrCustPaymTableSKS.CustPaymType == MCRCustPaymType::CreditCard
+                            && mcrCustPaymTableSKS.Status == MCRCustPaymStatus::NotSubmitted
+                    {
+                        // Set amounts to zero to avoid removal of void transactions from standard Call Center code
+                        if (mcrCustPaymTableSKS.Amount || mcrCustPaymTableSKS.PostedAmount)
+                        {
+                            try
+                            {
+                                mcrCustPaymTableSKS.selectForUpdate(true);                            
+                                ttsbegin;
+                                mcrCustPaymTableSKS.Amount = 0;
+                                mcrCustPaymTableSKS.PostedAmount = 0;
+                                mcrCustPaymTableSKS.update();
+                                ttscommit;
+                            }
+                            catch (Exception::Error)
+                            {
+                                ttsabort;
+                                warning(strFmt("@SKS:SKGCCCancelLineVoidErrorMsg", salesTableSKSLoc.SalesId));
+                            }
+                            catch (Exception::CLRError)
+                            {
+                                ttsabort;
+                                warning(strFmt("@SKS:SKGCCCancelLineVoidErrorMsg", salesTableSKSLoc.SalesId));
+                            }
+                        }
+                    }
+                }
+
+                if (sKS_CC_OneTimeCustEnabled && salesTableSKSLoc.custTable_InvoiceAccount().OneTimeCustomer)
+                {
+                    CreditCardCust creditCardCustOneTimeSKS;
+                    while select creditCardCustOneTimeSKS
+                        where creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefTableId == salesTableSKSLoc.TableId
+                           && creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefRecId == salesTableSKSLoc.RecId
+                           && creditCardCustOneTimeSKS.CustAccount == salesTableSKSLoc.InvoiceAccount
+                    {
+                        if (!creditCardCustOneTimeSKS.UniqueCardId)
+                        {
+                            continue;
+                        }
+
+                        SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+                        pfWalletHandler.parmCustAccount(creditCardCustOneTimeSKS.CustAccount);
+                        pfWalletHandler.parmOneTimeCustRefTableId(creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefTableId);
+                        pfWalletHandler.parmOneTimeCustRefRecId(creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefRecId);
+                        pfWalletHandler.setPayFabricCustomerNbr();
+
+                        boolean pfDeleteCardResult = pfWalletHandler.removePayFabricWallet(creditCardCustOneTimeSKS.UniqueCardId, creditCardCustOneTimeSKS.CardNumber);
+
+                        if (pfDeleteCardResult)
+                        {
+                            try
+                            {
+                                ttsbegin;
+                                creditCardCustOneTimeSKS.selectForUpdate(true);
+                                creditCardCustOneTimeSKS.delete();
+                                ttscommit;
+                            }
+                            catch (Exception::Error)
+                            {
+                                ttsabort;
+                                error("@SKS6039");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

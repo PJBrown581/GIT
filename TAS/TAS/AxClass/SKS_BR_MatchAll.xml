@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_MatchAll</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_BR_MatchAll
+{        
+    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the class with the specified arguments.
+    /// </summary>
+    /// <param name = "_args">The specified arguments.</param>
+    [SuppressBPWarning('BPErrorSelectUsingFirstOnly', 'The SELECT statements act as priming reads, and a subsequent "locBankAccountStatement" allows iteration through the resultset')]
+    public static void main(Args _args)
+    {
+        SKS_BR_Matching     locSKS_BR_Matching = new SKS_BR_Matching();
+        SKS_PP_500PPBas     locSKS_PP_500PPBas;
+        BankAccountStatement locBankAccountStatement;
+        BankAccountStatement FilteredBankAccountStatement;
+        SKS_BR_BankTran     locSKS_BR_BankTran;
+        FromDate            locFromDate;
+        SKS_BR_ClickNMatchSessions locSKS_BR_ClickNMatchSessions;
+        container           locCrossCompanyList;
+        SKS_BR_BankAccountStatementFilter   StatementFilter;
+
+        StatementFilter = _args.parmobject();
+
+        locCrossCompanyList = StatementFilter.GetSetCompany() == '' ? SKS_EB_VirtualCompany::getBankRecCompanies() : Global::str2con(StatementFilter.GetSetCompany(), ',', false);
+
+
+        if(StatementFilter.GetSetBankAccount() == '')
+        {
+            select crosscompany:locCrossCompanyList * from locBankAccountStatement
+                order by locBankAccountStatement.AccountStatementDate asc, locBankAccountStatement.AccountStatementNum, locBankAccountStatement.DataAreaId
+                where locBankAccountStatement.ReconcileDate == dateNull()
+                && locBankAccountStatement.SKS_BR_BankHeaderRecId != 0;
+        }
+        else
+        {
+            select crosscompany:locCrossCompanyList * from locBankAccountStatement
+                order by locBankAccountStatement.AccountStatementDate asc, locBankAccountStatement.AccountStatementNum, locBankAccountStatement.DataAreaId
+                where locBankAccountStatement.ReconcileDate == dateNull()
+                && locBankAccountStatement.AccountId == StatementFilter.GetSetBankAccount()
+                && locBankAccountStatement.SKS_BR_BankHeaderRecId != 0;
+        }
+
+        while(locBankAccountStatement)
+        {
+            //Different entities will have different Registrations states.
+            //In order to maint consistant behavior, matching should be 
+            //done in the context of the statement's company.
+            changecompany(locBankAccountStatement.company())
+            {
+                locSKS_BR_ClickNMatchSessions = SKS_BR_MatchAll::getClickNMatchSession(locBankAccountStatement);
+                if(locSKS_BR_ClickNMatchSessions)
+                {
+                    warning(strFmt("@SKS:SKGCurrentlyInClickNMatch"
+                            ,locBankAccountStatement.company()
+                            ,locBankAccountStatement.AccountId
+                            ,SKS_PP_StringFormats::strDateMMDDYYYY(locBankAccountStatement.AccountStatementDate,DateSeparator::Slash)
+                            ,locBankAccountStatement.AccountStatementNum
+                            ,new xSession(locSKS_BR_ClickNMatchSessions.SessionId).userId()));
+                    continue;
+                }
+                locSKS_PP_500PPBas = new SKS_PP_500PPBas();
+                if(locSKS_PP_500PPBas.IsRegistered('AB') != 1)
+                {
+                    continue;
+                }
+                //this buffer changes companies.  It is imperitive it be emptied prior to being refilled
+                // to avoid problems that occur when a buffer is reused in multiple companies.
+                locSKS_BR_BankTran = null;
+                // Only one SKS_BR_BankTran is needed for the file info.  this logic is based on the SKS_BR_StatementReconciliation Form
+                select firstonly FileDateTime, Filename, OriginalStatementRecId, RecId from locSKS_BR_BankTran
+                    where locSKS_BR_BankTran.OriginalStatementRecId == locBankAccountStatement.RecId;
+                if(locSKS_BR_BankTran)
+                {
+                    locSKS_BR_Matching.matchTransactions(locBankAccountStatement, dateNull(), locSKS_BR_BankTran.FileDateTime,
+                                                            locSKS_BR_BankTran.Filename, 0, locSKS_BR_BankTran.OriginalStatementRecId);
+                }
+            }
+            next locBankAccountStatement;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getClickNMatchSession</Name>
+				<Source><![CDATA[
+    //this method will return null, unless someone has a currentl click-n-match sessions, in which case you get that session
+    public static SKS_BR_ClickNMatchSessions getClickNMatchSession(BankAccountStatement _BankAccountStatement)
+    {
+        SKS_BR_ClickNMatchSessions locSKS_BR_ClickNMatchSessions;
+        boolean autoUnlockClickNMatch()
+        {
+            boolean rtnval = false;
+                
+            if(SKS_LB_JournalInUse::canBeAutoUnlocked(locSKS_BR_ClickNMatchSessions))
+            {
+                ttsBegin;
+                SKS_BR_Matching::removeGuidMatch(locSKS_BR_ClickNMatchSessions.ManualReconciliationID);
+                locSKS_BR_ClickNMatchSessions = SKS_LB_JournalInUse::updateBlockServer(locSKS_BR_ClickNMatchSessions,
+                                                                JournalBlockLevel::InUse,
+                                                                JournalBlockLevel::None,
+                                                                strFmt("@SKS3735",
+                                                                        _BankAccountStatement.AccountId,
+                                                                        new xSession(locSKS_BR_ClickNMatchSessions.SessionId).userId())
+                                                                );
+                ttsCommit;
+                rtnval = true;
+            }
+            return rtnval;
+        }
+        select forUpdate locSKS_BR_ClickNMatchSessions where locSKS_BR_ClickNMatchSessions.AccountID == _BankAccountStatement.AccountId;
+        if(!locSKS_BR_ClickNMatchSessions)
+        {
+            return null;
+        }
+        if (!locSKS_BR_ClickNMatchSessions.SessionId || autoUnlockClickNMatch())
+        {
+            ttsbegin;
+            locSKS_BR_ClickNMatchSessions.delete();
+            ttscommit;
+            locSKS_BR_ClickNMatchSessions = null;    
+        }
+        return locSKS_BR_ClickNMatchSessions;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

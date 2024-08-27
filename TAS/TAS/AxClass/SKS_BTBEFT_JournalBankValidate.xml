@@ -1,0 +1,2832 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BTBEFT_JournalBankValidate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_BTBEFT_JournalBankValidate
+{
+    boolean hasMappingData, reselect; //SKS_Bug_11831
+    SKS_EFT_MappingSourceContext prevSourceContext;
+    SKS_EFT_FileDetail mSKS_EFT_FileDetail;
+    //SKS_EFT_FileDetail_Intermediary mSKS_EFT_FileDetail_Intermediary;
+    SKS_EFT_FileDetail_VendAddress mSKS_EFT_FileDetail_VendAddress;
+    SKS_EFT_FileDetail_PaymentLine mSKS_EFT_FileDetail_PaymentLine;
+    SKS_EFT_FileDetail_BankAccount mSKS_EFT_FileDetail_BankAccount;
+    SKS_EFT_FileDetail_Addresses mSKS_EFT_FileDetail_VendBankAddress;
+    SKS_EFT_FileDetail_BenBank mSKS_EFT_FileDetail_BenBank;
+
+    SKS_EFT_FileDetail_Addresses msks_EFT_FileDetail_CustBankAddress, msks_EFT_FileDetail_BankAddress;
+    SKS_EFT_FileDetail_CustAddress msks_EFT_FileDetail_CustAddress;
+
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>paymJournalValidate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public boolean paymJournalValidate (SKS_BTB_PaymModeTable _SKS_BTB_PaymModeTable,
+                                        LedgerJournalTrans _ledgerJournalTrans,
+                                        boolean _enableLog,
+                                        boolean _valid)
+    {
+        SKS_EFT_FileFormatPaymSpec      sks_EFT_FileFormatPaymSpec;
+        SKS_EFT_BankFormatValidation    sks_EFT_BankFormatValidation;
+        SKS_EFT_FileFormat              sks_EFT_FileFormat;
+        boolean                         ret = true;
+        boolean                         countryValidation;
+        boolean                         format, sourceValueFound;
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList;
+        container                       sourceContainer;
+        str                             sourceValue;
+        int                             i;
+        boolean                         isBankValid = true,isBankLogisticPosAddressValid= true;
+        boolean                         isLedgerJourValid= true,isLogisticPosAddressValid= true,isBTBEFTBank = true;
+        boolean                         isBankAddressValid;//SKS_FDD_10590
+
+        //Transfer-In Buffers
+        boolean                                 isCustValid = true, isCustBankValid= true;
+        boolean                                 isDirPartyValid= true,isARLegalEntityValid = true,isARLegalEntityLogisticsLocValid = true;  //SKS_Bug:7415;
+        boolean                                 isCompanyInfoValid = true;//SKS_FDD_10590
+        
+        SKS_EFT_Processing              sks_eft_Processing;
+        str                             formatName;
+        str                             formatVersion;
+        str                             retMsg;
+        SysDictClass                    obj;
+        Object                          classInstance;
+
+        select firstonly FormatId,Selected,UseWithBanktoBank,FormatGroup,FormatGroupVersion,FormatGroupCodeSource from sks_EFT_FileFormat
+            where sks_EFT_FileFormat.FormatId == _SKS_BTB_PaymModeTable.FormatId &&
+                    sks_EFT_FileFormat.Selected == NoYes::Yes  &&
+                    sks_EFT_FileFormat.UseWithBanktoBank == NoYes::Yes
+            join sks_EFT_FileFormatPaymSpec
+            where sks_EFT_FileFormatPaymSpec.FormatId == sks_EFT_FileFormat.FormatId &&
+                    sks_EFT_FileFormatPaymSpec.PaymSpec == _ledgerJournalTrans.PaymSpec &&
+                    sks_EFT_FileFormatPaymSpec.UseWithBanktoBank == NoYes::Yes;
+
+        if (sks_EFT_FileFormat && sks_EFT_FileFormat.FormatGroupCodeSource == SKS_EB_CodeSource::D365)
+        {
+            formatName = strReplace('SKS_EFT_Format_' + sks_EFT_FileFormat.FormatGroup, '-', '_');
+            retMsg = SKS_EFT_JournalValidate::ValidateClass(formatName, sks_EFT_FileFormat.FormatId);
+        
+            if (retMsg)
+            {
+                SKS_EFT_JournalValidate::warningLog(retMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+            }
+            else
+            {
+                obj = new SysDictClass(className2Id(formatName));
+                classInstance = obj.makeObject(); // Instantiate class
+            
+                try
+                {
+                    formatVersion = obj.callObject('getFormatVersion', classInstance);
+                }
+                catch(Exception::Error)
+                {
+                    formatVersion = '';
+                }
+
+                if (sks_EFT_FileFormat.FormatGroupVersion != formatVersion)
+                {
+                    retMsg = strFmt("@SKS:SKGFmtVerValidation",formatName,formatVersion,sks_EFT_FileFormat.FormatGroupVersion);
+                    SKS_EFT_JournalValidate::warningLog(retMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount(),true);
+                }
+            }
+        }
+
+        select firstonly sks_EFT_BankFormatValidation
+            where sks_EFT_BankFormatValidation.FormatId == sks_EFT_FileFormatPaymSpec.FormatId &&
+                    sks_EFT_BankFormatValidation.PaymSpec == sks_EFT_FileFormatPaymSpec.PaymSpec &&
+                    sks_EFT_BankFormatValidation.Module == SKS_EFT_Module::BTB &&
+                    (sks_EFT_BankFormatValidation.Required != SKS_EFT_BankFormatRequired::No ||
+                    sks_EFT_BankFormatValidation.LengthValidation != SKS_EFT_LengthValidation::No ||
+                    SKS_EFT_BankFormatValidation.DataRuleId != '');
+        
+        if(sks_EFT_BankFormatValidation)
+        {
+            try
+            {
+                sks_eft_Processing = new SKS_EFT_Processing();
+
+                //Insert PaymData into file detail tables for Field validations
+                
+                sks_eft_Processing.fileDetailValidate(_ledgerJournalTrans, SKS_EFT_Module::BTBValidation); //Bug-11967
+
+                while select sks_EFT_BankFormatValidation
+                    where sks_EFT_BankFormatValidation.FormatId == sks_EFT_FileFormatPaymSpec.FormatId &&
+                    sks_EFT_BankFormatValidation.PaymSpec == sks_EFT_FileFormatPaymSpec.PaymSpec &&
+                    sks_EFT_BankFormatValidation.Module == SKS_EFT_Module::BTB &&
+                    sks_EFT_BankFormatValidation.BTB_TransferType == _SKS_BTB_PaymModeTable.TransferType &&
+                    (sks_EFT_BankFormatValidation.Required != SKS_EFT_BankFormatRequired::No ||
+                    sks_EFT_BankFormatValidation.LengthValidation != SKS_EFT_LengthValidation::No ||
+                    SKS_EFT_BankFormatValidation.DataRuleId != '')
+                {
+                    sourceValueFound = false;
+                    sourceValue = enum2str(sks_EFT_BankFormatValidation.SourceContext)+sks_EFT_BankFormatValidation.SourceField + SKS_EFT_BankFormatValidation.ISOCountrySpec; //SKS_VSTS_12653
+
+                    for (i=1; i <= conLen(sourceContainer); i++)
+                    {
+                        if (conPeek(sourceContainer, i) ==  sourceValue)
+                        {
+                            sourceValueFound = true;
+                        }
+                    }
+
+                    format = true;
+
+                    if (!sourceValueFound)
+                    {
+                        sourceContainer = conIns(sourceContainer,conLen(sourceContainer)+1,sourceValue);
+                        countryValidation = false;
+                        if (sks_EFT_BankFormatValidation.ISOCountrySpec != '')
+                        {
+                            countryValidation = this.countryRegionValidation(_ledgerJournalTrans,_SKS_BTB_PaymModeTable,sks_EFT_FileFormatPaymSpec, sks_EFT_BankFormatValidation);
+                        }
+
+                        if (countryValidation)   //ISO country specific validations
+                        {
+                            //Country specific
+                            switch (sks_EFT_BankFormatValidation.SourceContext)
+                            {
+                                case SKS_EFT_SourceContext::BTB_CompanyInfo_accountLegalEntity:
+                                    isCustValid = this.custValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isCustValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_BankAccountTable_Offset:
+                                    isBankValid = this.bankValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans,sks_EFT_BankFormatValidation,_enableLog) && isBankValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_BankAccountTable_Account:
+                                    isCustBankValid = this.custBankAccountValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isCustBankValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_LedgerJournalTrans:
+                                    isLedgerJourValid = this.ledgerJournalTransValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isLedgerJourValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_LogisticsPostalAddress_AccountLegalEntity:
+                                    isLogisticPosAddressValid = this.logisticsPostalAddressValidation_DD(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isLogisticPosAddressValid;
+                                    break;
+
+                                case  SKS_EFT_SourceContext::BTB_LogisticsPostalAddress_Bank_Accountside:
+                                    isBankLogisticPosAddressValid = this.bankLogisticsPostalAddressValidation_DD(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isBankLogisticPosAddressValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_DirPartyofCompany_accountLegalEntity:
+                                    isDirPartyValid =  this.dirParty_DDValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isDirPartyValid;
+                                    break;
+
+                                    //SKS_Bug:7415
+                                //case SKS_EFT_SourceContext::LogisticsPostalAddress_AREFTLegalEntity:
+                                //    isARLegalEntityValid = this.legalEntityARAddressValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isARLegalEntityValid;
+                                //    break;
+
+                                    //TFS: 7518
+                                case SKS_EFT_SourceContext::BTB_LogisticsLocation_OffsetBankAccount:
+                                    isARLegalEntityLogisticsLocValid = this.legalEntityARLogisticLocationValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isARLegalEntityLogisticsLocValid;
+                                    break;
+
+                                    // SKS_FDD_10590 -->
+                                case SKS_EFT_SourceContext::BTB_EFT_Bank:
+                                    isBTBEFTBank = this.apEFTVendBankValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isBTBEFTBank;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_CompanyInfo_OffsetAccountLegalEntity:
+                                    isCompanyInfoValid = this.companyInfoValidations(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isCompanyInfoValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_LogisticsPostalAddress_OffsetBankaccount:
+                                    isBankAddressValid = this.bankAddressValidations(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isBankAddressValid;
+                                    break;
+                                    // SKS_FDD_10590 <--
+
+                            }
+                        }
+                        else if (sks_EFT_BankFormatValidation.ISOCountrySpec == '')  //General validation if ISO country specific not provided
+                        {
+                            switch (sks_EFT_BankFormatValidation.SourceContext)
+                            {
+                                case SKS_EFT_SourceContext::BTB_CompanyInfo_accountLegalEntity:
+                                    isCustValid = this.custValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isCustValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_BankAccountTable_Offset:
+                                    isBankValid = this.bankValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans,sks_EFT_BankFormatValidation,_enableLog) && isBankValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_BankAccountTable_Account:
+                                    isCustBankValid = this.custBankAccountValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isCustBankValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_LedgerJournalTrans:
+                                    isLedgerJourValid = this.ledgerJournalTransValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isLedgerJourValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_LogisticsPostalAddress_AccountLegalEntity:
+                                    isLogisticPosAddressValid = this.logisticsPostalAddressValidation_DD(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isLogisticPosAddressValid;
+                                    break;
+
+                                case  SKS_EFT_SourceContext::BTB_LogisticsPostalAddress_Bank_Accountside:
+                                    isBankLogisticPosAddressValid = this.bankLogisticsPostalAddressValidation_DD(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isBankLogisticPosAddressValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_DirPartyofCompany_accountLegalEntity:
+                                    isDirPartyValid =  this.dirParty_DDValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isDirPartyValid;
+                                    break;
+
+                                    //SKS_Bug:7415
+                                    //case SKS_EFT_SourceContext::LogisticsPostalAddress_AREFTLegalEntity:
+                                    //    isARLegalEntityValid = this.legalEntityARAddressValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isARLegalEntityValid;
+                                    //    break;
+
+                                    //TFS: 7518
+                                case SKS_EFT_SourceContext::BTB_LogisticsLocation_OffsetBankAccount:
+                                    isARLegalEntityLogisticsLocValid = this.legalEntityARLogisticLocationValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isARLegalEntityLogisticsLocValid;
+                                    break;
+
+                                    // SKS_FDD_10590 -->
+                                case SKS_EFT_SourceContext::BTB_EFT_Bank:
+                                    isBTBEFTBank = this.apEFTVendBankValidation(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isBTBEFTBank;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_CompanyInfo_OffsetAccountLegalEntity:
+                                    isCompanyInfoValid = this.companyInfoValidations(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isCompanyInfoValid;
+                                    break;
+
+                                case SKS_EFT_SourceContext::BTB_LogisticsPostalAddress_OffsetBankaccount:
+                                    isBankAddressValid = this.bankAddressValidations(sks_EFT_BankFormatValidation.SourceContext,sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, sks_EFT_BankFormatValidation,_enableLog) && isBankAddressValid;
+                                    break;
+                                    // SKS_FDD_10590 <--
+                            }
+                        }
+                    }
+                    else if (sks_EFT_BankFormatValidation.ISOCountrySpec != '' && countryValidation == false)  // ISO country specific is failing
+                    {
+                        continue;
+                    }
+                }
+
+                if(_enableLog == false)
+                {
+                    if (format == true)
+                    {
+                        select firstonly RecId from custVendPaymExceptionList
+                    where custVendPaymExceptionList.JournalId == _ledgerJournalTrans.JournalNum;
+
+                        if (custVendPaymExceptionList.RecId)
+                        {
+                            ret =  false;
+                        }
+                    }
+                    else
+                    {
+                        ret = true;
+                    }
+                }
+                else
+                {
+                    if (isCustValid == false || isBankValid == false || isCustBankValid == false || isLedgerJourValid == false ||
+                    isLogisticPosAddressValid == false || isBankLogisticPosAddressValid == false || isDirPartyValid == false ||
+                    isARLegalEntityValid == false || isARLegalEntityLogisticsLocValid == false ||//SKS_Bug:7415
+                    isCompanyInfoValid == false || isBTBEFTBank == false || isBankAddressValid == false)//SKS_FDD_10590
+                    {
+                        ret = false;
+                    }
+                }
+            }
+            catch
+            {
+                SKS_EFT_JournalValidate::errorLog("@SKS984",_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                ret = false;
+            }
+            finally
+            {
+                // SKS_FDD_10590 -->
+                // Delete data from file details table once the validatations has been completed
+                sks_eft_Processing.deletePaymDataFromFileDetail(_ledgerJournalTrans);
+                // SKS_FDD_10590 <--
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>countryRegionValidation</Name>
+				<Source><![CDATA[
+    public boolean countryRegionValidation( LedgerJournalTrans          _ledgerJournalTrans,
+                                            SKS_BTB_PaymModeTable           _SKS_BTB_PaymModeTable,
+                                            SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        List list = new List(Types::String);
+        ListIterator    iterator;
+        container       isoCode;
+        boolean ret;
+
+        if (_sks_EFT_BankFormatValidation.ISOCountrySpec != '')
+        {
+            LogisticsAddressCountryRegion   lLogisticsAddressCountryRegion;
+
+            if(_sks_EFT_BankFormatValidation.ISOCountrySpec == 'IBAN-LIST')
+            {
+                while select lLogisticsAddressCountryRegion where lLogisticsAddressCountryRegion.SKS_IBANReqd == NoYes::Yes
+                {
+                    isoCode += lLogisticsAddressCountryRegion.ISOcode;
+                }
+            }
+            else
+            {
+                list = strSplit(_sks_EFT_BankFormatValidation.ISOCountrySpec,',');
+                iterator = new ListIterator(list);
+
+                while(iterator.more())
+                {
+                    isoCode += iterator.value();
+                    iterator.next();
+                }
+            }
+
+            switch (_sks_EFT_BankFormatValidation.CountryContext)
+            {
+                case SKS_EFT_CountryContext::BTB_BankBankAccount_Bank:
+                    if(_SKS_BTB_PaymModeTable.TransferType == SKS_BTB_TransferType::Transfer_in)
+                    {
+                        ret = this.bankCountryValidation(_sks_EFT_BankFormatValidation.CountryContext,_sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, isoCode,_sks_EFT_BankFormatValidation);
+                    }
+                    else
+                    {
+                        ret = this.vendBankAccountCountryValidation(_sks_EFT_BankFormatValidation.CountryContext,_sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, isoCode,_sks_EFT_BankFormatValidation);
+                    }
+
+                    break;
+
+                //case SKS_EFT_CountryContext::BTB_BankBankAccount_Bank:
+                //    ret = this.vendBankAccountCountryValidation(_sks_EFT_BankFormatValidation.CountryContext,_sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, isoCode,_sks_EFT_BankFormatValidation);
+                //    break;
+
+                case SKS_EFT_CountryContext::BTB_LogisticsPostalAddress_CountryBank:
+                    if(_SKS_BTB_PaymModeTable.TransferType == SKS_BTB_TransferType::Transfer_in)
+                    {
+                        ret = this.addressCustCountryValidation(_sks_EFT_BankFormatValidation.CountryContext,_sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, isoCode,_sks_EFT_BankFormatValidation);
+                    }
+                    else
+                    {
+                        ret = this.addressCountryValidation(_sks_EFT_BankFormatValidation.CountryContext,_sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, isoCode,_sks_EFT_BankFormatValidation);
+                    }
+
+                    break;
+                //SKS_VSTS_12653-->
+                case SKS_EFT_CountryContext::LogisticsPostalAddress_CountryLegalEntity:
+                    ret = this.legalEntityCountryValidation(_sks_EFT_BankFormatValidation.CountryContext,_sks_EFT_FileFormatPaymSpec,_ledgerJournalTrans, isoCode,_sks_EFT_BankFormatValidation);
+                    break;
+                //SKS_VSTS_12653<---
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>bankCountryValidation</Name>
+				<Source><![CDATA[
+    public boolean bankCountryValidation(SKS_EFT_CountryContext     _countryContext,
+                                        SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                        LedgerJournalTrans          _ledgerJournalTrans,
+                                        container                   _isoCode,
+                                        SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        SKS_EFT_Format                  sks_EFT_Format = new SKS_EFT_Format();
+        int i;
+        boolean countryMatching;
+        SKS_UPLD_PMT        paymentUpload;
+        // SKS_FDD_10590 -->
+        SKS_EFT_FileDetail  sks_EFT_FileDetail;
+        SKS_EFT_FileDetail_Addresses sks_EFT_FileDetail_BankAddress;
+        // SKS_FDD_10590 --
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                select firstonly paymentUpload
+                    where paymentUpload.RefRecId == _ledgerJournalTrans.RecId;
+            }
+            else
+            {
+                // SKS_FDD_10590 -->
+                select firstonly RecId from sks_EFT_FileDetail where sks_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId &&
+                    sks_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate
+                join CountryRegionId from sks_EFT_FileDetail_BankAddress where sks_EFT_FileDetail_BankAddress.RefRecId == sks_EFT_FileDetail.RecId &&
+                    sks_EFT_FileDetail_BankAddress.AddressType == SKS_EFT_AddressType::BankAddress;
+                // SKS_FDD_10590 <--
+            }
+
+            for (i=1; i <= conlen(_isoCode); i++)
+            {
+                if(subStr(conPeek(_isoCode, i), 1, 1) == '!')   //SKS_VSTS_12653--->
+                {
+                    if(subStr(conPeek(_isoCode, i), 2, 2) != sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BeneCountryRegionId : sks_EFT_FileDetail_BankAddress.CountryRegionId))
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                    }
+                }
+                else
+                {
+                    //SKS_VSTS_12653<---
+                    if (conpeek(_ISOCode, i) == sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BeneCountryRegionId : sks_EFT_FileDetail_BankAddress.CountryRegionId))// SKS_FDD_10590
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+                    }
+                }
+            }
+            if(countryMatching)// if any one country matching then return true.
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>vendBankAccountCountryValidation</Name>
+				<Source><![CDATA[
+    public boolean vendBankAccountCountryValidation(SKS_EFT_CountryContext      _countryContext,
+                                                    SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                                    LedgerJournalTrans          _ledgerJournalTrans,
+                                                    container                   _isoCode,
+                                                    SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        SKS_EFT_Format                  sks_EFT_Format = new SKS_EFT_Format();
+        int                             i;
+        boolean countryMatching;
+        SKS_UPLD_PMT                    paymentUpload;
+        SKS_EFT_FileDetail              sks_EFT_FileDetail; // SKS_FDD_10590
+        SKS_EFT_FileDetail_Addresses    sks_EFT_FileDetail_VendBankAddresses;
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                select firstonly paymentUpload
+                    where paymentUpload.RefRecId == _ledgerJournalTrans.RecId; //SKS_FDD_9785
+            }
+            else
+            {
+                // SKS_FDD_10590 -->
+                select firstonly Recid from sks_EFT_FileDetail where sks_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId &&
+                    sks_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate
+                join CountryRegionId from sks_EFT_FileDetail_VendBankAddresses where sks_EFT_FileDetail_VendBankAddresses.RefRecId == sks_EFT_FileDetail.RecId &&
+                    sks_EFT_FileDetail_VendBankAddresses.AddressType == SKS_EFT_AddressType::VendBankAddress;
+                // SKS_FDD_10590 <--
+            }
+
+            for (i=1; i <= conlen(_isoCode); i++)
+            {
+                if(subStr(conPeek(_isoCode, i), 1, 1) == '!')   //SKS_VSTS_12653--->
+                {
+                    if(subStr(conPeek(_isoCode, i), 2, 2) != sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BenBankCountryRegionId : sks_EFT_FileDetail_VendBankAddresses.CountryRegionId))
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                    }
+                }
+                else
+                {
+                    //SKS_VSTS_12653<---
+                    if (conpeek(_ISOCode, i) == sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BenBankCountryRegionId : sks_EFT_FileDetail_VendBankAddresses.CountryRegionId)) //SKS_FDD_9785 // SKS_FDD_10590
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                    }
+                }
+            }
+            if(countryMatching)// if any one country matching then return true.
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addressCountryValidation</Name>
+				<Source><![CDATA[
+    public boolean addressCountryValidation(SKS_EFT_CountryContext      _countryContext,
+                                            SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                            LedgerJournalTrans          _ledgerJournalTrans,
+                                            container                   _isoCode,
+                                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        SKS_EFT_Format                  sks_EFT_Format = new SKS_EFT_Format();
+        SKS_UPLD_PMT                    paymentUpload;
+        int i;
+        boolean countryMatching;
+        SKS_EFT_FileDetail              sks_EFT_FileDetail;
+        SKS_EFT_FileDetail_Addresses    sks_EFT_FileDetail_VendCountryAddress;
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                select firstonly paymentUpload
+                where paymentUpload.RefRecId == _ledgerJournalTrans.RecId; //SKS_FDD_9785
+            }
+            else
+            {
+                // SKS_FDD_10590 -->
+                select firstonly RecId from sks_EFT_FileDetail where sks_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId &&
+                    sks_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate
+                join CountryRegionId from sks_EFT_FileDetail_VendCountryAddress where sks_EFT_FileDetail_VendCountryAddress.RefRecId == sks_EFT_FileDetail.RecId &&
+                    sks_EFT_FileDetail_VendCountryAddress.AddressType == SKS_EFT_AddressType::VendCountryAddress;
+                // SKS_FDD_10590 <--
+            }
+
+
+            for (i=1; i <= conlen(_isoCode); i++)
+            {
+                if(subStr(conPeek(_isoCode, i), 1, 1) == '!')   //SKS_VSTS_12653--->
+                {
+                    if(subStr(conPeek(_isoCode, i), 2, 2) != sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BeneCountryRegionId : sks_EFT_FileDetail_VendCountryAddress.CountryRegionId))
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                    }
+                }
+                else
+                {
+                    //SKS_VSTS_12653<---
+                    if (conpeek(_ISOCode, i) == sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BeneCountryRegionId : sks_EFT_FileDetail_VendCountryAddress.CountryRegionId)) //SKS_FDD_9785
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                    }
+                }
+            }
+            if(countryMatching)// if any one country matching then return true.
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>legalEntityCountryValidation</Name>
+				<Source><![CDATA[
+    //SKS_VSTS_12653
+    public boolean legalEntityCountryValidation(SKS_EFT_CountryContext      _countryContext,
+                                                SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                                LedgerJournalTrans          _ledgerJournalTrans,
+                                                container                   _isoCode,
+                                                SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        SKS_EFT_Format                  sks_EFT_Format = new SKS_EFT_Format();
+        SKS_UPLD_PMT                    paymentUpload;
+        int i;
+        boolean countryMatching;
+        SKS_EFT_FileDetail              sks_EFT_FileDetail;
+        SKS_EFT_FileDetail_BankAccount    sKS_EFT_FileDetail_BankAccount;
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                select firstonly paymentUpload
+                where paymentUpload.RefRecId == _ledgerJournalTrans.RecId; //SKS_FDD_9785
+            }
+            else
+            {
+                // SKS_FDD_10590 -->
+                select firstonly RecId from sks_EFT_FileDetail where sks_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId &&
+                    sks_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate
+                join CountryRegionId from sKS_EFT_FileDetail_BankAccount where sKS_EFT_FileDetail_BankAccount.RefRecId == sks_EFT_FileDetail.RecId;
+                // SKS_FDD_10590 <--
+            }
+
+
+            for (i=1; i <= conlen(_isoCode); i++)
+            {
+                if(subStr(conPeek(_isoCode, i), 1, 1) == '!')
+                {
+                    if (subStr(conpeek(_isoCode, i), 2, 2) != sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BeneCountryRegionId : sKS_EFT_FileDetail_BankAccount.CountryRegionId))
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    if (conpeek(_isoCode, i) == sks_EFT_Format.getLogisticsAddressCountryISO(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload ? paymentUpload.BeneCountryRegionId : sKS_EFT_FileDetail_BankAccount.CountryRegionId)) //SKS_FDD_9785
+                    {
+                        countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                        continue;
+                    }
+                    else
+                    {
+                        continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                    }
+                }
+            }
+            if(countryMatching)// if any one country matching then return true.
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapfieldLengthValidation</Name>
+				<Source><![CDATA[
+    //SKS_FDD_9785
+    public boolean mapfieldLengthValidation(
+    anytype _fieldValue,
+    SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation,    // SKS_FDD_10590
+        LedgerJournalTrans   _ledgerJournalTrans,
+    boolean _enableLog = false)
+    {
+        SKS_EFT_BRValidationAltFieldMapping sks_EFT_BRValidationAltFieldMapping; // SKS_FDD_10590
+        str errorMsg;
+        str errorMessage = "@SKS4380";
+
+        // SKS_FDD_10590 -->
+        select firstonly sks_EFT_BRValidationAltFieldMapping
+            where sks_EFT_BRValidationAltFieldMapping.SourceContext == _sks_EFT_BankFormatValidation.SourceContext &&
+            sks_EFT_BRValidationAltFieldMapping.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+        // SKS_FDD_10590 <--
+
+        //Length validations
+        if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Yes &&
+              !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                // SKS_FDD_10590 -->
+                if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+                {
+                    errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                            sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation
+                        ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+                // SKS_FDD_10590 <--
+                else
+                {
+                    errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) +strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                            sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc
+                        ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+
+                SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+
+                return false;
+            }
+        }
+
+        else if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Yes &&
+              _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                // SKS_FDD_10590 -->
+                if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+                {
+                    errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                            sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation
+                        ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+                // SKS_FDD_10590 <--
+                else
+                {
+                    errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                            sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc
+                        ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+
+                SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapfieldvalidation</Name>
+				<Source><![CDATA[
+    //SKS_FDD_9785
+    public boolean mapfieldvalidation(
+        anytype _fieldValue,
+        SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation, // SKS_FDD_10590
+        LedgerJournalTrans _ledgerJournalTrans,
+        boolean _enableLog = false)
+    {
+        SKS_EFT_BRValidationAltFieldMapping sks_EFT_BRValidationAltFieldMapping;// SKS_FDD_10590
+
+        str errorMsg;
+        str errorMessage = "@SKS4384";
+
+        // SKS_FDD_10590 -->
+        select firstonly sks_EFT_BRValidationAltFieldMapping
+            where sks_EFT_BRValidationAltFieldMapping.SourceContext == _sks_EFT_BankFormatValidation.SourceContext &&
+            sks_EFT_BRValidationAltFieldMapping.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+        // SKS_FDD_10590 <--
+
+        //General validations
+        if (!_fieldValue && _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::Yes &&
+            !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            // SKS_FDD_10590 -->
+            if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id)+ strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation);
+            }
+            // SKS_FDD_10590 -->
+            else
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc);
+            }
+
+            // SKS_FDD_10590 <--
+            SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+            return false;
+
+        }
+        else if (!_fieldValue && _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::Yes &&
+                _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            // SKS_FDD_10590 -->
+            if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation);
+            }
+            // SKS_FDD_10590 <--
+            else
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc);
+            }
+
+
+            SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapfieldWarningLengthValidation</Name>
+				<Source><![CDATA[
+    //SKS_FDD_9785
+    public void mapfieldWarningLengthValidation(
+    anytype _fieldValue,
+    SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation,
+    LedgerJournalTrans _ledgerJournalTrans,
+    boolean _enableLog = false)
+    {
+        str warningMsg;
+        str warningMessage = "@SKS4387";
+        SKS_EFT_BRValidationAltFieldMapping sks_EFT_BRValidationAltFieldMapping; // SKS_FDD_10590
+
+        // SKS_FDD_10590 -->
+        select firstonly sks_EFT_BRValidationAltFieldMapping
+            where sks_EFT_BRValidationAltFieldMapping.SourceContext == _sks_EFT_BankFormatValidation.SourceContext &&
+            sks_EFT_BRValidationAltFieldMapping.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+        // SKS_FDD_10590 <--
+
+        //Length validations warning
+        if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Warning &&
+              !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                // SKS_FDD_10590 -->
+                if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+                {
+                    warningMsg = "@SKS4388" +
+                    ' ' +
+                    warningMessage +
+                    ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc"+ "@SKS:SKGFieldMinMaxLength",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation
+                    ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+                // SKS_FDD_10590 <--
+                else
+                {
+                    warningMsg = "@SKS4388" +
+                    ' ' +
+                    warningMessage +
+                    ' '+ strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) +strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc
+                    ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+
+
+                SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+            }
+        }
+
+        else if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Warning &&
+              _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+                {
+                    warningMsg = "@SKS4388" +
+                    ' ' +
+                    warningMessage +
+                    ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation
+                    ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+                // SKS_FDD_10590 -->
+                else
+                {
+                    warningMsg = "@SKS4388" +
+                    ' ' +
+                    warningMessage +
+                    ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) +strFmt("@SKS:SKGFieldDesc"+"@SKS:SKGFieldMinMaxLength",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc
+                    ,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+                }
+
+                // SKS_FDD_10590 <--
+                SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapfieldWarningValidation</Name>
+				<Source><![CDATA[
+    //SKS_FDD_9785
+    public void mapfieldWarningValidation(
+    anytype _fieldValue,
+    SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation,
+    LedgerJournalTrans _ledgerJournalTrans,
+    boolean _enableLog = false)
+    {
+        str warningMsg;
+        str warningMessage = "@SKS4389";
+        SKS_EFT_BRValidationAltFieldMapping sks_EFT_BRValidationAltFieldMapping; // SKS_FDD_10590
+
+        // SKS_FDD_10590 -->
+        select firstonly sks_EFT_BRValidationAltFieldMapping
+            where sks_EFT_BRValidationAltFieldMapping.SourceContext == _sks_EFT_BankFormatValidation.SourceContext &&
+            sks_EFT_BRValidationAltFieldMapping.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+        // SKS_FDD_10590 <--
+
+        //General validations
+        if (!_fieldValue && _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::ConditionalWarning &&
+            !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            // SKS_FDD_10590 -->
+            if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+            {
+                warningMsg = "@SKS4388" +
+                        ' ' +
+                        warningMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation);
+            }
+            // SKS_FDD_10590 <--
+            else
+            {
+                warningMsg = "@SKS4388" +
+                        ' ' +
+                        warningMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) +strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc);
+            }
+
+
+
+            SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+        }
+        else if (!_fieldValue && _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::ConditionalWarning &&
+                _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            // SKS_FDD_10590 -->
+            if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+            {
+                warningMsg = "@SKS4388" +
+                        ' ' +
+                        warningMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation);
+            }
+            // SKS_FDD_10590 <--
+            else
+            {
+                warningMsg = "@SKS4388" +
+                        ' ' +
+                        warningMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) +strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc);
+            }
+
+            SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>bankValidation</Name>
+				<Source><![CDATA[
+    public boolean bankValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str           tablename;
+        str field;
+        int fieldId;
+        TableId tableId;
+        Str tableNameLoc;
+        int delimiterPosition;
+        boolean     ret,retValid,retLenghtValid, retDataValid;
+        anytype     mapfieldValue;//SKS_FDD10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+            //SKS_FDD_9785 start
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                ret = this.validatePaymUpldData(_ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                return ret;
+            }
+            //SKS_FDD_9785 end
+            else
+            {
+                //SKS_FDD_10590 -->
+                mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                if(hasMappingData)// SKS_Bug_11831
+                {
+                    //Data validations for error and warning
+                    retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                    // general validations for error and warning
+                    retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                    this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                    // length validations for error and warning
+                    retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                    this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                }
+                //SKS_FDD_10590 <--
+            }
+        }
+        
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ledgerJournalTransValidation</Name>
+				<Source><![CDATA[
+    public boolean ledgerJournalTransValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str             tablename;
+        str             field;
+        int             fieldId;
+        TableId         tableId;
+        Str             tableNameLoc;
+        int             delimiterPosition;
+        boolean         ret,retValid,retLenghtValid, retDataValid;
+        anytype         mapfieldValue; //SKS_FDD_10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            //SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                //Data validations for error and warning
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dirParty_VendorValidation</Name>
+				<Source><![CDATA[
+    public boolean dirParty_VendorValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str             tablename;
+        str             field;
+        int             fieldId;
+        TableId         tableId;
+        Str             tableNameLoc;
+        int             delimiterPosition;
+        boolean         ret,retValid,retLenghtValid, retDataValid;
+        anytype         mapfieldValue; // SKS_FDD_10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            //SKS_FDD_9785 start
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                ret = this.validatePaymUpldData(_ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                return ret;
+            }
+            //SKS_FDD_9785 end
+            else
+            {
+                //Data validations for error and warning
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                //SKS_FDD_10590 -->
+                mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                //SKS_FDD_10590 <--
+            }
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>vendTransValidation</Name>
+				<Source><![CDATA[
+    public boolean vendTransValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str         tablename;
+        str         field;
+        int         fieldId;
+        TableId     tableId;
+        Str         tableNameLoc;
+        int         delimiterPosition;
+        boolean     ret,retValid,retLenghtValid, retDataValid;
+        anytype     mapfieldValue; // SKS_FDD_10590
+        SKS_EFT_FileDetail  sks_eft_fileDetailInvoice; //SKS_Bug_11967
+
+        if(_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+            //SKS_FDD_9785 start
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                ret = this.validatePaymUpldData(_ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                return ret;
+            }
+            //SKS_FDD_9785 end
+            else
+            {
+                //SKS_Bug_11967 -->
+                // for the PaymId validations iterate the file detail for invoice record
+                if(_sks_EFT_BankFormatValidation.SourceField == 'PaymId' && (_sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::Yes || _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::Conditional ||
+                  _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::ConditionalWarning ||
+                  _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Warning ||
+                  _sks_EFT_BankFormatValidation.LengthValidation ==SKS_EFT_LengthValidation::Yes))
+                {
+                    while select sks_eft_fileDetailInvoice where sks_eft_fileDetailInvoice.paymentlineRecId == _ledgerJournalTrans.RecId
+                    && sks_eft_fileDetailInvoice.RecordSection == SKS_EFT_RecordSection::EFTValidate
+                        && sks_eft_fileDetailInvoice.RecordSummary == SKS_EFT_RecordSummary::NonSummary
+                        && sks_eft_fileDetailInvoice.RecordType == SKS_EFT_RecordType::FieldValidations
+                    {
+                        //SKS_FDD_10590 -->
+                        mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation,
+                        _enableLog, true, sks_eft_fileDetailInvoice);
+                        if(hasMappingData)// SKS_Bug_11831
+                        {
+                            //Data validations for error and warning
+                            retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                            // general validations for error and warning
+                            retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                            this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                            // length validations for error and warning
+                            retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                            this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                            //SKS_FDD_10590 <--
+                        }
+                    }
+                }
+                else
+                {
+                    //SKS_FDD_10590 -->
+                    mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation,
+                        _enableLog, true, sks_eft_fileDetailInvoice);
+                    if(hasMappingData)// SKS_Bug_11831
+                    {
+                        //Data validations for error and warning
+                        retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                        // general validations for error and warning
+                        retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                        this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                        // length validations for error and warning
+                        retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                        this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                        //SKS_FDD_10590 <--
+                    }
+                }
+                //SKS_Bug_11967 <--
+            }
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>apEFTVendBankValidation</Name>
+				<Source><![CDATA[
+    public boolean apEFTVendBankValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str                 tablename;
+        str                 field;
+        int                 fieldId;
+        TableId             tableId;
+        Str                 tableNameLoc;
+        int                 delimiterPosition;
+        boolean             ret,retValid,retLenghtValid, retDataValid;
+        anytype             mapfieldValue; // SKS_FDD_10590
+
+        if(_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+            //SKS_FDD_9785 start
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                ret = this.validatePaymUpldData(_ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                return ret;
+            }
+            //SKS_FDD_9785 end
+            else
+            {
+                //SKS_FDD_10590 -->
+                mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                // If mapping data is there, check the field validations
+                if(hasMappingData) // SKS_Bug_11831
+                {
+                    //Data validations for error and warning
+                    retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                    // general validations for error and warning
+                    retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                    this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                    // length validations for error and warning
+                    retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                    this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                    //SKS_FDD_10590 <--
+
+                }
+            }
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>bankAddressValidations</Name>
+				<Source><![CDATA[
+    public boolean bankAddressValidations(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str                 tablename;
+        str                 field;
+        int                 fieldId;
+        TableId             tableId;
+        Str                 tableNameLoc;
+        int                 delimiterPosition;
+        boolean             ret,retValid,retLenghtValid, retDataValid;
+        anytype             mapfieldValue;
+
+        if(_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+            //SKS_FDD_9785 start
+            if(_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+            {
+                ret = this.validatePaymUpldData(_ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                return ret;
+            }
+            //SKS_FDD_9785 end
+            else
+            {
+                //SKS_FDD_10590 -->
+                mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+                if(hasMappingData)// SKS_Bug_11831
+                {
+                    //Data validations for error and warning
+                    retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                    // general validations for error and warning
+                    retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                    this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                    // length validations for error and warning
+                    retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                    this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                    //SKS_FDD_10590 <--
+                }
+            }
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validatePaymUpldData</Name>
+				<Source><![CDATA[
+    public boolean validatePaymUpldData(LedgerJournalTrans _ledgerJournalTrans,
+                                SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                                boolean _enableLog = false)
+    {
+        SKS_EFT_BRValidationAltFieldMapping  upldFieldValid;
+        SKS_UPLD_PMT        paymentUpload;
+        SKS_UPLD_INV        invoiceUpload;
+        SKS_UPLD_PMTXTRA    xtraUpload;
+        str                 mapField;
+        TableId             mapTableId;
+        int                 mapfieldId;
+        anytype             mapfieldValue;
+        boolean             ret,retValid,retLenghtValid, retDataValid;
+
+        select firstonly upldFieldValid
+                    where upldFieldValid.SourceContext == _sks_EFT_BankFormatValidation.SourceContext &&
+                    upldFieldValid.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+
+        if(upldFieldValid)
+        {
+            if(upldFieldValid.MappingSourceContext == SKS_EFT_MappingSourceContext::SKS_UPLD_PMT)
+            {
+                mapField = upldFieldValid.MappingField;
+                mapTableId = tableName2Id(tableStr(SKS_UPLD_PMT));
+                mapfieldId = fieldName2Id(mapTableId, mapField);
+
+                if(!mapfieldId)
+                {
+                    ret = true;
+                    return ret;
+                }
+                else
+                {
+                    select firstonly paymentUpload
+                            where paymentUpload.RefRecId == _ledgerJournalTrans.RecId;
+                    if(paymentUpload)
+                    {
+                        mapfieldValue = paymentUpload.(mapfieldId);
+                    }
+                }
+            }
+            else if(upldFieldValid.MappingSourceContext == SKS_EFT_MappingSourceContext::SKS_UPLD_INV)
+            {
+                mapField = upldFieldValid.MappingField;
+                mapTableId = tableName2Id(tableStr(SKS_UPLD_INV));
+                mapfieldId = fieldName2Id(mapTableId, mapField);
+
+                if(!mapfieldId)
+                {
+                    ret = true;
+                    return ret;
+                }
+                else
+                {
+                    select firstonly invoiceUpload
+                        where invoiceUpload.RefRecId == _ledgerJournalTrans.RecId;
+                    if(invoiceUpload)
+                    {
+                        mapfieldValue = invoiceUpload.(mapfieldId);
+                    }
+                }
+            }
+            else if(upldFieldValid.MappingSourceContext == SKS_EFT_MappingSourceContext::SKS_UPLD_PMTXTRA)
+            {
+                mapField = upldFieldValid.MappingField;
+                mapTableId = tableName2Id(tableStr(SKS_UPLD_PMTXTRA));
+                mapfieldId = fieldName2Id(mapTableId, mapField);
+
+                if(!mapfieldId)
+                {
+                    ret = true;
+                    return ret;
+                }
+                else
+                {
+                    select firstonly xtraUpload
+                        where xtraUpload.RefRecId == _ledgerJournalTrans.RecId;
+                    if(xtraUpload)
+                    {
+                        mapfieldValue = xtraUpload.(mapfieldId);
+                    }
+                }
+            }
+            //Data validations for error and warning
+            retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+            // general validations for error and warning
+            retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);// SKS_FDD_10590
+            this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);// SKS_FDD_10590
+
+            // length validations for error and warning
+            retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog); // SKS_FDD_10590
+            this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);// SKS_FDD_10590
+        }
+        else
+        {
+            ret = true;
+            return ret;
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFieldsInMappingTables</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SKS_FDD_10590
+    /// Used to check the field validations in file detail tables
+    /// </summary>
+    /// <param name = "_sourceContext">Source context</param>
+    /// <param name = "_ledgerJournalTrans">Ledger journal trans</param>
+    /// <param name = "_sks_EFT_BankFormatValidation">Bank format validation</param>
+    /// <param name = "_enableLog">Enable log</param>
+    /// <param name = "_iterateFileDetailInvoice">Iterate file detail invoice</param>
+    /// <param name = "_sks_eft_fileDetailInvoice">File detail invoice</param>
+    /// <returns>Returns field value</returns>
+    private anytype validateFieldsInMappingTables(SKS_EFT_SourceContext _sourceContext,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false,
+                            boolean _iterateFileDetailInvoice = false,
+                            SKS_EFT_FileDetail _sks_eft_fileDetailInvoice = null)
+    {
+        str                 mapTableName, mapField;
+        TableId             mapTableId;
+        int                 mapfieldId;
+        anytype             mapfieldValue;
+        Str                 tableNameLoc;
+        int                 delimiterPosition;
+        str                 warningMsg;
+        SKS_EFT_BRValidationAltFieldMapping  sks_BR_FieldMapping;
+        SKS_EFT_FileDetail_Extra SKS_EFT_FileDetail_Extra; // can't be global because each row of data is a mapping field and needs reselected each time
+
+        select firstonly sks_BR_FieldMapping
+                where sks_BR_FieldMapping.SourceContext == _sourceContext &&
+                sks_BR_FieldMapping.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+
+        if(sks_BR_FieldMapping)
+        {
+            hasMappingData = true; //SKS_Bug_11831
+            mapTableName = enum2str(sks_BR_FieldMapping.MappingSourceContext);
+            delimiterPosition = strFind(mapTableName,'-',0,strLen(mapTableName));
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(mapTableName, delimiterPosition + 2,strLen(mapTableName)));
+            }
+            else
+            {
+                tableNameLoc = mapTableName;
+            }
+
+            mapTableId = tableName2Id(tableNameLoc);
+            mapField = sks_BR_FieldMapping.MappingField;
+            mapfieldId = fieldName2Id(mapTableId, mapField);
+            if(!mapfieldId && sks_BR_FieldMapping.MappingSourceContext != SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_Extra)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS:SKGFieldMapInfo", mapField, mapTableName),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                hasMappingData = false;
+                return null;
+            }
+
+            if(mSKS_EFT_FileDetail.PaymentLineRecId != _ledgerJournalTrans.RecId)
+            {
+                mSKS_EFT_FileDetail = null;
+                select firstonly mSKS_EFT_FileDetail
+                    where mSKS_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId &&
+                    mSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate &&
+                    mSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+
+                select firstonly mSKS_EFT_FileDetail_VendBankAddress
+                    where mSKS_EFT_FileDetail_VendBankAddress.RefRecId == mSKS_EFT_FileDetail.RecId &&
+                        mSKS_EFT_FileDetail_VendBankAddress.AddressType == SKS_EFT_AddressType::VendBankAddress;
+
+                select msks_EFT_FileDetail_CustBankAddress
+                    where msks_EFT_FileDetail_CustBankAddress.RefRecId == msks_EFT_FileDetail.RecId
+                    && msks_EFT_FileDetail_CustBankAddress.AddressType == SKS_EFT_AddressType::CustBankAddress;
+
+                select msks_EFT_FileDetail_BankAddress
+                    where msks_EFT_FileDetail_BankAddress.RefRecId == msks_EFT_FileDetail.RecId
+                    && msks_EFT_FileDetail_BankAddress.AddressType == SKS_EFT_AddressType::BankAddress;
+
+                mSKS_EFT_FileDetail_VendAddress = SKS_EFT_FileDetail_VendAddress::find(mSKS_EFT_FileDetail.RecId);
+                //mSKS_EFT_FileDetail_Intermediary = SKS_EFT_FileDetail_Intermediary::find(mSKS_EFT_FileDetail.RecId);
+                mSKS_EFT_FileDetail_PaymentLine = SKS_EFT_FileDetail_PaymentLine::find(mSKS_EFT_FileDetail.RecId);
+                mSKS_EFT_FileDetail_BankAccount = SKS_EFT_FileDetail_BankAccount::find(mSKS_EFT_FileDetail.RecId);
+                mSKS_EFT_FileDetail_BenBank = SKS_EFT_FileDetail_BenBank::find(mSKS_EFT_FileDetail.RecId);
+                //mSKS_EFT_FileDetail_Instructions = SKS_EFT_FileDetail_Instructions::find(mSKS_EFT_FileDetail.RecId);
+                //mSKS_EFT_FileDetail_CreditParty = SKS_EFT_FileDetail_CreditParty::find(mSKS_EFT_FileDetail.RecId);
+
+                mSKS_EFT_FileDetail_CustAddress = SKS_EFT_FileDetail_CustAddress::find(msks_EFT_FileDetail.RecId);
+            }
+
+            switch (sks_BR_FieldMapping.MappingSourceContext)
+            {
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail:
+                    if(_iterateFileDetailInvoice && _sks_eft_fileDetailInvoice)
+                    {
+                        mapfieldValue = _sks_eft_fileDetailInvoice.(mapfieldId);
+                    }
+                    else if(mSKS_EFT_FileDetail)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail.(mapfieldId);
+                    }
+                    break;
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_VendAddress:
+                    if(mSKS_EFT_FileDetail_VendAddress)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_VendAddress.(mapfieldId);
+                    }
+                    break;
+
+                /*case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_Intermediary:
+                    if(mSKS_EFT_FileDetail_Intermediary)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_Intermediary.(mapfieldId);
+                    }
+                    break;*/
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_PaymentLine:
+                    if(mSKS_EFT_FileDetail_PaymentLine)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_PaymentLine.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_BankAccount:
+                    if(mSKS_EFT_FileDetail_BankAccount)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_BankAccount.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_VendBankAddress:
+                    if(mSKS_EFT_FileDetail_VendBankAddress)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_VendBankAddress.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_BenBank:
+                    if(mSKS_EFT_FileDetail_BenBank)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_BenBank.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_Extra:
+                    select firstonly SKS_EFT_FileDetail_Extra
+                    where SKS_EFT_FileDetail_Extra.FieldName == sks_BR_FieldMapping.MappingField &&
+                        SKS_EFT_FileDetail_Extra.RefRecId == mSKS_EFT_FileDetail.RecId;
+
+                    if(SKS_EFT_FileDetail_Extra)
+                    {
+                        mapfieldValue = SKS_EFT_FileDetail_Extra.Value;
+                    }
+                    break;
+
+                /*case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_Instructions:     // SKS_Bug_11905
+                    if(mSKS_EFT_FileDetail_Instructions)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_Instructions.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_CreditParty:      // SKS_Bug_11905
+                    if(mSKS_EFT_FileDetail_CreditParty)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_CreditParty.(mapfieldId);
+                    }
+                    break;*/
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_CustAddress:
+                    if(mSKS_EFT_FileDetail_CustAddress)
+                    {
+                        mapfieldValue = mSKS_EFT_FileDetail_CustAddress.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_CustBankAddress:
+                    if(msks_EFT_FileDetail_CustBankAddress)
+                    {
+                        mapfieldValue = msks_EFT_FileDetail_CustBankAddress.(mapfieldId);
+                    }
+                    break;
+
+                case SKS_EFT_MappingSourceContext::SKS_EFT_FileDetail_BankAddress:
+                    if(msks_EFT_FileDetail_BankAddress)
+                    {
+                        mapfieldValue = msks_EFT_FileDetail_BankAddress.(mapfieldId);
+                    }
+                    break;
+            }
+        }
+        // SKS_Bug_11831 -->
+        else
+        {
+            warningMsg = strFmt("@SKS:SKGFieldValidationWarning", enum2Str(_sourceContext),  _sks_EFT_BankFormatValidation.SourceField);     // SKS_Bug_11905
+
+            SKS_EFT_JournalValidate::warningLog(warningMsg, _ledgerJournalTrans, _enableLog, _ledgerJournalTrans.amount());     // SKS_Bug_11905
+            hasMappingData = false;
+        }
+        // SKS_Bug_11831 <--
+        return mapfieldValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fieldvalidation</Name>
+				<Source><![CDATA[
+    //SKS_VSTS_12680--->
+    public boolean fieldvalidation(
+        anytype _fieldValue,
+        SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation,
+        LedgerJournalTrans _ledgerJournalTrans,
+        boolean _enableLog = false)
+    {
+        str errorMsg;
+        str errorMessage = "@SKS4384";
+
+        //General validations
+        if (!_fieldValue && _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::Yes &&
+            !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' +  strFmt("@SKS4385",
+                        _sks_EFT_BankFormatValidation.Id,_sks_EFT_BankFormatValidation.SourceFieldDesc,_sks_EFT_BankFormatValidation.SourceFieldLoc
+                        ,_sks_EFT_BankFormatValidation.TargetFieldLoc);
+
+
+            SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+            return false;
+
+        }
+        else if (!_fieldValue && _sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::Yes &&
+                _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS4386",
+                        _sks_EFT_BankFormatValidation.Id,_sks_EFT_BankFormatValidation.SourceFieldDesc,_sks_EFT_BankFormatValidation.SourceFieldLoc
+                        ,_sks_EFT_BankFormatValidation.TargetFieldLoc,_sks_EFT_BankFormatValidation.ISOCountrySpec);
+
+            SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fieldWarningValidation</Name>
+				<Source><![CDATA[
+    public void fieldWarningValidation(
+    anytype _fieldValue,
+    SKS_EFT_BankFormatValidation  sks_EFT_BankFormatValidation,
+    LedgerJournalTrans _ledgerJournalTrans,
+    boolean _enableLog = false)
+    {
+        str warningMsg;
+        str warningMessage = "@SKS4389";
+
+        //General validations
+        if (!_fieldValue && sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::ConditionalWarning &&
+            !sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            warningMsg = "@SKS4388" +
+                        ' ' +
+                        warningMessage +
+                        ' ' +  strFmt("@SKS4385",
+                        sks_EFT_BankFormatValidation.Id,sks_EFT_BankFormatValidation.SourceFieldDesc,sks_EFT_BankFormatValidation.SourceFieldLoc
+                        ,sks_EFT_BankFormatValidation.TargetFieldLoc);
+
+            SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+        }
+        else if (!_fieldValue && sks_EFT_BankFormatValidation.Required == SKS_EFT_BankFormatRequired::ConditionalWarning &&
+                sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            warningMsg = "@SKS4388" +
+                        ' ' +
+                        warningMessage +
+                        ' ' + strFmt("@SKS4390",
+                        sks_EFT_BankFormatValidation.Id,sks_EFT_BankFormatValidation.SourceFieldDesc,sks_EFT_BankFormatValidation.SourceFieldLoc
+                        ,sks_EFT_BankFormatValidation.TargetFieldLoc,sks_EFT_BankFormatValidation.Notes,sks_EFT_BankFormatValidation.ISOCountrySpec);
+
+            SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fieldLengthValidation</Name>
+				<Source><![CDATA[
+    public boolean fieldLengthValidation(
+    anytype _fieldValue,
+    SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation,
+    LedgerJournalTrans   _ledgerJournalTrans,
+    boolean _enableLog = false)
+    {
+        str errorMsg;
+        str errorMessage = "@SKS4380";
+
+        //Length validations
+        if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Yes &&
+              !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                errorMsg = "@SKS4381" +
+                    ' ' +
+                    errorMessage +
+                    ' ' +
+                    strFmt("@SKS4382",
+                    _sks_EFT_BankFormatValidation.Id,_sks_EFT_BankFormatValidation.SourceFieldDesc,_sks_EFT_BankFormatValidation.SourceFieldLoc
+                    ,_sks_EFT_BankFormatValidation.TargetFieldLoc,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+
+
+                SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+
+                return false;
+            }
+        }
+
+        else if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Yes &&
+              _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                errorMsg = "@SKS4381" +
+                    ' ' +
+                    errorMessage +
+                    ' ' +
+                    strFmt("@SKS4383",
+                    _sks_EFT_BankFormatValidation.Id,_sks_EFT_BankFormatValidation.SourceFieldDesc,_sks_EFT_BankFormatValidation.SourceFieldLoc
+                    ,_sks_EFT_BankFormatValidation.TargetFieldLoc,_sks_EFT_BankFormatValidation.ISOCountrySpec,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+
+                SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fieldWarningLengthValidation</Name>
+				<Source><![CDATA[
+    public void fieldWarningLengthValidation(
+    anytype _fieldValue,
+    SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation,
+    LedgerJournalTrans _ledgerJournalTrans,
+    boolean _enableLog = false)
+    {
+        str warningMsg;
+        str warningMessage = "@SKS4387";
+
+        //Length validations warning
+        if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Warning &&
+              !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+
+                warningMsg = "@SKS4388" +
+                    ' ' +
+                    warningMessage +
+                    ' ' +
+                    strFmt("@SKS4382",
+                    _sks_EFT_BankFormatValidation.Id,_sks_EFT_BankFormatValidation.SourceFieldDesc,_sks_EFT_BankFormatValidation.SourceFieldLoc
+                    ,_sks_EFT_BankFormatValidation.TargetFieldLoc,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+
+                SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+            }
+        }
+
+        else if (_fieldValue && _sks_EFT_BankFormatValidation.LengthValidation == SKS_EFT_LengthValidation::Warning &&
+              _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            if (strLen(any2str(_fieldValue)) < _sks_EFT_BankFormatValidation.MinLength ||
+                strLen(any2str(_fieldValue)) > _sks_EFT_BankFormatValidation.MaxLength)
+            {
+                warningMsg = "@SKS4388" +
+                    ' ' +
+                    warningMessage +
+                    ' ' +
+                    strFmt("@SKS4383",
+                    _sks_EFT_BankFormatValidation.Id,_sks_EFT_BankFormatValidation.SourceFieldDesc,_sks_EFT_BankFormatValidation.SourceFieldLoc
+                    ,_sks_EFT_BankFormatValidation.TargetFieldLoc,_sks_EFT_BankFormatValidation.ISOCountrySpec,_sks_EFT_BankFormatValidation.MinLength,_sks_EFT_BankFormatValidation.MaxLength);
+
+                SKS_EFT_JournalValidate::warningLog(warningMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runValidation</Name>
+				<Source><![CDATA[
+    public static container runValidation(container _params)
+    {
+        SKS_BTBEFT_JournalBankValidate sks_BTBEFT_JournalBankValidate = new SKS_BTBEFT_JournalBankValidate();
+        sks_BTBEFT_JournalBankValidate.paymJournalValidate(conPeek(_params, 1),conPeek(_params, 2),conPeek(_params, 3),conPeek(_params, 4));
+
+        return conNull();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custValidation</Name>
+				<Source><![CDATA[
+    public boolean custValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str         tablename;
+        str         field;
+        int         fieldId;
+        TableId     tableId;
+        Str         tableNameLoc;
+        int         delimiterPosition;
+        boolean     ret,retValid,retLenghtValid,retDataValid;
+        anytype     mapfieldValue; // SKS_FDD_10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            //SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                //SKS_FDD_10590 <--
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dirParty_DDValidation</Name>
+				<Source><![CDATA[
+    public boolean dirParty_DDValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str         tablename;
+        str         field;
+        int         fieldId;
+        TableId     tableId;
+        Str         tableNameLoc;
+        int         delimiterPosition;
+        boolean     ret,retValid,retLenghtValid,retDataValid;
+        anytype     mapFieldValue; // SKS_FDD_10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            //SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                //SKS_FDD_10590 <--
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custBankAccountValidation</Name>
+				<Source><![CDATA[
+    public boolean custBankAccountValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str                 tablename;
+        str                 field;
+        int                 fieldId;
+        TableId             tableId;
+        Str                 tableNameLoc;
+        int                 delimiterPosition;
+        boolean             ret,retValid,retLenghtValid,retDataValid;
+        anytype             mapfieldValue;//SKS_FDD-10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logisticsPostalAddressValidation_DD</Name>
+				<Source><![CDATA[
+    public boolean logisticsPostalAddressValidation_DD(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str         tablename;
+        str         field;
+        int         fieldId;
+        TableId     tableId;
+        Str         tableNameLoc;
+        int         delimiterPosition;
+        boolean     ret,retValid,retLenghtValid,retDataValid;
+        anytype     mapfieldValue;//SKS_FDD-10590
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            // SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                // SKS_FDD_10590 <--
+            }
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>bankLogisticsPostalAddressValidation_DD</Name>
+				<Source><![CDATA[
+    public boolean bankLogisticsPostalAddressValidation_DD(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str         tablename;
+        str         field;
+        int         fieldId;
+        TableId     tableId;
+        Str         tableNameLoc;
+        int         delimiterPosition;
+        boolean     ret,retValid,retLenghtValid,retDataValid;
+        anytype     mapFieldValue;//SKS_FDD-10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            //SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                //SKS_FDD_10590 <--
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>legalEntityARAddressValidation</Name>
+				<Source><![CDATA[
+    public boolean legalEntityARAddressValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str                     tablename;
+        str                     field;
+        int                     fieldId;
+        TableId                 tableId;
+        Str                     tableNameLoc;
+        int                     delimiterPosition;
+        boolean                 ret,retValid,retLenghtValid, retDataValid;
+        anytype                 mapFieldValue; //SKS_FDD_10590
+
+        if(_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+
+            //SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                //SKS_FDD_10590 <--
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>legalEntityARLogisticLocationValidation</Name>
+				<Source><![CDATA[
+    //TFS: 7518
+    public boolean legalEntityARLogisticLocationValidation(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str                     tablename;
+        str                     field;
+        int                     fieldId;
+        TableId                 tableId;
+        Str                     tableNameLoc;
+        int                     delimiterPosition;
+        boolean                 ret,retValid,retLenghtValid,retDataValid;
+        anytype                 mapFieldValue; // SKS_FDD_10590
+
+        if(_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            //SKS_FDD_10590 -->
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                //SKS_FDD_10590 <--
+            }
+
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>companyInfoValidations</Name>
+				<Source><![CDATA[
+    public boolean companyInfoValidations(SKS_EFT_SourceContext _sourceContext,
+                            SKS_EFT_FileFormatPaymSpec _sks_EFT_FileFormatPaymSpec,
+                            LedgerJournalTrans _ledgerJournalTrans,
+                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation,
+                            boolean _enableLog = false)
+    {
+        Str         tablename;
+        str         field;
+        int         fieldId;
+        TableId     tableId;
+        Str         tableNameLoc;
+        int         delimiterPosition;
+        boolean     ret,retValid,retLenghtValid,retDataValid;
+        anytype     mapFieldValue;//SKS_FDD-10590
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            field = _sks_EFT_BankFormatValidation.SourceField;
+
+            tablename = enum2str(_sks_EFT_BankFormatValidation.SourceContext);
+
+            delimiterPosition = strFind(tableName,'-',0,strLen(tableName));
+
+            if (delimiterPosition)
+            {
+                tableNameLoc = strLTrim(subStr(tableName, delimiterPosition + 2,strLen(tableName)));
+            }
+            else
+            {
+                tableNameLoc = tableName;
+            }
+
+            tableId = tableName2id(tableNameLoc);
+
+            field = _sks_EFT_BankFormatValidation.SourceField;
+            fieldId = fieldName2id(tableId,field);
+
+            if (!fieldId)
+            {
+                SKS_EFT_JournalValidate::warningLog(strFmt("@SKS4391",tablename),_ledgerJournalTrans,_enableLog, _ledgerJournalTrans.amount());
+                return false;
+            }
+
+            mapfieldValue = this.validateFieldsInMappingTables(_sourceContext, _ledgerJournalTrans, _sks_EFT_BankFormatValidation, _enableLog);
+            if(hasMappingData)// SKS_Bug_11831
+            {
+                retDataValid =   SKS_EFT_JournalValidate::DataFieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+
+                // general validations for error and warning
+                retValid =   this.mapfieldvalidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningValidation(mapfieldValue,_sks_EFT_BankFormatValidation, _ledgerJournalTrans,_enableLog);
+
+                // length validations for error and warning
+                retLenghtValid =   this.mapfieldLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+                this.mapfieldWarningLengthValidation(mapfieldValue,_sks_EFT_BankFormatValidation,_ledgerJournalTrans,_enableLog);
+            }
+        }
+
+        if (retValid == true && retLenghtValid == true && retDataValid == true)
+        {
+            ret = true;
+            return ret;
+        }
+        else
+        {
+            ret = false;
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custBankAccountCountryValidation</Name>
+				<Source><![CDATA[
+    public boolean custBankAccountCountryValidation(SKS_EFT_CountryContext      _countryContext,
+                                                    SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                                    LedgerJournalTrans          _ledgerJournalTrans,
+                                                    container                   _isoCode,
+                                                    SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        SKS_EFT_Format                  sks_EFT_Format = new SKS_EFT_Format();
+        int                             i;
+        boolean countryMatching;
+        // SKS_FDD_10590 -->
+        SKS_EFT_FileDetail  sks_EFT_FileDetail;
+        SKS_EFT_FileDetail_Addresses sks_EFT_FileDetail_CustBankAddress;
+        // SKS_FDD_10590 <--
+        if (_sks_EFT_BankFormatValidation)
+        {
+
+            select firstonly Recid from sks_EFT_FileDetail where sks_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId &&
+                sks_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate
+            join CountryRegionId from sks_EFT_FileDetail_CustBankAddress where sks_EFT_FileDetail_CustBankAddress.RefRecId == sks_EFT_FileDetail.RecId &&
+                sks_EFT_FileDetail_CustBankAddress.AddressType == SKS_EFT_AddressType::CustBankAddress;
+
+            for (i=1; i <= conlen(_isoCode); i++)
+            {
+                if (conpeek(_ISOCode, i) == sks_EFT_Format.getLogisticsAddressCountryISO(sks_EFT_FileDetail_CustBankAddress.CountryRegionId))
+                {
+                    countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                    continue;
+                }
+                else
+                {
+                    continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                }
+            }
+            if(countryMatching)// if any one country matching then return true.
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addressCustCountryValidation</Name>
+				<Source><![CDATA[
+    public boolean addressCustCountryValidation(SKS_EFT_CountryContext      _countryContext,
+                                            SKS_EFT_FileFormatPaymSpec  _sks_EFT_FileFormatPaymSpec,
+                                            LedgerJournalTrans          _ledgerJournalTrans,
+                                            container                   _isoCode,
+                                            SKS_EFT_BankFormatValidation    _sks_EFT_BankFormatValidation)
+    {
+        SKS_EFT_Format                  sks_EFT_Format = new SKS_EFT_Format();
+        int i;
+        boolean countryMatching;
+        // SKS_FDD_10590 -->
+        SKS_EFT_FileDetail  sks_EFT_FileDetail;
+        SKS_EFT_FileDetail_CustAddress sks_EFT_FileDetail_CustAddress;
+        // SKS_FDD_10590 <--
+
+        if (_sks_EFT_BankFormatValidation)
+        {
+            select firstonly sks_EFT_FileDetail where sks_EFT_FileDetail.PaymentLineRecId == _ledgerJournalTrans.RecId && sks_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate;
+            sks_EFT_FileDetail_CustAddress = SKS_EFT_FileDetail_CustAddress::find(sks_EFT_FileDetail.RecId);
+
+
+            for (i=1; i <= conlen(_isoCode); i++)
+            {
+                if (conpeek(_ISOCode, i) == sks_EFT_Format.getLogisticsAddressCountryISO(sks_EFT_FileDetail_CustAddress.CustCountryRegionId))
+                {
+                    countryMatching = true;//we have to validate all country region, so keeping this boolean only for matching country region.
+                    continue;
+                }
+                else
+                {
+                    continue;// if we have multiple country region, we have to check all. So giving continue here to allow validate for next country region.
+
+                }
+            }
+            if(countryMatching)// if any one country matching then return true.
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPInventFlexSamplingQualityDelete</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     The <c>PIPInventFlexSamplingQualityDelete</c> class updates the relevant flexible sampling activity
+///     and its activity details from the deletion of a quality order.
+/// </summary>
+class PIPInventFlexSamplingQualityDelete
+{
+    PIPInventFlexSamplingCurrentState       currentState;
+
+    PIPInventFlexSamplingActivityTable      activityTable;
+    InventQualityOrderTable                 inventQualityOrderTable;
+    PIPInventFlexSamplingPlanLines          currentPlanLine;
+    PIPInventFlexSamplingActivityDetails    activityDetailFromQualityOrder;
+    PIPInventFlexSamplingActivityDetails    firstActivityInSampleGroup;
+
+    InventQualityOrderId                    qualityOrderId;
+    InventTestOrderStatus                   qualityOrderStatus;
+
+    boolean                                 achievedPassCriteria;
+    boolean                                 hitFailCriteria;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmQualityOrderId</Name>
+				<Source><![CDATA[
+    public InventQualityOrderId parmQualityOrderId(InventQualityOrderId _qualityOrderId = qualityOrderId)
+    {
+        qualityOrderId = _qualityOrderId;
+    
+        return qualityOrderId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateActivities</Name>
+				<Source><![CDATA[
+    public void updateActivities()
+    {
+        #PIPFlexibleSampling
+    
+        inventQualityOrderTable = InventQualityOrderTable::find(qualityOrderId);
+    
+        select forUpdate firstOnly activityDetailFromQualityOrder
+            where activityDetailFromQualityOrder.QualityOrder == qualityOrderId;
+    
+        if (!activityDetailFromQualityOrder)
+        {
+            return;
+        }
+    
+        activityTable   = activityDetailFromQualityOrder.inventFlexSamplingActivityTable();
+    
+        currentState    = PIPInventFlexSamplingCurrentState::newFromTable(activityTable);
+    
+        currentPlanLine = currentState.currentPlanLine();
+    
+        ttsBegin;
+    
+        if (currentState.firstActivityDetail() && activityDetailFromQualityOrder.createdDateTime >= currentState.firstActivityDetail().createdDateTime)
+        {
+            this.updateFromPlanLine();
+        }
+        else
+        {
+            activityDetailFromQualityOrder.Reference = "@PIP394";
+            activityDetailFromQualityOrder.update();
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFromPlanLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Updates activity details based on the flexible sampling plan line
+    ///     being used in the current level.
+    /// </summary>
+    private void updateFromPlanLine()
+    {
+        PIPPlanActivityNumber   planActivityNumber;
+        PIPRound                clearedRoundNumber;
+        #PIPFlexibleSampling
+    
+        if (currentPlanLine.Skip)
+        {
+            firstActivityInSampleGroup = PIPInventFlexSamplingActivityDetails::firstActivityInSampleGroup(activityDetailFromQualityOrder, true);
+    
+            if (firstActivityInSampleGroup.RoundNumber)
+            {
+                clearedRoundNumber = firstActivityInSampleGroup.RoundNumber;
+                firstActivityInSampleGroup.RoundNumber = 0;
+                firstActivityInSampleGroup.update();
+            }
+    
+            activityDetailFromQualityOrder.Reference = "@PIP394";
+            activityDetailFromQualityOrder.update();
+        }
+        else
+        {
+            clearedRoundNumber = activityDetailFromQualityOrder.RoundNumber;
+            planActivityNumber = activityDetailFromQualityOrder.PlanActivityNumber;
+    
+            activityDetailFromQualityOrder.delete();
+    
+            this.updatePlanActivityNumbers(planActivityNumber);
+        }
+    
+        this.updateRoundNumbers(clearedRoundNumber);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePlanActivityNumbers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Updates the subsequent activity details with the correct plan activity number
+    ///     to adjust for the deletion of an activity detail.
+    /// </summary>
+    /// <param name="_planActivityNumber">
+    ///     The plan activity number of the deleted activity detail.
+    /// </param>
+    private void updatePlanActivityNumbers(PIPPlanActivityNumber _planActivityNumber)
+    {
+        PIPInventFlexSamplingActivityDetails    activityDetails;
+    
+        update_recordset activityDetails
+            setting
+                PlanActivityNumber = activityDetails.PlanActivityNumber - 1
+            where activityDetails.PlanActivityNumber               >= _planActivityNumber
+                && activityDetails.InventFlexSamplingActivityRecId == activityTable.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRoundNumbers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Updates round number values on all activity details that have a round number
+    ///     greater than the given round number.
+    /// </summary>
+    /// <param name="_clearedRoundNumber">
+    ///     The round number to be used as reference.
+    /// </param>
+    private void updateRoundNumbers(PIPRound _clearedRoundNumber)
+    {
+        PIPInventFlexSamplingActivityDetails    activityDetails;
+        int                                     timeDiff;
+    
+        update_recordset activityDetails
+            setting
+                RoundNumber = activityDetails.RoundNumber - 1
+            where activityDetails.RoundNumber
+                && activityDetails.PlanActivityNumber               >= currentState.firstActivityDetail().PlanActivityNumber
+                && activityDetails.RoundNumber                      >= _clearedRoundNumber
+                && activityDetails.InventFlexSamplingActivityRecId  == activityTable.RecId;
+    
+        if (currentPlanLine.TimeSpanDays)
+        {
+            timeDiff = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - DateTimeUtil::date(currentState.firstActivityValidationDateTime());
+    
+            if (timeDiff >= currentPlanLine.TimeSpanDays)
+            {
+                activityTable.updateRoundsTimeExpired(currentPlanLine.TimeSpanDays);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    private static PIPInventFlexSamplingQualityDelete construct()
+    {
+        return new PIPInventFlexSamplingQualityDelete();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromQualityOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Initializes a new instance of the <c>PIPInventFlexSamplingQualityDelete</c> class.
+    /// </summary>
+    /// <param name="_inventQualityOrderId">
+    ///     The quality order id of the quality order being reopened.
+    /// </param>
+    /// <returns>
+    ///     A new instance of the <c>PIPInventFlexSamplingQualityDelete</c> class.
+    /// </returns>
+    public static PIPInventFlexSamplingQualityDelete newFromQualityOrder(InventQualityOrderId _inventQualityOrderId)
+    {
+        PIPInventFlexSamplingQualityDelete inventFlexSamplingQualityDelete = PIPInventFlexSamplingQualityDelete::construct();
+    
+        inventFlexSamplingQualityDelete.parmQualityOrderId(_inventQualityOrderId);
+    
+        return inventFlexSamplingQualityDelete;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

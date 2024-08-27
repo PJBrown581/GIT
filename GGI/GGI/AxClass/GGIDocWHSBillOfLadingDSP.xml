@@ -1,0 +1,1070 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIDocWHSBillOfLadingDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     Replica of the Docentric WHSBillOfLading DSP class.
+/// </summary>
+class GGIDocWHSBillOfLadingDSP extends DocDataSourceProviderSrsReporting
+{
+    WHSBillOfLadingTmp      header;     // used for placeholders
+    
+    #define.BillOfLadingHeader          ('BillOfLading')
+    #define.CarrierInformation          ('CarrierInformation')
+    #define.CustomerOrderInformation    ('CustomerOrderInformation')
+    #define.Separator                   (' ')
+    #define.Hyphon                      (' - ')
+    #define.HyphonNoSpace               ('-')
+    #define.ThirdParty                  ('Third-Party Billing')
+    #define.Comma                       (', ')
+
+    //WHSBillOfLadingTmp is a single temporary table (filled by class WhsBillOfLadingDP) that contains header and lines
+
+    // fields used for Carrier information lines
+    container carrierFieldList = [
+                    fieldStr(WHSBillOfLadingTmp, LineQty),
+                    fieldStr(WHSBillOfLadingTmp, DefaultHandlingType),
+                    fieldStr(WHSBillOfLadingTmp, Qty),
+                    fieldStr(WHSBillOfLadingTmp, PackingType),
+                    fieldStr(WHSBillOfLadingTmp, grossWeight),
+                    fieldStr(WHSBillOfLadingTmp, HazardousMaterial),
+                    fieldStr(WHSBillOfLadingTmp, NmfcName),
+                    fieldStr(WHSBillOfLadingTmp, LTLClassCode),
+                    fieldStr(WHSBillOfLadingTmp, nmfcCode)];
+
+    // fields used for Customer order information lines
+    container orderFieldList = [
+                    fieldStr(WHSBillOfLadingTmp, PurchOrderFormNum),
+                    fieldStr(WHSBillOfLadingTmp, CustOrderPackQty),
+                    fieldStr(WHSBillOfLadingTmp, CustOrderWeight),
+                    fieldStr(WHSBillOfLadingTmp, CircleY),
+                    fieldStr(WHSBillOfLadingTmp, CircleN),
+                    fieldStr(WHSBillOfLadingTmp, AdditionalInfo)];
+                                                                                      
+    // fields not used for DDSP
+    container uselessFieldList = [
+                    fieldStr(WHSBillOfLadingTmp, DummyCustomer),
+                    fieldStr(WHSBillOfLadingTmp, CustLine),
+                    fieldStr(WHSBillOfLadingTmp, CountLine)];
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()                                                     
+    {
+        return 'WHS Bill of lading DSP';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>singleLineStreet</Name>
+				<Source><![CDATA[
+    LogisticsAddressStreet singleLineStreet(LogisticsAddressStreet _street)
+    {
+        _street = strReplace(_street, '\n', ', ');
+        _street = strReplace(_street, '\r', '');
+        _street = strReplace(_street, '\t', ' ');
+
+        return _street;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>subBOLIds</Name>
+				<Source><![CDATA[
+    String255 subBOLIds(WHSBillOfLading _whsBillOfLading, boolean _requireMaster = true)
+    {
+        String255           res = '';
+        String255           resTemp = '';
+        WHSBillOfLading     subWHSBillOfLading;
+
+        if (_requireMaster && !_whsBillOfLading.MasterBOLFlag)
+        {
+            return res;
+        }
+        while select BillOfLadingId from subWHSBillOfLading where subWHSBillOfLading.MasterBillOfLadingId == _whsBillOfLading.BillOfLadingId
+        {
+            if (res)
+            {
+                res += ', ';
+            }
+            res += subWHSBillOfLading.BillOfLadingId;
+            resTemp = this.subBOLIds(subWHSBillOfLading, false);
+            if (resTemp)
+            {
+                res += ', ' + resTemp;
+            }
+        }
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProductCategory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Returns product categorey information.
+    /// </summary>
+    /// <param name = "_itemId">
+    ///     Order line itemid
+    /// </param>
+    /// <returns>
+    ///     Returns product categorey information
+    /// </returns>
+    String255 getProductCategory(ItemId _itemId)
+    {
+        EcoResProductCategory   ecoResProductCategory;
+        EcoResCategory          ecoResCategory;
+        String255               res = '';
+        EcoResCategoryDescription categoryDescription;
+        RecId                   productRecid;
+        EcoResCategoryHierarchyName hierarchyName;
+
+        productRecid = InventTable::find(_itemId).Product;
+
+        while select EcoResProductCategory
+            where EcoResProductCategory.Product == productRecid
+        {
+            select firstonly EcoResCategory
+                where EcoResCategory.RecId == EcoResProductCategory.Category;
+
+            hierarchyName = ecoResCategoryHierarchy::find(EcoResProductCategory.CategoryHierarchy).Name;
+            categoryDescription = EcoResCategory.Name;
+
+            if (res)
+            {
+                res += ', ';
+            }
+            res += hierarchyName + #Hyphon + categoryDescription;
+        }
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetThirdPartyAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Returns address
+    /// </summary>
+    /// <param name = "_accountNum">
+    ///     Account number
+    /// </param>
+    /// <returns>
+    ///     Returns address
+    /// </returns>
+    LogisticsAddressing GetThirdPartyAddress(AccountNum _accountNum)
+    {
+        DirPartyPostalAddressView           dirPartyPostalAddrlocal;
+        DirPartyLocationRolesView           dirPartyLocationRoleslocal;
+        LogisticsLocationRole               logisticsLocRole;
+        
+        select firstOnly dirPartyPostalAddrlocal
+                exists join dirPartyLocationRoleslocal
+                    where dirPartyLocationRoleslocal.Location   == dirPartyPostalAddrlocal.Location
+                        && dirPartyLocationRoleslocal.Party     ==     VendTable::find(_accountNum).Party
+                exists join logisticsLocRole
+                    where logisticsLocRole.Name     == #ThirdParty
+                        && logisticsLocRole.RecId   == dirPartyLocationRoleslocal.LocationRole
+                        && logisticsLocRole.IsPostalAddress;
+
+        return dirPartyPostalAddrlocal.address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        // Standard mechanism is replaced by custom DDSP generation
+        //super(_recordBuilder);
+
+        WHSBillOfLadingTmp whsBillOfLadingTmp = this.getReportDataTableContext(tableStr(WHSBillOfLadingTmp));
+
+        // Header
+        select firstOnly whsBillOfLadingTmp;
+        whsBillOfLadingTmp.FromStreet = this.singleLineStreet(whsBillOfLadingTmp.FromStreet);
+        whsBillOfLadingTmp.ToStreet   = this.singleLineStreet(whsBillOfLadingTmp.ToStreet);
+        
+        WHSBillOfLading     billOfLading = WHSBillOfLading::find(whsBillOfLadingTmp.BillOfLadingId);
+        whsBillOfLadingTmp.MasterBillOfLadingId = billOfLading.MasterBillOfLadingId;
+
+        DocXmlRecord headerDataRecord = _recordBuilder.addRecord(whsBillOfLadingTmp.data());     // each line contains header data
+        headerDataRecord.setRecordName(#BillOfLadingHeader);
+        headerDataRecord.setRecordLabel('Bill Of Lading');
+        headerDataRecord.addAllFieldsExcept(carrierFieldList + orderFieldList + uselessFieldList);
+
+        // Master Bill of Lading
+        headerDataRecord.addCalculatedFieldFromEnum('MasterBOL', enumStr(boolean), billOfLading.MasterBOLFlag);
+        headerDataRecord.addCalculatedField('SubBOLIds', this.subBOLIds(billOfLading), 'Undelaying Bill of Lading Numbers');
+        
+        // Split addresses in multiple fields and convert multiline street into single line
+        LogisticsPostalAddress fromAddress = LogisticsPostalAddress::findRecId(billOfLading.ShippingPostalAddress);
+        LogisticsPostalAddress toAddress = LogisticsPostalAddress::findRecId(billOfLading.DeliveryPostalAddress);
+        LogisticsPostalAddress thirdPartyAddress = LogisticsPostalAddress::findRecId(billOfLading.ThirdPartyPostalAddress);
+        headerDataRecord.addCalculatedFieldFromEdt('FromCountry', extendedTypeStr(LogisticsAddressCountryRegionId), fromAddress.CountryRegionId);
+        headerDataRecord.addCalculatedFieldFromEdt('ToCountry', extendedTypeStr(LogisticsAddressCountryRegionId), toAddress.CountryRegionId);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyCity', extendedTypeStr(LogisticsAddressCityName), thirdPartyAddress.City);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyStreet', extendedTypeStr(LogisticsAddressStreet), this.singleLineStreet(thirdPartyAddress.Street));
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyState', extendedTypeStr(LogisticsAddressStateId), thirdPartyAddress.State);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyZipCode', extendedTypeStr(LogisticsAddressZipCodeId), thirdPartyAddress.ZipCode);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyCountry', extendedTypeStr(LogisticsAddressCountryRegionId), thirdPartyAddress.CountryRegionId);
+         
+        GGIShipmentManager  shipmentManager = GGIShipmentManager::newRecord(whsBillOfLadingTmp);
+        SalesTable          salesTable      = shipmentManager.salesTable();
+        salesTable          salesTableCustPO;
+        TTBPermitTable      permitTable; 
+        GGICustAuthDisclaimerAddressTable  authTable;
+        SalesLine           salesLine, salesLineDetails;
+        InventTransferTable transTable;
+        InventTransferLine  transLine, transLineDetails;
+        WHSShipmentTable    shipmentTable;
+        TMSSalesTable       tmsSalesTable = tmsSalesTable::find(salesTable.SalesId);
+        TMSCarrier          tmsCarrier = tmsCarrier::find(tmsSalesTable.CarrierCode);
+        TMSInventTransferTable  tmsInvTransTable;
+        TMSCarrier          tmsCarrierTrans;
+        TMSCarrierService   tmsCarrierService = tmsCarrierService::find(tmsSalesTable.CarrierServiceCode, tmsCarrier.CarrierCode);
+        VendTable           vendTable;
+        DocuRef             docuRef;
+        str                 notes = '';
+        str                 notesTrans = '';
+        str                 notesLines = '';
+        LogisticsPostalAddress  lpa;
+        LogisticsLocation   logisticsLocation;
+        WHSLoadTable        whsLoadTable;
+        WHSLoadLine         whsLoadLine;
+        InventTable         inventTable;
+        WHSEcoResProductTransportationCodes transCode;
+        HMIMItemMaterial    hazMaterial;
+        HMIMClass           HazCodeDescr;
+        InventTransOrigin   invTransOrg;
+        InventTrans         invTrans;
+        InventDim           invDim, invDim2;
+        WHSNMFC             nmfc;
+        int                 serialNumInt, serialNumIntNext, totalSerials, runningCount, singleBatchSerial, totalSerials2;
+        str                 serialNumStr, itemid, serialNumStrFirst, serialNumStrLast, serialPrint, batchPrint, itemPrint, batchNumStrFirst, lastSerial, lastBatch, lastItemid;
+
+        DocXmlRecord    docPermit = headerDataRecord.addChildCalculatedRecord('Permit');
+        DocXmlRecord    docAuth = headerDataRecord.addChildCalculatedRecord('Authorisation');
+
+        if (salesTable)
+        {
+            shipmentTable = WHSShipmentTable::find(whsBillOfLadingTmp.ShipmentId);
+            
+            select sum(TTBWineGallon), sum(TTBProofGallon)
+                from salesLine
+                where salesLine.SalesId == salesTable.SalesId;
+
+            select firstonly lpa
+                where lpa.RecId == salestable.DeliveryPostalAddress;
+
+            select firstonly logisticsLocation
+                where logisticsLocation.recid == lpa.Location;
+
+            while select docuRef
+                where docuRef.RefRecId == logisticsLocation.RecId
+                && docuRef.Restriction == DocuRestriction::External
+                && docuRef.TypeId == 'BOL Note'
+            {
+                notes = docuRef.Notes + #Separator + notes;
+            }
+
+            vendTable = vendTable::find(tmsCarrier.VendorCode);
+            permitTable     = salesTable.ttbPermitTable();
+            authTable = salesTable.ggiCustAuthTable();
+            
+            docPermit.addCalculatedFieldFromEdt('Id', extendedTypeStr(TTBPermitId), permitTable.PermitId);
+            docPermit.addCalculatedFieldFromEnum('Type', enumStr(TTBPermitType), permitTable.PermitType);
+            docPermit.addCalculatedFieldFromEdt('DSPSerialId', extendedTypeStr(TTBApprovalSerialNum), salesTable.TTBDSPApprovalSerialId);
+            docPermit.addCalculatedFieldFromEdt('DSPApprovalDate', extendedTypeStr(TTBApprovalDate), salesTable.TTBDSPApprovalDate);
+            docPermit.addCalculatedFieldFromEdt('TransferBondShipmentId', extendedTypeStr(TTBTransferBondShipmentId), salesTable.TTBTransferBondShipmentId);
+            docPermit.addCalculatedFieldFromEdt('TaxPaidShipmentId', extendedTypeStr(TTBTaxPaidShipmentId), salesTable.TTBTaxPaidShipmentId);
+            docPermit.addCalculatedFieldFromEdt('WineGallon', extendedTypeStr(TTBWineGallon), salesLine.TTBWineGallon);
+            docPermit.addCalculatedFieldFromEdt('ProofGallon', extendedTypeStr(TTBProofGallon), salesLine.TTBProofGallon);
+
+            docAuth.addCalculatedFieldFromEdt('Code', extendedTypeStr(GGIAuthDisclaimerCode), GGIAuthDisclaimerTable::find(authTable.GGIAuthKey).Code);
+            docAuth.addCalculatedFieldFromEdt('Number', extendedTypeStr(Num), authTable.Num);
+
+            headerDataRecord.AddCalculatedFieldFromEdt('ExciseTax', extendedTypeStr(LineAmount), GGI_ExciseTaxManager::GetExciseTaxAmount(salesTable.SalesId));
+            headerDataRecord.addCalculatedField('DlvTerms', salesTable.DlvTerm);
+            headerDataRecord.addCalculatedField('DlvName', tmsCarrierService.Name);
+            headerDataRecord.addCalculatedField('DlvLoadTemplateId', tmsCarrierService.LoadTemplateId);
+            headerDataRecord.addCalculatedField('DlvMethodCode', tmsCarrierService.MethodCode);
+            headerDataRecord.addCalculatedField('DlvModeId', tmsCarrierService.DlvModeId);
+            headerDataRecord.addCalculatedField('DlvExternalCode', tmsCarrierService.ExternalCode);
+            headerDataRecord.addCalculatedField('DlvBillingGroupId', tmsCarrierService.BillingGroupId);
+            headerDataRecord.addCalculatedField('DlvVolumeFactor', tmsCarrierService.VolumeFactor);
+            headerDataRecord.addCalculatedField('BrokerCode', tmsSalesTable.BrokerCode);
+            headerDataRecord.addCalculatedField('RouteConfigCode', tmsSalesTable.RouteConfigCode);
+            headerDataRecord.addCalculatedField('TransportationTemplateId', tmsSalesTable.TransportationTemplateId);
+            headerDataRecord.addCalculatedField('CarrierCustomerAccountNumber', tmsSalesTable.CarrierCustomerAccountNumber);
+            headerDataRecord.addCalculatedField('CustomerPOHeader', salesTable.PurchOrderFormNum);
+            headerDataRecord.addCalculatedField('CustomerName', salesTable.SalesName);
+            headerDataRecord.addCalculatedField('SOExternalBOLNotes', notes);
+            headerDataRecord.addCalculatedField('SOCarrierVendorAddress', this.GetThirdPartyAddress(vendTable.AccountNum));
+            headerDataRecord.addCalculatedField('SOCustomerAddress', this.GetThirdPartyAddress(salesTable.CustAccount));
+            headerDataRecord.addCalculatedField('SOShipToAddress', salesTable.deliveryAddressing());
+
+            //CR_17344_UpdateBOL_DSP PJB_091120233
+            //Header
+            //Add actual weights
+            select firstonly whsLoadTable
+                join whsloadline
+                where whsLoadTable.LoadId == whsloadline.LoadId
+                    && whsloadline.ShipmentId == shipmentTable.ShipmentId
+                    join salesLineDetails
+                        where salesLineDetails.InventTransId == whsloadline.InventTransId
+                        && whsloadline.InventTransType == InventTransType::Sales;
+            headerDataRecord.addCalculatedField('ActualGrossWeight', whsLoadTable.ActualGrossWeight);
+            headerDataRecord.addCalculatedField('ActualTareWeight', whsLoadTable.ActualTareWeight);
+            headerDataRecord.addCalculatedField('ActualNetWeight', whsLoadTable.ActualNetWeight);
+            //Add VAT#
+            headerDataRecord.addCalculatedField('VATNum', salesTable.VATNum);
+            //Additional WHSLoadTable fields - PJB 10022021
+            headerDataRecord.addCalculatedField('LoadSchedShipUTCDateTime', whsLoadTable.LoadSchedShipUTCDateTime);
+            headerDataRecord.addCalculatedField('LoadArrivalUTCDateTime', whsLoadTable.LoadArrivalUTCDateTime);
+            headerDataRecord.addCalculatedField('ETA2', whsLoadTable.ETA);
+            headerDataRecord.addCalculatedField('RequiredSailUTCDateTime', whsLoadTable.RequiredSailUTCDateTime);
+            headerDataRecord.addCalculatedField('CutOffUTCDateTime', whsLoadTable.CutOffUTCDateTime);
+            headerDataRecord.addCalculatedField('LoadShipConfirmUTCDateTime', whsLoadTable.LoadShipConfirmUTCDateTime);
+            headerDataRecord.addCalculatedField('ActualVolume', whsLoadTable.ActualVolume);
+            headerDataRecord.addCalculatedField('BrokerCodeWHS', whsLoadTable.BrokerCode);
+            headerDataRecord.addCalculatedField('BillOfLadingIdWHS', whsLoadTable.BillOfLadingId);
+            headerDataRecord.addCalculatedField('ProNum', whsLoadTable.ProNum);
+            headerDataRecord.addCalculatedField('HouseBill', whsLoadTable.HouseBill);
+            headerDataRecord.addCalculatedField('BookingNum', whsLoadTable.BookingNum);            
+            headerDataRecord.addCalculatedField('VoyageNum', whsLoadTable.VoyageNum);
+            headerDataRecord.addCalculatedField('VesselName', whsLoadTable.VesselName);
+            headerDataRecord.addCalculatedField('ShippingContainerId', whsLoadTable.ShippingContainerId);
+            headerDataRecord.addCalculatedField('TractorNumber', whsLoadTable.TractorNumber);
+            headerDataRecord.addCalculatedField('CarNumber', whsLoadTable.CarNumber);
+            headerDataRecord.addCalculatedField('LoadReferenceNum', whsLoadTable.LoadReferenceNum);
+            headerDataRecord.addCalculatedField('Loader', whsLoadTable.Loader);
+            //end CR_17344_UpdateBOL_DSP PJB_091120233
+            
+            //CR_17629_UpdateBOL_DSP_Currency_Payment PJB_102520233
+            //Add payment
+            headerDataRecord.addCalculatedField('Payment', salesTable.Payment);
+            //end CR_17629_UpdateBOL_DSP_Currency_Payment PJB_102520233
+
+            while select whsloadline
+                where whsloadline.ShipmentId == shipmentTable.ShipmentId
+                join salesLineDetails
+                    where salesLineDetails.InventTransId == whsloadline.InventTransId
+                        && whsloadline.InventTransType == InventTransType::Sales
+            {
+                DocXmlRecord    docLines = headerDataRecord.addChildCalculatedRecord('Lines');
+
+                salesTableCustPO = salesTable::find(salesLineDetails.SalesId);
+                inventTable = inventTable::find(salesLineDetails.ItemId);
+                transCode = WHSEcoResProductTransportationCodes::findByItemId(salesLineDetails.ItemId);
+                nmfc = WHSNMFC::find(transCode.NMFCCode);
+
+                docLines.addCalculatedField('OrderNum', salesLineDetails.SalesId);
+                docLines.addCalculatedField('LineNum', salesLineDetails.LineNum);
+                docLines.addCalculatedField('ItemId', salesLineDetails.ItemId);
+                docLines.addCalculatedField('ExternalItemId', salesLineDetails.ExternalItemId);
+                docLines.addCalculatedField('SalesQty', salesLineDetails.SalesQty);
+                docLines.addCalculatedField('LoadLineQty', whsloadline.Qty);
+                docLines.addCalculatedField('SalesUnit', salesLineDetails.SalesUnit);
+                docLines.addCalculatedField('NetWeightPerUnit', inventTable.NetWeight);
+                docLines.addCalculatedField('GrossWeightPerUnit', inventTable.grossWeight());
+                docLines.addCalculatedField('CustomerPO', salesTableCustPO.PurchOrderFormNum);
+                docLines.addCalculatedField('WineGallons', salesLineDetails.TTBWineGallon);
+                docLines.addCalculatedField('ProofGallons', salesLineDetails.TTBProofGallon);
+                docLines.addCalculatedField('NMFCcode', transCode.NMFCCode);
+                docLines.addCalculatedField('HarmonizedSystem',transCode.HarmonizedCode);//SR-133548
+                docLines.addCalculatedField('LTLClassCode', nmfc.LTLClassCode);
+                docLines.addCalculatedField('GGILegacyItem', inventTable.GGINAVLegacyItemId);
+                docLines.addCalculatedField('ProductCategory', this.getProductCategory(salesLineDetails.ItemId), 'Product Categories');
+                docLines.addCalculatedFieldFromEnum('HazardousMaterial', enumStr(NoYes),inventTable.HMIMIndicator);
+
+                //CR_17344_UpdateBOL_DSP PJB_091120233
+                //Add sales price and line amount
+                docLines.addCalculatedField('SalesPrice', salesLineDetails.SalesPrice);
+                docLines.addCalculatedField('LineAmount', salesLineDetails.LineAmount);
+                //end CR_17344_UpdateBOL_DSP PJB_091120233
+                
+                //CR_17629_UpdateBOL_DSP_Currency_Payment PJB_102520233
+                //Add currency code
+                docLines.addCalculatedField('Currency', salesLineDetails.CurrencyCode);
+                //end CR_17629_UpdateBOL_DSP_Currency_Payment PJB_102520233
+
+                notesLines = '';
+                while select docuRef
+                where docuRef.RefRecId == salesLineDetails.RecId
+                && docuRef.RefTableId == salesLineDetails.TableId
+                && docuRef.Restriction == DocuRestriction::External
+                && docuRef.TypeId == 'BOL Note'
+                {
+                    notesLines = docuRef.Notes + #Separator + notesLines;
+                }
+
+                docLines.addCalculatedField('BOLNotes', notesLines);
+
+                DocXmlRecord    hazMat = docLines.addChildCalculatedRecord('HazerdousMaterial');
+
+                select firstonly hazMaterial
+                    where hazMaterial.ItemId == salesLineDetails.ItemId;
+
+                hazMat.addCalculatedField('ItemId', hazMaterial.ItemId);
+                hazMat.addCalculatedField('MaterialCode', hazMaterial.MaterialCode);
+                hazMat.addCalculatedField('MaterialDescription', hazMaterial.MaterialDescription);
+                hazMat.addCalculatedField('ClassGroupCode', hazMaterial.ClassGroupCode);
+                hazMat.addCalculatedField('Qty', hazMaterial.Qty);
+                hazMat.addCalculatedField('Multiplier', hazMaterial.Multiplier);
+                hazMat.addCalculatedField('UnitOfMeasure', hazMaterial.UnitOfMeasure);
+                hazMat.addCalculatedField('PackCode', hazMaterial.PackCode);
+                hazMat.addCalculatedField('IdentificationCode', hazMaterial.IdentificationCode);
+                hazMat.addCalculatedField('TechnicalNameCode', hazMaterial.TechnicalNameCode);
+                hazMat.addCalculatedField('TunnelCode', hazMaterial.TunnelCode);
+                hazMat.addCalculatedFieldFromEnum('MarinePollutant', enumStr(NoYes),hazMaterial.MarinePollutant);
+                hazMat.addCalculatedFieldFromEnum('EnviroDangerous', enumStr(NoYes),hazMaterial.EnviroDangerous);
+                hazMat.addCalculatedFieldFromEnum('LimitedQty', enumStr(NoYes),hazMaterial.LimitedQty);
+                hazMat.addCalculatedField('TransportCategoryCode', hazMaterial.TransportCategoryCode);
+                hazMat.addCalculatedField('DivisionCode', hazMaterial.DivisionCode);
+                hazMat.addCalculatedField('ClassCode', hazMaterial.ClassCode);
+                hazMat.addCalculatedField('flashpoint',hazMaterial.Flashpoint);//SR-133548
+
+                select firstonly HazCodeDescr
+                    where HazCodeDescr.ClassCode == hazMaterial.ClassCode;
+                hazMat.addCalculatedField('ClassCodeDescription', HazCodeDescr.Description);
+
+                hazMat.addCalculatedField('PackingGroupCode', hazMaterial.PackingGroupCode);
+                hazMat.addCalculatedField('RegCode', hazMaterial.RegCode);
+                hazMat.addCalculatedField('LabelCode', hazMaterial.LabelCode);
+                hazMat.addCalculatedFieldFromEnum('NOS', enumStr(NoYes),hazMaterial.NOS);
+                hazMat.addCalculatedField('StowageCode', hazMaterial.StowageCode);
+                hazMat.addCalculatedFieldFromEnum('IATAStar', enumStr(NoYes),hazMaterial.IATAStar);
+                hazMat.addCalculatedField('EMSCode', hazMaterial.EMSCode);
+                hazMat.addCalculatedFieldFromEnum('AirType', enumStr(NoYes),hazMaterial.AirType);
+                hazMat.addCalculatedField('PackInstCodePassenger', hazMaterial.PackInstCodePassenger);
+                hazMat.addCalculatedField('PackInstCodeCargo', hazMaterial.PackInstCodeCargo);
+                    
+                select firstonly invTransOrg
+                    where invTransOrg.ReferenceId == salesLineDetails.SalesId
+                        && invTransOrg.InventTransId == salesLineDetails.InventTransId;
+
+                select count(RecId) from invDim
+                    exists join invTrans
+                        where invDim.inventDimId == invTrans.inventDimId
+                        && invTrans.inventtransorigin == invTransOrg.RecId;
+
+                totalSerials = invDim.recid;
+
+                while select invTrans
+                    where invTrans.inventtransorigin == invTransOrg.RecId
+                    join invDim2
+                        order by invDim2.inventbatchid asc
+                        group by invDim2.inventbatchid
+                        where invDim2.inventDimId == invTrans.inventDimId
+                {
+                    InventTrans invTrans2;
+                    GGIBolSerials   BOLserials;
+                    int i;
+                    DocXmlRecord    batchSerials = hazMat.addChildCalculatedRecord('BatchSerials');
+
+                    while select  invDim
+                        order by invDim.inventSerialId asc
+                        where invDim.inventbatchid == invDim2.inventbatchid
+                            exists join invTrans2
+                            where invTrans2.inventDimId == invDim.inventDimId
+                            && invTrans2.inventTransOrigin == invTransOrg.RecId
+                    {
+                        runningCount = runningcount + 1;
+
+                        BOLserials.ItemId = invTransOrg.ItemId;
+                        BOLserials.BatchNum = invDim.inventBatchId;
+                        BOLserials.Serial = invDim.inventSerialId;
+                        BOLserials.insert();
+
+                        select count(RecId) from BOLserials;
+                        totalSerials2 = BOLserials.RecId;
+                    }
+                    
+                    while select BOLserials
+                    {
+                        i++;
+                        itemPrint = BOLserials.ItemId;
+                        batchPrint = BOLserials.BatchNum;
+                        serialNumStr = strDel(BOLserials.Serial,1,2);
+                        serialNumInt = str2Int(serialNumStr);
+                                               
+                        if (1 == totalSerials2)
+                        {
+                            serialNumStrFirst = BOLserials.Serial;
+                            serialPrint = serialNumStrFirst;
+                        }
+                        if (serialPrint == '' && i == 1 && totalSerials2 != 1)
+                        {
+                            serialNumStrFirst = BOLserials.Serial;
+                            serialNumIntNext = serialNumInt + 1;
+                        }
+                        else if(serialNumIntNext == serialNumInt && i != totalSerials2 && totalSerials2 != 1)
+                        {
+                            serialNumStrLast = BOLserials.Serial;
+                            serialNumIntNext = serialNumInt + 1;
+                        }
+                        else if(serialNumIntNext == serialNumInt && i == totalSerials2 && totalSerials2 != 1)
+                        {
+                            serialNumStrLast = BOLserials.Serial;
+                            serialNumIntNext = serialNumInt + 1;
+                            if (serialPrint != '')
+                            {
+                                serialPrint = serialPrint + #Comma + serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                            }
+                            else
+                            {
+                                serialPrint = serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                            }
+                        }
+                        else if(serialNumIntNext != serialNumInt && totalSerials2 != 1)
+                        {
+                            if (serialNumIntNext != serialNumInt && i == totalSerials2)
+                            {
+                                if (serialNumStrLast != '')
+                                {
+                                    if (serialPrint == '')
+                                    {
+                                        serialPrint = serialNumStrFirst + #HyphonNoSpace + serialNumStrLast + #Comma + BOLserials.Serial;
+                                    }
+                                    else
+                                    {
+                                        serialPrint = serialPrint + #Comma + serialNumStrFirst + #HyphonNoSpace + serialNumStrLast + #Comma + BOLserials.Serial;
+                                    }
+                                }
+                                if (serialNumStrLast == '')
+                                {
+                                    if (serialPrint == '')
+                                    {
+                                        serialPrint = serialNumStrFirst + #Comma + BOLserials.Serial;
+                                    }
+                                    else
+                                    {
+                                        serialPrint = serialPrint + #Comma + serialNumStrFirst + #Comma + BOLserials.Serial;
+                                    }
+                                }
+                            }
+                            else if (serialPrint == '' && i != totalSerials2 && serialNumStrLast == '')
+                            {
+                                serialPrint = serialNumStrFirst;
+                                serialNumStrFirst = BOLserials.Serial;
+                                serialNumIntNext = serialNumInt + 1;
+                                serialNumStrLast = '';
+                            }
+                            else if (serialNumStrLast != '' && i != totalSerials2)
+                            {
+                                if (serialPrint == '')
+                                {
+                                    serialPrint = serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                                else
+                                {
+                                    serialPrint = serialPrint + #Comma + serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                            }
+                            else if (serialNumStrLast == '' && i != totalSerials2)
+                            {
+                                if (serialPrint == '')
+                                {
+                                    serialPrint = serialNumStrFirst;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                                else
+                                {
+                                    serialPrint = serialPrint + #Comma + serialNumStrFirst;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                            }
+                        }
+                    }
+
+                    batchSerials.addCalculatedField('Batch', batchPrint);
+                    batchSerials.addCalculatedField('Serial', serialPrint);
+                    batchSerials.addCalculatedField('ItemId', itemPrint);
+
+                    BOLserials.delete();
+
+                    totalSerials = 0;
+                    singleBatchSerial = 0;
+                    lastItemid = '';
+                    lastSerial = '';
+                    lastBatch = '';
+                    runningCount = 0;
+                    batchPrint = '';
+                    serialPrint = '';
+                    itemPrint = '';
+                    serialNumStr = '';
+                    serialNumInt = 0;
+                    serialNumIntNext = 0;
+                    serialNumStrFirst = '';
+                    serialNumStrLast = '';
+                    batchNumStrFirst = '';
+                    i = 0;
+                }
+            }
+        }
+
+        if (!salesTable)
+        {
+            shipmentTable = WHSShipmentTable::find(whsBillOfLadingTmp.ShipmentId);
+            
+            select firstonly transTable
+                where transTable.TransferId == shipmentTable.OrderNum;
+
+            tmsInvTransTable = TMSInventTransferTable::find(transTable.transferid);
+            tmsCarrierTrans = tmsCarrier::find(tmsInvTransTable.CarrierCode);
+            tmsCarrierService = tmsCarrierService::find(tmsInvTransTable.CarrierServiceCode, tmsCarrierTrans.CarrierCode);
+
+            select sum(TTBWineGallon), sum(TTBProofGallon)
+                from transLine
+                    where transLine.TransferId == transTable.TransferId;
+
+            select firstonly lpa
+                where lpa.RecId == transTable.ToPostalAddress;
+
+            select firstonly logisticsLocation
+                where logisticsLocation.recid == lpa.Location;
+
+            while select docuRef
+                where docuRef.RefRecId == logisticsLocation.RecId
+                && docuRef.Restriction == DocuRestriction::External
+                && docuRef.TypeId == 'BOL Note'
+            {
+                notesTrans = docuRef.Notes + #Separator + notesTrans;
+            }
+
+            vendTable = vendTable::find(tmsCarriertrans.VendorCode);
+            permitTable = transTable.ttbPermitTable();
+
+            docPermit.addCalculatedFieldFromEdt('Id', extendedTypeStr(TTBPermitId), permitTable.PermitId);
+            docPermit.addCalculatedFieldFromEnum('Type', enumStr(TTBPermitType), permitTable.PermitType);
+            docPermit.addCalculatedFieldFromEdt('DSPSerialId', extendedTypeStr(TTBApprovalSerialNum), transTable.TTBDSPApprovalSerialId);
+            docPermit.addCalculatedFieldFromEdt('DSPApprovalDate', extendedTypeStr(TTBApprovalDate), transTable.TTBDSPApprovalDate);
+            docPermit.addCalculatedFieldFromEdt('TransferBondShipmentId', extendedTypeStr(TTBTransferBondShipmentId), transTable.TTBTransferBondShipmentId);
+            docPermit.addCalculatedFieldFromEdt('TaxPaidShipmentId', extendedTypeStr(TTBTaxPaidShipmentId), salesTable.TTBTaxPaidShipmentId);
+            docPermit.addCalculatedFieldFromEdt('WineGallon', extendedTypeStr(TTBWineGallon), transLine.TTBWineGallon);
+            docPermit.addCalculatedFieldFromEdt('ProofGallon', extendedTypeStr(TTBProofGallon), transLine.TTBProofGallon);
+
+            headerDataRecord.addCalculatedField('DlvTerms', transTable.DlvTermId);
+            headerDataRecord.addCalculatedField('DlvName', tmsCarrierService.Name);
+            headerDataRecord.addCalculatedField('DlvLoadTemplateId', tmsCarrierService.LoadTemplateId);
+            headerDataRecord.addCalculatedField('DlvMethodCode', tmsCarrierService.MethodCode);
+            headerDataRecord.addCalculatedField('DlvModeId', transTable.DlvModeId);
+            headerDataRecord.addCalculatedField('DlvExternalCode', tmsCarrierService.ExternalCode);
+            headerDataRecord.addCalculatedField('DlvBillingGroupId', tmsCarrierService.BillingGroupId);
+            headerDataRecord.addCalculatedField('DlvVolumeFactor', tmsCarrierService.VolumeFactor);
+            headerDataRecord.addCalculatedField('CustAccountTransfer', transTable.InventLocationIdTo);
+            headerDataRecord.addCalculatedField('CustomerName', transTable.locationNameTo());
+            headerDataRecord.addCalculatedField('TOExternalBOLNotes', notesTrans);
+            headerDataRecord.addCalculatedField('TOCarrierVendorAddress', this.GetThirdPartyAddress(vendTable.AccountNum));
+            headerDataRecord.addCalculatedField('TOShipToAddress', transTable.toAddress());
+
+            while select whsloadline
+                where whsloadline.ShipmentId == shipmentTable.ShipmentId
+                join transLineDetails
+                    where transLineDetails.InventTransId == whsloadline.InventTransId
+                        && whsloadline.InventTransType == InventTransType::TransferOrderShip
+            {
+                DocXmlRecord    docLines = headerDataRecord.addChildCalculatedRecord('Lines');
+
+                inventTable = inventTable::find(transLineDetails.ItemId);
+                transCode = WHSEcoResProductTransportationCodes::findByItemId(transLineDetails.ItemId);
+                nmfc = WHSNMFC::find(transCode.NMFCCode);
+
+                docLines.addCalculatedField('OrderNum', transLineDetails.TransferId);
+                docLines.addCalculatedField('LineNum', transLineDetails.LineNum);
+                docLines.addCalculatedField('ItemId', transLineDetails.ItemId);
+                docLines.addCalculatedField('Qty', transLineDetails.QtyTransfer);
+                docLines.addCalculatedField('LoadLineQty', whsloadline.Qty);
+                docLines.addCalculatedField('UnitId', transLineDetails.UnitId);
+                docLines.addCalculatedField('NetWeightPerUnit', inventTable.NetWeight);
+                docLines.addCalculatedField('GrossWeightPerUnit', inventTable.grossWeight());
+                docLines.addCalculatedField('LTLClassCode', nmfc.LTLClassCode);
+                docLines.addCalculatedField('WineGallons', transLineDetails.TTBWineGallon);
+                docLines.addCalculatedField('ProofGallons', transLineDetails.TTBProofGallon);
+                docLines.addCalculatedField('NMFCcode', transCode.NMFCCode);
+                docLines.addCalculatedField('HarmonizedSystem',transCode.HarmonizedCode);//SR-133548
+                docLines.addCalculatedField('GGILegacyItem', inventTable.GGINAVLegacyItemId);
+                docLines.addCalculatedField('ProductCategory', this.getProductCategory(transLineDetails.ItemId), 'Product Categories');
+                docLines.addCalculatedFieldFromEnum('HazardousMaterial', enumStr(NoYes),inventTable.HMIMIndicator);
+            
+                notesLines = '';
+                while select docuRef
+                where docuRef.RefRecId == transLineDetails.RecId
+                && docuRef.RefTableId == transLineDetails.TableId
+                && docuRef.Restriction == DocuRestriction::External
+                && docuRef.TypeId == 'BOL Note'
+                {
+                    notesLines = docuRef.Notes + #Separator + notesLines;
+                }
+
+                docLines.addCalculatedField('BOLNotes', notesLines);
+      
+                DocXmlRecord    hazMat = docLines.addChildCalculatedRecord('HazerdousMaterial');
+
+                select firstonly hazMaterial
+                    where hazMaterial.ItemId == transLineDetails.ItemId;                
+                
+                hazMat.addCalculatedField('ItemId', hazMaterial.ItemId);
+                hazMat.addCalculatedField('MaterialCode', hazMaterial.MaterialCode);
+                hazMat.addCalculatedField('MaterialDescription', hazMaterial.MaterialDescription);
+                hazMat.addCalculatedField('ClassGroupCode', hazMaterial.ClassGroupCode);
+                hazMat.addCalculatedField('Qty', hazMaterial.Qty);
+                hazMat.addCalculatedField('Multiplier', hazMaterial.Multiplier);
+                hazMat.addCalculatedField('UnitOfMeasure', hazMaterial.UnitOfMeasure);
+                hazMat.addCalculatedField('PackCode', hazMaterial.PackCode);
+                hazMat.addCalculatedField('IdentificationCode', hazMaterial.IdentificationCode);
+                hazMat.addCalculatedField('TechnicalNameCode', hazMaterial.TechnicalNameCode);
+                hazMat.addCalculatedField('TunnelCode', hazMaterial.TunnelCode);
+                hazMat.addCalculatedFieldFromEnum('MarinePollutant', enumStr(NoYes),hazMaterial.MarinePollutant);
+                hazMat.addCalculatedFieldFromEnum('EnviroDangerous', enumStr(NoYes),hazMaterial.EnviroDangerous);
+                hazMat.addCalculatedFieldFromEnum('LimitedQty', enumStr(NoYes),hazMaterial.LimitedQty);
+                hazMat.addCalculatedField('TransportCategoryCode', hazMaterial.TransportCategoryCode);
+                hazMat.addCalculatedField('DivisionCode', hazMaterial.DivisionCode);
+                hazMat.addCalculatedField('ClassCode', hazMaterial.ClassCode);
+                hazMat.addCalculatedField('flashpoint',hazMaterial.Flashpoint);//SR-133548
+                hazMat.addCalculatedField('PackingGroupCode', hazMaterial.PackingGroupCode);
+                hazMat.addCalculatedField('RegCode', hazMaterial.RegCode);
+                hazMat.addCalculatedField('LabelCode', hazMaterial.LabelCode);
+                hazMat.addCalculatedFieldFromEnum('NOS', enumStr(NoYes),hazMaterial.NOS);
+                hazMat.addCalculatedField('StowageCode', hazMaterial.StowageCode);
+                hazMat.addCalculatedFieldFromEnum('IATAStar', enumStr(NoYes),hazMaterial.IATAStar);
+                hazMat.addCalculatedField('EMSCode', hazMaterial.EMSCode);
+                hazMat.addCalculatedFieldFromEnum('AirType', enumStr(NoYes),hazMaterial.AirType);
+                hazMat.addCalculatedField('PackInstCodePassenger', hazMaterial.PackInstCodePassenger);
+                hazMat.addCalculatedField('PackInstCodeCargo', hazMaterial.PackInstCodeCargo);
+                select firstonly HazCodeDescr
+                    where HazCodeDescr.ClassCode == hazMaterial.ClassCode;
+                hazMat.addCalculatedField('ClassCodeDescription', HazCodeDescr.Description);
+                    
+                select firstonly invTransOrg
+                    where invTransOrg.ReferenceId == transLineDetails.TransferId
+                        && invTransOrg.InventTransId == transLineDetails.InventTransId;
+
+                select count(RecId) from invDim
+                    exists join invTrans
+                        where invDim.inventDimId == invTrans.inventDimId
+                        && invTrans.inventtransorigin == invTransOrg.RecId;
+
+                totalSerials = invDim.recid;
+
+                while select invTrans
+                    where invTrans.inventtransorigin == invTransOrg.RecId
+                    join invDim2
+                        order by invDim2.inventbatchid asc
+                        group by invDim2.inventbatchid
+                        where invDim2.inventDimId == invTrans.inventDimId
+                {
+                    InventTrans invTrans2;
+                    GGIBolSerials   BOLserials;
+                    int i;
+                    DocXmlRecord    batchSerials = hazMat.addChildCalculatedRecord('BatchSerials');
+
+                    while select  invDim
+                        order by invDim.inventSerialId asc
+                        where invDim.inventbatchid == invDim2.inventbatchid
+                            exists join invTrans2
+                            where invTrans2.inventDimId == invDim.inventDimId
+                            && invTrans2.inventTransOrigin == invTransOrg.RecId
+                    {
+                        runningCount = runningcount + 1;
+
+                        BOLserials.ItemId = invTransOrg.ItemId;
+                        BOLserials.BatchNum = invDim.inventBatchId;
+                        BOLserials.Serial = invDim.inventSerialId;
+                        BOLserials.insert();
+
+                        select count(RecId) from BOLserials;
+                        totalSerials2 = BOLserials.RecId;
+                    }
+                    
+                    while select BOLserials
+                    {
+                        i++;
+                        itemPrint = BOLserials.ItemId;
+                        batchPrint = BOLserials.BatchNum;
+                        serialNumStr = strDel(BOLserials.Serial,1,2);
+                        serialNumInt = str2Int(serialNumStr);
+                                               
+                        if (1 == totalSerials2)
+                        {
+                            serialNumStrFirst = BOLserials.Serial;
+                            serialPrint = serialNumStrFirst;
+                        }
+                        if (serialPrint == '' && i == 1 && totalSerials2 != 1)
+                        {
+                            serialNumStrFirst = BOLserials.Serial;
+                            serialNumIntNext = serialNumInt + 1;
+                        }
+                        else if(serialNumIntNext == serialNumInt && i != totalSerials2 && totalSerials2 != 1)
+                        {
+                            serialNumStrLast = BOLserials.Serial;
+                            serialNumIntNext = serialNumInt + 1;
+                        }
+                        else if(serialNumIntNext == serialNumInt && i == totalSerials2 && totalSerials2 != 1)
+                        {
+                            serialNumStrLast = BOLserials.Serial;
+                            serialNumIntNext = serialNumInt + 1;
+                            if (serialPrint != '')
+                            {
+                                serialPrint = serialPrint + #Comma + serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                            }
+                            else
+                            {
+                                serialPrint = serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                            }
+                        }
+                        else if(serialNumIntNext != serialNumInt)
+                        {
+                            if (serialNumIntNext != serialNumInt && i == totalSerials2 && totalSerials2 != 1)
+                            {
+                                if (serialNumStrLast != '')
+                                {
+                                    if (serialPrint == '')
+                                    {
+                                        serialPrint = serialNumStrFirst + #HyphonNoSpace + serialNumStrLast + #Comma + BOLserials.Serial;
+                                    }
+                                    else
+                                    {
+                                        serialPrint = serialPrint + #Comma + serialNumStrFirst + #HyphonNoSpace + serialNumStrLast + #Comma + BOLserials.Serial;
+                                    }
+                                }
+                                if (serialNumStrLast == '')
+                                {
+                                    if (serialPrint == '')
+                                    {
+                                        serialPrint = serialNumStrFirst + #Comma + BOLserials.Serial;
+                                    }
+                                    else
+                                    {
+                                        serialPrint = serialPrint + #Comma + serialNumStrFirst + #Comma + BOLserials.Serial;
+                                    }
+                                }
+                            }
+                            else if (serialPrint == '' && i != totalSerials2 && serialNumStrLast == '')
+                            {
+                                serialPrint = serialNumStrFirst;
+                                serialNumStrFirst = BOLserials.Serial;
+                                serialNumIntNext = serialNumInt + 1;
+                                serialNumStrLast = '';
+                            }
+                            else if (serialNumStrLast != '' && i != totalSerials2)
+                            {
+                                if (serialPrint == '')
+                                {
+                                    serialPrint = serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                                else
+                                {
+                                    serialPrint = serialPrint + #Comma + serialNumStrFirst + #HyphonNoSpace + serialNumStrLast;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                            }
+                            else if (serialNumStrLast == '' && i != totalSerials2)
+                            {
+                                if (serialPrint == '')
+                                {
+                                    serialPrint = serialNumStrFirst;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                                else
+                                {
+                                    serialPrint = serialPrint + #Comma + serialNumStrFirst;
+                                    serialNumStrFirst = BOLserials.Serial;
+                                    serialNumIntNext = serialNumInt + 1;
+                                    serialNumStrLast = '';
+                                }
+                            }
+                        }
+                    }
+
+                    batchSerials.addCalculatedField('Batch', batchPrint);
+                    batchSerials.addCalculatedField('Serial', serialPrint);
+                    batchSerials.addCalculatedField('ItemId', itemPrint);
+
+                    BOLserials.delete();
+
+                    totalSerials = 0;
+                    singleBatchSerial = 0;
+                    lastItemid = '';
+                    lastSerial = '';
+                    lastBatch = '';
+                    runningCount = 0;
+                    batchPrint = '';
+                    serialPrint = '';
+                    itemPrint = '';
+                    serialNumStr = '';
+                    serialNumInt = 0;
+                    serialNumIntNext = 0;
+                    serialNumStrFirst = '';
+                    serialNumStrLast = '';
+                    batchNumStrFirst = '';
+                    i = 0;
+                }
+            }
+        }
+
+        headerDataRecord.addCalculatedField('LoadId', shipmentTable.LoadId);
+       
+        // Carrier items
+        while select whsBillOfLadingTmp where
+            whsBillOfLadingTmp.LineQty ||
+            whsBillOfLadingTmp.DefaultHandlingType ||
+            whsBillOfLadingTmp.Qty ||
+            whsBillOfLadingTmp.PackingType ||
+            whsBillOfLadingTmp.grossWeight ||
+            whsBillOfLadingTmp.HazardousMaterial ||
+            whsBillOfLadingTmp.NmfcName ||
+            whsBillOfLadingTmp.LTLClassCode ||
+            whsBillOfLadingTmp.nmfcCode
+        {
+            _recordBuilder.goToParentRecord();
+            DocXmlRecord carrierDataRecord = _recordBuilder.addRecord(whsBillOfLadingTmp);
+            carrierDataRecord.setRecordName(#CarrierInformation);
+            carrierDataRecord.setRecordLabel('Carrier information');
+            carrierDataRecord.addFields(carrierFieldList);
+        }
+
+        // Customer orders
+        while select whsBillOfLadingTmp where
+            whsBillOfLadingTmp.PurchOrderFormNum ||
+            whsBillOfLadingTmp.CustOrderPackQty ||
+            whsBillOfLadingTmp.CustOrderWeight ||
+            whsBillOfLadingTmp.CircleY ||
+            whsBillOfLadingTmp.CircleN ||
+            whsBillOfLadingTmp.AdditionalInfo
+        {
+            _recordBuilder.goToParentRecord();
+            DocXmlRecord orderDataRecord = _recordBuilder.addRecord(whsBillOfLadingTmp);
+            orderDataRecord.setRecordName(#CustomerOrderInformation);
+            orderDataRecord.setRecordLabel('Customer order information');
+            orderDataRecord.addFields(orderFieldList);
+        }
+
+        // Store the header to use it in overrideReportRunSettings()
+        header = headerDataRecord.getCommon();
+
+        // Export generated XML to a string or a file to check the resulting report DS.
+        //_recordBuilder.exportToXmlFile('WHSBillOfLadingDs.xml');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // Custom placeholders
+    #define.BillOfLadingId('BillOfLadingId')
+    #define.ShipFromName('ShipFromName')
+    #define.ShipmentId('ShipmentId')
+    #define.ShipToName('ShipToName')
+    #define.CustAccount('CustAccount')
+    #define.CustName('CustName')
+    #define.CustContactName('CustContactName')
+    #define.CompanyName('CompanyName')
+    #define.CarrierCode('CarrierCode')
+    #define.CarrierName('CarrierName')
+    #define.TrailerNumber('TrailerNumber')
+    #define.SealNum('SealNum')
+    #define.SCAC('SCAC')
+    #define.ProNum('ProNum')
+    #define.MasterBOL('MasterBOL')
+    #define.MasterBillOfLadingId('MasterBillOfLadingId')
+    #define.Notes('Notes')
+    #define.TotalHandlingQty('TotalHandlingQty')
+    #define.TotalPackageQty('TotalPackageQty')
+    #define.TotalWeight('TotalWeight')
+    // for SessionDate use standard CurrentDate placeholder
+    
+    [DocPlaceholderAttribute(#BillOfLadingId, 'BOL - Bill of Lading ID'),
+     DocPlaceholderAttribute(#ShipFromName, 'BOL - Ship From Name'),
+     DocPlaceholderAttribute(#ShipmentId, 'BOL - Shipment ID'),
+     DocPlaceholderAttribute(#ShipToName, 'BOL - Ship To Name'),
+     DocPlaceholderAttribute(#CustAccount, 'BOL - Customer Account'),
+     DocPlaceholderAttribute(#CustName, 'BOL - Customer Name'),
+     DocPlaceholderAttribute(#CustContactName, 'BOL - Customer Contact Name'),
+     DocPlaceholderAttribute(#CompanyName, 'BOL - Company Name'),
+     DocPlaceholderAttribute(#CarrierCode, 'BOL - Shipping Carrier'),
+     DocPlaceholderAttribute(#CarrierName, 'BOL - Carrier Name'),
+     DocPlaceholderAttribute(#TrailerNumber, 'BOL - Trailer Number'),
+     DocPlaceholderAttribute(#SealNum, 'BOL - Seal Number'),
+     DocPlaceholderAttribute(#SCAC, 'BOL - SCAC'),
+     DocPlaceholderAttribute(#ProNum, 'BOL - Pro Number'),
+     DocPlaceholderAttribute(#MasterBOL, 'BOL - Master Bill of Lading'),
+     DocPlaceholderAttribute(#MasterBillOfLadingId, 'BOL - Master Bill of Lading ID'),
+     DocPlaceholderAttribute(#Notes, 'BOL - Notes'),
+     DocPlaceholderAttribute(#TotalHandlingQty, 'BOL - Total Handlig Qty'),
+     DocPlaceholderAttribute(#TotalPackageQty, 'BOL - Total Package Qty'),
+     DocPlaceholderAttribute(#TotalWeight, 'BOL - Total Weight')]
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        // Replace standard placeholders.
+        DocPlaceholderManager placeholderMng = super(_reportRunContext, _replaceStandardPlaceholders);
+
+        // Replace custom placeholders.
+        CustTable custTable = CustTable::find(header.CustAccount);
+        WHSBillOfLading billOfLading = WHSBillOfLading::find(header.BillOfLadingId);
+
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#BillOfLadingId, header.BillOfLadingId);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipFromName, header.ShipFromName);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipmentId, header.ShipmentId);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipToName, header.ShipToName);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustAccount, header.CustAccount);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustName, custTable.name());
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustContactName, DocDspHelper::contactPersonName(custTable.ContactPersonId));
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CompanyName, header.CompanyName);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CarrierCode, header.CarrierCode);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CarrierName, header.Name);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TrailerNumber, header.TrailerNumber);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#SealNum, header.SealNum);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#SCAC, header.SCAC);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ProNum, header.ProNumShipment);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#MasterBOL, billOfLading.MasterBOLFlag);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#MasterBillOfLadingId, billOfLading.MasterBillOfLadingId);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#Notes, header.Notes);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TotalHandlingQty, header.TotalHandlingQty);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TotalPackageQty, header.TotalPackingQty);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TotalWeight, header.TotalWeight);
+
+        // Fill the Print archive contract.
+        _reportRunContext.archiveContract().setCustAccount(header.CustAccount);
+        _reportRunContext.archiveContract().setWHSShipmentId(header.ShipmentId);
+        _reportRunContext.archiveContract().setDocument(header.BillOfLadingId);
+        
+        return placeholderMng;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

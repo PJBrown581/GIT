@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CustCreditCardSyncSubTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_CustCreditCardSyncSubTask extends RunBaseBatch
+{
+    #OCCRetryCount
+    CreditCardProcessors    activeCreditCardProcessor;
+    container               recordList;
+    str                     threadCaption;
+    boolean                 isBatchMode;
+    boolean                 displayCustSyncResults;
+    Counter                 customersSynchedRecCnt;
+    int                     procStartTime;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        recordList,
+        threadCaption,
+        displayCustSyncResults,
+        isBatchMode
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>newSubTask</Name>
+				<Source><![CDATA[
+    public static SKS_CC_CustCreditCardSyncSubTask newSubTask(
+        container _recordList,
+        str _threadCaption,
+        boolean _displayCustSyncResults,
+        boolean _isBatchMode = false)
+    {
+        SKS_CC_CustCreditCardSyncSubTask custCreditCardSyncSubTask = SKS_CC_CustCreditCardSyncSubTask::construct();
+
+        custCreditCardSyncSubTask.parmRecordList(_recordList);
+        custCreditCardSyncSubTask.parmThreadCaption(_threadCaption);
+        custCreditCardSyncSubTask.parmDisplayCustSyncResults(_displayCustSyncResults);
+        custCreditCardSyncSubTask.parmIsBatchMode(_isBatchMode);
+
+        return custCreditCardSyncSubTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsBatchMode</Name>
+				<Source><![CDATA[
+    public boolean parmIsBatchMode(boolean _isBatchMode = isBatchMode)
+    {
+        isBatchMode = _isBatchMode;
+
+        return isBatchMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDisplayCustSyncResults</Name>
+				<Source><![CDATA[
+    public boolean parmDisplayCustSyncResults(boolean _displayCustSyncResults = displayCustSyncResults)
+    {
+        displayCustSyncResults = _displayCustSyncResults;
+
+        return displayCustSyncResults;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecordList</Name>
+				<Source><![CDATA[
+    public container parmRecordList(container _recordList = recordList)
+    {
+        recordList = _recordList;
+
+        return recordList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmThreadCaption</Name>
+				<Source><![CDATA[
+    public str parmThreadCaption(str _threadCaption = threadCaption)
+    {
+        threadCaption = _threadCaption;
+
+        return threadCaption;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayLogResults</Name>
+				<Source><![CDATA[
+    public void displayLogResults()
+    {
+        info(strFmt("@SKS:SKGCCCustSyncCardSuccessMsg", customersSynchedRecCnt));
+
+        int procEndTime = WinAPIServer::getTickCount();
+        int procExecutionTime = (procEndTime-procStartTime) div 1000;
+        if (procExecutionTime)
+        {
+            str execTimeUnit = "@SKS:SKGCCSecondsProcUnit";
+            if (procExecutionTime > 180)
+            {
+                // Greater than 180 seconds then convert to minutes
+                procExecutionTime = any2Int(procExecutionTime / 60);
+                execTimeUnit = "@SKS:SKGCCMinutesProcUnit";
+            }
+            info(strFmt("@SKS:SKGCCProcElapsedTimeWithProcUnit", procExecutionTime, execTimeUnit));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>synchronizePayFabricCards</Name>
+				<Source><![CDATA[
+    protected void synchronizePayFabricCards(CustAccount _custAccountToProcess)
+    {
+        SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(_custAccountToProcess);
+        pfWalletHandler.setPayFabricCustomerNbr();
+
+        CreditCardPaymentProperties allCreditCardPaymentProperties = pfWalletHandler.getPayFabricCreditCardsForCustomer();
+        
+        if (pfWalletHandler.synchronizeCreditCardsFromPayFabric(allCreditCardPaymentProperties, activeCreditCardProcessor.RecId, '', false, !displayCustSyncResults))
+        {
+            customersSynchedRecCnt++;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        int counterIdx;
+        CustTable custTable;
+        RecId custAccountRecId;
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS6608");
+        }
+        
+        if (!SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor())
+        {
+            throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+        }
+
+        procStartTime = WinAPIServer::getTickCount();
+
+        activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+        CreditCardPaymentCardTokenize cardTokenize = CreditCardPaymentCardTokenize::construct();
+        cardTokenize.init(activeCreditCardProcessor.Name);
+
+        for (counterIdx = 1; counterIdx <= conLen(recordList); counterIdx++)
+        {
+            custAccountRecId = conPeek(recordList, counterIdx);
+            if (!custAccountRecId)
+            {
+                continue;
+            }
+
+            custTable = CustTable::findRecId(custAccountRecId);
+            if (!custTable)
+            {
+                error(strFmt("@SKS:SKGCCCouldNotFindCustomerForCardSync", custAccountRecId));
+                continue;
+            }
+
+            setPrefix(strFmt('%1: %2', "@SYS7149", custTable.AccountNum));
+
+            try
+            {
+                this.synchronizePayFabricCards(custTable.AccountNum);
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::DuplicateKeyException)
+            {
+                error(strFmt("@SKS:SKGCCDuplicateKeyErrorOccurredDuringCardSync", custTable.AccountNum));
+            }
+            catch (Exception::CLRError)
+            {
+                error(strFmt("@SKS:SKGCCErrorOccurredDuringCardSync", custTable.AccountNum));
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@SKS:SKGCCErrorOccurredDuringCardSync", custTable.AccountNum));
+            }
+        }
+
+        this.displayLogResults();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_CustCreditCardSyncSubTask construct()
+    {
+        return new SKS_CC_CustCreditCardSyncSubTask();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS6027";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public ClassDescription caption()
+    {
+        ClassDescription ret;
+    
+        ret = super();
+
+        if (threadCaption)
+        {
+            ret = threadCaption;
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

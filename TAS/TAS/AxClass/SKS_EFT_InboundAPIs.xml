@@ -1,0 +1,356 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_InboundAPIs</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EFT_InboundAPIs extends SKS_EFT_APIBatchInbound
+{
+    #DEFINE.CurrentVersion(1)
+    #define.Empty('<Empty>')
+
+    SKS_EFTAP_File gSKS_EFTAP_File;
+    SKS_EFT_FileDetail gSKS_EFT_FileDetail;
+    SKS_EFT_Bank gSKS_EFT_Bank;
+    SKS_EB_CommProcess gSKS_EB_CommProcess;
+    SKS_EFT_InboundFileFormat gInboundFileFormat;
+    SKS_EFT_InboundFileGroups   gInboundFileGroup;
+    SKG_BF.Models.PaymentStatusResponse paymStatusResponse = new SKG_BF.Models.PaymentStatusResponse();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning("BPCheckNestedLoopinCode","Nested data access loop need to process each commid one at a time")]
+    public void run()
+    {
+        Batch bat;        
+        RefRecId locRefRecID;
+        
+        SKS_EFT_FileFormat          fileFormat;
+        SKG_BF.Models.PaymentStatusImportSource  paymStatusImpSrc;
+    
+        bat = this.parmCurrentBatch();
+        locRefRecID = bat.RecId;
+
+        while  select crossCompany  gSKS_EB_CommProcess
+            where gSKS_EB_CommProcess.BatchJobId == locRefRecID
+        {
+            while select FormatId, FileRecId, APIPaymentId from gSKS_EFT_FileDetail
+            join gSKS_EFTAP_File 
+            join gSKS_EFT_Bank
+            group by gSKS_EFT_FileDetail.FileRecId, gSKS_EFT_FileDetail.FormatId, gSKS_EFT_FileDetail.APIPaymentId
+            where gSKS_EFTAP_File.RecId ==  gSKS_EFT_FileDetail.FileRecId
+            && gSKS_EFTAP_File.FileStatus == SKS_EFT_FileStatus::Transmitted
+            && gSKS_EFT_FileDetail.APIResponseStatus == SKS_EFT_APIResponseType::Received
+            && gSKS_EFT_Bank.BankAccountId == gSKS_EFT_FileDetail.BankAccountId
+            && gSKS_EFT_Bank.PaymMode == gSKS_EFT_FileDetail.PaymMode
+            && gSKS_EFT_Bank.InboundCommID == gSKS_EB_CommProcess.CommID
+            {
+                int       numrecords;
+                int       counter;
+                
+                select InboundFormatId1,InboundFormatId2,InboundFormatId3,InboundFileGroupId  from gInboundFileGroup
+                join fileFormat
+                where fileFormat.FormatId == gSKS_EFT_FileDetail.FormatId
+                && fileFormat.InboundFileGroupId == gInboundFileGroup.InboundFileGroupId;
+                
+                this.getPaymentStatus(gSKS_EFT_FileDetail.APIPaymentId);
+
+                numrecords = paymStatusResponse.PaymentStatusSource.get_count();
+                for(counter = 0; counter < numrecords; Counter++)
+                {
+                    paymStatusImpSrc = paymStatusResponse.PaymentStatusSource.get_item(Counter);
+                    if(paymStatusImpSrc != null)
+                    {
+                        if (paymStatusImpSrc.Success)
+                        {
+                            //Payment ID matches???
+                            if (paymStatusImpSrc.BFIdentifier == gSKS_EFT_FileDetail.APIPaymentId)
+                            {
+                                this.importPaymentStatus(paymStatusImpSrc);                                
+                            }
+                            else
+                            {
+                                if (paymStatusImpSrc.Reason)
+                                {
+                                    Info(paymStatusImpSrc.Reason);
+                                }
+                                else
+                                {
+                                    Info(strFmt("@SKS:SKGAPIPaymIdNotFound", gSKS_EFT_FileDetail.APIPaymentId));
+                                }
+                            }
+                        }
+                        else
+                        {
+                            info(paymStatusImpSrc.Reason);
+                        }
+                    }
+                }                
+            }
+        }
+        SKS_EFT_InboundFiles::CompletionTimeout();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPaymentStatus</Name>
+				<Source><![CDATA[
+    private void getPaymentStatus(str _Paymentid)
+    {
+        SKG_BF.Models.PaymentStatusRequest  paymReqContract = new SKG_BF.Models.PaymentStatusRequest();
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType::BankFabric);
+        System.Collections.Generic.List<System.String> paymentIds = new System.Collections.Generic.List<System.String>();
+
+        paymentIds.add(_Paymentid);
+        paymReqContract.Company = gSKS_EFT_FileDetail.dataareaid;
+        paymReqContract.BankFabricCommunicationName = gSKS_EB_CommProcess.BankFabricCommunicationName;
+        paymReqContract.DNS = SKS_EB_FileHub::getDNS(SKS_BF_BankIntType::BankFabric);
+        System.Object asObject = paymentIds;
+        paymReqContract.BankEFTReference = asObject;
+        paymReqContract.TASVersion = '';
+        paymReqContract.SecretName = '';
+
+        paymStatusResponse = filehub.callAPIPaymentStatus(paymReqContract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importPaymentStatus</Name>
+				<Source><![CDATA[
+    private void importPaymentStatus(SKG_BF.Models.PaymentStatusImportSource  _paymStatusImpSrc)
+    {
+        int       numrecords;
+        int       counter;
+        boolean   outboundDetailupdtd;
+        SKS_EFT_InboundFile locInboundFile;
+        SKS_EFTAP_File locOutboundFile;  
+        SKG_BF.Models.PaymentStatusHeader  paymStatusHdr;
+
+        numrecords = _paymStatusImpSrc.PaymentStatus.get_count();
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            paymStatusHdr = _paymStatusImpSrc.PaymentStatus.get_item(Counter);
+            if(paymStatusHdr != null)
+            {
+                if (paymStatusHdr.PaymentStatusLines != null)
+                {
+                    //check inbound header line exist if yes then update else create Inbound header line
+                    select * from locInboundFile where locInboundFile.InboundBankID == paymStatusHdr.BankId && locInboundFile.APIFormatType == SKS_EFT_APIFormatType::API;
+                    ttsBegin;
+                    if (locInboundFile)
+                    {
+                        locInboundFile.selectForUpdate(true);                        
+                        locInboundFile.FileStatusId = (paymStatusHdr.StatusCode == '' ? #Empty : paymStatusHdr.StatusCode);
+                        locInboundFile.InboundStatusesRecId =
+                                    SKS_EFT_RF::getInboundStatus(locInboundFile.InboundFormatId, locInboundFile.FileStatusId, SKS_EFT_InboundStatusType::File);
+                        locInboundFile.ReasonCode = (paymStatusHdr.ReasonCode == '' ? #Empty : paymStatusHdr.ReasonCode);
+                        locInboundFile.InboundReasonCodesRecId =
+                                    SKS_EFT_RF::getInboundReasonCode(locInboundFile.InboundFormatId, locInboundFile.ReasonCode, locInboundFile.AdditionalData);
+                        locInboundFile.AdditionalData = paymStatusHdr.AddtionalData;
+                        locInboundFile.FileDateTime = paymStatusHdr.BankStatusDateTime;
+                        locInboundFile.update();
+                    }
+                    else
+                    {                        
+                        locInboundFile.InboundBankID = paymStatusHdr.BankId;
+                        locInboundFile.InboundFormatId = gInboundFileGroup.InboundFormatId1;
+                        locInboundFile.AdditionalData = paymStatusHdr.AddtionalData;
+                        locInboundFile.FileStatusId = (paymStatusHdr.StatusCode == '' ? #Empty : paymStatusHdr.StatusCode);
+                        locInboundFile.InboundStatusesRecId =
+                                    SKS_EFT_RF::getInboundStatus(locInboundFile.InboundFormatId, locInboundFile.FileStatusId, SKS_EFT_InboundStatusType::File);
+                        locInboundFile.ReasonCode = (paymStatusHdr.ReasonCode == '' ? #Empty : paymStatusHdr.ReasonCode);
+                        locInboundFile.InboundReasonCodesRecId =
+                                    SKS_EFT_RF::getInboundReasonCode(locInboundFile.InboundFormatId, locInboundFile.ReasonCode, locInboundFile.AdditionalData);
+                        locInboundFile.FileDateTime = paymStatusHdr.BankStatusDateTime;
+                        locInboundFile.ImportDateTime = DateTimeUtil::getSystemDateTime();
+                        locInboundFile.InboundFileGroupId = gInboundFileGroup.InboundFileGroupId;
+                        locInboundFile.CommunicationId = gSKS_EB_CommProcess.CommID;
+                        locInboundFile.InboundFileNbr = NumberSeq::newGetNum(SKS_PP_Setup::numRefAPEFTPlusNextInboundFileNumber()).num();
+                        locInboundFile.BFBankIntegration = SKS_BF_BankIntType::BankFabric;
+                        locInboundFile.APIFormatType = SKS_EFT_APIFormatType::API;                        
+                        locInboundFile.OutboundFormatId = gSKS_EFT_FileDetail.FormatId;
+                        locInboundFile.OutboundFileRecId = gSKS_EFT_FileDetail.FileRecId;
+
+                        if(gSKS_EB_CommProcess.Module == SKS_EB_Module::BankToBankTransfer)
+                        {
+                            locInboundFile.Module = SKS_EFT_Module::BTB;
+                        }
+                        else if(gSKS_EB_CommProcess.Module == SKS_EB_Module::CustomerReimbursements)
+                        {
+                            locInboundFile.Module = SKS_EFT_Module::CNP;
+                        }
+                        else if(gSKS_EB_CommProcess.Module == SKS_EB_Module::AREFT)
+                        {
+                            locInboundFile.Module = SKS_EFT_Module::AR;
+                        }
+                        else
+                        {
+                            locInboundFile.Module = SKS_EFT_Module::AP;
+                        }                        
+                        locInboundFile.insert();
+                    }
+                    //create inblund lines
+                    this.importPaymentStatusLines(paymStatusHdr, locInboundFile.InboundFileNbr);
+                    ttscommit;
+                    if (locInboundFile)
+                    {
+                        SKS_EFT_InboundFiles::findStatus(locInboundFile);
+                    }                    
+                }
+                else
+                {
+                    info (strFmt("@SKS:SKGOutBoundAPINoLines",paymStatusHdr.BankId));
+                }
+            }
+        }     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importPaymentStatusLines</Name>
+				<Source><![CDATA[
+    private void importPaymentStatusLines(SKG_BF.Models.PaymentStatusHeader _PaymentStatusHeader, SKS_EFT_InboundFileNbr _InboundFileNbr)
+    {
+        int       numrecords;
+        int       counter;
+        boolean   inboundlinefound;
+        SKS_EFT_InboundFileLine locInboundFileLine;
+        SKS_EFT_RF locSKS_EFT_RF = new SKS_EFT_RF();
+        SKS_EFT_RF_Transaction locSKS_EFT_RF_Transaction;
+        SKG_BF.Models.PaymentStatusLines  paymStatusline;
+        SKS_EFT_FileDetail locSKS_EFT_FileDetail;
+
+        numrecords = _PaymentStatusHeader.PaymentStatusLines.get_count();
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            paymStatusline = _PaymentStatusHeader.PaymentStatusLines.get_item(Counter);
+            if(paymStatusline != null)
+            {
+                inboundlinefound = false;
+                //create or update inbound lines
+                select forupdate locInboundFileLine where locInboundFileLine.InboundFileNbr == _InboundFileNbr && locInboundFileLine.InOutKeyFormat1 == paymStatusline.StatusLineKey;
+                if (!locInboundFileLine)
+                {                                 
+                    locInboundFileLine.InboundFileNbr = _InboundFileNbr;
+                    locInboundFileLine.InOutKeyFormat1 = paymStatusline.StatusLineKey;
+                    // Line status
+                    locInboundFileLine.StatusId = paymStatusline.StatusCode;
+                
+                    locInboundFileLine.InboundStatusesRecId =
+                                      SKS_EFT_RF::getInboundStatus(gInboundFileGroup.InboundFormatId1, locInboundFileLine.StatusId, SKS_EFT_InboundStatusType::Transaction);
+
+                    // Line reason
+                    locInboundFileLine.ReasonCode = paymStatusline.ReasonCode;
+            
+                    locInboundFileLine.InboundReasonCodesRecId =
+                                      SKS_EFT_RF::getInboundReasonCode(gInboundFileGroup.InboundFormatId1, locInboundFileLine.ReasonCode, paymStatusline.AddtionalData);
+
+                    locInboundFileLine.AdditionalData = paymStatusline.AddtionalData;
+                    locInboundFileLine.paymdate = paymStatusline.PaymentDate;
+                    locInboundFileLine.BankAmt = paymStatusline.BankAmount;
+                    locInboundFileLine.BankAmtCurr = paymStatusline.CurrencyCode;
+                    locInboundFileLine.PaymentAmt = paymStatusline.BankAmount;
+                    locInboundFileLine.PaymAmtCurr = paymStatusline.CurrencyCode;
+                    locInboundFileLine.ExchRate = num2Str((paymStatusline.ExchangeRate == 0 ? 1 : paymStatusline.ExchangeRate),0,2,DecimalSeparator::Dot,ThousandSeparator::None);
+                    locInboundFileLine.BankRefNum = paymStatusline.BankRefNum;
+                    locInboundFileLine.BankRefNum2 = paymStatusline.BankRefNum2;
+                    locInboundFileLine.InboundRefNum = paymStatusline.RefNum; 
+                    locInboundFileLine.InOutKeyFormat1 = paymStatusline.StatusLineKey;
+                    locInboundFileLine.insert();
+                }
+                else
+                {
+                    ttsbegin;
+
+                    // Line status
+                    locInboundFileLine.StatusId = paymStatusline.StatusCode;
+                
+                    locInboundFileLine.InboundStatusesRecId =
+                                      SKS_EFT_RF::getInboundStatus(gInboundFileGroup.InboundFormatId1, locInboundFileLine.StatusId, SKS_EFT_InboundStatusType::Transaction);
+
+                    // Line reason
+                    locInboundFileLine.ReasonCode = paymStatusline.ReasonCode;
+            
+                    locInboundFileLine.InboundReasonCodesRecId =
+                                      SKS_EFT_RF::getInboundReasonCode(gInboundFileGroup.InboundFormatId1, locInboundFileLine.ReasonCode, paymStatusline.AddtionalData);
+
+                    locInboundFileLine.AdditionalData = paymStatusline.AddtionalData;
+                    locInboundFileLine.AdditionalData = paymStatusline.AddtionalData;
+                    locInboundFileLine.paymdate = paymStatusline.PaymentDate;
+                    locInboundFileLine.BankAmt = paymStatusline.BankAmount;
+                    locInboundFileLine.BankAmtCurr = paymStatusline.CurrencyCode;
+                    locInboundFileLine.PaymentAmt = paymStatusline.BankAmount;
+                    locInboundFileLine.PaymAmtCurr = paymStatusline.CurrencyCode;
+                    locInboundFileLine.ExchRate = num2Str((paymStatusline.ExchangeRate == 0 ? 1 : paymStatusline.ExchangeRate),0,2,DecimalSeparator::Dot,ThousandSeparator::None);
+                    locInboundFileLine.BankRefNum = paymStatusline.BankRefNum;
+                    locInboundFileLine.BankRefNum2 = paymStatusline.BankRefNum2;
+                    locInboundFileLine.InboundRefNum = paymStatusline.RefNum;
+                    locInboundFileLine.FileDetailRecId = 0;
+                    locInboundFileLine.doUpdate();
+                    ttscommit;
+                }
+
+                if (locInboundFileLine)
+                { 
+                    select firstonly locSKS_EFT_FileDetail where 
+                        locSKS_EFT_FileDetail.FormatId == gSKS_EFT_FileDetail.FormatId && 
+                        locSKS_EFT_FileDetail.APIPaymentId == gSKS_EFT_FileDetail.APIPaymentId && 
+                        locSKS_EFT_FileDetail.PaymentReference == paymStatusline.StatusLineKey &&
+                        locSKS_EFT_FileDetail.FileRecId == gSKS_EFT_FileDetail.FileRecId;
+
+                    ttsbegin;
+                    locInboundFileLine.FileDetailRecId = locSKS_EFT_FileDetail.RecId;
+                    locInboundFileLine.update();
+                    ttscommit;
+                }
+                //this.UpdateOutboundDetail(paymStatusline);
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateOutboundDetail</Name>
+				<Source><![CDATA[
+    private void UpdateOutboundDetail(SKG_BF.Models.PaymentStatusLines _paymStatusline)
+    {
+        SKS_EFT_FileDetail lOutboundFileDetail;
+        /*
+        select * from lOutboundFileDetail 
+            where lOutboundFileDetail.FileRecId == gSKS_EFT_FileDetail.FileRecId
+            && lOutboundFileDetail.APIPaymentId == gSKS_EFT_FileDetail.APIPaymentId
+            && lOutboundFileDetail.PaymentReference == _paymStatusline.StatusLineKey;
+
+        if (lOutboundFileDetail)
+        {
+            lOutboundFileDetail.selectForUpdate(true);
+            if (_paymStatusline.StatusCode == 'BOKUD_AN_VILLU')
+            {
+                lOutboundFileDetail.APIResponseStatus = SKS_EFT_APIResponseType::Success;
+            }
+            else if (_paymStatusline.StatusCode == 'BOKUD_MED_VILLU')
+            {
+                lOutboundFileDetail.APIResponseStatus = SKS_EFT_APIResponseType::Failed;
+            }
+            else if (_paymStatusline.StatusCode == 'NIDUFELLD')
+            {
+                lOutboundFileDetail.APIResponseStatus = SKS_EFT_APIResponseType::Rejected;
+            }
+            lOutboundFileDetail.update();
+        }
+        */
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

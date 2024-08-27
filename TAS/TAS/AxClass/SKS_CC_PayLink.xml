@@ -1,0 +1,259 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_PayLink</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_PayLink extends RunBaseBatch
+{
+    PositiveNumber numberOfThreads;
+    Map recordsToProcessMap;
+    Counter queueRecord;
+    RecId recIdFrom, recIdTo;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        numberOfThreads
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setRangePerThread</Name>
+				<Source><![CDATA[
+    private container setRangePerThread(int _nbrToProc)
+    {
+        container   rangeFromCon;
+        container   rangeToCon;        
+        int         intDiv, lastUsedRange;
+
+        if (numberOfThreads == 1)
+        {
+            return [[recIdFrom], [recIdTo]];
+        }
+
+        intDiv = _nbrToProc div numberOfThreads;
+
+        int         i;
+        for (i = 1; i <= numberOfThreads; i++)
+        {
+            if (i == 1)
+            {
+                rangeFromCon += recIdFrom;
+                rangeToCon   += recordsToProcessMap.lookup(intDiv);
+            }
+            else
+            {
+                rangeFromCon += recordsToProcessMap.lookup(lastUsedRange + 1);
+
+                if (i == numberOfThreads)
+                {
+                    rangeToCon += recIdTo;
+                    break;
+                }
+
+                rangeToCon += recordsToProcessMap.lookup(lastUsedRange + intDiv);
+            }
+
+            lastUsedRange += intDiv;
+        }
+
+        return [rangeFromCon, rangeToCon];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        SKS_PP_Setup sKS_PP_Setup = SKS_PP_Setup::find();
+
+        if (sks_pp_setup.ModCC == NoYes::No ||
+            (sks_pp_setup.CCPLEnableWalletLinks == NoYes::No &&
+             sks_pp_setup.CCPLEnablePayLinks == NoYes::No))        
+        {
+            throw error("@SKS:SKGCCRefreshLinkIsNotAllowedDueToParameters");
+        }
+
+        if (!sKS_PP_Setup.CCPayLinkEnumUpgraded)
+        {
+            throw error("@SKS:SKGCCRefreshLinkIsNotAllowedDueToUpgrade");
+        }
+
+        SKS_CC_PayLinkProcessStatus linkRetStatus;
+        Counter nbrOfLinksSetToCompleted, nbrOfLinksSetToError;
+        Counter nbrOfLinksSetToCanceled, nbrOfLinksSetToExpired;              
+        
+        recordsToProcessMap = new Map(Types::Integer, Types::Int64);
+        SKS_CC_PayLinkQueue payLinkQueue;
+                
+        while select RecId from payLinkQueue
+            order by RecId
+            where (payLinkQueue.Status == SKS_CC_PayLinkProcessStatus::Pending ||
+                   payLinkQueue.Status == SKS_CC_PayLinkProcessStatus::Error)
+        {
+            queueRecord++;
+
+            if (queueRecord == 1)
+            {
+                recIdFrom = payLinkQueue.RecId;
+            }
+
+            recordsToProcessMap.insert(queueRecord, payLinkQueue.RecId);
+        }
+
+        if (!queueRecord || !recordsToProcessMap || recordsToProcessMap.empty())
+        {
+            return;
+        }
+
+        recIdTo = recordsToProcessMap.lookup(queueRecord);
+        
+        SKS_CC_PayLinkQueueRefresh payLinkQueueRefreshTask;
+        str batchThreadCaption;
+
+        //when in batch create specified number of tasks
+        if (this.isInBatch())
+        {
+            BatchHeader batchHeader;
+
+            if (!numberOfThreads)
+            {
+                numberOfThreads = 4;
+            }
+
+            if (queueRecord <= numberOfThreads )
+            {
+                numberOfThreads = 1;
+            }
+
+            container rangesPerThreadCon;
+            container rangeFromCon;
+            container rangeToCon;
+
+            rangesPerThreadCon = this.setRangePerThread(queueRecord);
+            rangeFromCon = conpeek(rangesPerThreadCon, 1);
+            rangeToCon   = conpeek(rangesPerThreadCon, 2);
+
+            Batch batchLoc = this.parmCurrentBatch();
+            RefRecId batchRecIDLoc = batchLoc.RecId;
+
+            int i;
+            for (i = 1; i <= numberOfThreads; i++)
+            {
+                if (!batchHeader)
+                {
+                    batchHeader = BatchHeader::construct(batchLoc.BatchJobId);
+                }
+
+                batchThreadCaption = strfmt("@SKS:SKGCCPayLinkBatchThreadCaption", SKS_CC_PayLink::description(), i, conpeek(rangeFromCon, i), conpeek(rangeToCon, i));
+
+                payLinkQueueRefreshTask = SKS_CC_PayLinkQueueRefresh::newRange(
+                    conpeek(rangeFromCon, i),
+                    conpeek(rangeToCon, i),
+                    i,
+                    batchThreadCaption,
+                    true);
+
+                batchHeader.addRuntimeTask(payLinkQueueRefreshTask, batchRecIDLoc);
+            }
+
+            if (batchHeader)
+            {
+                batchHeader.save();
+            }
+        }
+        else
+        {
+            // when not in batch
+            batchThreadCaption = strfmt("@SKS:SKGCCPayLinkBatchThreadCaption", SKS_CC_PayLink::description(), 1, recIdFrom, recIdTo);
+
+            SKS_CC_PayLinkQueueRefresh::newRange(recIdFrom, recIdTo, 1, batchThreadCaption, false).run();
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmNumberOfThreads</Name>
+				<Source><![CDATA[
+    public PositiveNumber parmNumberOfThreads(PositiveNumber _numberOfThreads = numberOfThreads)
+    {
+        numberOfThreads = _numberOfThreads;
+        return numberOfThreads;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateThreads</Name>
+				<Source><![CDATA[
+    public boolean validateThreads()
+    {
+        boolean ret = true;
+
+        if (numberOfThreads > 8)
+        {
+            ret = checkFailed("@SKS:SKGCCMaxNbrOfThreadsMsg");
+        }
+ 
+        return ret; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_PayLink construct()
+    {
+        return new SKS_CC_PayLink();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS:SKGCCRefreshPayLinkOrWalletLink";
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

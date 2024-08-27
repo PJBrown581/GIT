@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIProdTable_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Code extensions for class <c>ProdTable</c>.
+/// </summary>
+[ExtensionOf(tableStr(ProdTable))]
+public final class GGIProdTable_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ggiReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retreives reference to Sales/transfer order either diectly on the PO or when created through master planning.
+    /// </summary>
+    /// <returns>
+    /// A string showing the Sales/Transfer order number.
+    /// </returns>
+    public display str ggiReference()
+    {
+        return this.InventRefId? this.InventRefId : this.GGIInventRefId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiGetReferenceForReqPO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// find po reference 
+    /// </summary>
+    /// <param name = "_reqPO">record buffer</param>
+    /// <returns>reference value</returns>
+    public static str ggiGetReferenceForReqPO(ReqPO _reqPO)
+    {
+        ReqTrans    reqTrans;
+        ReqTransCov reqTransCov;
+        ReqTrans    reqTransSettled;
+        str         reference;
+
+        select firstonly reqTransSettled
+                join reqTransCov
+                where reqTransSettled.RecId             == reqTransCov.IssueRecId
+                join reqTrans
+                where reqTransCov.ReceiptRecId          == reqTrans.RecId
+                    && reqTrans.RefId                   == _reqPO.RefId
+                    && reqTrans.RefType                 == _reqPO.RefType
+                    && (reqTransSettled.RefType         == ReqRefType::Sales
+                        || reqTransSettled.RefType      == ReqRefType::TransferOrderShip);
+                 
+        reference = reqTransSettled.RefId;
+
+        return reference;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiCalculatedFillTolerance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the fill tolerance range.
+    /// </summary>
+    /// <returns>
+    /// A string representing the fill tolerance range.
+    /// </returns>
+    public display str ggiCalculatedFillTolerance()
+    {
+        GGIBatchRecordPackagingType batchRecordPackagingType = GGIBatchRecordPackagingType::find(this.inventTable().GGIBatchRecordPackagingTypeId);
+        Weight                      totalWeightOfChemicals;
+        Weight                      totalWeightofChemicalsInLbs;
+        Weight                      netWeightWithVarianceMin;
+        Weight                      netWeightWithVarianceMax;
+        Weight                      variance;
+        ProdBOM                     prodBOM;
+        InventTable                 inventTable;
+        BOMQty                      qtyPerSeries;
+        const str CHEMICAL = 'CHEMICAL';
+
+        if (!batchRecordPackagingType)
+        {
+            return '';
+        }
+
+        while select prodBOM
+            join inventTable
+            where prodBOM.ItemId                == inventTable.ItemId
+                && prodBOM.ProdId               == this.ProdId
+                && inventTable.PackagingGroupId == CHEMICAL
+
+        {
+            //calcaute per series
+            qtyPerSeries  = prodBOM.PmfQtyWithoutYield/prodBOM.BOMQtySerie;
+      
+            if (prodBOM.UnitId == 'lb')
+            {
+                totalWeightofChemicalsInLbs += qtyPerSeries;
+            }
+            else
+            {
+                UnitOfMeasureConverter_Product uomProduct = UnitOfMeasureConverter_Product::newFromInventTable(prodBOM.inventTable());
+                uomProduct.parmFromUnitId(prodBOM.UnitId);
+                uomProduct.parmToUnitId('lb');
+                if (uomProduct.canValueBeConverted())
+                { 
+                    totalWeightofChemicalsInLbs += uomProduct.convertValue(qtyPerSeries);
+                }
+            }
+        }
+
+        totalWeightOfChemicals      = totalWeightofChemicalsInLbs * batchRecordPackagingType.Lb2GmAdjustment * batchRecordPackagingType.BotteUnitAdjustment;
+        variance                    = (totalWeightOfChemicals * batchRecordPackagingType.VariancePercent/100);
+        netWeightWithVarianceMin    = totalWeightOfChemicals - variance;
+        netWeightWithVarianceMax    = totalWeightOfChemicals + variance;
+
+        return strFmt("@GGI:Range", num2Str(netWeightWithVarianceMin, 4, 1, DecimalSeparator::Dot, ThousandSeparator::Comma), num2Str(netWeightWithVarianceMax, 4, 1, DecimalSeparator::Dot, ThousandSeparator::Comma), batchRecordPackagingType.UnitId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiWeights</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// locate weights for invent transaction
+    /// </summary>
+    /// <returns>container of weights</returns>
+    public container ggiWeights()
+    {
+        GGIInventTrans  ggiInventTrans;
+        InventTrans     inventTrans;
+
+        select firstonly ggiInventTrans
+            where ggiInventTrans.ReferenceId        == this.ProdId
+                && ggiInventTrans.ReferenceCategory == InventTransType::Production;
+
+        inventTrans = InventTrans::findRecId(ggiInventTrans.InventTrans);
+
+        return [inventTrans.GGINetWeightCalculated, inventTrans.GGITareWeightManual, inventTrans.GGIGrosWeightManual];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiSignee</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the signee information for the table record.
+    /// </summary>
+    /// <returns>singner name</returns>
+    public display PIPSigner ggiSignee()
+    {
+        SIGSignatureLog     signatureLog;
+        UserInfo            userInfo;
+        PIPSigner           signer;
+        SIGProdStatusChange prodStatusChange;
+
+        select firstonly prodStatusChange
+            where prodStatusChange.ProdId       == this.ProdId
+                && prodStatusChange.NewStatus   == ProdStatus::Released;
+        
+        select firstOnly Name,Id from userInfo
+            exists join signatureLog
+                where signatureLog.SigneeId     == userInfo.id
+                    && signatureLog.RefTableId  == prodStatusChange.TableId
+                    && signatureLog.RefRecId    == prodStatusChange.RecId;
+        
+        if (userInfo)
+        {
+            signer = userInfo.name;
+        }
+        
+        return signer;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromReqPo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  init invent transref Id 
+    /// </summary>
+    /// <param name = "_reqPO">record buffer</param>
+    public void initFromReqPo(ReqPO _reqPo)
+    {
+        next initFromReqPO(_reqPo);
+
+        this.GGIInventRefId = ProdTable::ggiGetReferenceForReqPO(_reqPo);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiReferenceType</Name>
+				<Source><![CDATA[
+    [SysClientCacheDataMethodAttribute(true)]
+    public static display str ggiReferenceType(ProdTable _prodTable)
+    {
+        return enum2Str(_prodTable.InventRefType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiShipTo</Name>
+				<Source><![CDATA[
+    [SysClientCacheDataMethodAttribute(true)]
+    public static display str ggiShipTo(ProdTable _prodTable)
+    {
+        switch(_prodTable.InventRefType)
+        {
+            case InventRefType::Sales:
+                return CustTable::find(SalesTable::find(_prodTable.InventRefId).CustAccount).name();
+                break;
+            case InventRefType::InventTransfer:
+                return InventTransferTable::find(_prodTable.InventRefId).InventLocationIdTo;
+                break;
+        }
+        return "";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiReferenceCustAccount</Name>
+				<Source><![CDATA[
+    [SysClientCacheDataMethodAttribute(true)]
+    public display str ggiReferenceCustAccount(ProdTable _prodTable)
+    {
+        return CustTable::find(SalesTable::find(this.ggiReference()).CustAccount).name();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiOrderWarehouse</Name>
+				<Source><![CDATA[
+    [SysClientCacheDataMethodAttribute(true)]
+    public display str ggiOrderWarehouse(ProdTable _prodTable)
+    {
+        ReqTrans reqTransPO;
+
+        return SalesTable::find(this.ggiReference()).InventLocationId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,593 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocSalesQuotationDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class DocSalesQuotationDSP extends DocDataSourceProviderSrsReporting
+{
+    SalesQuotationContract  reportContract;
+    boolean                 transLineAdded, taxLineAdded;
+    CustQuotationJour       journal;
+    RecId                   journalRecId;
+    SalesQuotationTable     salesQuotationTable;
+    DocTableFieldsMetadata  extensionFieldsMetadata_SalesQuotationDetailsTmp = DocTableFieldsMetadata::construct(tableStr(SalesQuotationDetailsTmp));
+
+    CustTable               orderCustomer;
+    smmBusRelTable          prospect;
+    HcmWorker               salesTaker;
+
+    /* Variable used for custom placeholders */
+    SalesQuotationHeaderTmp header;
+    str                     placeholder_accountContactName;
+
+    #define.SalesQuotationHeader('SalesQuotationHeader')
+    #define.SalesQuotationLines('SalesQuotationLines')
+    #define.SalesQuotationTaxLines('SalesQuotationTaxLines')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addCustomLabels</Name>
+				<Source><![CDATA[
+    // This overridden method adds additional custom labels to the DDSP to use them in template designer.
+    // Learn more: https://ax.docentric.com/d365-how-to-manuals/d365-miscellaneous/d365-how-to-add-missing-labels-to-multilingual-reports/
+    protected void addCustomLabels(Map _labelMap)
+    {
+        super(_labelMap);
+
+        // Labels in order of appearance on document from top to bottom, left to right.
+
+        // Shipping information.
+        _labelMap.insert(literalStr("@SYS344987"), 'Ship to:');
+
+        // Document header.
+        _labelMap.insert(literalStr("@SYS180816"), 'Giro');
+        _labelMap.insert(literalStr("@SYS13864"), 'Number');
+        _labelMap.insert(literalStr("@SYS12056"), 'Your ref.');
+        _labelMap.insert(literalStr("@SYS8934"), 'Our ref.');
+        _labelMap.insert(literalStr("@SYS4054"), 'Quotation deadline');
+
+        // Pagination
+        _labelMap.insert(literalStr("@SYS5250"), 'Page');
+        _labelMap.insert(literalStr("@SYS26401"), 'of');
+
+        // Document lines.
+        _labelMap.insert(literalStr("@SYS12836"), 'Item number'); // Conditionally used for header of itemId field.
+        _labelMap.insert(literalStr("@SYS6303"), 'Description');
+        _labelMap.insert(literalStr("@SYS177345"), 'Amount');
+
+        // Tax lines.
+        _labelMap.insert(literalStr("@SYS10946"), 'Cash discount amount'); // Conditionally used for CashDiscAmount header field.
+        _labelMap.insert(literalStr("@SYS99166"), 'Percent cash discount'); // Conditionally used for CashDiscAmount header field.
+        _labelMap.insert(literalStr("@SYS22646"), 'Sales tax amount');
+
+        // Final cost calculation.
+        _labelMap.insert(literalStr("@SYS464"), 'Sales subtotal amount');
+        _labelMap.insert(literalStr("@SYS8371"), 'Charges');
+        _labelMap.insert(literalStr("@SYS6901"), 'Net amount');
+        _labelMap.insert(literalStr("@SYS5878"), 'Sales tax');
+        _labelMap.insert(literalStr("@SYS9242"), 'Total');
+
+        // Misc.
+        _labelMap.insert(literalStr("@SYS77429"), 'Enterprise number');
+        _labelMap.insert(literalStr("@SYS23989"), 'Requisition');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForHeader</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForHeader(DocXmlRecord _addingRecord, SalesQuotationHeaderTmp _header)
+    {
+        void addHeaderFields()
+        {
+            // Add all fields except the company related fields since we already have them
+            // in the GeneralData data section at our disposal.
+            _addingRecord.addAllFieldsExcept([
+                fieldStr(SalesQuotationHeaderTmp, CompanyName),
+                fieldStr(SalesQuotationHeaderTmp, CompanyAddress),
+                fieldStr(SalesQuotationHeaderTmp, CompanyPhone),
+                fieldStr(SalesQuotationHeaderTmp, CompanyTeleFax),
+                fieldStr(SalesQuotationHeaderTmp, CompanyGiro),
+                fieldStr(SalesQuotationHeaderTmp, CompanyCoRegNum),
+                fieldStr(SalesQuotationHeaderTmp, CompanyLogo),
+                fieldStr(SalesQuotationHeaderTmp, CompanyEnterpriseNumber),
+                fieldStr(SalesQuotationHeaderTmp, CompanyBankAccountName),
+                fieldStr(SalesQuotationHeaderTmp, CompanyBankAccountNum),
+                fieldStr(SalesQuotationHeaderTmp, CompanyCommercialRegister),
+                fieldStr(SalesQuotationHeaderTmp, CompanyCommercialRegisterInsetNumber),
+                fieldStr(SalesQuotationHeaderTmp, CompanyCommercialRegisterSection),
+                fieldStr(SalesQuotationHeaderTmp, CompanyEmail),
+                fieldStr(SalesQuotationHeaderTmp, CompanyRegNum)
+            ]);
+        }
+
+        // Setting the flag needed for Docentric NextGen
+        _addingRecord.setSingleRecord(true);
+
+        // Rename the record from 'SalesQuotationHeaderTmp' to 'SalesQuotationHeader'.
+        _addingRecord.setRecordName(#SalesQuotationHeader);
+        // Change the label of the record if needed.
+        _addingRecord.setRecordLabel('Sales quotation header'); // NOTE: Use literalStr("@LabelID") instead.
+
+        // Add all fields from the SalesQuotationHeaderTmp table.
+        addHeaderFields();
+
+        // Add salas administrator name.
+        _addingRecord.addCalculatedField('SalesAdministratorName', HcmWorker::findByPersonnelNumber(_header.SalesAdministrator).name());
+
+        // Add Custom Fields defined on the SalesQuotationTable table, if any.
+        // Custom Fields: https://docs.microsoft.com/en-us/dynamics365/unified-operations/fin-and-ops/get-started/user-defined-fields
+        DocCustomFieldsHelper::tryAddAllCustomFieldsToDataRecord(this.salesQuotationTable(), _addingRecord);
+        // NOTE: You don't have to add all Custom Fields but only specific ones:
+        //DocCustomFieldsHelper::addCustomFieldsToDataRecord(['CustomFieldName1', 'CustomFieldName2'], salesQuotationTable, _addingRecord);
+        //DocCustomFieldsHelper::addCustomFieldToDataRecord('CustomFieldName', salesQuotationTable, _addingRecord);
+
+        // TODO: Add here additional fields (or records) to the single header record by using the related
+        // data to the _rdpTableRecord table buffer (SalesQuotationHeaderTmp) or reportContract.
+        // For example, get the related CustQuotationJour record and add additional data you need:
+        //CustQuotationJour custQuotationJour = this.custQuotationJour();
+        //DocXmlRecord jourDataRecord = _addingRecord.addChildRecord(custQuotationJour);
+        //jourDataRecord.addField(fieldStr(CustQuotationJour, DefaultDimension));
+        //jourDataRecord.addDisplayMethod(tableMethodStr(CustQuotationJour, paymentCode));
+        // Or, add the project name:
+        //_addingRecord.addCalculatedField('ProjName', SalesTable::find(_header.SalesId).projTable().Name);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine(DocXmlRecord _addingRecord, SalesQuotationDetailsTmp _currentLine)
+    {
+        if (_currentLine.QuotationTransOrTaxTrans)
+        {
+            this.addDataFieldsForLine_Trans(_addingRecord, _currentLine);
+            transLineAdded = true;
+        }
+        else
+        {
+            this.addDataFieldsForLine_Tax(_addingRecord, _currentLine);
+            taxLineAdded = true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine_Tax</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine_Tax(DocXmlRecord _addingRecord, SalesQuotationDetailsTmp _currentLine)
+    {
+        // Rename the record from 'SalesQuotationDetailsTmp' to 'SalesQuotationTaxLines'.
+        _addingRecord.setRecordName(#SalesQuotationTaxLines);
+        // Change the label of the record.
+        _addingRecord.setRecordLabel('Taxes'); // NOTE: use literalStr("@LabelID") instead.
+
+        // Add all fields related to the tax lines.
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxCode));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, PrintCode));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxBaseAmount));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxBaseQty));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxAmount));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxAmountMST));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxExemptDescription));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, TaxBaseAmountMST));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, Amount));
+        _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, CashDiscAmount));
+
+        //-- Redundant fields.
+        //_addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, QuotationTransOrTaxTrans));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine_Trans</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine_Trans(DocXmlRecord _addingRecord, SalesQuotationDetailsTmp _currentLine)
+    {
+        void addLineFields()
+        {
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, CurrencyCode));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, DiscAmount));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, DiscPercent));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, DlvDate));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, ExternalItemId));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, InventDimProduct));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, InventDimQtyPrint));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, ItemId));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, LineAmount));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, LineHeader));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, Name));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, Notes));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, ProjTransType));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, Qty));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, SalesPrice));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, SalesUnitTxt));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, PdsCWQty));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, PdsCWUnitId));
+            _addingRecord.addField(fieldStr(SalesQuotationDetailsTmp, PrintCode));
+
+            //-- Redundant fields.
+            //_addingRecord.addField(fieldStr(SalesquotationDetailsTmp, QuotationTransOrTaxTrans));
+        }
+
+
+        // Rename the record from 'SalesQuotationDetailsTmp' to 'SalesQuotationLines'.
+        _addingRecord.setRecordName(#SalesQuotationLines);
+        // Change the label of the record.
+        _addingRecord.setRecordLabel('Sales quotation lines'); // NOTE: use literalStr("@LabelID") instead.
+
+        // Add all fields from the SalesQuotationDetailsTmp table related to the transaction data.
+        addLineFields();
+
+        // Add Extension fields defined on SalesQuotationDetailsTmp, if any.
+        // NOTE: Fields will be added to the child record named ExtensionFields. Change the last parameter to false to add
+        // Extension fields on flat. If the result doesn't suit you, add your Extension fields directly using the addField() method.
+        DocExtensionFieldsHelper::tryAddAllExtensionFieldsToDataRecord(_currentLine, _addingRecord, true, extensionFieldsMetadata_SalesQuotationDetailsTmp);
+
+        // TODO: Add here additional fields from the related CustQuotationTrans table (or some other tables).
+        //CustQuotationTrans custQuotationTrans = this.custQuotationTrans(_currentLine.CustQuotationTrans);
+        //_addingRecord.addCalculatedField('LineNum', custQuotationTrans.LineNum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Extend/Override this method in order to add additional parameters to the report data source.
+    /// </summary>
+    /// <param name = "_recordBuilderParameters">Record builder for the Parameters data section.</param>
+    protected void addParameters(DocXmlRecordBuilder _recordBuilderParameters)
+    {
+        super(_recordBuilderParameters);
+
+        // Add the Original/Copy print information to the Parameters data section of DDSP
+        DocPrintMgmtOriginalCopyType printMgmtOriginalCopyType = this.parmParamsReporting().parmOriginalCopyType();
+        DocDspHelper::addPrintMgmtOriginalCopyField(_recordBuilderParameters.topRecord(), printMgmtOriginalCopyType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForRdpTableRecord</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForRdpTableRecord(DocXmlRecord _addingRecord, Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        if (_rdpTableName == tableStr(SalesQuotationHeaderTmp))
+        {
+            this.addDataFieldsForHeader(_addingRecord, _rdpTableRecord);
+        }
+        else if (_rdpTableName == tableStr(SalesQuotationDetailsTmp))
+        {
+            this.addDataFieldsForLine(_addingRecord, _rdpTableRecord);
+        }
+        else
+        {
+            super(_addingRecord, _rdpTableRecord, _rdpTableName);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return 'Sales quotation DSP';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        DocXmlRecord                emptyLineDataRecord;
+        SalesQuotationDetailsTmp    emptyLine;
+
+        salesTaker = HcmWorker::find(this.salesQuotationTable().WorkerSalesTaker);
+        placeholder_accountContactName = this.salesQuotationTable().contactPersonName();
+
+        // Add the single data record representing the header and add multilpe records representing the lines.
+        super(_recordBuilder);
+
+        // If this is design time, add main or tax lines if they haven't been already added.
+        _recordBuilder.goToTopRecord();
+        if (!this.isRuntime())
+        {
+            emptyLine.clear();
+
+            // Main lines.
+            if (!transLineAdded)
+            {
+                emptyLineDataRecord = _recordBuilder.addRecord(emptyLine);
+                this.addDataFieldsForLine_Trans(emptyLineDataRecord, emptyLine);
+                _recordBuilder.goToTopRecord();
+            }
+
+            // TaxLines.
+            if (!taxLineAdded)
+            {
+                emptyLineDataRecord = _recordBuilder.addRecord(emptyLine);
+                this.addDataFieldsForLine_Tax(emptyLineDataRecord, emptyLine);
+                _recordBuilder.goToTopRecord();
+            }
+        }
+
+        // Check the resulting XML.
+        //info(_recordBuilder.exportToXmlStr());
+        //_recordBuilder.exportToXmlFile("ReportMainData.xml");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preRunGenerateDS</Name>
+				<Source><![CDATA[
+    protected void preRunGenerateDS()
+    {
+        super();
+
+        // Initialize here the class global variables.
+        reportContract = this.getSrsRdpContract();
+        journalRecId = reportContract.parmRecordId();
+
+        transLineAdded = false;
+        taxLineAdded = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custQuotationJour</Name>
+				<Source><![CDATA[
+    protected CustQuotationJour custQuotationJour()
+    {
+        if (!journal)
+        {
+            journal = CustQuotationJour::findRecId(journalRecId);
+        }
+
+        return journal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custQuotationTrans</Name>
+				<Source><![CDATA[
+    protected CustQuotationTrans custQuotationTrans(RecId _custQuotationTransRecId)
+    {
+        CustQuotationTrans custQuotationTrans;
+
+        custQuotationTrans = CustQuotationTrans::findRecId(_custQuotationTransRecId);
+
+        return custQuotationTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesQuotationTable</Name>
+				<Source><![CDATA[
+    protected SalesQuotationTable salesQuotationTable()
+    {
+        if (!salesQuotationTable)
+        {
+            salesQuotationTable = this.custQuotationJour().salesQuotationTable();
+        }
+
+        return salesQuotationTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesQuotationLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns SalesQuotationLine record related to the CustQuotationTrans record.
+    /// </summary>
+    /// <param name = "_custQuotationTrans">
+    /// CustQuotationTrans record.
+    /// </param>
+    /// <returns>SalesQuotationLine</returns>
+    protected SalesQuotationLine salesQuotationLine(CustQuotationTrans _custQuotationTrans)
+    {
+        return SalesQuotationLine::findInventTransId(_custQuotationTrans.InventTransId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // List of defined custom placeholders for the report:
+    #define.QuotationId('QuotationId')
+    #define.QuotationDocNum('QuotationDocNum')
+    #define.CustAccount('CustAccount')
+    #define.CustName('CustName')
+    #define.CustContactName('CustContactName')
+    #define.CustRef('CustRef')
+    #define.CustReq('CustReq')
+    #define.QuotationDate('QuotationDate')
+    #define.ExpiryDate('ExpiryDate')
+    #define.DeliveryName('DeliveryName')
+    #define.SalesId('SalesId')
+    #define.SalesTakerName('SalesTakerName')
+    #define.SalesTakerImage('SalesTakerImage')
+
+    [DocPlaceholderAttribute(#QuotationId, 'SQ - Quotation ID'),
+     DocPlaceholderAttribute(#QuotationDocNum, 'SQ - Quotation Document Number'),
+     DocPlaceholderAttribute(#CustAccount, 'SQ - Account Numer'),
+     DocPlaceholderAttribute(#CustName, 'SQ - Account Name'),
+     DocPlaceholderAttribute(#CustContactName, 'SQ - Account Contact Name'),
+     DocPlaceholderAttribute(#CustRef, 'SQ - Customer Reference'),
+     DocPlaceholderAttribute(#CustReq, 'SQ - Customer Requisition'),
+     DocPlaceholderAttribute(#QuotationDate, 'SQ - Quotation Date'),
+     DocPlaceholderAttribute(#ExpiryDate, 'SQ - Expiry Date'),
+     DocPlaceholderAttribute(#DeliveryName, 'SQ - Delivery Name'),
+     DocPlaceholderAttribute(#SalesId, 'SQ - Sales ID'),
+     DocPlaceholderAttribute(#SalesTakerName, 'SQ - Sales Taker Name'),
+     DocPlaceholderImageAttribute(#SalesTakerImage, 'SQ - Sales taker picture', 80, 80)]
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        // Set the report execution context record to the corresponding salesQuotationTable. This will affect:
+        // (1) Standard placeholders
+        // (2) Saving to Attachments -> Record type: Context record
+        // (3) Additional Attachments -> Load from: Context record
+        _reportRunContext.setReportExecutionContextRecord(this.salesQuotationTable());
+
+        // Replace standard placeholders.
+        DocPlaceholderManager placeholderMng = super(_reportRunContext, _replaceStandardPlaceholders);
+        
+        // -- Placeholder @QuotationId@
+        // Note that header.QuotationId is not the correct QuotationId!
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#QuotationId, this.salesQuotationTable().QuotationId);
+        
+        // Replace custom placeholders:
+        // -- Placeholder @QuotationDocNum@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#QuotationDocNum, header.QuotationDocNum);
+        
+        // -- Placeholder @CustAccount@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustAccount, this.salesQuotationTable().CustAccount ? this.salesQuotationTable().CustAccount : this.salesQuotationTable().BusRelAccount);
+
+        // -- Placeholder @CustName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustName, this.salesQuotationTable().customerName() ? this.salesQuotationTable().customerName() : this.salesQuotationTable().busRelName());
+
+        // -- Placeholder @CustContactName@
+        if (!placeholder_accountContactName)
+        {
+            placeholder_accountContactName = DocDspHelper::SirMadam;
+        }
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustContactName, placeholder_accountContactName);
+        
+        // -- Placeholder @CustRef@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustRef, header.CustomerRef);
+        
+        // -- Placeholder @CustReq@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustReq, header.PurchaseOrder);
+
+        // -- Placeholder @DeliveryName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#DeliveryName, header.DeliveryName);
+
+        // -- Placeholder @QuotationDate@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#QuotationDate, header.QuotationDate);
+
+        // -- Placeholder @ExpiryDate@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ExpiryDate, header.RespiteDate);
+
+        // -- Placeholder @SalesId@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#SalesId, header.SalesId);
+        
+        // -- Placeholder @SalesTakerName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#SalesTakerName, salesTaker.name());
+
+        // For image placeholders first check if they are used in the Email print destination, if it is the currently selected print destination.
+        // NOTE: Remove this condition if it's not true:
+        if (_reportRunContext.parmPrintDestination() == DocPrintDestination::Email)
+        {
+            /*** Replace a custom placeholder image ***/
+            // -- Placeholder @SalesTakerImage@
+            if (salesTaker && DocPlaceholderManager::findPlaceholder(_reportRunContext.emailPrintDestSettings().parmEmailBody(), #SalesTakerImage))
+            {
+                Bitmap workerImage = salesTaker.personImageOrNull_DC();
+                if (workerImage)
+                {
+                    placeholderMng.replacePlaceholderImage(#SalesTakerImage, workerImage);
+                }
+            }
+        }
+
+
+        // Fill the Print archive contract.
+        if (this.salesQuotationTable().CustAccount)
+        {
+            _reportRunContext.archiveContract().setCustAccount(this.salesQuotationTable().CustAccount);
+        }
+
+        _reportRunContext.archiveContract().setQuotationId(this.salesQuotationTable().QuotationId);
+        _reportRunContext.archiveContract().setDocument(header.QuotationDocNum, header.QuotationDate);
+        _reportRunContext.archiveContract().setJournal(this.custQuotationJour().RecId, DocJournalType::CustQuotationJour);
+
+        return placeholderMng;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSelectedRdpTableRecord</Name>
+				<Source><![CDATA[
+    protected void onSelectedRdpTableRecord(Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        super(_rdpTableRecord, _rdpTableName);
+
+        if (_rdpTableName == tableStr(SalesQuotationHeaderTmp))
+        {
+            // Store data used for custom placeholders.
+            header = _rdpTableRecord.data();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        // TODO: (1) Select the sample journal record.
+        // We will just select the first posted quotation.
+        CustQuotationJour custQuotationJour;
+        select firstonly custQuotationJour;
+
+        // Add it as the context record, which is going to be printed.
+        Args args = new Args();
+        args.record(custQuotationJour);
+        
+        // TODO: (2) Change the name SSRS Report Design if needed.
+        SalesQuotationController salesQuotationController = SalesQuotationController::construct();
+        salesQuotationController.parmReportName(PrintMgmtDocType::construct(PrintMgmtDocumentType::Quotation).getDefaultReportFormat());
+        salesQuotationController.parmArgs(args);
+
+        // Set the report data contract with parameters.
+        SalesQuotationContract salesQuotationContract = salesQuotationController.parmReportContract().parmRdpContract();
+        salesQuotationContract.parmRecordId(custQuotationJour.RecId);
+        salesQuotationContract.parmTableId(custQuotationJour.TableId);
+
+        // Set the Docentric Generate DS print destination settings.
+        SRSPrintDestinationSettings pds = salesQuotationController.parmReportContract().parmPrintSettings();
+        pds.printMediumType(SRSPrintMediumType::GenerateDataSource_DC);
+
+        // TODO: (3) Set the Design and Preview languages if needed.
+        pds.parmGenerateDSPrintDestSettings_DC().parmLanguageId(custQuotationJour.LanguageId);
+        pds.parmGenerateDSPrintDestSettings_DC().parmPreviewLanguages('fr,de,it,es');
+
+        // Inicilaze SalesQuotationEditLinesForm_Sales_Send class instance and set NOT to use Print Management.
+        SalesQuotationEditLinesForm_Sales_Send salesQuotationEditLinesForm_sales = new SalesQuotationEditLinesForm_Sales_Send();
+        salesQuotationEditLinesForm_sales.updatePrinterSettingsFormLetter(pds.pack());
+        salesQuotationEditLinesForm_sales.usePrintManagement(false);
+
+        args.caller(salesQuotationEditLinesForm_sales);
+        args.parmEnumType(enumNum(PrintCopyOriginal));
+        args.parmEnum(PrintCopyOriginal::OriginalPrint);
+
+        salesQuotationController.parmExecutionMode(SysOperationExecutionMode::Synchronous);
+        salesQuotationController.parmShowDialog(false);
+        salesQuotationController.startOperation();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

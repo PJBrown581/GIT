@@ -1,0 +1,788 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>DocElectronicSignatureCertificateLoad</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+using DocFS = Docentric.AX.Storage.File;
+using Docentric.AX.Certificates;
+using Docentric.AX.Security.Azure.KeyVault;
+using System.Security.Cryptography.X509Certificates;
+
+[Form]
+public class DocElectronicSignatureCertificateLoad extends FormRun
+{
+    private DocElectronicSignatureCertificate bufferDocElectronicSignatureCertificate;
+    private DocElectronicSignatureCertificate docElectronicSignatureCertificate;
+    private boolean replaceCertificate = false;
+    private System.IO.Stream certificateStream = null;
+    private X509Certificate2 certificate = null;
+
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a form.
+    /// </summary>
+    public void init()
+    {
+        super();
+    
+        if (element.args() == null || element.args().dataset() != tableNum(DocElectronicSignatureCertificate))
+        {
+            throw error(Error::missingFormActiveBuffer(formStr(DocElectronicSignatureCertificateLoad), tableStr(DocElectronicSignatureCertificate)));
+        }
+        
+        bufferDocElectronicSignatureCertificate = element.args().record();
+
+        // Buffer used for adding a new certifcate or replacing an existing one
+        docElectronicSignatureCertificate = DocElectronicSignatureCertificate::find(bufferDocElectronicSignatureCertificate.CertificateId);
+
+        // Initializes variables 
+        str formCaption = '';
+        if (element.args().menuItemName() == menuItemDisplayStr(DocElectronicSignatureCertificateAdd))
+        {
+            formCaption = "@DocentricAX3:ElectronicSignatureCertificateAddCaption";
+            replaceCertificate = false;
+        }
+        else
+        {
+            formCaption = "@DocentricAX3:ElectronicSignatureCertificateReplaceCaption";
+            replaceCertificate = true;
+        }
+
+        // Set the values from the current table buffer.
+        if (replaceCertificate)
+        {
+            CertificateStorage.selection(bufferDocElectronicSignatureCertificate.CertificateStorage);
+            CertificateId.text(bufferDocElectronicSignatureCertificate.CertificateId);
+
+            // Change the help text for the CertificateId and CertificateStorage controls.
+            CertificateStorage.helpText("@DocentricAX3:ElectronicSingatureCertificateStorageHelp");
+            CertificateId.helpText("@DocentricAX3:ElectronicSignatureCertificateIdHelp");
+        }
+
+        // Set the form caption
+        element.design().caption(formCaption);
+
+        // Set form controls
+        element.setControls();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setControls</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the controls on the form.
+    /// </summary>
+    private void setControls()
+    {
+        CertificateId.allowEdit(!replaceCertificate);
+
+        element.setVisibleTabPage();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setVisibleTabPage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets a visible tab page depending on selected certificate storage.
+    /// </summary>
+    private void setVisibleTabPage()
+    {
+        LocalCertificateTabPage.visible(CertificateStorage.selection() == DocCertificateStorage::Database);
+        KeyVaultCertificateTabPage.visible(CertificateStorage.selection() == DocCertificateStorage::KeyVault);
+
+        // Set certificate Id
+        element.setCertificateId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCertificateId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets a certificate Id depending on selected certificate storage and only when adding a new ceritficate.
+    /// </summary>
+    private void setCertificateId()
+    {
+        if (!replaceCertificate && !CertificateId.text())
+        {
+            switch (CertificateStorage.selection())
+            {
+                case DocCertificateStorage::Database:
+                    CertificateId.text(System.IO.Path::GetFileNameWithoutExtension(CertificateFilename.text()));
+                    break;
+
+                case DocCertificateStorage::KeyVault:
+                    CertificateId.text(KeyVaultCertificateTable::findRecId(KeyVaultCertificate.value()).Name);
+                    break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the selected certificate.
+    /// </summary>
+    /// <returns>True/False</returns>
+    private boolean validate()
+    {
+        // Check certificate Id
+        if (!CertificateId.validate())
+        {
+            return false;
+        }
+
+        switch (CertificateStorage.selection())
+        {
+            case DocCertificateStorage::Database:
+                // Check if PFX certificate is uploaded
+                if (!certificateStream)
+                {
+                    DocGlobalHelper::handleWarning("@DocentricAX3:SelectCertificateFileWarning");
+                    return false;
+                }
+
+                // Load PFX certificate content 
+                try
+                {        
+                    certificateStream.Position = 0;
+                    certificate = CertificateUtils::Load(certificateStream, LocalCertificatePassword.text());
+
+                    if (!certificate.HasPrivateKey)
+                    {
+                        DocGlobalHelper::handleWarning("@DocentricAX3:ElectronicSignatureErrorPrivateKeyMissing");
+                        return false;
+                    }
+                }
+                catch (Exception::CLRError)
+                {
+                    DocGlobalHelper::handleClrError('', '', false, false);
+                    return false;
+                }
+                catch
+                {
+                    return false;
+                }
+                break;
+
+            case DocCertificateStorage::KeyVault:
+                // Check if Key Vault certificate is selected
+                if (!KeyVaultCertificate.value())
+                {
+                    DocGlobalHelper::handleWarning("@DocentricAX3:ElectronicSignatureErrorSelectKeyVaultCert");
+                    return false;
+                }
+
+                // Load Key Vault certificate content
+                try
+                {
+                    KeyVaultCertificateTable keyVaultCertificateTable = KeyVaultCertificateTable::findRecId(KeyVaultCertificate.value());
+                    if (keyVaultCertificateTable)
+                    {
+                        KeyVaultParameters keyVaultParameters = KeyVaultParameters::findRecId(keyVaultCertificateTable.KeyVaultRef);
+                        if (keyVaultParameters)
+                        {
+                            str keyVaultSecretUrl = KeyVaultProtocolUtils::GetIdentifierUrlFromKeyVaultProtocol(
+                                                                keyVaultCertificateTable.KeyVaultCertificate,
+                                                                KeyVaultObjectType::Secret, 
+                                                                keyVaultParameters.Url);
+
+                            certificate = CertificateUtils::LoadFromAzureKeyVault(
+                                                                keyVaultParameters.AppClientId,
+                                                                keyVaultParameters.getClientSecretKey(),
+                                                                keyVaultSecretUrl);
+                        }
+                    }
+                }
+                catch (Exception::CLRError)
+                {
+                    DocGlobalHelper::handleClrError('', '', false, false);
+                    return false;
+                }
+                catch
+                {
+                    return false;
+                }
+                break;
+        }
+
+        // Check if certificate content is successfuly loaded
+        if (!certificate)
+        {
+            DocGlobalHelper::handleWarning("@DocentricAX3:ElectronicSignatureErrorInvalidCertificateFile");
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeOk</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Called when button Ok is clicked.
+    /// </summary>
+    public void closeOk()
+    {
+        // Validate the selected certificate
+        if (this.validate())
+        {
+            DocGlobalHelper::assert(certificate != null);
+
+            try
+            {
+                if (replaceCertificate)
+                {
+                    // Replace the existing certificate with the new one
+                    docElectronicSignatureCertificate.CertificateStorage = CertificateStorage.selection();
+                    docElectronicSignatureCertificate.KeyVaultCertificate = 0;
+                    if (CertificateStorage.selection() == DocCertificateStorage::KeyVault)
+                    {
+                        docElectronicSignatureCertificate.KeyVaultCertificate = KeyVaultCertificate.value();
+                    }
+                    docElectronicSignatureCertificate.fillFromX509Certificate2(certificate);
+                    if (!docElectronicSignatureCertificate.validateWrite())
+                    {
+                        return;
+                    }
+                    ttsbegin;
+                    docElectronicSignatureCertificate.selectForUpdate(true);
+                    docElectronicSignatureCertificate.update();
+                    ttscommit;
+                }
+                else
+                {
+                    // Add a new certificate
+                    docElectronicSignatureCertificate.clear();
+                    docElectronicSignatureCertificate.CertificateId = CertificateId.text();
+                    docElectronicSignatureCertificate.CertificateStorage = CertificateStorage.selection();
+                    if (CertificateStorage.selection() == DocCertificateStorage::KeyVault)
+                    {
+                        docElectronicSignatureCertificate.KeyVaultCertificate = KeyVaultCertificate.value();
+                    }
+                    docElectronicSignatureCertificate.fillFromX509Certificate2(certificate);
+                    if (!docElectronicSignatureCertificate.validateWrite())
+                    {
+                        return;
+                    }
+                    ttsbegin;
+                    docElectronicSignatureCertificate.insert();
+                    ttscommit;
+                }
+
+                // Update the status of the certificate
+                DocElectronicSignatureCertificateUtil::refreshCertificates([docElectronicSignatureCertificate.CertificateId]);
+            }
+            catch
+            {
+                DocGlobalHelper::handleError("@DocentricAX3:ElectronicSignatureErrorSaveCertificate", false);
+                return;
+            }
+
+            super();
+
+            // Dispose the memory stream.
+            if (certificateStream)
+            {
+                certificateStream.Dispose();
+                certificateStream = null;
+            }
+
+            // Refresh the caller form.
+            if (element.args() && element.args().caller())
+            {
+                IDocRefreshable caller = element.args().caller() as IDocRefreshable;
+                if (caller)
+                {
+                    caller.refreshCallerDataSourceAndPosition(docElectronicSignatureCertificate);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>close</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Called when the form is closed.
+    /// </summary>
+    public void close()
+    {
+        // Dispose the certificate
+        if (certificate != null)
+        {
+            certificate.Reset();
+            certificate = null;
+        }
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="" />
+		<DataControls xmlns="">
+			<Control>
+				<Name>CertificateStorage</Name>
+				<Type>ComboBox</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Called when a value is moodified.
+        /// </summary>
+        /// <returns>True/False</returns>
+        public boolean modified()
+        {
+            boolean ret;
+    
+            ret = super();
+
+            element.setVisibleTabPage();
+    
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>GetCertificateFile</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Uploads the selected certificate.
+        /// </summary>
+        public void clicked()
+        {
+            str errMsg = "@DocentricAX3:CertificateUploadFailed";
+            str certificateFilename2;
+
+            super();
+
+            CertificateFilename.text('');
+            certificate = null;
+
+            if (certificateStream)
+            {
+                certificateStream.Dispose();
+                certificateStream = null;
+            }
+
+            if (DocConstantGlobal::isOnPremEnvironment())
+            {
+                DocFS.File certificateFile = DocFileUploadOnPremHelper::GetFileFromUser(DocConstantFile::FileExtensionDelimiter + DocConstantFile::FileExtPfx);
+                if (certificateFile)
+                {
+                    try
+                    {
+                        certificateStream = DocGlobalHelper::convertBytesToMemoryStream(certificateFile.Bytes);
+                        certificateFilename2 = certificateFile.Name;
+                        if (!(certificateStream && certificateFilename2))
+                        {
+                            throw Exception::Error;
+                        }
+                        CertificateFilename.text(certificateFilename2);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleError(errMsg, false, '', true);
+                    }
+                }
+            }
+            else
+            {
+                FileUploadResultBase result = File::GetFileFromUser(classStr(DocFileUploadTemporaryPrivateCertificateStorageStrategy));
+                if (result && result.getUploadStatus())
+                {
+                    try
+                    {
+                        certificateStream = result.openResult();
+                        certificateFilename2 = result.getFileName();
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        DocGlobalHelper::handleClrError('', errMsg, true, false);
+                    }
+                    catch (Exception::Internal)
+                    {
+                        DocGlobalHelper::handleClrError('', errMsg, true, false);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleError(errMsg, false, '', true);
+                    }
+
+                    if (!(certificateStream && certificateFilename2))
+                    {
+                        DocGlobalHelper::handleError(errMsg, false, '', true);
+                    }
+                    
+                    CertificateFilename.text(certificateFilename2);
+                }
+            }
+
+            // Set certificate Id
+            if (CertificateFilename.text())
+            {
+                element.setCertificateId();
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>KeyVaultCertificate</Name>
+				<Type>ReferenceGroup</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Called when a value is moodified.
+        /// </summary>
+        /// <returns>True/False</returns>
+        public boolean modified()
+        {
+            boolean ret;
+    
+            ret = super();
+
+            if (ret)
+            {
+                // Set certificate Id
+                element.setCertificateId();
+            }
+    
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>lookupReference</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Calls a lookup form.
+        /// </summary>
+        /// <returns>Selected record</returns>
+        public Common lookupReference()
+        {        
+            SysReferenceTableLookup sysReferenceTableLookup = SysReferenceTableLookup::newParameters(tableNum(KeyVaultCertificateTable), this);
+
+            sysReferenceTableLookup.addLookupField(fieldNum(KeyVaultCertificateTable, Name));
+            sysReferenceTableLookup.addLookupField(fieldNum(KeyVaultCertificateTable, Description));
+            sysReferenceTableLookup.addLookupField(fieldNum(KeyVaultCertificateTable, KeyVaultRef));
+
+            Query query = new Query();
+            QueryBuildDataSource qbds = query.addDataSource(tableNum(KeyVaultCertificateTable));
+            qbds.addRange(fieldNum(KeyVaultCertificateTable, KeyVaultCertificateType)).value(queryValue(KeyVaultCertificateType::Certificate));
+
+            sysReferenceTableLookup.parmQuery(query);
+
+            return sysReferenceTableLookup.performFormLookup();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>jumpRef</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Jumps to the referenced table.
+        /// </summary>
+        public void jumpRef()
+        {
+            Args args = new Args();
+
+            KeyVaultCertificateTable keyVaultCertificateTable = KeyVaultCertificateTable::findRecId(KeyVaultCertificate.value());
+            if (keyVaultCertificateTable)
+            {
+                KeyVaultParameters keyVaultParameters = KeyVaultParameters::findRecId(keyVaultCertificateTable.KeyVaultRef);
+
+                args.lookupRecord(keyVaultParameters);
+                args.caller(element);
+
+                new MenuFunction(menuItemDisplayStr(KeyVaultParameters), MenuItemType::Display).run();
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources />
+	<Design>
+		<Caption xmlns="">@DocentricAX3:ElectronicSignatureCertificateAddCaption</Caption>
+		<DefaultAction xmlns="">OKButton</DefaultAction>
+		<Pattern xmlns="">DialogFastTabs</Pattern>
+		<PatternVersion xmlns="">1.0</PatternVersion>
+		<Style xmlns="">Dialog</Style>
+		<WindowType xmlns="">Popup</WindowType>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>HeaderGroup</Name>
+				<ElementPosition>715827882</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<Pattern>Custom</Pattern>
+				<Type>Group</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormGroupControl">
+						<Name>CertificateGroup</Name>
+						<Type>Group</Type>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormComboBoxControl">
+								<Name>CertificateStorage</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HelpText>@DocentricAX3:ElectronicSignatureCertificateStorageLoadHelp</HelpText>
+								<Type>ComboBox</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<EnumType>DocCertificateStorage</EnumType>
+								<Items />
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>CertificateId</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HelpText>@DocentricAX3:ElectronicSignatureCertificateIdLoadHelp</HelpText>
+								<Type>String</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>DocCertificateIdSelect</ExtendedDataType>
+								<Mandatory>Yes</Mandatory>
+							</AxFormControl>
+						</Controls>
+					</AxFormControl>
+				</Controls>
+				<Style>DialogContent</Style>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormTabControl">
+				<Name>Tab</Name>
+				<Type>Tab</Type>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>LocalCertificateTabPage</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Pattern>Custom</Pattern>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStaticTextControl">
+								<Name>LocalCertificateInstructions</Name>
+								<ExtendedStyle>dialog_secondaryInstruction</ExtendedStyle>
+								<Type>StaticText</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Text>@DocentricAX3:ElectronicSignatureCertificateDatabaseTabInstruction</Text>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>LocalCertificateGroup</Name>
+								<Type>Group</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormGroupControl">
+										<Name>LocalCertificateFileGroup</Name>
+										<Type>Group</Type>
+										<WidthMode>SizeToAvailable</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormStringControl">
+												<Name>CertificateFilename</Name>
+												<AllowEdit>No</AllowEdit>
+												<AutoDeclaration>Yes</AutoDeclaration>
+												<HelpText>@DocentricAX3:CertificateFilenameHelp</HelpText>
+												<Skip>Yes</Skip>
+												<Type>String</Type>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<DisplayLength>50</DisplayLength>
+												<DisplayLengthMode>Fixed</DisplayLengthMode>
+												<ExtendedDataType>Filename</ExtendedDataType>
+												<Label>@DocentricAX3:CertificateFilename</Label>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonControl">
+												<Name>GetCertificateFile</Name>
+												<ExtendedStyle>button_inlineImageOnly</ExtendedStyle>
+												<Type>Button</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<ButtonDisplay>ImageOnly</ButtonDisplay>
+												<NormalImage>Upload</NormalImage>
+												<Text>@DocentricAX2:UploadFile</Text>
+											</AxFormControl>
+										</Controls>
+										<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+										<FrameType>None</FrameType>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>LocalCertificatePassword</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<HelpText>@DocentricAX3:ElectronicSignatureCertificatePasswordHelp</HelpText>
+										<Type>String</Type>
+										<WidthMode>SizeToAvailable</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<Label>@DocentricAX3:ElectronicSignatureCertificatePassword</Label>
+										<PasswordStyle>Yes</PasswordStyle>
+									</AxFormControl>
+								</Controls>
+							</AxFormControl>
+						</Controls>
+						<Caption>@DocentricAX3:ElectronicSignatureCertificateDatabaseTabCaption</Caption>
+						<FastTabExpanded>Always</FastTabExpanded>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>KeyVaultCertificateTabPage</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Pattern>Custom</Pattern>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStaticTextControl">
+								<Name>KeyVaultCertificateInstructions</Name>
+								<ExtendedStyle>dialog_secondaryInstruction</ExtendedStyle>
+								<Type>StaticText</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Text>@DocentricAX3:ElectronicSignatureCertificateKeyVaultTabInstruction</Text>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>KeyVaultGroup</Name>
+								<Type>Group</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormReferenceGroupControl">
+										<Name>KeyVaultCertificate</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<HelpText>@DocentricAX3:ElectronicSignatureKeyVaultReferenceLoadHelp</HelpText>
+										<Type>ReferenceGroup</Type>
+										<WidthMode>SizeToAvailable</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls />
+										<ExtendedDataType>KeyVaultCertificateRef</ExtendedDataType>
+									</AxFormControl>
+								</Controls>
+							</AxFormControl>
+						</Controls>
+						<Caption>@DocentricAX3:ElectronicSignatureCertificateKeyVaultTabCaption</Caption>
+						<FastTabExpanded>Always</FastTabExpanded>
+					</AxFormControl>
+				</Controls>
+				<Style>FastTabs</Style>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormButtonGroupControl">
+				<Name>ButtonGroup</Name>
+				<ElementPosition>1073741822</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<LeftMode>AutoRight</LeftMode>
+				<Type>ButtonGroup</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>OKButton</Name>
+						<ElementPosition>1073741822</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Skip>Yes</Skip>
+						<Type>CommandButton</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Command>OK</Command>
+						<DefaultButton>Yes</DefaultButton>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>CancelButton</Name>
+						<ElementPosition>1610612733</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Skip>Yes</Skip>
+						<Type>CommandButton</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Command>Cancel</Command>
+					</AxFormControl>
+				</Controls>
+				<ArrangeMethod>HorizontalRight</ArrangeMethod>
+				<Style>DialogCommitContainer</Style>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

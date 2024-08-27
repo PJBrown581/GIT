@@ -1,0 +1,420 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPFlexInventQualityManagementCreate_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(classStr(InventQualityManagementCreate))]
+public final class PIPFlexInventQualityManagementCreate_Extension
+{
+    private PIPInventFlexSamplingActivityCreate     inventFlexSamplingActivityCreate;
+    private InventTestUpdatedQuantityTmp            pipInventTestUpdatedQuantityTmp;
+    private PIPInventFlexSamplingPlanLines          flexSamplingPlanLevel;
+    private PIPInventFlexSamplingActivityTable      currentActivity;
+    private int                                     qualityOrderNumber;
+    private int                                     qualityOrderCount;
+    private container                               roundsToSkip;
+    private container                               roundsToTestMultipleOrders;
+    private int                                     trackingNumMultipleOrders;
+    private InventQualityOrderTable                 initializedInventQualityOrderTable;
+
+    private int                                     registrationCount;
+    internal int                                    testCounter;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>pipBuildSampleDimensionQtyList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds a list of inventory dimensions and quantities for which quality orders can be created.
+    /// </summary>
+    /// <param name="_quantityToSample">
+    /// The quantity for which dimensions must be found.
+    /// </param>
+    /// <param name="_cwQuantityToSample">
+    /// The catch weight quantity for which dimensions must be found.
+    /// </param>
+    /// <returns>
+    /// A list filled with containers. Each container holds 3 elements: an <c>InventDimId</c> a quantity and a catch weight quantity
+    /// </returns>
+    public List pipBuildSampleDimensionQtyList(InventQty _quantityToSample, PdsCWInventQty _cwQuantityToSample)
+    {
+        InventQty       quantityToSample        = _quantityToSample;
+        PdsCWInventQty  cwInventTransQty;
+        PdsCWInventQty  cwInventTransQtyTemp;
+        PdsCWInventQty  cwQuantityToSample      = _cwQuantityToSample;
+        boolean         isCWItem                = PdsGlobal::pdsIsCWItem(this.parmReferenceType().itemId());
+        InventQty       minInventQty;
+        QueryRun        queryRun;
+        InventTrans     inventTrans;
+        InventQty       inventTransQty;
+        InventQty       inventTransQtyTemp;
+        InventDimId     inventDimIdTemp;
+        InventDim       inventDim;
+        InventDim       inventTransInventDim;
+        InventDimParm   inventDimParm;
+        List            result                  = new List(Types::Container);
+        List            resultTemp;
+        ListEnumerator  resultEnumerator;
+        Set             inventDimIdSet          = new Set(Types::String);
+    
+        // Get the query for inventory transactions related to the lot
+        queryRun = new QueryRun(this.parmReferenceType().queryInventTrans(this.parmDocumentStatus(), this.parmExecution(), inventItemSampling.DiscriminatingInventoryDimensions));
+    
+        inventDimParm.initFromInventDimFixed(inventItemSampling.DiscriminatingInventoryDimensions);
+    
+        if (isCWItem)
+        {
+            minInventQty = PdsCatchWeight::minInventQty(this.parmReferenceType().itemId(),1);
+        }
+        // Iterate all inventory transactions
+        while (queryRun.next() && (isCWItem ? cwQuantityToSample > 0 : quantityToSample > 0))
+        {
+            inventTrans             = queryRun.get(tableNum(InventTrans));
+            inventTransInventDim    = queryRun.get(tableNum(InventDim));
+    
+            // Merge basic lot dimensions with inventory transaction dimensions
+            inventDim       = InventDim::find(this.adjustedReferenceInventDimId());
+            inventDim.initFromInventDim(inventTransInventDim, inventDimParm.selectedDimFields());
+            inventDim       = InventDim::findOrCreate(inventDim);
+            inventTransQty  = min(abs(inventTrans.Qty), quantityToSample);
+    
+            if (isCWItem)
+            {
+                cwInventTransQty = min(abs(inventTrans.PdsCWQty), cwQuantityToSample);
+                // There can be inventory transactions that have 0 CW quantity (bacause of the reservation). They shouldn't be sampled.
+                if (cwInventTransQty == 0)
+                {
+                    continue;
+                }
+    
+                inventTransQty = max(inventTransQty, minInventQty);
+            }
+            else
+            {
+                cwInventTransQty = 0;
+            }
+    
+            if (inventDimIdSet.in(inventDim.InventDimId))
+            { // Dimension already seen - probably with other dates. Update the quantity, but keep order
+                resultTemp          = List::create(result.pack());
+                resultEnumerator    = resultTemp.getEnumerator();
+                result              = new List(Types::Container);
+                while (resultEnumerator.moveNext())
+                {
+                    [inventDimIdTemp, inventTransQtyTemp, cwInventTransQtyTemp] = resultEnumerator.current();
+                    if (inventDimIdTemp == inventDim.InventDimId)
+                    { // Adjust quantity for dimension
+                        inventTransQtyTemp      += inventTransQty;
+                        cwInventTransQtyTemp    += cwInventTransQty;
+                    }
+                    if (isCWItem ? cwInventTransQtyTemp != 0 : inventTransQtyTemp != 0)
+                    { // Insert in list  again with new quantity
+                        result.addEnd([inventDimIdTemp, inventTransQtyTemp, cwInventTransQtyTemp]);
+                    }
+                    else
+                    { // Don't insert in list, but also remove from set.
+                        inventDimIdSet.remove(inventDimIdTemp);
+                    }
+                }
+            }
+            else
+            {
+                result.addEnd([inventDim.InventDimId, inventTransQty, cwInventTransQty]);
+                inventDimIdSet.add(inventDim.InventDimId);
+            }
+    
+            quantityToSample    -= inventTransQty;
+            cwQuantityToSample  -= cwInventTransQty;
+        }
+    
+        if (isCWItem)
+        {
+            Debug::assert(cwQuantityToSample <= 0);
+        }
+        else
+        {
+            Debug::assert(quantityToSample <= 0);
+        }
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipInitFromFlexSamplingPlan</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns values to an <c>InventQualityOrderTable</c> record from a record in <c>PIPInventFlexSamplingPlanLines</c>
+    /// </summary>
+    /// <param name="_inventQualityOrderTable">
+    /// A record in the <c>InventQualityOrderTable</c> table.
+    /// </param>
+    /// <param name="_planLevel">
+    /// A record in the <c>PIPInventFlexSamplingPlanLines</c> table.
+    /// </param>
+    /// <returns>
+    /// A record in the <c>InventQualityOrderTable</c> table.
+    /// </returns>
+    private InventQualityOrderTable pipInitFromFlexSamplingPlan(InventQualityOrderTable _inventQualityOrderTable, PIPInventFlexSamplingPlanLines _planLevel)
+    {
+        _inventQualityOrderTable.PIPFlexibleSamplingPlanId   = _planLevel.FlexibleSamplingPlanId;
+        _inventQualityOrderTable.ItemSamplingId              = _planLevel.ItemSamplingId;
+        _inventQualityOrderTable.TestGroupId                 = _planLevel.TestGroupId;
+    
+        return _inventQualityOrderTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipShouldGenerateFromInventFlexSampling</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines whether a quality order needs to be generated based on the current state of asscoaited flexible sampling
+    ///     activities and skipping logic if applicable.
+    /// </summary>
+    /// <param name="_inventTestAssociationTable">
+    ///     The quality association to be used for determining quality order generation.
+    /// </param>
+    /// <returns>
+    ///     true if the quality order should be generated; otherwise false.
+    /// </returns>
+    protected boolean pipShouldGenerateFromInventFlexSampling(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        WrkCtrIdBase    wrkCtrId;
+        int             counter = 1;
+        List            dimensionQtyList;
+        boolean         ok;
+    
+        if (this.parmReferenceType().referenceType() == InventTestReferenceType::RouteOpr)
+        {
+            wrkCtrId = this.parmReferenceType().routeWrkCtrId();
+        }
+        else
+        {
+            wrkCtrId = _inventTestAssociationTable.WrkCtrRelation;
+        }
+    
+        ttsBegin;
+        if (PIPInventFlexSamplingPlanTable::findByPlanId(_inventTestAssociationTable.PIPFlexibleSamplingPlanId).Approved)
+        {
+            currentActivity = PIPInventFlexSamplingActivityTable::findOrCreateActivity(
+                _inventTestAssociationTable.PIPFlexibleSamplingPlanId,
+                _inventTestAssociationTable.OrderType,
+                this.parmReferenceType().accountRelation(),
+                this.parmReferenceType().itemId(),
+                wrkCtrId);
+    
+            inventFlexSamplingActivityCreate = PIPInventFlexSamplingActivityCreate::newFromActivityTable(currentActivity);
+            inventFlexSamplingActivityCreate.buildCurrentState();
+            inventFlexSamplingActivityCreate.initActivityDetail();
+    
+            flexSamplingPlanLevel = inventFlexSamplingActivityCreate.state().currentPlanLine();
+    
+            this.findInventItemSampling(flexSamplingPlanLevel.ItemSamplingId);
+    
+            if (this.isNonInvent())
+            {
+                dimensionQtyList = this.pipBuildSampleDimensionQtyList(this.parmUpdatedQuantity(), this.parmUpdatedCWQuantity());
+                registrationCount = dimensionQtyList.elements();
+            }
+    
+            if (registrationCount > 1 && flexSamplingPlanLevel.Skip)
+            {
+                inventFlexSamplingActivityCreate.parmRegistrationCount(registrationCount);
+                inventFlexSamplingActivityCreate.createActivitiesForMultipleOrders();
+    
+                ok = true;
+            }
+            else if (flexSamplingPlanLevel.Skip && !inventFlexSamplingActivityCreate.checkNeedToTest())
+            {
+                inventFlexSamplingActivityCreate.createActivityDetailSkip();
+                ok = false;
+            }
+            else
+            {
+                ok = true;
+            }
+        }
+        else
+        {
+            info("@PIP351");
+            info("@PIP352");
+            ok = false;
+        }
+    
+        ttsCommit;
+    
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isNonInvent</Name>
+				<Source><![CDATA[
+    public boolean isNonInvent()
+    {
+        return this is InventQualityMgmtCreateNonInvent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPIPRegistrationCount</Name>
+				<Source><![CDATA[
+    public int parmPIPRegistrationCount(int _registrationCount = registrationCount)
+    {
+        registrationCount = _registrationCount;
+    
+        return registrationCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkNeedToGenerateQualityOrders</Name>
+				<Source><![CDATA[
+    protected boolean checkNeedToGenerateQualityOrders(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        boolean ret = true;
+
+        InventItemSamplingId savedItemSamplingId = _inventTestAssociationTable.ItemSamplingId;
+        InventTestGroupId savedTestGroupId = _inventTestAssociationTable.TestGroupId;
+        if (_inventTestAssociationTable.PIPFlexibleSampling)
+        {
+            ret = this.pipShouldGenerateFromInventFlexSampling(_inventTestAssociationTable);
+
+            // Temporarily override ItemSamplingId and TestGroupId from the flexible sampling plan level
+            _inventTestAssociationTable.ItemSamplingId = flexSamplingPlanLevel.ItemSamplingId;
+            _inventTestAssociationTable.TestGroupId = flexSamplingPlanLevel.TestGroupId;
+        }
+
+        // If ret == false this really shouldn't call the base method but that's mandatory for CoC without the appropriate attribute
+        ret = next checkNeedToGenerateQualityOrders(_inventTestAssociationTable) && ret;
+    
+        // Restore the temporarily overridden field values
+        if (_inventTestAssociationTable.PIPFlexibleSampling)
+        {
+            _inventTestAssociationTable.ItemSamplingId = savedItemSamplingId;
+            _inventTestAssociationTable.TestGroupId = savedTestGroupId;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createQualityOrder</Name>
+				<Source><![CDATA[
+    protected void createQualityOrder(
+        InventTestAssociationTable  _inventTestAssociationTable,
+        InventQty                   _quantityToSample,
+        InventDimId                 _inventDimId,
+        PdsCWInventQty              _cwQuantityToSample)
+    {
+        next createQualityOrder(_inventTestAssociationTable, _quantityToSample, _inventDimId, _cwQuantityToSample);
+
+        if (_inventTestAssociationTable.PIPFlexibleSampling)
+        {
+            this.pipQualityOrderInserted(initializedInventQualityOrderTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeQualityOrder</Name>
+				<Source><![CDATA[
+    protected InventQualityOrderTable initializeQualityOrder(
+        InventTestAssociationTable  _inventTestAssociationTable,
+        InventQty                   _quantityToSample,
+        InventDimId                 _inventDimId,
+        PdsCWInventQty              _cwQuantityToSample)
+    {
+        InventItemSamplingId savedItemSamplingId = _inventTestAssociationTable.ItemSamplingId;
+        InventTestGroupId savedTestGroupId = _inventTestAssociationTable.TestGroupId;
+        if (_inventTestAssociationTable.PIPFlexibleSampling)
+        {
+            // Temporarily override ItemSamplingId and TestGroupId from the flexible sampling plan level
+            _inventTestAssociationTable.ItemSamplingId = flexSamplingPlanLevel.ItemSamplingId;
+            _inventTestAssociationTable.TestGroupId = flexSamplingPlanLevel.TestGroupId;
+        }
+        
+        InventQualityOrderTable inventQualityOrderTable = next initializeQualityOrder(_inventTestAssociationTable, _quantityToSample, _inventDimId, _cwQuantityToSample);
+    
+        // Restore the temporarily overridden field values
+        if (_inventTestAssociationTable.PIPFlexibleSampling)
+        {
+            this.pipInitFromFlexSamplingPlan(inventQualityOrderTable, this.flexSamplingPlanLevel);
+            
+            _inventTestAssociationTable.ItemSamplingId = savedItemSamplingId;
+            _inventTestAssociationTable.TestGroupId = savedTestGroupId;
+        }
+
+        initializedInventQualityOrderTable = inventQualityOrderTable;
+        
+        return inventQualityOrderTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipQualityOrderInserted</Name>
+				<Source><![CDATA[
+    private void pipQualityOrderInserted(InventQualityOrderTable inventQualityOrderTable)
+    {
+        if (registrationCount > 1)
+        {
+            // multiple quality orders with skipping
+            if (flexSamplingPlanLevel.Skip)
+            {
+                inventFlexSamplingActivityCreate.updateActivitiesForMultipleOrders(inventQualityOrderTable.QualityOrderId);
+            }
+            // multiple quality orders without skipping needs to be reconstructed
+            else
+            {
+                inventFlexSamplingActivityCreate.buildCurrentState();
+                inventFlexSamplingActivityCreate.initActivityDetail();
+                inventFlexSamplingActivityCreate.createActivityDetailNonSkip(inventQualityOrderTable);
+            }
+        }
+        else
+        {
+            inventFlexSamplingActivityCreate.createActivityDetailNonSkip(inventQualityOrderTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCreateQualityOrderForInventDim</Name>
+				<Source><![CDATA[
+    protected boolean mustCreateQualityOrderForInventDim(InventTestAssociationTable  _inventTestAssociationTable,
+                                                         InventQty                   _quantityToSample,
+                                                         InventDimId                 _inventDimId,
+                                                         PdsCWInventQty              _cwQuantityToSample)
+    {
+        boolean ret = next mustCreateQualityOrderForInventDim(_inventTestAssociationTable, _quantityToSample, _inventDimId, _cwQuantityToSample);
+
+        if (ret && inventFlexSamplingActivityCreate)
+        {
+            ret = !inventFlexSamplingActivityCreate.roundsToTestForMultipleGroups() || inventFlexSamplingActivityCreate.roundsToTestForMultipleGroups().in(testCounter);
+
+            if (inventFlexSamplingActivityCreate.roundsToTestForMultipleGroups())
+            {
+                testCounter++;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

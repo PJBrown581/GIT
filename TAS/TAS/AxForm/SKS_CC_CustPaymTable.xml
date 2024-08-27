@@ -1,0 +1,1956 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>SKS_CC_CustPaymTable</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+[Form]
+public class SKS_CC_CustPaymTable extends FormRun
+{
+    LedgerJournalTrans          ledgerJournalTrans;
+    SalesTable                  salesTable;
+    SMAServiceOrderTable        serviceOrderTable;
+    ProjProposalJour            projProposalJour;
+    ProjInvoiceJour             projInvoiceJour;
+    FormDataSource              callerDataSource;
+    CustAccount                 callerCustAccount;
+    CustTable                   custTableCaller;
+    boolean                     callerAllowEdit, callerAllowDelete;
+    boolean                     isPayFabricActiveProcessor;
+    boolean                     hasTransCaller;
+    boolean                     isShowAll;
+    boolean                     isSendEmailAllowed, isProcessTransAllowed;
+    boolean                     isAmountChangeAllowed;
+    boolean                     showAmountsGroup;
+    SKS_PP_Setup                sKS_PP_Setup;
+    LedgerJournalTable          ledgerJournalTableOneTimeCust;
+
+    [FormObservable]
+    AmountCur                   amountToCharge;
+    [FormObservable]
+    AmountCur                   amountCharged;
+    [FormObservable]
+    AmountCur                   amountPendingToCharge;
+    [FormObservable]
+    RefTableId                  callerRefTableId;
+    [FormObservable]
+    RefRecId                    callerRefRecId;
+    
+    
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayAmountToCharge</Name>
+				<Source><![CDATA[
+    public display AmountCur displayAmountToCharge()
+    {
+        return amountToCharge;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayAmountRemainingCharge</Name>
+				<Source><![CDATA[
+    public display AmountCur displayAmountRemainingCharge()
+    {
+        AmountCur               retAmount;
+        SKS_CC_CustPaymTable    custPaymTable;
+
+        if (!amountToCharge)
+        {
+            return 0;
+        }
+
+        if (callerRefTableId == tableNum(SMAServiceOrderTable))
+        {
+            if (amountToCharge)
+            {
+                if (!SKS_CC_CustPaymTable::hasApprovedAuthorization(callerRefTableId, callerRefRecId))
+                {
+                    retAmount = amountToCharge - amountPendingToCharge;
+                }
+                else
+                {
+                    select sum(CreditCardTransAmountCur) from custPaymTable
+                        where custPaymTable.RefTableId == callerRefTableId
+                           && custPaymTable.RefRecId == callerRefRecId
+                           && custPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Authorization
+                           && custPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::Approved
+                           && custPaymTable.ApprovalVoid == NoYes::No
+                           && custPaymTable.ApprovalExpired == NoYes::No;
+
+                    retAmount = amountToCharge - custPaymTable.CreditCardTransAmountCur;
+                }
+            }
+        }
+        else
+        {
+            retAmount = amountToCharge - amountCharged - amountPendingToCharge;
+        }
+
+        if (retAmount > 0 && amountToCharge < 0)
+        {
+            retAmount = 0;
+        }
+
+        if (retAmount < 0 && amountToCharge > 0)
+        {
+            retAmount = 0;
+        }
+
+        return retAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDataSourceEditOptionsFromCaller</Name>
+				<Source><![CDATA[
+    public void setDataSourceEditOptionsFromCaller(boolean _calledFromInit = false)
+    {
+        boolean hasPendingTrans, hasPendingPayLink;
+
+        SKS_CC_PaylinkBtnGrp.visible(sKS_PP_Setup.ModCC == NoYes::Yes && (sKS_PP_Setup.CCPLEnablePayLinks || sKS_PP_Setup.CCPLEnableWalletLinks));
+        
+        if (hasTransCaller)
+        {            
+            if (callerRefTableId == tableNum(LedgerJournalTrans))
+            {
+                if (ledgerJournalTrans.AmountCurCredit)
+                {
+                    if (SKS_CC_CustPaymTable::findPendingPayment(ledgerJournalTrans.TableId, ledgerJournalTrans.RecId))
+                    {
+                        hasPendingTrans = true;
+                    }
+                    else
+                    {
+                        hasPendingTrans = false;
+                    }
+                    hasPendingPayLink = SKS_CC_PayLinkQueue::journalLineHasPendingPayLink(ledgerJournalTrans);
+                }
+                SKS_CC_CustPaymTable_ds.allowCreate(callerAllowEdit && ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None &&
+                    !hasPendingPayLink);
+                SKS_CC_CustPaymTable_ds.allowEdit(callerAllowEdit &&
+                    SKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA &&
+                    ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None);
+                SKS_CC_CustPaymTable_ds.allowDelete(callerAllowDelete &&
+                    SKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA &&
+                    ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None);
+                SKS_CC_CustPaymTable_ds.object(fieldNum(SKS_CC_CustPaymTable, OrigAuthorizationForRefund)).allowEdit(
+                    SKS_CC_CustPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Refund &&
+                    ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None);
+                ProcessCaptureOrRefund.enabled(ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None && !hasPendingPayLink);
+
+                if (SKS_CC_PaylinkBtnGrp.visible())
+                {
+                    SKS_CC_SendCapturePayLink.enabled(callerAllowEdit && ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None
+                        && !hasPendingTrans && ledgerJournalTrans.AmountCurCredit && sKS_PP_Setup.CCPLEnablePayLinks
+                        && SKS_CC_CustPaymTable::getCreditCardAmountFromSource(ledgerJournalTrans.TableId,
+                                ledgerJournalTrans.RecId));
+
+                    SKS_CC_PayLinkQueueRefresh.enabled(callerAllowEdit && ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None
+                        && hasPendingPayLink && sKS_PP_Setup.CCPLEnablePayLinks);
+
+                    PendingPayLinkCtrl.visible(hasPendingPayLink);
+                    if (hasPendingPayLink)
+                    {
+                        PendingPayLinkCtrl.text("@SKS:SKGCCPayLinkPending");
+                    }
+                }
+            }
+            else
+            {
+                SKS_CC_CustPaymTable_ds.allowCreate(callerAllowEdit);
+                SKS_CC_CustPaymTable_ds.allowEdit(callerAllowEdit && SKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA);
+                SKS_CC_CustPaymTable_ds.allowDelete(callerAllowDelete && SKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA);
+                SKS_CC_CustPaymTable_ds.object(fieldNum(SKS_CC_CustPaymTable, OrigAuthorizationForRefund)).
+                    allowEdit(SKS_CC_CustPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Refund);
+
+                ProcessCaptureOrRefund.enabled(isProcessTransAllowed);                
+            }
+
+            SKS_CC_CustPaymTable_ds.object(fieldNum(SKS_CC_CustPaymTable, CreditCardTransAmountCur)).allowEdit(callerAllowEdit && isAmountChangeAllowed);
+        }
+        else
+        {
+            SKS_CC_CustPaymTable_ds.allowCreate(false);
+            SKS_CC_CustPaymTable_ds.allowEdit(false);
+            SKS_CC_CustPaymTable_ds.allowDelete(false);
+            if (_calledFromInit)
+            {
+                CreditCardCustRegister.needsRecord(1);
+            }
+
+            if (SKS_CC_PaylinkBtnGrp.visible())
+            {
+                SKS_CC_SendCapturePayLink.enabled(false);
+            }
+        }
+
+        if (!SKS_CC_CustPaymTable_ds.allowEdit() && _calledFromInit)
+        {
+            element.design().viewEditMode(ViewEditMode::View);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    public void init()
+    {
+        if (element.args())
+        {
+            switch (element.args().dataset())
+            {
+                case tableNum(LedgerJournalTrans):
+                    ledgerJournalTrans = element.args().record();
+                    callerCustAccount = ledgerJournalTrans.accountDisplay();
+                    if (!callerCustAccount)
+                    {
+                        throw error(strFmt("@SYS50104", fieldId2PName(ledgerJournalTrans.TableId, fieldNum(LedgerJournalTrans, LedgerDimension))));
+                    }
+
+                    if (!ledgerJournalTrans.amount())
+                    {
+                        throw error("@SKS6448");
+                    }
+
+                    if (!ledgerJournalTrans.PaymMode)
+                    {
+                        throw error("@SKS6449");
+                    }
+
+                    CustPaymModeTable paymModeTable = CustPaymModeTable::find(ledgerJournalTrans.PaymMode);
+                    if (paymModeTable.RecId)
+                    {
+                        if (paymModeTable.PaymentType != CustPaymentType::CreditCard)
+                        {
+                            throw error(strFmt("@SKS6450", enum2str(CustPaymentType::CreditCard)));
+                        }
+                        else
+                        {
+                            if (paymModeTable.PaymStatus != CustVendPaymStatus::Confirmed)
+                            {
+                                if (!SKS_CC_CustPaymTable::hasCreditCardPaymentRecord(ledgerJournalTrans.TableId, ledgerJournalTrans.RecId))
+                                {
+                                    throw error(strFmt("@SKS6453", enum2str(CustVendPaymStatus::Confirmed)));
+                                }
+                            }
+                        }
+                    }
+
+                    if (TradeFormHelper::isCalledFromForm(element.args(), formStr(LedgerJournalTransCustPaym)))
+                    {
+                        callerDataSource = element.args().record().dataSource();
+                    }
+                    else
+                    {
+                        throw error(strFmt("@SKS6454", formStr(LedgerJournalTransCustPaym)));
+                    }
+
+                    if (CustTable::find(callerCustAccount).OneTimeCustomer && SKS_PP_Setup::isCreditCardOneTimeCustLogicEnabled())
+                    {
+                        ledgerJournalTableOneTimeCust = ledgerJournalTrans.ledgerJournalTable();
+                    }
+                    break;
+            }
+        }
+
+        super();
+
+        AmountsGroup.visible(hasTransCaller && showAmountsGroup);
+        ProcessCaptureOrRefund.visible(hasTransCaller && isProcessTransAllowed);
+        SendEmailReceipt.visible(hasTransCaller && isSendEmailAllowed);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="">
+			<DataSource>
+				<Name>SKS_CC_CustPaymTable</Name>
+				<Methods>
+					<Method>
+						<Name>saveCurrentRecord</Name>
+						<Source><![CDATA[
+        public void saveCurrentRecord()
+        {
+            if (SKS_CC_CustPaymTable.CreditCardCustRefId && SKS_CC_CustPaymTable.CreditCardTransAmountCur)
+            {
+                SKS_CC_CustPaymTable_ds.write();
+            }
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>validateWrite</Name>
+						<Source><![CDATA[
+        public boolean validateWrite()
+        {
+            boolean ret;
+
+            ret =    super();
+
+            if (ret)
+            {
+                if ((SKS_CC_CustPaymTable.CreditCardTransAmountCur > 0 && amountToCharge < 0) ||
+                    (SKS_CC_CustPaymTable.CreditCardTransAmountCur < 0 && amountToCharge > 0))
+                {
+                    ret = checkFailed(strFmt("@SKS6460", SKS_CC_CustPaymTable.CreditCardTransAmountCur, amountToCharge));
+                }
+                else
+                {
+                    if (SKS_CC_CustPaymTable.RefTableId == tableNum(SMAServiceOrderTable) &&
+                        SKS_CC_CustPaymTable.CreditCardTransAmountCur < 0)
+                    {
+                        ret = checkFailed("@SKS6730");
+                    }
+                }
+            }
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+
+            ret = super();
+
+            element.setDataSourceEditOptionsFromCaller();
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>initValue</Name>
+						<Source><![CDATA[
+        public void initValue()
+        {
+            SKS_CC_CustPaymTable    custPaymTableCnt;
+            CreditCardCust          creditCardCustDefault;
+            ProjTable               projTable;
+
+            switch (element.args().dataset())
+            {
+                case tableNum(LedgerJournalTrans):
+                    if (ledgerJournalTrans)
+                    {
+                        if (SKS_CC_PayLinkQueue::journalLineHasPendingPayLink(ledgerJournalTrans))
+                        {
+                            throw error("@SKS:SKGCCPaymentMayNotBeCreatedDueToPayLink");
+                        }
+                    }
+                    break;
+            }
+
+            super();
+
+            SKS_CC_CustPaymTable.CustAccount = callerCustAccount;
+            switch (element.args().dataset())
+            {
+                case tableNum(LedgerJournalTrans):
+                    if (ledgerJournalTrans)
+                    {
+                        SKS_CC_CustPaymTable.CreditCardTransAmountCur = SKS_CC_CustPaymTable::getCreditCardAmountFromSource(ledgerJournalTrans.TableId,
+                                                                    ledgerJournalTrans.RecId);
+                        SKS_CC_CustPaymTable.CreditCardCurrency = ledgerJournalTrans.CurrencyCode;
+                        SKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::JournalLine;
+                        SKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Capture;
+                        SKS_CC_CustPaymTable.RefTableId = ledgerJournalTrans.TableId;
+                        SKS_CC_CustPaymTable.RefRecId = ledgerJournalTrans.RecId;
+                        SKS_CC_CustPaymTable.RefOriginId = ledgerJournalTrans.JournalNum;                        
+                    }
+                    break;
+                case tableNum(SalesTable):
+                    if (salesTable)
+                    {
+                        SKS_CC_CustPaymTable.CreditCardTransAmountCur = SKS_CC_CustPaymTable::getCreditCardAmountFromSource(salesTable.TableId,
+                                                                    salesTable.RecId);
+                        SKS_CC_CustPaymTable.CreditCardCurrency = salesTable.CurrencyCode;
+                        SKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::SalesOrder;
+                        SKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Authorization;
+                        SKS_CC_CustPaymTable.RefTableId = salesTable.TableId;
+                        SKS_CC_CustPaymTable.RefRecId = salesTable.RecId;
+                        SKS_CC_CustPaymTable.RefOriginId = salesTable.SalesId;
+                    }
+                    break;
+                case tableNum(SMAServiceOrderTable):
+                    if (serviceOrderTable)
+                    {
+                        projTable = ProjTable::find(serviceOrderTable.ProjId);
+                        SKS_CC_CustPaymTable.CreditCardTransAmountCur = SKS_CC_CustPaymTable::getCreditCardAmountFromSource(serviceOrderTable.TableId,
+                                                                                                                            serviceOrderTable.RecId);
+                        SKS_CC_CustPaymTable.CreditCardCurrency = projTable.projInvoice().CurrencyId;
+                        SKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::ProjServiceOrder;
+                        SKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Authorization;
+                        SKS_CC_CustPaymTable.RefTableId = serviceOrderTable.TableId;
+                        SKS_CC_CustPaymTable.RefRecId = serviceOrderTable.RecId;
+                        SKS_CC_CustPaymTable.RefOriginId = serviceOrderTable.ServiceOrderId;
+                    }
+                    break;
+                case tableNum(ProjProposalJour):
+                    if (projProposalJour)
+                    {
+                        SKS_CC_CustPaymTable.CreditCardTransAmountCur = SKS_CC_CustPaymTable::getCreditCardAmountFromSource(projProposalJour.TableId,
+                                                                                                                            projProposalJour.RecId);
+                        SKS_CC_CustPaymTable.CreditCardCurrency = projProposalJour.CurrencyId;
+                        SKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::InvoiceProposal;
+                        SKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Capture;
+                        SKS_CC_CustPaymTable.RefTableId = projProposalJour.TableId;
+                        SKS_CC_CustPaymTable.RefRecId = projProposalJour.RecId;
+                        SKS_CC_CustPaymTable.RefOriginId = projProposalJour.ProposalId;
+                    }
+                    break;
+            }
+
+            SKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::NA;
+            if (amountToCharge < 0)
+            {
+                SKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Refund;
+            }
+            SKS_CC_CustPaymTable.CreditCardTransStatusOrig = SKS_CC_CustPaymTable.CreditCardTransStatus;
+            SKS_CC_CustPaymTable.CreditCardTransTypeOrig = SKS_CC_CustPaymTable.CreditCardTransType;
+
+            if (ledgerJournalTableOneTimeCust)
+            {
+                creditCardCustDefault = CreditCardCust::sKS_CC_FindDefaultCardForCust(
+                    callerCustAccount,
+                    ledgerJournalTableOneTimeCust.TableId,
+                    ledgerJournalTableOneTimeCust.RecId);
+            }
+            else
+            {
+                creditCardCustDefault = CreditCardCust::sKS_CC_FindDefaultCardForCust(callerCustAccount);
+            }
+
+            if (creditCardCustDefault)
+            {
+                if (callerRefTableId == tableNum(LedgerJournalTrans))
+                {
+                    select RecId from custPaymTableCnt
+                        where custPaymTableCnt.RefTableId == SKS_CC_CustPaymTable.RefTableId
+                           && custPaymTableCnt.RefRecId == SKS_CC_CustPaymTable.RefRecId
+                           && custPaymTableCnt.CreditCardCustRefId == creditCardCustDefault.RecId
+                           && custPaymTableCnt.ApprovalVoid == NoYes::No
+                           && custPaymTableCnt.ApprovalExpired == NoYes::No
+                           && custPaymTableCnt.CreditCardTransStatus != CreditCardProcessorStatus::Declined;
+                }
+
+                if (!custPaymTableCnt.RecId)
+                {
+                    SKS_CC_CustPaymTable.CreditCardCustRefId = creditCardCustDefault.RecId;
+                    SKS_CC_CustPaymTable.CreditCardTypeName = creditCardCustDefault.CreditCardTypeName;
+
+                    SKS_CC_CustPaymTable_ds.saveCurrentRecord();
+                }
+            }
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>init</Name>
+						<Source><![CDATA[
+        public void init()
+        {
+            SMAStageTable           smaStageTable;
+            QueryBuildDataSource    qbdsCustPaymTable;
+            QueryBuildRange         qbrRefTableId, qbrRefRecId;
+            CreditCardCust          creditCardCustCaller;
+            SKS_CC_CustPaymTable    custPaymTableCallerLocal;
+            SMAServiceOrderTable    serviceOrderTableCallerLocal;
+            CreditCardAuthTrans     creditCardAuthTransForProjInv;
+
+            sKS_PP_Setup = SKS_PP_Setup::find();
+
+            super();            
+
+            isSendEmailAllowed = true;
+            isProcessTransAllowed = true;
+            isAmountChangeAllowed = true;
+            showAmountsGroup = true;
+
+            isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS6447");
+            }
+
+            if (element.args())
+            {
+                qbdsCustPaymTable = this.query().dataSourceTable(tableNum(SKS_CC_CustPaymTable));
+                qbdsCustPaymTable.addOrderByField(fieldNum(SKS_CC_CustPaymTable, RecId), SortOrder::Descending);
+                qbrRefTableId = qbdsCustPaymTable.addRange(fieldNum(SKS_CC_CustPaymTable, RefTableId));
+                qbrRefRecId = qbdsCustPaymTable.addRange(fieldNum(SKS_CC_CustPaymTable, RefRecId));
+
+                switch (element.args().dataset())
+                {
+                    case tableNum(LedgerJournalTrans):
+                        ledgerJournalTrans = element.args().record();
+                        callerCustAccount = ledgerJournalTrans.accountDisplay();
+                        callerAllowEdit = callerDataSource.allowEdit();
+                        callerAllowDelete = callerDataSource.allowDelete();
+                        qbrRefTableId.value(SysQuery::value(ledgerJournalTrans.TableId));
+                        qbrRefRecId.value(SysQuery::value(ledgerJournalTrans.RecId));
+                        hasTransCaller = true;
+                        break;
+                    case tableNum(SalesTable):
+                        salesTable = element.args().record();
+                        callerCustAccount = salesTable.CustAccount;
+                        if (TradeFormHelper::isCalledFromForm(element.args(), formStr(SalesTable)))
+                        {
+                            callerDataSource = element.args().record().dataSource();
+                        }
+                        else if (TradeFormHelper::isCalledFromForm(element.args(), formStr(SalesTableListPage)))
+                        {
+                            callerDataSource = element.args().record().dataSource();
+                        }
+                        else
+                        {
+                            throw error(strFmt("@SKS6454", formStr(SalesTable)));
+                        }
+
+                        callerAllowEdit = callerDataSource.allowEdit();
+                        callerAllowDelete = callerDataSource.allowDelete();
+                        qbrRefTableId.value(SysQuery::value(salesTable.TableId));
+                        qbrRefRecId.value(SysQuery::value(salesTable.RecId));
+                        hasTransCaller = true;
+                        break;
+                    case tableNum(SMAServiceOrderTable):
+                        serviceOrderTable = element.args().record();
+                        callerCustAccount = projTable::find(serviceOrderTable.ProjId).projInvoice().fundingSourceCustomerID();
+                        if (!callerCustAccount)
+                        {
+                            throw error(strFmt("@SKS6670", serviceOrderTable.ProjId));
+                        }
+
+                        if (sKS_PP_Setup.ModCC == NoYes::Yes &&
+                            sKS_PP_Setup.CCUseOneTimeCustomerLogic == NoYes::Yes &&
+                            CustTable::find(callerCustAccount).OneTimeCustomer)
+                        {
+                            throw error(strFmt("@SKS:SKGCCOneTimeCustSvcProjWarnMsg", callerCustAccount));
+                        }
+
+                        element.design().caption("@SKS6673");
+                        if (sKS_PP_Setup.ModCC == NoYes::Yes && sKS_PP_Setup.CCAllowCCProcFromSvcOrder == NoYes::Yes &&
+                            serviceOrderTable.SKS_CC_Payment && SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(serviceOrderTable.SKS_CC_Payment))
+                        {
+                            if (!sKS_PP_Setup.CCProjSvcOrderPaymMode)
+                            {
+                                throw error("@SKS6683");
+                            }
+
+                            smaStageTable = SMAStageTable::find(serviceOrderTable.StageId);
+                            if (smaStageTable.StageCanModify == NoYes::Yes)
+                            {
+                                callerAllowEdit = true;
+                            }
+
+                            if (smaStageTable.StageCanModify == NoYes::Yes)
+                            {
+                                callerAllowDelete = true;
+                            }
+
+                            if (sKS_PP_Setup.CCPreAuthorization == NoYes::No)
+                            {
+                                isProcessTransAllowed = false;
+                            }
+
+                            if (sKS_PP_Setup.CCAllowAmountChangeForSvcOrder == NoYes::No)
+                            {
+                                isAmountChangeAllowed = false;
+                            }
+                        }
+                        else
+                        {
+                            callerAllowEdit = false;
+                            callerAllowDelete = false;
+                            isProcessTransAllowed = false;
+                            isAmountChangeAllowed = false;
+                        }
+
+                        qbrRefTableId.value(SysQuery::value(serviceOrderTable.TableId));
+                        qbrRefRecId.value(SysQuery::value(serviceOrderTable.RecId));
+                        hasTransCaller = true;
+                        isSendEmailAllowed = false;
+                        break;
+                    case tableNum(ProjProposalJour):
+                        projProposalJour = element.args().record();
+                        callerCustAccount = projProposalJour.InvoiceAccount;
+                        if (!callerCustAccount)
+                        {
+                            throw error(strFmt("@SKS6699", projProposalJour.ProposalId));
+                        }
+
+                        if (sKS_PP_Setup.ModCC == NoYes::Yes &&
+                            sKS_PP_Setup.CCUseOneTimeCustomerLogic == NoYes::Yes &&
+                            CustTable::find(callerCustAccount).OneTimeCustomer)
+                        {
+                            throw error(strFmt("@SKS:SKGCCOneTimeCustSvcProjWarnMsg", callerCustAccount));
+                        }
+
+                        if (sKS_PP_Setup.ModCC == NoYes::Yes &&
+                            (sKS_PP_Setup.CCAllowCCProcFromSvcOrder == NoYes::Yes ||
+                             sKS_PP_Setup.CCAllowCCProcFromProjInvProposal == NoYes::Yes) &&
+                            projProposalJour.Payment && SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(projProposalJour.Payment))
+                        {
+                            if (!sKS_PP_Setup.CCProjSvcOrderPaymMode)
+                            {
+                                throw error("@SKS6683");
+                            }
+
+                            if (projProposalJour.LineProperty == ProjLinePropertyCode::Canceled     ||
+                                projProposalJour.LineProperty == ProjLinePropertyCode::PSASubmitted ||
+                                projProposalJour.LineProperty == ProjLinePropertyCode::Invoiced)
+                            {
+                                callerAllowEdit = false;
+                                callerAllowDelete = false;
+                                showAmountsGroup = false;
+                            }
+                            else
+                            {
+                                callerAllowEdit = true;
+                                callerAllowDelete = true;
+                            }
+                        }
+                        else
+                        {
+                            callerAllowEdit = false;
+                            callerAllowDelete = false;
+                            showAmountsGroup = false;
+                        }
+
+                        qbrRefTableId.value(SysQuery::value(projProposalJour.TableId));
+                        qbrRefRecId.value(SysQuery::value(projProposalJour.RecId));
+                        hasTransCaller = true;
+                        isSendEmailAllowed = false;
+                        isProcessTransAllowed = false;
+                        isAmountChangeAllowed = false;
+                        break;
+                    case tableNum(ProjInvoiceJour):
+                        projInvoiceJour = element.args().record();
+                        callerCustAccount = projInvoiceJour.InvoiceAccount;
+                        if (!callerCustAccount)
+                        {
+                            throw error(strFmt("@SKS6727", projInvoiceJour.ProjInvoiceId));
+                        }
+
+                        if (sKS_PP_Setup.ModCC == NoYes::Yes &&
+                            sKS_PP_Setup.CCUseOneTimeCustomerLogic == NoYes::Yes &&
+                            CustTable::find(callerCustAccount).OneTimeCustomer)
+                        {
+                            throw error(strFmt("@SKS:SKGCCOneTimeCustSvcProjWarnMsg", callerCustAccount));
+                        }
+
+                        // Try to find CreditCardAuthTrans record related to project invoice.
+                        // If found then set SKS_CC_CustPaymTable range on RecId of related record.
+                        if (projInvoiceJour.InvoiceAmount < 0)
+                        {
+                            creditCardAuthTransForProjInv = CreditCardAuthTrans::sKS_CC_findRefundByProjInvoice(projInvoiceJour.ProjInvoiceId);
+                        }
+                        else
+                        {
+                            creditCardAuthTransForProjInv = CreditCardAuthTrans::sKS_CC_findChargeByProjInvoice(projInvoiceJour.ProjInvoiceId);
+                        }
+
+                        if (creditCardAuthTransForProjInv)
+                        {
+                            if (creditCardAuthTransForProjInv.SKS_CC_CustPaymTable)
+                            {
+                                custPaymTableCallerLocal = SKS_CC_CustPaymTable::findByRecID(creditCardAuthTransForProjInv.SKS_CC_CustPaymTable);
+                                if (custPaymTableCallerLocal)
+                                {
+                                    qbdsCustPaymTable.addRange(fieldNum(SKS_CC_CustPaymTable, RecId)).value(SysQuery::value(custPaymTableCallerLocal.RecId));
+                                }
+                            }
+                        }
+
+                        // If no SKS_CC_CustPaymTable record found using the CreditCardAuthTrans related record
+                        // then attempt to find the link through the service order or proposal record.
+                        if (!custPaymTableCallerLocal)
+                        {
+                            if (projInvoiceJour.SKS_CC_ServiceOrderId)
+                            {
+                                serviceOrderTableCallerLocal = SMAServiceOrderTable::find(projInvoiceJour.SKS_CC_ServiceOrderId);
+                            }
+
+                            if (serviceOrderTableCallerLocal)
+                            {
+                                custPaymTableCallerLocal = SKS_CC_CustPaymTable::findApprovedCreditCardPayments(serviceOrderTableCallerLocal.TableId, serviceOrderTableCallerLocal.RecId);
+                                if (custPaymTableCallerLocal)
+                                {
+                                    qbdsCustPaymTable.addRange(fieldNum(SKS_CC_CustPaymTable, RecId)).value(SysQuery::value(custPaymTableCallerLocal.RecId));
+                                }
+                            }
+
+                            if (!custPaymTableCallerLocal)
+                            {
+                                if (projInvoiceJour.ProposalId)
+                                {
+                                    projProposalJour = ProjProposalJour::find(projInvoiceJour.ProposalId);
+                                    qbrRefTableId.value(SysQuery::value(projProposalJour.TableId));
+                                    qbrRefRecId.value(SysQuery::value(projProposalJour.RecId));
+                                }
+                                else
+                                {
+                                    // Since the caller could not be determined correctly then we want to
+                                    // set caller query range values to zero so that no records are displayed.
+                                    qbrRefTableId.value(SysQuery::value(0));
+                                    qbrRefRecId.value(SysQuery::value(0));
+                                }
+                            }
+                        }
+
+                        hasTransCaller = true;
+                        isSendEmailAllowed = false;
+                        isProcessTransAllowed = false;
+                        isAmountChangeAllowed = false;
+                        callerAllowEdit = false;
+                        callerAllowDelete = false;
+                        showAmountsGroup = false;
+                        break;
+                    case tableNum(CustTable):
+                        custTableCaller = element.args().record();
+                        callerCustAccount = custTableCaller.AccountNum;
+                        qbdsCustPaymTable.addRange(fieldNum(SKS_CC_CustPaymTable, CustAccount)).value(callerCustAccount);
+                        callerAllowEdit = false;
+                        callerAllowDelete = false;
+                        hasTransCaller = false;
+                        break;
+                    case tableNum(CreditCardCust):
+                        creditCardCustCaller = element.args().record();
+                        callerCustAccount = creditCardCustCaller.CustAccount;
+                        qbdsCustPaymTable.addRange(fieldNum(SKS_CC_CustPaymTable, CreditCardCustRefId)).value(SysQuery::value(creditCardCustCaller.RecId));
+                        callerAllowEdit = false;
+                        callerAllowDelete = false;
+                        hasTransCaller = false;
+                        break;
+                }
+
+                if (hasTransCaller)
+                {
+                    callerRefTableId = element.args().record().TableId;
+                    callerRefRecId = element.args().record().RecId;
+                    amountToCharge = SKS_CC_CustPaymTable::getCreditCardAmountToCharge(callerRefTableId, callerRefRecId);
+
+                    if (amountToCharge < 0)
+                    {
+                        displayAmountToCharge.label("@SKS6702");
+                        displayAmountCharged.label("@SKS6703");
+                        displayAmountPendingToCharge.label("@SKS6704");
+                        displayAmountRemainingCharge.label("@SKS6705");
+                    }
+                }
+            }
+            else
+            {
+                hasTransCaller = false;
+                callerAllowEdit = false;
+                callerAllowDelete = false;
+            }
+
+            if (callerCustAccount)
+            {
+                if (!custTableCaller)
+                {
+                    custTableCaller = CustTable::find(callerCustAccount);
+                }
+            }
+            else
+            {
+                isShowAll = true;
+            }
+
+            element.setDataSourceEditOptionsFromCaller(true);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayAmountPendingToCharge</Name>
+						<Source><![CDATA[
+        public display AmountCur displayAmountPendingToCharge(SKS_CC_CustPaymTable _sKS_CC_CustPaymTable)
+        {
+            SKS_CC_CustPaymTable    custPaymTable;
+
+            if (callerRefTableId == tableNum(SMAServiceOrderTable))
+            {
+                select sum(CreditCardTransAmountCur) from custPaymTable
+                    where custPaymTable.RefTableId == callerRefTableId
+                       && custPaymTable.RefRecId == callerRefRecId
+                       && custPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Authorization
+                       && custPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA
+                       && custPaymTable.ApprovalVoid == NoYes::No
+                       && custPaymTable.ApprovalExpired == NoYes::No;
+            }
+            else
+            {
+                select sum(CreditCardTransAmountCur) from custPaymTable
+                    where custPaymTable.RefTableId == callerRefTableId
+                       && custPaymTable.RefRecId == callerRefRecId
+                       && custPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA
+                       && custPaymTable.ApprovalVoid == NoYes::No
+                       && custPaymTable.ApprovalExpired == NoYes::No;
+            }
+
+            amountPendingToCharge = custPaymTable.CreditCardTransAmountCur;
+
+            return amountPendingToCharge;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayAmountCharged</Name>
+						<Source><![CDATA[
+        public display AmountCur displayAmountCharged(SKS_CC_CustPaymTable _sKS_CC_CustPaymTable)
+        {
+            SKS_CC_CustPaymTable    custPaymTable;
+
+            select sum(CreditCardTransAmountCur) from custPaymTable
+                where custPaymTable.RefTableId == callerRefTableId
+                   && custPaymTable.RefRecId == callerRefRecId
+                   && (custPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::Approved ||
+                       custPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::Settled)
+                   && custPaymTable.ApprovalVoid == NoYes::No
+                   && custPaymTable.ApprovalExpired == NoYes::No;
+
+            amountCharged = custPaymTable.CreditCardTransAmountCur;
+
+            return amountCharged;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>delete</Name>
+						<Source><![CDATA[
+        public void delete()
+        {
+            super();
+
+            SKS_CC_CustPaymTable_ds.displayAmountPendingToCharge(SKS_CC_CustPaymTable);
+            element.displayAmountRemainingCharge();
+            displayAmountRemainingCharge.update();
+            element.setDataSourceEditOptionsFromCaller();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>validateDelete</Name>
+						<Source><![CDATA[
+        public boolean validateDelete()
+        {
+            boolean ret;
+        
+            ret = super();
+
+            if (ret)
+            {
+                if (callerAllowDelete && SKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::NA)
+                {
+                    ret = true;
+                }
+                else
+                {
+                    ret = false;
+                }
+            }
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>create</Name>
+						<Source><![CDATA[
+        public void create(boolean _append = false)
+        {
+            SMAServiceOrderTable    serviceOrderTableInvPropRel;
+            SKS_CC_CustPaymTable    custPaymTableSvcOrderRel;
+            Set                     serviceOrdersToVoidSet;
+
+            if (callerRefTableId == tableNum(SMAServiceOrderTable))
+            {
+                // Validate that new line can be added
+                if (SKS_CC_CustPaymTable::hasPendingOrApprovedAuthorization(callerRefTableId, callerRefRecId))
+                {
+                    throw warning("@SKS6672");
+                }
+
+                if (!amountToCharge && sKS_PP_Setup.CCAllowAmountChangeForSvcOrder == NoYes::No)
+                {
+                    throw warning("@SKS6686");
+                }
+
+                if (amountToCharge < 0)
+                {
+                    throw warning("@SKS6730");
+                }
+            }
+            else if (callerRefTableId == tableNum(ProjProposalJour))
+            {
+                if (!amountToCharge)
+                {
+                    throw warning("@SKS6686");
+                }
+
+                // Validate that new line can be added
+                if (SKS_CC_CustPaymTable::hasPendingOrApprovedPayment(callerRefTableId, callerRefRecId))
+                {
+                    throw warning("@SKS6701");
+                }
+
+                if (projProposalJour.SKS_CC_ServiceOrderId &&
+                    SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(projProposalJour.Payment))
+                {
+                    serviceOrderTableInvPropRel = SMAServiceOrderTable::find(projProposalJour.SKS_CC_ServiceOrderId);
+                    if (serviceOrderTableInvPropRel)
+                    {
+                        custPaymTableSvcOrderRel = SKS_CC_CustPaymTable::findCCPaymWithApprovedAuthorization(serviceOrderTableInvPropRel.TableId, serviceOrderTableInvPropRel.RecId);
+                        if (custPaymTableSvcOrderRel)
+                        {
+                            // Has an approved authorization on a related service order.
+                            if (Box::okCancel(strFmt("@SKS6706", '\n', projProposalJour.SKS_CC_ServiceOrderId), DialogButton::Cancel, "@SKS6691") == DialogButton::Cancel)
+                            {
+                                return;
+                            }
+
+                            serviceOrdersToVoidSet = new Set(Types::String);
+                            serviceOrdersToVoidSet.add(serviceOrderTableInvPropRel.ServiceOrderId);
+
+                            SKS_CC_CustPaymTable::voidServiceOrderAuthorization(serviceOrdersToVoidSet);
+                        }
+
+                        if (SKS_CC_CustPaymTable::hasPendingAuthorization(serviceOrderTableInvPropRel.TableId, serviceOrderTableInvPropRel.RecId))
+                        {
+                            // Has a service order with a credit card specified on it.
+                            if (Box::okCancel(strFmt("@SKS6707", '\n', projProposalJour.SKS_CC_ServiceOrderId), DialogButton::Cancel, "@SKS6708") == DialogButton::Cancel)
+                            {
+                                return;
+                            }
+
+                            SKS_CC_CustPaymTable::delete_CC_CustPaymTable(
+                                serviceOrderTableInvPropRel.TableId,
+                                serviceOrderTableInvPropRel.RecId,
+                                SKS_CC_CreditCardTransType::Authorization,
+                                CreditCardProcessorStatus::NA,
+                                false);
+                        }
+                    }
+                }
+            }
+
+            super(_append);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>CreditCardTransAmountCur</DataField>
+						<Methods>
+							<Method>
+								<Name>modified</Name>
+								<Source><![CDATA[
+            public void modified()
+            {
+                super();
+
+                SKS_CC_CustPaymTable_ds.saveCurrentRecord();
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+					<Field>
+						<DataField>OrigAuthorizationForRefund</DataField>
+						<Methods>
+							<Method>
+								<Name>lookup</Name>
+								<Source><![CDATA[
+            public void lookup(FormControl _formControl, str _filterStr)
+            {
+                if (SKS_CC_CustPaymTable.CreditCardCustRefId)
+                {
+                    SKS_CC_CustPaymTable::lookupOrigCaptureAuthTrans(_formControl,
+                                                         SKS_CC_CustPaymTable.CreditCardCustRefId,
+                                                         SKS_CC_CustPaymTable.CreditCardCurrency);
+                }
+                else
+                {
+                    super(_formControl, _filterStr);
+                }
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+		</DataSources>
+		<DataControls xmlns="">
+			<Control>
+				<Name>CreditCardCustRegister</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            const str constSKS_CC_CustPaymTable = 'SKS_CC_CustPaymTable';
+            MenuFunction menuFunction;
+            Args args = new Args();
+
+            menuFunction = new MenuFunction(menuitemDisplayStr(CreditCardCust), MenuItemType::Display);
+            if (isShowAll && SKS_CC_CustPaymTable.CustAccount)
+            {
+                custTableCaller = CustTable::find(SKS_CC_CustPaymTable.CustAccount);                
+                args.parm(constSKS_CC_CustPaymTable);
+            }
+
+            if (!custTableCaller)
+            {
+                if (SKS_CC_CustPaymTable.CustAccount)
+                {
+                    custTableCaller = CustTable::find(SKS_CC_CustPaymTable.CustAccount);
+                }
+                else
+                {
+                    if (callerCustAccount)
+                    {
+                        custTableCaller = CustTable::find(callerCustAccount);
+                    }
+                }
+            }
+
+            if (ledgerJournalTableOneTimeCust)
+            {
+                args.parm(int642Str(ledgerJournalTableOneTimeCust.RecId));
+            }
+            
+            args.record(custTableCaller);
+            args.caller(element);            
+            menuFunction.run(args);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>CreditCardAuthTrans</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            if (!SKS_CC_CustPaymTable.RecId)
+            {
+                return;
+            }
+            else
+            {
+                SKS_CC_CustPaymTable_ds.write();
+            }
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>ProcessCaptureOrRefund</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            if (!SKS_CC_CustPaymTable.RecId)
+            {
+                if ((SKS_CC_CustPaymTable.CreditCardCustRefId && SKS_CC_CustPaymTable.CreditCardTransAmountCur) ||
+                    SKS_CC_CustPaymTable.CustAccount)
+                {
+                    SKS_CC_CustPaymTable_ds.write();
+                }
+                else
+                {
+                    return;
+                }
+            }
+            else
+            {
+                SKS_CC_CustPaymTable_ds.write();
+            }
+
+            super();
+
+            if (callerDataSource)
+            {
+                callerDataSource.research(true);
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SendEmailReceipt</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            if (!SKS_CC_CustPaymTable.RecId)
+            {
+                return;
+            }
+            else
+            {
+                SKS_CC_CustPaymTable_ds.write();
+            }
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SKS_CC_SendCapturePayLink</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        /// <summary>
+        ///
+        /// </summary>
+        public void clicked()
+        {
+            Args args = new Args();
+            if (ledgerJournalTrans)
+            {
+                args.record(ledgerJournalTrans);
+            }
+        
+            args.caller(element);
+            MenuFunction menuFunction;
+            menuFunction = new MenuFunction(menuitemActionStr(SKS_CC_SendCapturePayLink), MenuItemType::Action);
+            menuFunction.run(args);
+            element.setDataSourceEditOptionsFromCaller(false);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SKS_CC_PayLinkQueue</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            Args args = new Args();
+            if (ledgerJournalTrans)
+            {
+                args.record(ledgerJournalTrans);
+            }            
+        
+            args.caller(element);
+            MenuFunction menuFunction;
+            menuFunction = new MenuFunction(menuitemDisplayStr(SKS_CC_PayLinkQueue), MenuItemType::Display);
+            menuFunction.run(args);
+            element.setDataSourceEditOptionsFromCaller(false);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SKS_CC_PayLinkQueueRefresh</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            if (ledgerJournalTrans)
+            {
+                SKS_CC_PayLinkQueue payLinkQueueSKS = SKS_CC_PayLinkQueue::getJournalLinePendingPayLink(ledgerJournalTrans);
+                if (payLinkQueueSKS)
+                {
+                    Args argsSKSLoc = new Args();
+                    
+                    argsSKSLoc.record(payLinkQueueSKS);
+                    argsSKSLoc.caller(this);
+
+                    MenuFunction menuFunction;
+                    menuFunction = new MenuFunction(menuitemActionStr(SKS_CC_PayLinkQueueRefresh), MenuItemType::Action);
+                    menuFunction.run(argsSKSLoc);                    
+                    SKS_CC_CustPaymTable_ds.research();
+                }                
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>EditCreditCard</Name>
+				<Type>String</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+
+            ret = super();
+
+            SKS_CC_CustPaymTable_ds.saveCurrentRecord();
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>lookup</Name>
+						<Source><![CDATA[
+        public void lookup()
+        {
+            if (ledgerJournalTableOneTimeCust)
+            {
+                CreditCardCust::sKS_CC_lookupCreditCard(this,
+                    SKS_CC_CustPaymTable.CustAccount,
+                    SKS_CC_CustPaymTable.CreditCardCustRefId,
+                    ledgerJournalTableOneTimeCust);
+            }
+            else
+            {
+                CreditCardCust::lookupCreditCard(
+                    this,
+                    SKS_CC_CustPaymTable.CustAccount,
+                    SKS_CC_CustPaymTable.CreditCardCustRefId);
+            }
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>validate</Name>
+						<Source><![CDATA[
+        public boolean validate()
+        {
+            boolean ret;        
+
+            ret = super();
+
+            if (ret && ledgerJournalTableOneTimeCust)
+            {
+                ret = CreditCardCust::sKS_CC_IsValidCreditCardForOneTimeCust(
+                    ledgerJournalTableOneTimeCust,
+                    callerCustAccount,
+                    SKS_CC_CustPaymTable.CreditCardCustRefId);
+
+                if (!ret)
+                {
+                    ret = checkFailed(strFmt("@SKS:SKGCCOneTimeCustCCNotFound",
+                        this.text(), fieldNum(SKS_CC_CustPaymTable, CreditCardCustRefId), tableNum(CreditCardCust), callerCustAccount));
+                }
+            }
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources>
+		<AxFormDataSource xmlns="">
+			<Name>SKS_CC_CustPaymTable</Name>
+			<Table>SKS_CC_CustPaymTable</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>ApprovalCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ApprovalCodeOrig</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ApprovalExpired</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ApprovalVoid</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ApprovedDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ApprovedDateTimeOrig</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AuthorizationCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AuthorizationCodeOrig</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreatedBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreatedDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardCurrency</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardCustRefId</DataField>
+					<Mandatory>Yes</Mandatory>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransAmountCur</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransAmountCurOrig</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransOrigin</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransStatus</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransStatusOrig</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTransTypeOrig</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardTypeName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustAccount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IsPaymentReversal</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ModifiedBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ModifiedDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>OrigAuthorizationForRefund</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RefOriginId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RefRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RefTableId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+	</DataSources>
+	<Design>
+		<Caption xmlns="">@SKS6529</Caption>
+		<DataSource xmlns="">SKS_CC_CustPaymTable</DataSource>
+		<Pattern xmlns="">Task</Pattern>
+		<PatternVersion xmlns="">1.2</PatternVersion>
+		<TitleDataSource xmlns="">SKS_CC_CustPaymTable</TitleDataSource>
+		<ViewEditMode xmlns="">Edit</ViewEditMode>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormActionPaneControl">
+				<Name>ActionPane</Name>
+				<HeightMode>Auto</HeightMode>
+				<Type>ActionPane</Type>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormActionPaneTabControl">
+						<Name>ActionPaneTab</Name>
+						<HeightMode>Auto</HeightMode>
+						<Type>ActionPaneTab</Type>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonGroupControl">
+								<Name>ButtonGroup</Name>
+								<HeightMode>Auto</HeightMode>
+								<Type>ButtonGroup</Type>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>CreditCardCustRegister</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<MenuItemName>CreditCardCust</MenuItemName>
+										<MultiSelect>No</MultiSelect>
+										<Text>@SYS316457</Text>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>CreditCardAuthTrans</Name>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<MenuItemName>CreditCardAuthTrans</MenuItemName>
+										<MultiSelect>No</MultiSelect>
+										<NeedsRecord>Yes</NeedsRecord>
+										<Text>@SYS317472</Text>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>ProcessCaptureOrRefund</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<AutoRefreshData>Yes</AutoRefreshData>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<MenuItemName>SKS_CC_ProcessCapture</MenuItemName>
+										<MenuItemType>Action</MenuItemType>
+										<MultiSelect>No</MultiSelect>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>SendEmailReceipt</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<AutoRefreshData>Yes</AutoRefreshData>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<MenuItemName>SKS_CC_SendEmailReceipt</MenuItemName>
+										<MenuItemType>Action</MenuItemType>
+										<MultiSelect>No</MultiSelect>
+										<NeedsRecord>Yes</NeedsRecord>
+									</AxFormControl>
+								</Controls>
+								<ArrangeMethod>Vertical</ArrangeMethod>
+								<Caption>@SYS327526</Caption>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonGroupControl">
+								<Name>SKS_CC_PaylinkBtnGrp</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<Type>ButtonGroup</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>SKS_CC_SendCapturePayLink</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<AutoRefreshData>Yes</AutoRefreshData>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<MenuItemName>SKS_CC_SendCapturePayLink</MenuItemName>
+										<MenuItemType>Action</MenuItemType>
+										<MultiSelect>No</MultiSelect>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>SKS_CC_PayLinkQueue</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<MenuItemName>SKS_CC_PayLinkQueue</MenuItemName>
+										<MultiSelect>No</MultiSelect>
+										<Text>@SKS:SKGCCPayLinkQueue</Text>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormButtonControl">
+										<Name>SKS_CC_PayLinkQueueRefresh</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<NeededPermission>Create</NeededPermission>
+										<Type>Button</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<AutoRefreshData>Yes</AutoRefreshData>
+										<MultiSelect>No</MultiSelect>
+										<Text>@SKS:SKGCCRefreshPayLink</Text>
+									</AxFormControl>
+								</Controls>
+								<ArrangeMethod>Vertical</ArrangeMethod>
+								<Caption>@SKS3944</Caption>
+								<DataSource>SKS_CC_CustPaymTable</DataSource>
+							</AxFormControl>
+						</Controls>
+						<Caption>@SKS6673</Caption>
+					</AxFormControl>
+				</Controls>
+				<DataSource>SKS_CC_CustPaymTable</DataSource>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>HasPendingPayLinkGroup</Name>
+				<Pattern>CustomFilters</Pattern>
+				<PatternVersion>1.1</PatternVersion>
+				<Type>Group</Type>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormGroupControl">
+						<Name>PendingPayLinkGroup</Name>
+						<Type>Group</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>PendingPayLinkCtrl</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<Skip>Yes</Skip>
+								<Type>String</Type>
+								<Visible>No</Visible>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>String20</ExtendedDataType>
+								<ShowLabel>No</ShowLabel>
+								<ViewEditMode>View</ViewEditMode>
+							</AxFormControl>
+						</Controls>
+					</AxFormControl>
+				</Controls>
+				<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+				<FrameType>None</FrameType>
+				<Style>CustomFilter</Style>
+				<ViewEditMode>Edit</ViewEditMode>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormTabControl">
+				<Name>Tab</Name>
+				<Type>Tab</Type>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>Overview</Name>
+						<Pattern>ToolbarList</Pattern>
+						<PatternVersion>1.2</PatternVersion>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormGridControl">
+								<Name>OverviewGrid</Name>
+								<Type>Grid</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>EditCreditCard</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataMethod>editCreditCard</DataMethod>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>SKS_CC_CustPaymTable_CreditCardTransAmountCur</Name>
+										<Type>Real</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransAmountCur</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CC_CustPaymTable_OrigAuthorizationForRefund</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>OrigAuthorizationForRefund</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CC_CustPaymTable_CreditCardCurrency</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardCurrency</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CC_CustPaymTable_CustAccount</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CustAccount</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CC_CustPaymTable_CreditCardTypeName</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTypeName</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>SKS_CC_CustPaymTable_CreditCardTransType</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransType</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>SKS_CC_CustPaymTable_CreditCardTransStatus</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransStatus</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>SKS_CC_CustPaymTable_ApprovalVoid</Name>
+										<Type>CheckBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ApprovalVoid</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>SKS_CC_CustPaymTable_ApprovalExpired</Name>
+										<Type>CheckBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ApprovalExpired</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>SKS_CC_CustPaymTable_CreditCardTransOrigin</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransOrigin</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CC_CustPaymTable_AuthorizationCode</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>AuthorizationCode</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CC_CustPaymTable_ApprovalCode</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ApprovalCode</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateTimeControl">
+										<Name>SKS_CC_CustPaymTable_ApprovedDateTime</Name>
+										<Type>DateTime</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ApprovedDateTime</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>SKS_CC_CustPaymTable_IsPaymentReversal</Name>
+										<Type>CheckBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>IsPaymentReversal</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+								</Controls>
+								<DataSource>SKS_CC_CustPaymTable</DataSource>
+							</AxFormControl>
+						</Controls>
+						<Caption>@SYS6188</Caption>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>General</Name>
+						<Pattern>FieldsFieldGroups</Pattern>
+						<PatternVersion>1.1</PatternVersion>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>Reference</Name>
+								<Type>Group</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>Reference_CreditCardTransOrigin</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransOrigin</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>Reference_RefOriginId</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>RefOriginId</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+								</Controls>
+								<DataGroup>Reference</DataGroup>
+								<DataSource>SKS_CC_CustPaymTable</DataSource>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>OriginalTransInfo</Name>
+								<Type>Group</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>OriginalTransInfo_CreditCardTransTypeOrig</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransTypeOrig</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>OriginalTransInfo_CreditCardTransStatusOrig</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransStatusOrig</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateTimeControl">
+										<Name>OriginalTransInfo_ApprovedDateTimeOrig</Name>
+										<Type>DateTime</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ApprovedDateTimeOrig</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>OriginalTransInfo_AuthorizationCodeOrig</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>AuthorizationCodeOrig</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>OriginalTransInfo_ApprovalCodeOrig</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ApprovalCodeOrig</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>OriginalTransInfo_CreditCardTransAmountCurOrig</Name>
+										<Type>Real</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CreditCardTransAmountCurOrig</DataField>
+										<DataSource>SKS_CC_CustPaymTable</DataSource>
+									</AxFormControl>
+								</Controls>
+								<DataGroup>OriginalTransInfo</DataGroup>
+								<DataSource>SKS_CC_CustPaymTable</DataSource>
+							</AxFormControl>
+						</Controls>
+						<ColumnsMode>Fill</ColumnsMode>
+						<Caption>@SYS35893</Caption>
+						<DataSource>SKS_CC_CustPaymTable</DataSource>
+					</AxFormControl>
+				</Controls>
+				<ArrangeMethod>Vertical</ArrangeMethod>
+				<DataSource>SKS_CC_CustPaymTable</DataSource>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>AmountsGroup</Name>
+				<AllowEdit>No</AllowEdit>
+				<AutoDeclaration>Yes</AutoDeclaration>
+				<Pattern>FieldsFieldGroups</Pattern>
+				<PatternVersion>1.1</PatternVersion>
+				<Type>Group</Type>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormRealControl">
+						<Name>displayAmountToCharge</Name>
+						<AllowEdit>No</AllowEdit>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>Real</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<CacheDataMethod>Yes</CacheDataMethod>
+						<DataMethod>displayAmountToCharge</DataMethod>
+						<Label>@SKS6459</Label>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormRealControl">
+						<Name>displayAmountCharged</Name>
+						<AllowEdit>No</AllowEdit>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>Real</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<CacheDataMethod>No</CacheDataMethod>
+						<DataMethod>displayAmountCharged</DataMethod>
+						<DataSource>SKS_CC_CustPaymTable</DataSource>
+						<Label>@SKS6456</Label>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormRealControl">
+						<Name>displayAmountPendingToCharge</Name>
+						<AllowEdit>No</AllowEdit>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>Real</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<CacheDataMethod>No</CacheDataMethod>
+						<DataMethod>displayAmountPendingToCharge</DataMethod>
+						<DataSource>SKS_CC_CustPaymTable</DataSource>
+						<Label>@SKS6457</Label>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormRealControl">
+						<Name>displayAmountRemainingCharge</Name>
+						<AllowEdit>No</AllowEdit>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>Real</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<CacheDataMethod>No</CacheDataMethod>
+						<DataMethod>displayAmountRemainingCharge</DataMethod>
+						<Label>@SKS6458</Label>
+					</AxFormControl>
+				</Controls>
+				<ColumnsMode>Fill</ColumnsMode>
+				<DataSource>SKS_CC_CustPaymTable</DataSource>
+				<FrameType>None</FrameType>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

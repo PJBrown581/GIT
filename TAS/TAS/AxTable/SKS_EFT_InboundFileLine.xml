@@ -1,0 +1,595 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_InboundFileLine</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class SKS_EFT_InboundFileLine extends common
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>update</Name>
+				<Source><![CDATA[
+    public void update()
+    {
+        SKS_EFT_FileDetail  sks_eft_filedetail;
+        SKS_EFT_InboundFile lSKS_EFT_InboundFile;
+        SKS_EFT_InboundTransCompletion  lSKS_EFT_InboundTransCompletion;
+        SKS_EFT_InboundStatuses lSKS_EFT_InboundStatuses;
+        SKS_EFT_InboundFileLine this_orig = this.orig();
+    
+    
+        ttsBegin;
+    
+        if(this_orig.FileDetailRecId != this.FileDetailRecId)
+        {
+            select firstonly forUpdate SKS_EFT_FileDetail where SKS_EFT_FileDetail.recid == this.filedetailrecid;
+    
+            if(sks_eft_filedetail)
+            {
+                sks_eft_filedetail.InboundStatusesRecId = this.InboundStatusesRecId;
+    
+                sks_eft_filedetail.update();
+    
+                select firstonly inboundfilegroupid, inboundformatid from lsks_eft_inboundfile where lSKS_EFT_InboundFile.InboundFileNbr == this.InboundFileNbr;
+    
+                if(lSKS_EFT_InboundFile)
+                {
+                    select firstonly recid from lsks_eft_inboundstatuses where lSKS_EFT_InboundStatuses.statusid == this.statusid
+                        && lSKS_EFT_InboundStatuses.StatusType == sks_eft_InboundStatusType::transaction
+                        && lSKS_EFT_InboundStatuses.FormatId == lSKS_EFT_InboundFile.InboundFormatId;
+    
+                    if(lSKS_EFT_InboundStatuses)
+                    {
+                        select firstonly paymentjournalstatus from lSKS_EFT_InboundTransCompletion
+                            where lSKS_EFT_InboundTransCompletion.InboundFileGroupId == lsks_eft_inboundfile.InboundFileGroupId
+                                && lSKS_EFT_InboundTransCompletion.InboundStatusRecID == lsks_eft_inboundstatuses.RecId;
+    
+                        if(lSKS_EFT_InboundTransCompletion)
+                        {
+                            this.updatepaymentjournalLines(sks_eft_filedetail, lSKS_EFT_InboundTransCompletion.paymentJournalstatus);
+                        }
+                    }
+                }
+    
+            }
+        }
+    
+        super();
+
+        if(this_orig.FileDetailRecId != this.FileDetailRecId)
+        {
+            SKS_EFT_RF::AssignInboundFieldsToLedgerJournalTable(SKS_EFT_FileDetail, this.RecId);        //SKS_VSTS_14632
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatepaymentjournalLines</Name>
+				<Source><![CDATA[
+    public void updatepaymentjournalLines(SKS_EFT_FileDetail lSKS_EFT_FileDetail, sks_eft_paymentjournalstatus paymentjournalstatus)
+    {
+        LedgerJournalTrans lLedgerJournalTrans;
+        LedgerJournalTable  lLedgerJournalTable;
+        SKS_EFT_InboundFile lSKS_EFT_InboundFile;
+        SKS_EFT_InboundFileLine lSKS_EFT_InboundFileLine;
+        SKS_EFT_FileDetail lOutbound_FileLine;
+        SKS_CustVendPaymReconciliationSetStatus locSKS_CustVendPaymReconciliationSetStatus;
+    
+        ttsBegin;
+    
+        // If it is already rejected, just write history record, no payment journal to update
+        if ( lSKS_EFT_FileDetail.PaymentRejected)
+        {
+            SKS_EFT_Processing::createFileHistory(SKS_EFT_ActionHistory::RejectedRejected,lSKS_EFT_FileDetail.FileRecId, this.InboundFileNbr,
+                                                            strFmt("@SKS2922", lLedgerJournalTrans.Voucher,lLedgerJournalTrans.PaymReference),lLedgerJournalTrans.JournalNum);
+        }
+        else
+        {
+            
+            changecompany(lSKS_EFT_FileDetail.PaymentCompany ? lSKS_EFT_FileDetail.PaymentCompany : lSKS_EFT_FileDetail.DataAreaId)// SKS_FDD_10590
+            {
+                lLedgerJournalTrans = null;
+                lLedgerJournalTable = null;
+
+                select forupdate PaymentStatus, Voucher, PaymReference from lLedgerJournalTrans
+                    where lLedgerJournalTrans.RecId == lSKS_EFT_FileDetail.PaymentLineRecId
+                join JournalNum, Posted from lLedgerJournalTable
+                    where  lledgerJournalTable.JournalNum == lledgerJournalTrans.JournalNum;    
+            }
+            
+            if(lLedgerJournalTrans)
+            {
+                if(paymentjournalstatus == SKS_EFT_PaymentJournalStatus::Approved)
+                {
+                    if (!lLedgerJournalTable.Posted && lLedgerJournalTrans.PaymentStatus != CustVendPaymStatus::Confirmed)
+                    {
+                        changecompany(lSKS_EFT_FileDetail.PaymentCompany ? lSKS_EFT_FileDetail.PaymentCompany : lSKS_EFT_FileDetail.DataAreaId) // SKS_FDD_10590
+                        {
+                            lLedgerJournalTrans.PaymentStatus = CustVendPaymStatus::Confirmed;
+                            lLedgerJournalTrans.update();
+                        }
+                    }
+                    this.Action = SKS_EFT_InboundPossibleActions::Approved;
+                    
+                    //updated outbound line API Response status.
+                    update_recordset lOutbound_FileLine setting APIResponseStatus = SKS_EFT_APIResponseType::Success
+                        where lOutbound_FileLine.RecId == this.FileDetailRecId;
+                    // if this is the last line approved then update SKS_EFT_Inbound File summary status to AllApproved
+                    select firstonly recid from lSKS_EFT_InboundFileLine
+                        where lSKS_EFT_InboundFileLine.InboundFileNbr == this.InboundFileNbr
+                            && lSKS_EFT_InboundFileLine.RecId != this.RecId
+                            && lSKS_EFT_InboundFileLine.Action != SKS_EFT_InboundPossibleActions::Approved;
+                    if (!lSKS_EFT_InboundFileLine)
+                    {
+                        select forUpdate RecId from lSKS_EFT_InboundFile where lSKS_EFT_InboundFile.InboundFileNbr == this.InboundFileNbr;
+                        lSKS_EFT_InboundFile.TransactionStatus = SKS_EFT_InboundTransactionStatus::AllApproved;
+                        lSKS_EFT_InboundFile.update();
+                    }
+                }
+                else if(paymentjournalstatus == SKS_EFT_PaymentJournalStatus::Rejected)
+                {
+                    if (lLedgerJournalTable.Posted)
+                    {
+                        this.Action = SKS_EFT_InboundPossibleActions::RejectFailure;
+                        SKS_EFT_Processing::createFileHistory(SKS_EFT_ActionHistory::RejectPosted,lSKS_EFT_FileDetail.FileRecId, this.InboundFileNbr,
+                                                            strFmt("@SKS2922", lLedgerJournalTrans.Voucher,lLedgerJournalTrans.PaymReference),lLedgerJournalTrans.JournalNum);
+                    }
+                    else
+                    {
+                        if (lLedgerJournalTrans.PaymentStatus != CustVendPaymStatus::Rejected)
+                        {
+                            //We are COPYING the CustVendPaymReconciliationSetStatus.RejectNegInst method, to remove dialogs for batch processing.
+                            //If problems arise in the RejectNegInst method, Compare this RejectNegInst method with
+                            //  CustVendPaymReconciliationSetStatus.RejectNegInst method.  It's likely AX will
+                            //  we just need to update our copy of the method
+                            changecompany(lSKS_EFT_FileDetail.PaymentCompany ? lSKS_EFT_FileDetail.PaymentCompany : lSKS_EFT_FileDetail.DataAreaId) // SKS_FDD_10590
+                            {
+                                locSKS_CustVendPaymReconciliationSetStatus = new SKS_CustVendPaymReconciliationSetStatus();
+                                lLedgerJournalTrans.PaymentStatus = CustVendPaymStatus::Rejected;
+                                locSKS_CustVendPaymReconciliationSetStatus.rejectNegInst(lLedgerJournalTrans);
+                                // ISSUE# 9333 -->
+                                lLedgerJournalTrans.update();
+                                // ISSUE# 9333 <--
+                            }                            
+                        }
+                        
+                        this.Action = SKS_EFT_InboundPossibleActions::Rejected;
+                        SKS_EFT_Processing::createFileHistory(SKS_EFT_ActionHistory::Rejected,lSKS_EFT_FileDetail.FileRecId, this.InboundFileNbr,
+                                                            strFmt("@SKS2922", lLedgerJournalTrans.Voucher,lLedgerJournalTrans.PaymReference),lLedgerJournalTrans.JournalNum);
+    
+                        this.updateVendBankAccountStatus(lLedgerJournalTrans); //SKS_Custom_DevOps14920
+                    }
+                    //updated outbound line API Response status.
+                    update_recordset lOutbound_FileLine setting APIResponseStatus = SKS_EFT_APIResponseType::Rejected
+                        where lOutbound_FileLine.RecId == this.FileDetailRecId;
+                }
+            }
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVendBankAccountStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unused method. It's not deleted for backwards support.
+    /// </summary>
+    /// <param name = "_locLedgerJournalTrans">Ledger journal transaction record</param>
+    public void updateVendBankAccountStatus(LedgerJournalTrans _locLedgerJournalTrans)
+    {
+        // Below is only to remove BP errors
+        LedgerJournalTrans trans = _locLedgerJournalTrans;
+        trans = trans;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+	<DeveloperDocumentation>@SKS2729</DeveloperDocumentation>
+	<Label>@SKS2736</Label>
+	<TableGroup>TransactionLine</TableGroup>
+	<TitleField1>StatusId</TitleField1>
+	<TitleField2>ReasonCode</TitleField2>
+	<DeleteActions />
+	<FieldGroups>
+		<AxTableFieldGroup>
+			<Name>AutoReport</Name>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>StatusId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>ReasonCode</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>Action</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoLookup</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoIdentification</Name>
+			<AutoPopulate>Yes</AutoPopulate>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoSummary</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoBrowse</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>FormatKeys</Name>
+			<Label>@SKS2734</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>InOutKeyFormat1</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InOutKeyFormat2</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InOutKeyFormat3</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>Identification</Name>
+			<Label>@SKS142</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>FileDetailRecId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundFileNbr</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>FileLineNbr</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>Status</Name>
+			<Label>@SYS36398</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>StatusId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>ReasonCode</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>Action</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>AdditionalData</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundReasonCodesRecId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundStatusesRecId</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>All</Name>
+			<Label>@SYS11696</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>Action</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>AdditionalData</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>FileDetailRecId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>FileLineNbr</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundFileNbr</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundReasonCodesRecId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundStatusesRecId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InOutKeyFormat1</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InOutKeyFormat2</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InOutKeyFormat3</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>ReasonCode</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>StatusId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>PaymDate</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>BankAmt</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>BankAmtCurr</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>PaymentAmt</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>PaymAmtCurr</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>BankRefNum</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>ExchRate</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>BankRefNum2</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InboundRefNum</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+	</FieldGroups>
+	<Fields>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldEnum">
+			<Name>Action</Name>
+			<HelpText>@SKS2902</HelpText>
+			<EnumType>SKS_EFT_InboundPossibleActions</EnumType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>AdditionalData</Name>
+			<ExtendedDataType>SKS_EFT_InboundData</ExtendedDataType>
+			<StringSize>100</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldInt64">
+			<Name>FileDetailRecId</Name>
+			<ExtendedDataType>RefRecId</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldInt">
+			<Name>FileLineNbr</Name>
+			<ExtendedDataType>SKS_EB_FileRecord</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>InboundFileNbr</Name>
+			<ExtendedDataType>SKS_EFT_InboundFileNbr</ExtendedDataType>
+			<StringSize>20</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldInt64">
+			<Name>InboundReasonCodesRecId</Name>
+			<ExtendedDataType>RefRecId</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldInt64">
+			<Name>InboundStatusesRecId</Name>
+			<ExtendedDataType>RefRecId</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>InOutKeyFormat1</Name>
+			<ExtendedDataType>SKS_EFT_InOutKey</ExtendedDataType>
+			<StringSize>50</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>InOutKeyFormat2</Name>
+			<ExtendedDataType>SKS_EFT_InOutKey</ExtendedDataType>
+			<StringSize>50</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>InOutKeyFormat3</Name>
+			<ExtendedDataType>SKS_EFT_InOutKey</ExtendedDataType>
+			<StringSize>50</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>ReasonCode</Name>
+			<ExtendedDataType>SKS_EFT_ReasonCode</ExtendedDataType>
+			<StringSize>30</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>StatusId</Name>
+			<ExtendedDataType>SKS_EFT_InboundStatusId</ExtendedDataType>
+			<StringSize>30</StringSize>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldDate">
+			<Name>PaymDate</Name>
+			<ExtendedDataType>PaymDate</ExtendedDataType>
+			<Label>@Expense:PaymentDate</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldReal">
+			<Name>BankAmt</Name>
+			<ExtendedDataType>Amount</ExtendedDataType>
+			<Label>@SKS4320</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>BankAmtCurr</Name>
+			<ExtendedDataType>CurrencyCode</ExtendedDataType>
+			<Label>@SKS:SKGBankAmountCurr</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldReal">
+			<Name>PaymentAmt</Name>
+			<ExtendedDataType>Amount</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>PaymAmtCurr</Name>
+			<ExtendedDataType>CurrencyCode</ExtendedDataType>
+			<Label>@SYS66023</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>BankRefNum</Name>
+			<ExtendedDataType>Str60</ExtendedDataType>
+			<Label>@SYS79560</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>ExchRate</Name>
+			<ExtendedDataType>string20</ExtendedDataType>
+			<Label>@SYS125988</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>BankRefNum2</Name>
+			<ExtendedDataType>Str60</ExtendedDataType>
+			<Label>@SYS79560</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>InboundRefNum</Name>
+			<ExtendedDataType>SKS_BR_BankCustomerNum</ExtendedDataType>
+		</AxTableField>
+	</Fields>
+	<FullTextIndexes />
+	<Indexes>
+		<AxTableIndex>
+			<Name>SKS_EFT_FileDetailIdx</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>FileDetailRecId</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>InboundfilenbrActionStatusId</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>InboundFileNbr</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>Action</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>StatusId</DataField>
+					<IncludedColumn>Yes</IncludedColumn>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>InboundfileFiledetail</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>FileLineNbr</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>FileDetailRecId</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+	</Indexes>
+	<Mappings />
+	<Relations>
+		<AxTableRelation xmlns=""
+			i:type="AxTableRelationForeignKey">
+			<Name>SKS_EFT_FileDetail</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<OnDelete>Restricted</OnDelete>
+			<RelatedTable>SKS_EFT_FileDetail</RelatedTable>
+			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>FileDetailRecId</Name>
+					<Field>FileDetailRecId</Field>
+					<RelatedField>RecId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+			<Index>RecId</Index>
+		</AxTableRelation>
+		<AxTableRelation xmlns=""
+			i:type="AxTableRelationForeignKey">
+			<Name>SKS_EFT_InboundFile</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<OnDelete>Cascade</OnDelete>
+			<RelatedTable>SKS_EFT_InboundFile</RelatedTable>
+			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>InboundFileNbr</Name>
+					<Field>InboundFileNbr</Field>
+					<RelatedField>InboundFileNbr</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+			<Index>InboundFileNbrIdx</Index>
+		</AxTableRelation>
+		<AxTableRelation xmlns=""
+			i:type="AxTableRelationForeignKey">
+			<Name>SKS_EFT_InboundReasonCodes</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<OnDelete>Restricted</OnDelete>
+			<RelatedTable>SKS_EFT_InboundReasonCodes</RelatedTable>
+			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>InboundReasonCodesRecId</Name>
+					<Field>InboundReasonCodesRecId</Field>
+					<RelatedField>RecId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+			<Index>RecId</Index>
+		</AxTableRelation>
+		<AxTableRelation xmlns=""
+			i:type="AxTableRelationForeignKey">
+			<Name>SKS_EFT_InboundStatuses</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<OnDelete>Restricted</OnDelete>
+			<RelatedTable>SKS_EFT_InboundStatuses</RelatedTable>
+			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>InboundStatusesRecId</Name>
+					<Field>InboundStatusesRecId</Field>
+					<RelatedField>RecId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+			<Index>RecId</Index>
+		</AxTableRelation>
+	</Relations>
+	<StateMachines />
+</AxTable>

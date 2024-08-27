@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPDispProdJournalCheckPostBOM_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(classStr(ProdJournalCheckPostBOM))]
+public final class PIPDispProdJournalCheckPostBOM_Extension
+{
+    private PIPUserInfo                     pipUserInfo;
+    private boolean                         skipDispenseProcessing;
+    private PIPDispensingAdjustmentCreator  dispensingAdjustmentCreator;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmPIPSkipDispenseProcessing</Name>
+				<Source><![CDATA[
+    public boolean parmPIPSkipDispenseProcessing(boolean _skipDispenseProcessing = skipDispenseProcessing)
+    {
+        skipDispenseProcessing = _skipDispenseProcessing;
+        return skipDispenseProcessing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipCheckDispensing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks that the journal line meets all the dispensing related rules.
+    /// </summary>
+    /// <param name="_journalTransData">
+    ///    An instance of the <c>JournalTransData</c> class containing a production order journal BOM line.
+    /// </param>
+    /// <returns>
+    ///    true if the production order journal BOM line passes the dispensing related rules; otherwise, false.
+    /// </returns>
+    private boolean pipCheckDispensing(JournalTransData _journalTransData)
+    {
+        ProdJournalBOM      prodJournalBOM  = _journalTransData.journalTrans();
+        boolean             ret             = true;
+        InventTable         inventTable;
+        BOM                 bom;
+        InventQty           adjInventQty;
+        PdsCWQty            adjCWQty;
+    
+        if (!#PIPDispensingEnabled || skipDispenseProcessing || !this.pipProdParametersDim(prodJournalBOM.ProdId).PIPDispensingEnabled)
+        {
+            return true;
+        }
+    
+        inventTable = prodJournalBOM.inventTable();
+        if (!inventTable.PIPDispensingControl)
+        {
+            return true;
+        }
+    
+        if (inventTable.PIPAuthorizedPersonnel && !this.pipUserInfo().AuthorizedForDispensing)
+        {
+            ret = checkFailed("@PIP907");
+        }
+    
+        if (ret)
+        {
+            bom = prodJournalBOM.prodBOM().pipBOM();
+    
+            if (PdsGlobal::pdsIsCWItem(prodJournalBOM.ItemId))
+            {
+                ret = bom.pipCheckDispensingTolerances(prodJournalBOM.PdsCWInventProposal, prodJournalBOM.PIPDispensedCWQty);
+    
+                // Check the adjustment journal quantities, if any, since the adjustment can possibly have a CW quantity tolerance error
+                if (ret && prodJournalBOM.BOMProposal > 0
+                    && (prodJournalBOM.PIPDispensedQty > 0 && prodJournalBOM.BOMConsump > prodJournalBOM.PIPDispensedQty)
+                        || (prodJournalBOM.PIPDispensedCWQty > 0 && prodJournalBOM.PdsCWInventConsump > prodJournalBOM.PIPDispensedCWQty))
+                {
+                    adjInventQty = inventTable.pipToUnit(prodJournalBOM.PIPDispensedQty - prodJournalBOM.BOMConsump, prodJournalBOM.BOMUnitId);
+                    adjCWQty     = prodJournalBOM.PIPDispensedCWQty - prodJournalBOM.PdsCWInventConsump;
+    
+                    setPrefix(strFmt("@PIP969", adjInventQty, adjCWQty));
+                    ret = PdsCatchWeight::validateInventQty(prodJournalBOM.ItemId, adjInventQty, adjCWQty);
+                }
+            }
+            else
+            {
+                ret = bom.pipCheckDispensingTolerances(prodJournalBOM.BOMProposal, prodJournalBOM.PIPDispensedQty);
+            }
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipUpdateDispensingAdjustmentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates a dispensing adjustment journal, if any, for a given production journal BOM line.
+    /// </summary>
+    /// <param name="_journalTransData">
+    ///    An instance of the <c>JournalTransData</c> class containing a production order journal BOM line.
+    /// </param>
+    private void pipUpdateDispensingAdjustmentJournal(JournalTransData _journalTransData)
+    {
+        if (#PIPDispensingEnabled && !skipDispenseProcessing)
+        {
+            if (!dispensingAdjustmentCreator)
+            {
+                dispensingAdjustmentCreator = PIPDispensingAdjustmentCreator::newJournalTableData(journalTableData);
+            }
+    
+            dispensingAdjustmentCreator.checkAddJournalLine(_journalTransData);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipUpdateReleasedBOMData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the tracking quantities for the production BOM line generated when the production order has Released status.
+    /// </summary>
+    /// <param name="_journalTransData">
+    ///    An instance of the <c>JournalTransData</c> class containing a production order journal BOM line.
+    /// </param>
+    private void pipUpdateReleasedBOMData(JournalTransData _journalTransData)
+    {
+        ProdJournalTable        prodJournalTable     = journalTableData.journalTable();
+        ProdJournalTransData    prodJournalTransData = _journalTransData;
+        ProdJournalBOM          prodJournalBOM;
+        ProdBOM                 prodBOM;
+        PIPProdReleaseBOM       prodReleaseBOM;
+    
+        if (!#PIPDispensingEnabled
+            || prodJournalTable.PIPProdGenerationSource != PIPProdGenerationSource::Released
+            || !this.pipProdParametersDim(prodJournalTransData.prodId()).PIPDispensingEnabled)
+        {
+            return;
+        }
+    
+        prodJournalBOM = _journalTransData.journalTrans();
+        prodBOM = prodJournalBOM.prodBOM();
+    
+        prodReleaseBOM = PIPProdReleaseBOM::findProdBOM(prodBOM.RecId, true);
+        prodReleaseBOM.addConsumpQuantities(prodJournalBOM);
+        if (prodReleaseBOM.hasQty())
+        {
+            prodReleaseBOM.ProdBOM = prodBOM.RecId;
+            if (!prodReleaseBOM.validateWrite())
+            {
+                throw error("@SYS21533");
+            }
+            prodReleaseBOM.write();
+        }
+        else if (prodReleaseBOM.RecId)
+        {
+            prodReleaseBOM.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipUserInfo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets a record in the <c>PIPUserInfo</c> table for the current user.
+    /// </summary>
+    /// <returns>
+    ///    The record in the <c>PIPUserInfo</c> table for the current user or an empty buffer if none exists.
+    /// </returns>
+    public PIPUserInfo pipUserInfo()
+    {
+        if (!pipUserInfo)
+        {
+            pipUserInfo = PIPUserInfo::find(curUserId());
+        }
+    
+        return pipUserInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    protected void postJournal(JournalTransList _journalTransList)
+    {
+        next postJournal(_journalTransList);
+
+        if (dispensingAdjustmentCreator)
+        {
+            dispensingAdjustmentCreator.finish();
+            dispensingAdjustmentCreator = null;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipCheckTransPost</Name>
+				<Source><![CDATA[
+    [PostHandlerFor(classStr(ProdJournalCheckPostBOM), methodStr(ProdJournalCheckPostBOM, checkTrans))]
+    /// <summary>
+    ///    Executes additional logic in the post-method event for the <see cref="checkTransPost method"/> on this class.
+    /// </summary>
+    /// <param name="_prePostArgs">
+    ///    The standard pre-/post- arguments for a static method event handler.
+    /// </param>
+    public static void pipCheckTransPost(XppPrePostArgs _prePostArgs)
+    {
+        ProdJournalCheckPostBOM checkPost           = _prePostArgs.getThis();
+        JournalTransData        journalTransData    = _prePostArgs.getArg('_journalTransData');
+        boolean                 ok                  = _prePostArgs.getReturnValue();
+    
+        ok = ok && checkPost.pipCheckDispensing(journalTransData);
+    
+        _prePostArgs.setReturnValue(ok);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipPostTransLedgerPost</Name>
+				<Source><![CDATA[
+    [PostHandlerFor(classStr(ProdJournalCheckPostBOM), methodStr(ProdJournalCheckPostBOM, postTransLedger))]
+    /// <summary>
+    ///    Executes additional logic in the post-method event for the <see cref="postTransLedger method"/> on this class.
+    /// </summary>
+    /// <param name="_args">
+    ///    The standard pre-/post- arguments for a static method event handler.
+    /// </param>
+    public static void pipPostTransLedgerPost(XppPrePostArgs _args)
+    {
+        ProdJournalCheckPostBOM prodJournalCheckPostBOM = _args.getThis();
+        JournalTransData        journalTransData        = _args.getArg('_journalTransData');
+    
+        prodJournalCheckPostBOM.pipUpdateDispensingAdjustmentJournal(journalTransData);
+        prodJournalCheckPostBOM.pipUpdateReleasedBOMData(journalTransData);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

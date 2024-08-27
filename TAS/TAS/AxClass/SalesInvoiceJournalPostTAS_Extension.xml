@@ -1,0 +1,576 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SalesInvoiceJournalPostTAS_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(ClassStr(SalesInvoiceJournalPost))]
+final class SalesInvoiceJournalPostTAS_Extension
+{
+    public RecId sKS_CC_ZeroInvRemAmtToPayAuthRecId;
+    public AmountCur sKS_CC_InvoicePrepaidAmount;
+    public Set sKS_CC_PrepaidCustTransSet;
+    public AmountCur invoiceRemainAmountSKS;
+    public RefRecId creditCardCustRefIdSKS;
+    public SKS_PP_Setup sksParms;
+    public boolean skipCreditCardCaptureSKS; 
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>creditCardDoCaptureOrPostAuthorize</Name>
+				<Source><![CDATA[
+    protected boolean creditCardDoCaptureOrPostAuthorize(SalesInvoiceId _salesInvoiceId, boolean _isRefund, CustInvoiceJour _custInvoiceJour)
+    {        
+        SalesInvoiceId newSalesInvoiceIdSKS;
+        CreditCardAuthTrans ccTransCheckSKS;
+        RefRecId newCustInvoiceJourRecIdSKS;
+
+        skipCreditCardCaptureSKS = false;
+
+        // Only if payment method is credit card
+        if (sksParms.ModCC == NoYes::Yes && creditCardSalesTable.isCreditCardPaymentType())
+        {
+            if (sksParms.CCPLEnablePayLinks == NoYes::Yes && SKS_CC_PayLinkQueue::salesOrderHasPendingPayLink(creditCardSalesTable))
+            {
+                throw error(strFmt("@SKS:SKGCCProcessNotAllowedForSOSincePayLinkExist", creditCardSalesTable.SalesId));
+            }
+
+            if (creditCardSalesTable.CreditCardCustRefId)
+            {
+                invoiceRemainAmountSKS = _custInvoiceJour.remainAmountToBePaid();
+
+                if (_custInvoiceJour.SalesId && !invoiceRemainAmountSKS)
+                {
+                    this.sKS_CC_CreateZeroAmountCCAuthTrans(_custInvoiceJour);
+                }
+                else
+                {           
+                    // CCA-Used to avoid multiple duplicate charges during FormLetterService retry.
+                    // Also, allows an existing approved CC payment/refund on a sales order without a
+                    // successful sales invoice to be used during the invoice process and avoid
+                    // multiple charges for the same sales order.
+                           
+                    CreditCardNumber ccNbrSKS = CreditCardCust::find(creditCardSalesTable.CreditCardCustRefId).CardNumber;
+                    
+                    if (!_isRefund)
+                    {
+                        // CCA-Used for '% allowance - capture amount over auth amount' functionality.
+                        // If not a refund invoice then skip the standard credit card capture
+                        // on sales order record to bypass call to CreditCardProcess::doCapture() method
+                        // in the base class and execute custom SKS method in our class which
+                        // will determine if capture amount is greater than auth amount but within tolerance.
+                        // See implementation further below.
+                        skipCreditCardCaptureSKS = true;
+
+                        select firstonly1 ccTransCheckSKS
+                            order by ApprovedDateTime desc
+                            where ccTransCheckSKS.SalesId == creditCardSalesTable.SalesId &&
+                                  (ccTransCheckSKS.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+                                   ccTransCheckSKS.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+                                  ccTransCheckSKS.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+                                  ccTransCheckSKS.ApprovalVoid == NoYes::No;
+                    }
+                    else
+                    {
+                        select firstonly1 ccTransCheckSKS
+                            order by ApprovedDateTime desc
+                            where ccTransCheckSKS.SalesId == creditCardSalesTable.SalesId &&
+                                  ccTransCheckSKS.ApprovalType == CreditCardOperation::Refund &&
+                                  ccTransCheckSKS.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+                                  ccTransCheckSKS.ApprovalVoid == NoYes::No;
+                    }
+
+                    if (ccTransCheckSKS)
+                    {                        
+                        utcdatetime cutOffDateTime = DateTimeUtil::addMinutes(DateTimeUtil::utcNow(), -1440);
+
+                        if (ccTransCheckSKS.CreditCardNumber == ccNbrSKS &&
+                            ccTransCheckSKS.ApprovalAmountCur == invoiceRemainAmountSKS &&
+                            ccTransCheckSKS.ApprovedDateTime > cutOffDateTime)
+                        {
+                            if (ccTransCheckSKS.SalesInvoiceId)
+                            {
+                                CustInvoiceJour custInvoiceJourCheckSKS;        
+                                
+                                select firstonly1 InvoiceId, RecId from custInvoiceJourCheckSKS
+                                    where custInvoiceJourCheckSKS.SalesId == creditCardSalesTable.SalesId &&
+                                          custInvoiceJourCheckSKS.InvoiceId == ccTransCheckSKS.SalesInvoiceId;
+
+                                if (!custInvoiceJourCheckSKS.InvoiceId ||
+                                    (ccTransCheckSKS.SKS_CC_CustInvoceJourRecId &&
+                                     ccTransCheckSKS.SKS_CC_CustInvoceJourRecId != custInvoiceJourCheckSKS.RecId))
+                                {
+                                    skipCreditCardCaptureSKS = true;
+                                    newSalesInvoiceIdSKS = _custInvoiceJour.InvoiceId;
+                                    newCustInvoiceJourRecIdSKS = _custInvoiceJour.RecId;
+                                }                                
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        boolean ret = next creditCardDoCaptureOrPostAuthorize(_salesInvoiceId, _isRefund, _custInvoiceJour);
+
+        if (newSalesInvoiceIdSKS || newCustInvoiceJourRecIdSKS)
+        {
+            if (ccTransCheckSKS)
+            {
+                UserConnection connectionSKS = new UserConnection();
+
+                try
+                {                        
+                    SalesTable salesTableSKSUpd; 
+                    ccTransCheckSKS.setConnection(connectionSKS);
+                    salesTableSKSUpd.setConnection(connectionSKS);
+
+                    connectionSKS.ttsbegin();
+                    ccTransCheckSKS.selectForUpdate(true);
+                    ccTransCheckSKS.SalesInvoiceId = newSalesInvoiceIdSKS;
+                    ccTransCheckSKS.SKS_CC_CustInvoceJourRecId = newCustInvoiceJourRecIdSKS;
+                    ccTransCheckSKS.SKS_CC_InvoiceRetriesExecuted += 1;
+                    ccTransCheckSKS.update();
+
+                    if (creditCardSalesTable.CreditCardAuthorization != ccTransCheckSKS.Authorization)
+                    {                            
+                        salesTableSKSUpd = SalesTable::find(creditCardSalesTable.SalesId, true);
+                        salesTableSKSUpd.CreditCardAuthorization = ccTransCheckSKS.Authorization;
+                        salesTableSKSUpd.update();
+                    }                        
+                    connectionSKS.ttscommit();
+
+                    if (salesTableSKSUpd)
+                    {
+                        creditCardSalesTable.reread();
+                    }
+                }
+                finally
+                {
+                    connectionSKS.finalize();
+                }                    
+            }
+        }
+        else
+        {
+            // CCA-If standard credit card processing was bypassed in the base class 
+            // then restore the original credit card reference value here then
+            // call custom method to process capture.
+            if (skipCreditCardCaptureSKS && sksParms.ModCC == NoYes::Yes)
+            {
+                ret = SKS_CC_CreditCardProcess::sKS_CC_DoCaptureFromSalesOrder(creditCardSalesTable, _salesInvoiceId, _custInvoiceJour);
+            }
+        }
+        
+        if (skipCreditCardCaptureSKS)
+        {
+            skipCreditCardCaptureSKS = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_CreateZeroAmountCCAuthTrans</Name>
+				<Source><![CDATA[
+    private void sKS_CC_CreateZeroAmountCCAuthTrans(CustInvoiceJour _custInvoiceJour)
+    {
+        CreditCardAuthTrans authTrans;
+
+        authTrans.clear();
+        authTrans.initValue();
+        authTrans.SalesId = creditCardSalesTable.SalesId;
+        authTrans.Authorization = creditCardSalesTable.CreditCardAuthorization;
+        authTrans.ApprovalType = CreditCardOperation::CaptureAfterAuthorize;
+        authTrans.ProcessorStatus = CreditCardProcessorStatus::Approved;
+        authTrans.ApprovalAmountCur = 0;
+        authTrans.LineNum = 999.99;
+        authTrans.SalesInvoiceId = _custInvoiceJour.InvoiceId;
+        authTrans.ApprovalExpired = NoYes::Yes;
+        authTrans.ApprovalVoid = NoYes::Yes;
+        authTrans.ApprovedDateTime = DateTimeUtil::getSystemDateTime();
+        authTrans.insert();
+
+        sKS_CC_ZeroInvRemAmtToPayAuthRecId = authTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setSalesOrderMarkedAmount</Name>
+				<Source><![CDATA[
+    private void setSalesOrderMarkedAmount(SalesTable _salesTable)
+    {        
+        QueryRun queryRunLocSKS = SpecTrans::createQueryRunToRefTable(_salesTable.company(), _salesTable.TableId, _salesTable.RecId, tableNum(CustTransOpen));
+
+        queryRunLocSKS.allowCrossCompany(true);
+
+        SpecTrans specTransLocSKS;
+        CustTransOpen custTransOpenSKS;
+
+        while (queryRunLocSKS.next())
+        {
+            if (queryRunLocSKS.changed(tableNum(SpecTrans)))
+            {
+                specTransLocSKS = queryRunLocSKS.get(tableNum(SpecTrans)) as SpecTrans;
+                if (specTransLocSKS)
+                {
+                    sKS_CC_InvoicePrepaidAmount += specTransLocSKS.Balance01;
+                }
+            }
+
+            if (queryRunLocSKS.changed(tableNum(CustTransOpen)))
+            {
+                custTransOpenSKS = queryRunLocSKS.get(tableNum(CustTransOpen)) as CustTransOpen;
+                if (custTransOpenSKS)
+                {
+                    if (!sKS_CC_PrepaidCustTransSet)
+                    {
+                        sKS_CC_PrepaidCustTransSet = new Set(Types::Record);
+                    }
+
+                    sKS_CC_PrepaidCustTransSet.add(custTransOpenSKS);
+                }
+            }
+        }
+
+        sKS_CC_InvoicePrepaidAmount = abs(sKS_CC_InvoicePrepaidAmount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Posts a journal.
+    /// </summary>
+    public void run()
+    {
+        AmountCur sKS_CC_InvoicePrepayRemainAmount;
+
+        sksParms = SKS_PP_Setup::find();
+        
+        if (sksParms.ModCC == NoYes::Yes)
+        {
+            SalesTable creditCardSalesTableLocSKS = custInvoiceJour.SalesTable();
+            if (creditCardSalesTableLocSKS)
+            {
+                this.setSalesOrderMarkedAmount(creditCardSalesTableLocSKS);
+
+                AmountCur curInvoiceAmountSKS;
+                if (this.parmTotals())
+                {
+                    SalesTotals salesTotalsLocSKS = this.parmTotals();
+                    curInvoiceAmountSKS = salesTotalsLocSKS.totalAmount();
+                }
+
+                if (curInvoiceAmountSKS > 0)
+                {
+                    sKS_CC_InvoicePrepayRemainAmount = curInvoiceAmountSKS - sKS_CC_InvoicePrepaidAmount;
+                    if (sKS_CC_InvoicePrepayRemainAmount < 0 && creditCardSalesTableLocSKS.isCreditCardPaymentType() &&
+                        creditCardSalesTableLocSKS.CreditCardCustRefId)
+                    {
+                        creditCardCustRefIdSKS = creditCardSalesTableLocSKS.CreditCardCustRefId;
+                        creditCardSalesTableLocSKS.selectForUpdate(true);
+                        creditCardSalesTableLocSKS.CreditCardCustRefId = 0;
+                        creditCardSalesTableLocSKS.doUpdate();
+                    }
+                }
+            }
+        }
+
+        next run();
+
+        if (sksParms.ModCC == NoYes::Yes)
+        {
+            if (sKS_CC_ZeroInvRemAmtToPayAuthRecId)
+            {
+                CreditCardAuthTrans ccAuthTransSKS;
+
+                select firstonly ccAuthTransSKS
+                    where ccAuthTransSKS.RecId == sKS_CC_ZeroInvRemAmtToPayAuthRecId;
+
+                if (ccAuthTransSKS)
+                {
+                    try
+                    {
+                        ttsbegin;
+                        ccAuthTransSKS.selectForUpdate(true);
+                        ccAuthTransSKS.doDelete();
+                        ttscommit;
+                    }
+                    catch(Exception::Error)
+                    {
+                        ttsabort;
+                    }
+                }
+            }
+
+            sKS_CC_InvoicePrepayRemainAmount = abs(custInvoiceJour.InvoiceAmount) - sKS_CC_InvoicePrepaidAmount;
+            if (sKS_CC_InvoicePrepayRemainAmount < 0 && creditCardSalesTable)
+            {
+                creditCardSalesTable.reread();
+                if (!creditCardSalesTable.CreditCardCustRefId && creditCardCustRefIdSKS && creditCardSalesTable.isCreditCardPaymentType())
+                {
+                    creditCardSalesTable.selectForUpdate(true);
+                    creditCardSalesTable.CreditCardCustRefId = creditCardCustRefIdSKS;
+                    creditCardSalesTable.doUpdate();
+                }
+
+                if (sKS_CC_PrepaidCustTransSet && sKS_CC_PrepaidCustTransSet.elements() == 1 &&
+                    creditCardSalesTable.canInvoiceOrderFromCurrentSalesStatus())
+                {
+                    SetEnumerator sePrePaidSKS = sKS_CC_PrepaidCustTransSet.getEnumerator();
+                    while (sePrePaidSKS.moveNext())
+                    {
+                        CustTransOpen custTransOpenSKS = sePrePaidSKS.current();
+
+                        if(custTransOpenSKS)
+                        {
+                            SpecTrans specTransSKS = SpecTrans::findByRef(custTransOpenSKS.company(),custTransOpenSKS.TableId, custTransOpenSKS.RecId);
+                            
+                            if(specTransSKS && SpecTransSKS.Balance01)
+                            {
+                                continue;
+                            }
+                        }
+
+                        CustVendOpenTransManager managerSKS;        
+                        managerSKS = CustVendOpenTransManager::construct(creditCardSalesTable);
+
+                        if (custTransOpenSKS)
+                        {
+                            custTransOpenSKS.reread();
+
+                            managerSKS.parmSkipPrePaymentSettlementWarning(true);
+                            managerSKS.updateTransMarked(custTransOpenSKS, true);                            
+
+                            managerSKS.updateOriginatorForMarkedTrans();
+                            managerSKS.updateSpecTransWithSelectedDate();
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (creditCardSalesTable && 
+                    sksParms.CCSkipSONewAuthForPartialShip == NoYes::Yes &&
+                    !creditCardSalesTable.CreditCardCustRefId &&
+                    creditCardSalesTable.SKS_CC_TmpCreditCardCustRefIdForSkipAuth &&
+                    creditCardSalesTable.SKS_CC_SkipAutoAuthDueToPartialShip == NoYes::Yes &&
+                    creditCardSalesTable.isCreditCardPaymentType())
+                {
+                    creditCardSalesTable.selectForUpdate(true);
+                    creditCardSalesTable.CreditCardCustRefId = creditCardSalesTable.SKS_CC_TmpCreditCardCustRefIdForSkipAuth;
+                    creditCardSalesTable.SKS_CC_TmpCreditCardCustRefIdForSkipAuth = 0;                    
+                    creditCardSalesTable.doUpdate();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postFailed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Called when the posting of a journal fails.
+    /// </summary>
+    /// <param name="_logText">
+    ///     A String with an error message.
+    /// </param>
+    public void postFailed(LogText _logText)
+    {
+        CreditCardAuthTrans creditCardAuthTransToVoid, creditCardAuthTransUpd;
+        boolean voidOK;
+        str transTypeForVoid, voidCaptureLogMsg;
+        const str constRefund = 'Refund';
+        const str constCapture = 'Capture';
+
+        CustInvoiceJour custInvoiceJourSKS = custInvoiceJour;
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::Yes && !this.parmIsInvoiceCommittedSKS() &&
+            custInvoiceJour && custInvoiceJour.InvoiceId && custInvoiceJour.SalesId)
+        {
+            while select creditCardAuthTransToVoid
+                order by LineNum desc
+                where creditCardAuthTransToVoid.SalesId == custInvoiceJourSKS.SalesId &&
+                    creditCardAuthTransToVoid.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+                    (creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::AuthorizeAndCapture ||
+                        creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+                        creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::Refund)
+                     && creditCardAuthTransToVoid.ApprovalVoid == NoYes::No
+                     && creditCardAuthTransToVoid.SalesInvoiceId == custInvoiceJourSKS.InvoiceId
+            {                
+                transTypeForVoid = creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::Refund ? constRefund : constCapture;
+
+                voidOK = SKS_CC_CreditCardProcess::sKS_CC_DoVoidCapture(creditCardAuthTransToVoid, false, strFmt("@SKS6494", transTypeForVoid, creditCardAuthTransToVoid.Authorization));
+                if (voidOK)
+                {
+                    voidCaptureLogMsg = strFmt("@SKS6495", transTypeForVoid, creditCardAuthTransToVoid.Authorization);
+                    info(voidCaptureLogMsg);
+
+                    if (transTypeForVoid == constRefund)
+                    {
+                        select firstonly forUpdate creditCardAuthTransUpd
+                        where creditCardAuthTransUpd.SalesId == custInvoiceJourSKS.SalesId &&
+                            creditCardAuthTransUpd.RefundStatus == CreditCardRefundStatus::Processed &&
+                            (creditCardAuthTransUpd.ApprovalType == CreditCardOperation::CaptureAfterAuthorize || creditCardAuthTransUpd.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+                            creditCardAuthTransUpd.ProcessorStatus == CreditCardProcessorStatus::Approved;
+
+                        if (creditCardAuthTransUpd)
+                        {
+                            ttsBegin;
+                            creditCardAuthTransUpd.RefundStatus = CreditCardRefundStatus::Marked;
+                            creditCardAuthTransUpd.update();
+                            ttsCommit;
+                        }
+                    }
+                }
+                else
+                {
+                    voidCaptureLogMsg = strFmt("@SKS6496", strLwr(transTypeForVoid), creditCardAuthTransToVoid.Authorization);
+                    error(voidCaptureLogMsg);
+                }
+
+                UserConnection connection = new UserConnection();
+                SalesTable salesTableSKSUpd;
+                salesTableSKSUpd.setConnection(connection);
+                SKS_CC_InvoiceErrorAfterCaptureLog  invoiceErrorAfterCaptureLog;
+                invoiceErrorAfterCaptureLog.setConnection(connection);
+
+                connection.ttsbegin();
+
+                salesTableSKSUpd = SalesTable::find(custInvoiceJourSKS.SalesId, true);
+                if (salesTableSKSUpd)
+                {                    
+                    if (voidOK)
+                    {
+                        salesTableSKSUpd.SKS_CC_InvoiceErrorAfterCapture = SKS_CC_InvoiceErrorAfterCCCaptureSuccess::CaptureVoided;
+                    }
+                    else
+                    {
+                        salesTableSKSUpd.SKS_CC_InvoiceErrorAfterCapture = SKS_CC_InvoiceErrorAfterCCCaptureSuccess::CaptureVoidFailed;
+                    }
+
+                    salesTableSKSUpd.doUpdate();
+
+                    if (creditCardAuthTransToVoid.MCRPaymRecId && salesTableSKSUpd.mcrIsCallCenter() &&
+                        RetailMCRChannelTable::mcrEnableOrderCompletion(salesTableSKSUpd))
+                    {
+                        MCRCustPaymTable custPaymTableSKSUpd = MCRCustPaymTable::findByRecID(creditCardAuthTransToVoid.MCRPaymRecId);
+                        if (custPaymTableSKSUpd && custPaymTableSKSUpd.Status == MCRCustPaymStatus::Authorized)
+                        {
+                            custPaymTableSKSUpd.selectForUpdate(true);
+                            custPaymTableSKSUpd.Status = MCRCustPaymStatus::NotSubmitted;                            
+                            custPaymTableSKSUpd.doUpdate();
+
+                            if (salesTableSKSUpd.MCROrderStopped == NoYes::No &&
+                                salesTableSKSUpd.SalesStatus != SalesStatus::Invoiced &&
+                                salesTableSKSUpd.SalesStatus != SalesStatus::Canceled)
+                            {
+                                salesTableSKSUpd.reread();
+                                salesTableSKSUpd.mcrOpenSalesOrder();
+                            }
+                        }
+                    }                    
+                    
+                    invoiceErrorAfterCaptureLog.clear();
+                    invoiceErrorAfterCaptureLog.initValue();
+                    invoiceErrorAfterCaptureLog.SalesId = salesTableSKSUpd.SalesId;
+                    invoiceErrorAfterCaptureLog.InvoiceAccount = salesTableSKSUpd.InvoiceAccount;
+                    invoiceErrorAfterCaptureLog.ApprovalAmountCur = creditCardAuthTransToVoid.ApprovalAmountCur;
+                    invoiceErrorAfterCaptureLog.ApprovalCode = creditCardAuthTransToVoid.SKS_CC_ApprovalCode;
+                    invoiceErrorAfterCaptureLog.ApprovalType = creditCardAuthTransToVoid.ApprovalType;
+                    invoiceErrorAfterCaptureLog.Authorization = creditCardAuthTransToVoid.Authorization;
+                    invoiceErrorAfterCaptureLog.CreditCardAuthTransRefRecId = creditCardAuthTransToVoid.RecId;
+                    invoiceErrorAfterCaptureLog.CreditCardCustRefId = salesTableSKSUpd.CreditCardCustRefId;
+                    invoiceErrorAfterCaptureLog.CreditCardNumber = creditCardAuthTransToVoid.CreditCardNumber;
+                    invoiceErrorAfterCaptureLog.CreditCardTypeName = creditCardAuthTransToVoid.CreditCardTypeName;
+                    invoiceErrorAfterCaptureLog.CurrencyCode = creditCardAuthTransToVoid.CurrencyCode;
+                    invoiceErrorAfterCaptureLog.InvoiceErrorAfterCapture = salesTableSKSUpd.SKS_CC_InvoiceErrorAfterCapture;
+
+                    if (voidCaptureLogMsg)
+                    {
+                        invoiceErrorAfterCaptureLog.ErrorMessage = _logText + '\n' + voidCaptureLogMsg;
+                    }
+                    else
+                    {
+                        invoiceErrorAfterCaptureLog.ErrorMessage = _logText;
+                    }                    
+
+                    if (creditCardAuthTransToVoid.SKS_CC_ProjInvoiceId)
+                    {
+                        invoiceErrorAfterCaptureLog.ProjInvoiceId = creditCardAuthTransToVoid.SKS_CC_ProjInvoiceId;
+                    }
+                    else
+                    {
+                        invoiceErrorAfterCaptureLog.SalesInvoiceId = creditCardAuthTransToVoid.SalesInvoiceId;
+                    }
+                                        
+                    invoiceErrorAfterCaptureLog.insert();
+                }
+
+                connection.ttscommit();
+            }
+        }        
+
+        next postFailed(_logText);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCaptureCreditCard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the credit card can be captured.
+    /// </summary>
+    /// <returns>true if the credit card can be captured.</returns>
+    protected boolean canCaptureCreditCard()
+    {
+        boolean ret;
+
+        ret = next canCaptureCreditCard();
+
+        if (ret && sksParms.ModCC == NoYes::Yes && skipCreditCardCaptureSKS)
+        {
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_GetCanCaptureCreditCard</Name>
+				<Source><![CDATA[
+    public boolean SKS_GetCanCaptureCreditCard()
+    {
+        return this.canCaptureCreditCard();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>capturePaymentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Capture paymnet journal
+    /// </summary>
+    protected final void capturePaymentJournal()
+    {
+        next capturePaymentJournal();     
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

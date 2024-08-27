@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_DD_NETS_MandateRegisterOut</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_DD_NETS_MandateRegisterOut extends SKS_DD_MandatesBatchOutbound
+{
+    #define.FilePrefixNetsBS('NETS_BS605_')
+    #define.FilePrefixNetsLS('NETS_LS_DebtorInfo_')
+
+    CustDirectDebitMandate  mCustDirectDebitMandate;
+    SKS_BF_BankIntType mSKS_BF_BankIntType;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>runProcess</Name>
+				<Source><![CDATA[
+    delegate void runProcess(RefRecId _RecId){}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {        
+        Batch bat;
+
+        bat = this.parmCurrentBatch();
+        this.runProcess(bat.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SendFile</Name>
+				<Source><![CDATA[
+    private boolean SendFile(SKS_EB_CommProcess _SKS_EB_CommProcess, 
+                                SKS_EB_FilePath _SKS_EB_FilePath, 
+                                SKS_EB_FileName _SKS_EB_FileName)
+    {
+        boolean retval = false;
+        str locParamters;
+        boolean locSendSuccess = false;
+        boolean locErrorFileExists = false;
+        str mReturnMsg;
+
+        //Build params list.
+        locParamters = SKS_EB_Send::getParams(_SKS_EB_CommProcess,
+                                                            _SKS_EB_FileName,
+                                                            _SKS_EB_FilePath,
+                                                            _SKS_EB_FilePath + '\\' + _SKS_EB_FileName,
+                                                            SKS_EB_ParamGroup::unclassified);
+
+        //Launch communications, if any.
+        locSendSuccess = SKS_EB_Send::Send(_SKS_EB_CommProcess,
+                                                locParamters,
+                                                _SKS_EB_CommProcess.CommUserProg,
+                                                _SKS_EB_FilePath + '\\' + _SKS_EB_FileName,
+                                                true,
+                                                FalseTrue::False,
+                                                _SKS_EB_FileName,
+                                                _SKS_EB_FilePath);
+
+        //because the error file could come from AP or AR, you have to use a variable to store if it exist for shared code later.
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(mSKS_BF_BankIntType);
+        fileHub.parmThrowErrorIfException(false);
+        fileHub.runFileInquire(_SKS_EB_FilePath + '\\LOG\\' + _SKS_EB_FileName + '.err');
+        locErrorFileExists = fileHub.attrFileExists();
+        //if commfailed and the previous run wasn't a commfailure, set it to commfailed status
+        if(locErrorFileExists || !locSendSuccess)
+        {
+            mReturnMsg = "@SKS3755";
+            error(mReturnMsg);
+            retval = false;
+        }
+
+        return retval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFile</Name>
+				<Source><![CDATA[
+    public void createFile(SKS_EB_MandateType _mandateScheme, RefRecId _batRecId)
+    {
+        SKS_PP_Bank             locSKS_PP_Bank;
+        SKS_EB_BankTable        locSKS_EB_BankTable;
+        SKS_EB_CommProcess		locSKS_EB_CommProcess;
+        str locDDFilesDir;
+        str locfileName;
+        str fileTxt;
+        SKS_DD_OutboundFormat locSksDDFormatNETS;
+        SKS_EB_FileStorage  sks_EB_FileStorage;
+
+        //BankFabric
+        select firstonly sks_EB_FileStorage;
+
+        if (sks_EB_FileStorage.StorageOption_MandateAutomation == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+        {
+            mSKS_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+        }
+        else
+        {
+            mSKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+        }
+
+        while select crossCompany locSKS_PP_Bank
+            join locSKS_EB_BankTable where locSKS_EB_BankTable.BankAccountID == locSKS_PP_Bank.BankID
+            join locSKS_EB_CommProcess where locSKS_EB_CommProcess.CommID == locSKS_EB_BankTable.OutboundCommId
+            && locSKS_EB_CommProcess.BatchJobId == _batRecId
+            && locSKS_EB_CommProcess.Direction == SKS_EB_Direction::Outbound
+        {
+            changeCompany(locSKS_PP_Bank.company())
+            {
+                switch(_mandateScheme)
+                {
+                    case SKS_EB_MandateType::Betalings:
+                    case SKS_EB_MandateType::BetalingsTotal:
+                        select * from mCustDirectDebitMandate
+                            where mCustDirectDebitMandate.SKS_EB_BankRegisterStatus == SKS_EB_BankRegisterStatus::Ready &&
+                            (mCustDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Betalings        ||
+                             mCustDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::BetalingsTotal)   &&
+                            ((mCustDirectDebitMandate.Status ==  CustMandateStatus::Incomplete || mCustDirectDebitMandate.SignatureDate == dateNull() || mCustDirectDebitMandate.BankAccount == '' || mCustDirectDebitMandate.CustomerAddress == 0) || (mCustDirectDebitMandate.Status ==  CustMandateStatus::Canceled || mCustDirectDebitMandate.CancellationDate != dateNull()) || mCustDirectDebitMandate.SKS_EB_MandateAutoStatus == SKS_EB_MandateAutoStatus::Canceled /*Bug 11030*/) &&//Bug 10976
+                            mCustDirectDebitMandate.CreditorBankAccount == locSKS_PP_Bank.BankAccountId;
+
+                        locfileName = #FilePrefixNetsBS + System.DateTime::UtcNow.ToString(#DateFormat) + #FileExtestion;
+                        locSksDDFormatNETS = new SKS_DD_OutboundFormat_NETS_BS_605();
+
+                        break;
+
+                    case SKS_EB_MandateType::Leverander:
+                        select * from mCustDirectDebitMandate
+                            where mCustDirectDebitMandate.SKS_EB_BankRegisterStatus == SKS_EB_BankRegisterStatus::Ready &&
+                            mCustDirectDebitMandate.SKS_EB_MandateAutoStatus == SKS_EB_MandateAutoStatus::Completed &&
+                            //mCustDirectDebitMandate.Status == CustMandateStatus::New &&
+                            mCustDirectDebitMandate.SignatureDate != dateNull() && //Bug 11066
+                            mCustDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Leverander &&
+                            mCustDirectDebitMandate.CreditorBankAccount == locSKS_PP_Bank.BankAccountId;
+
+                        locfileName = #FilePrefixNetsLS + System.DateTime::UtcNow.ToString(#DateFormat) + #FileExtestion;
+                        locSksDDFormatNETS = new SKS_DD_OutboundFormat_NETS_LS_DebtorInfo();
+
+                        break;
+
+                    default:
+                        break;
+                }
+
+                if(mCustDirectDebitMandate)
+                {
+                    
+                    if(mSKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric)
+                    {
+                        locDDFilesDir = locSKS_EB_BankTable.BankFabricFileLocation;
+                    }
+                    else
+                    {
+                        locDDFilesDir = locSKS_EB_BankTable.OutboundFileLoc;
+                    }
+
+                    if(locDDFilesDir)
+                    {
+                        fileTxt = locSksDDFormatNETS.formatStructure(mCustDirectDebitMandate);
+                        if(strLen(fileTxt) > 0)
+                        {
+                            if (mSKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric)
+                            {
+                                this.fileCreate(locfileName, locDDFilesDir);
+                            }
+                            else
+                            {
+                                this.fileCreate(locDDFilesDir + @'\' + locfileName);
+                            }
+
+							this.fileWrite(fileTxt);
+							this.fileClose();
+                            this.SendFile(locSKS_EB_CommProcess,locDDFilesDir, locfileName);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

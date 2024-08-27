@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_AnalyzeNCreateJournal</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+// This class is to Analyze and Create new journal based on the Note field value
+class SKS_BR_AnalyzeNCreateJournal
+{
+    SKS_BR_BankTran sKS_BR_BankTran;
+    SKS_BR_NoteType sKS_BR_NoteType;
+    SKS_BR_NoteMemo searchTextInvoice;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createJournalLine</Name>
+				<Source><![CDATA[
+    public Integer createJournalLine(
+            SKS_LB_UnstructuredMatchContainers  _matchContainers,
+            SKS_BR_BankTran                     _sKS_BR_BankTran,
+            boolean                             _crossCompanySearch = false)
+    {
+        SKS_LB_JournalARApplic  journalARApplic;
+        CustTrans               custTrans;
+        CustTransOpen           custTransOpen ;
+        RecId                   conGoodInv;
+        Integer                 i;
+        container               virtualCompanyCompanies;
+        Integer                 noOfInvoicesPosted;
+        // 7483 -->
+        SpecTransManager        specTransManager;
+        boolean                 lbIsMarked = false;
+        SKS_LB_JournalARApplic  locSKS_LB_JournalARApplic;
+        AmountCur               invoiceAmount;
+        str                     invoiceAmountStr;
+        RecordInsertList        journalARApplicRecordInsertList =  new RecordInsertList(tableNum(SKS_LB_JournalARApplic));      //TAS_CAR
+        // 7483 <--
+        if(_crossCompanySearch)
+        {
+            virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+        }
+        else
+        {
+            virtualCompanyCompanies += curext();
+        }
+        changecompany(_sKS_BR_BankTran.company())
+        {
+            for (i=1; i <= conlen(_matchContainers.GoodInv()); i++)
+            {
+                conGoodInv = str2int64(conPeek(_matchContainers.GoodInv(), i));
+                invoiceAmount = conPeek(_matchContainers.ConAmountCur(), i); // 7483
+
+                select firstonly crosscompany:virtualCompanyCompanies RecId, DueDate, RefRecId from custTransOpen
+                    index hint recid
+                        where custTransOpen.RecId == conGoodInv;
+
+                if(this.findInvoiceFromJournalGrid(conGoodInv,_sKS_BR_BankTran) == false)
+                {
+                    While select crosscompany:virtualCompanyCompanies custTrans where custTrans.RecId == custTransOpen.RefRecId
+                    {
+                        journalARApplic.clear();
+                        journalarapplic.AccountType     = LedgerJournalACType::Cust;
+                        changeCompany(custTrans.company())
+                        {
+                            journalarapplic.LedgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(custTrans.AccountNum, LedgerJournalACType::Cust);
+                        }
+
+                        journalarapplic.CustTransDataAreaId = custtrans.dataAreaId;
+                        journalarapplic.CustTransRecId      = custTrans.RecId;
+                        journalarapplic.CustTransOpenRecId  = custtransopen.RecId;
+                        journalarapplic.InvoiceDate         = custTrans.TransDate;
+                        journalarapplic.InvoiceDueDate      = custtransopen.DueDate;
+                        journalarapplic.Invoice             = custtrans.Invoice;
+                        journalarapplic.Description         = SKS_PP_Setup::find().CustPaymentsDescription; // 9657 CR
+
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        // 7483 -->
+                        /*
+                        specTransManager = SpecTransManager::newRefTableId(CustTable::find(custTrans.AccountNum),0, true);
+                        lbIsMarked = specTransManager.existForOtherSpec(custTransopen.company(),custTransopen.TableId,custTransopen.RecId);
+                        if (!lbIsMarked)
+                        {
+                            locSKS_LB_JournalARApplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(custTransopen.RecId); // SKS_Bug_9627
+
+                            if (locSKS_LB_JournalARApplic.RecId)
+                            {
+                                lbIsMarked = true;
+                                invoiceAmount = 0;
+                            }
+                            else
+                            {
+                                lbIsMarked = false;
+                            }
+                        }
+
+                        journalarapplic.AlreadyMarked       = lbIsMarked;
+                        // 7483 <--
+                        */
+                        locSKS_LB_JournalARApplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(custTransopen.RecId); // SKS_Bug_9627
+
+                        if (locSKS_LB_JournalARApplic.RecId)
+                        {
+                            lbIsMarked = true;
+                            //invoiceAmount = 0; // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        }
+                        else
+                        {
+                            lbIsMarked = false;
+                        }
+
+                        journalarapplic.AlreadyMarked       = lbIsMarked;
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                        journalarapplic.SKS_BR_BankTran     = _sKS_BR_BankTran.RecId;
+                        journalarapplic.AltInvLookupType    = conPeek(_matchContainers.MatchType(), i);
+
+                        switch(journalarapplic.AltInvLookupType)
+                        {
+                            case SKS_LB_MatchType::InvoiceNumber:
+                                journalarapplic.AltInvLookupRef = custTrans.Invoice;
+                                break;
+
+                            case SKS_LB_MatchType::PaymentID:
+                                journalarapplic.AltInvLookupRef = custTrans.PaymId;
+                                break;
+
+                            case SKS_LB_MatchType::SalesOrderNumber:
+                                CustInvoiceSalesLink SalesLink;
+                                select SalesID from SalesLink where SalesLink.InvoiceID  == custTrans.Invoice;
+                                journalarapplic.AltInvLookupRef = SalesLink.SalesId;
+                                break;
+
+                            case SKS_LB_MatchType::CustomerReq:
+                                CustInvoiceJour Cust_InvoiceJour;
+                                select firstOnly Cust_InvoiceJour
+                                    where Cust_InvoiceJour.PurchaseOrder != '' &&
+                                          Cust_InvoiceJour.InvoiceId == custTrans.Invoice &&
+                                          Cust_InvoiceJour.InvoiceAccount == custTrans.AccountNum &&
+                                          Cust_InvoiceJour.InvoiceDate == custTrans.TransDate;
+                                journalarapplic.AltInvLookupRef = Cust_InvoiceJour.PurchaseOrder;
+                                break;
+
+                            case SKS_LB_MatchType::BillOfLading:
+                                CustInvoiceJour Cust_InvoiceJournal;
+                                WMSBillOfLadingOrder WMS_BillOfLadingOrder;
+                                select RecId from Cust_InvoiceJournal
+                                    where (Cust_InvoiceJournal.InvoiceID == custTrans.Invoice)
+                                join billOfLadingId from WMS_BillOfLadingOrder
+                                    where ( WMS_BillOfLadingOrder.InventTransRefID == Cust_InvoiceJournal.SalesId
+                                            && WMS_BillOfLadingOrder.WMSReferenceType == WMSReferenceType::Sales);
+
+                                journalarapplic.AltInvLookupRef = WMS_BillOfLadingOrder.billOfLadingId;
+                                break;
+
+                            case SKS_LB_MatchType::PaymentReference:
+                                journalarapplic.AltInvLookupRef = custTrans.PaymReference;
+                                break;
+
+                            case SKS_LB_MatchType::DocNum:
+                                journalarapplic.AltInvLookupRef = custTrans.DocumentNum;
+                                break;
+                        }
+
+                        journalarapplic.Status = SKS_BR_Status::Full;
+                        // 7483 <--
+                        if(invoiceAmount == 0)
+                        {
+                            journalarapplic.DiscApplyAmount = 0;
+                            journalarapplic.TransactionAmount = 0; // 7628
+                        }
+                        else
+                        {
+                            journalarapplic.TransactionAmount   = journalarapplic.InvoiceCurToTransCur(invoiceAmount) - journalarapplic.displayDiscountAvail(); // 7628
+                            journalarapplic.DiscApplyAmount = journalarapplic.displayDiscountAvail();
+                        }
+                        // 7483 <--
+                        if(journalarapplic.displayInvoiceBalance() != 0)
+                        {
+                            journalarapplic.DiscountTakenPercent    = decRound((journalarapplic.DiscApplyAmount * 100 )/ journalarapplic.displayInvoiceBalance(),1); // 7334
+                        }
+                        journalarapplic.DefaultDimension = SKS_LB_JournalARApplic::getCustDefaultDimension(journalarapplic); // 7572
+                        journalarapplic.DefaultBankDimension = SKS_LB_JournalARApplic::getDefaultBankAccount(journalarapplic.findSKS_BR_BankTran());//8655
+                        journalARApplicRecordInsertList.add(journalarapplic);
+                        journalarapplic = null;
+                        noOfInvoicesPosted++;
+                    }
+                    journalARApplicRecordInsertList.insertDatabase();       //TAS_CAR
+                }
+            }
+        }
+
+        return noOfInvoicesPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInvoiceFromJournalGrid</Name>
+				<Source><![CDATA[
+    private boolean findInvoiceFromJournalGrid(
+            RecId               _custTransRecId,
+            SKS_BR_BankTran     _sKS_BR_BankTran)
+    {
+        SKS_LB_JournalARApplic  journalARApplic;
+
+        select RecId from journalARApplic
+                where journalARApplic.SKS_BR_BankTran       == _sKS_BR_BankTran.RecId
+                    && journalARApplic.CustTransOpenRecId   == _custTransRecId;
+
+        return journalARApplic.RecId != 0 ? true:false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_BR_BankTran</Name>
+				<Source><![CDATA[
+    public SKS_BR_BankTran parmSKS_BR_BankTran(SKS_BR_BankTran  _sKS_BR_BankTran = sKS_BR_BankTran)
+    {
+        sKS_BR_BankTran = _sKS_BR_BankTran;
+
+        return sKS_BR_BankTran;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_BR_NoteType</Name>
+				<Source><![CDATA[
+    public SKS_BR_NoteType parmSKS_BR_NoteType(SKS_BR_NoteType  _sKS_BR_NoteType = sKS_BR_NoteType)
+    {
+        sKS_BR_NoteType = _sKS_BR_NoteType;
+
+        return sKS_BR_NoteType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_BR_SearchText</Name>
+				<Source><![CDATA[
+    public SKS_BR_NoteMemo parmSKS_BR_SearchText(SKS_BR_NoteMemo  _searchTextInvoice = searchTextInvoice)
+    {
+        searchTextInvoice = _searchTextInvoice;
+
+        return searchTextInvoice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        SKS_PP_Bank                         sKS_PP_Bank;
+        SKS_LB_MatchingRules                sKS_LB_MatchingRules;
+        SKS_LB_UnstructuredRulesMatching    unstructuredRulesMatching = new SKS_LB_UnstructuredRulesMatching();
+        List                                invoiceNumberList = new List(Types::Class);
+        SKS_LB_UnstructuredMatchContainers  matchContainers;
+        container                           goodInvoices;
+        SKS_BR_NoteMemo                     analyzeNote; // 7483
+        Integer                             noOfInvoicesPosted;
+
+        changecompany(SKS_BR_BankTran.company()) // 7628
+        {
+            sKS_PP_Bank = SKS_PP_Bank::find(sKS_BR_BankTran.AccountId);
+
+            select UnstrRuleID,lookupType,SearchType, IncludeDuplicateInvs from sKS_LB_MatchingRules
+                    where sKS_LB_MatchingRules.GroupID == sKS_PP_Bank.MatchingRulesGroupIdCustSettle
+                        && sKS_LB_MatchingRules.lookupType == SKS_LB_MatchType::UnstrData;
+
+            switch(sKS_BR_NoteType)
+            {
+                case sKS_BR_NoteType::User:
+                    analyzeNote = sKS_BR_BankTran.TranDescriptionUser;
+                    break;
+                case sKS_BR_NoteType::Original:
+                    analyzeNote = sKS_BR_BankTran.TranDescription;
+                    break;
+                case sKS_BR_NoteType::Search:
+                    analyzeNote = searchTextInvoice;
+                    break;
+            }
+
+            if (sKS_LB_MatchingRules.UnstrRuleID)
+            {
+                invoiceNumberList = unstructuredRulesMatching.ParseInvNumbers(analyzeNote,sKS_LB_MatchingRules.UnstrRuleID);
+                matchContainers = unstructuredRulesMatching.CycleValues(invoiceNumberList, sKS_BR_BankTran.CustAccount, sKS_LB_MatchingRules.IncludeDuplicateInvs,sKS_PP_Bank.InvoiceSearchCrossComp, true);
+
+                goodInvoices = matchContainers.GoodInv();
+                if(matchContainers)
+                {
+                    noOfInvoicesPosted = this.createJournalLine(matchContainers,sKS_BR_BankTran,sKS_PP_Bank.InvoiceSearchCrossComp);
+                }
+                // 7364 -->
+                if(noOfInvoicesPosted > 0)
+                {
+                    SKS_LB_JournalARApplic::checkIsAlreadyMarked(sKS_BR_BankTran.RecId); // 8778 CR
+                    info(strFmt("@SKS6226", noOfInvoicesPosted));
+                }
+                // 7364 <--
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        SKS_BR_AnalyzeNCreateJournal    analyzeNCreateJournal = new SKS_BR_AnalyzeNCreateJournal();
+        SKS_BR_BankTran sKS_BR_BankTran;
+
+        if(_args.record().TableId == tableNum(SKS_BR_BankTran))
+        {
+            sKS_BR_BankTran = _args.record();
+            analyzeNCreateJournal.parmSKS_BR_BankTran(sKS_BR_BankTran);
+            analyzeNCreateJournal.parmSKS_BR_SearchText(_args.parm());
+            analyzeNCreateJournal.parmSKS_BR_NoteType(_args.parmEnum());
+        }
+
+        analyzeNCreateJournal.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLookupType</Name>
+				<Source><![CDATA[
+    public SKS_LB_MatchType getLookupType(
+    SKS_BR_BankTran     _bankTran)
+    {
+        SKS_LB_RemitTxtParse    sKS_LB_RemitTxtParse;
+        SKS_LB_MatchingRules    sKS_LB_MatchingRules;
+        SKS_PP_Bank              locSKS_PP_Bank = SKS_PP_Bank::find(_bankTran.AccountId);
+
+        select UnstrRuleID,lookupType,SearchType from sKS_LB_MatchingRules
+            where sKS_LB_MatchingRules.GroupID == locSKS_PP_Bank.MatchingRulesGroupIdCustSettle
+            && sKS_LB_MatchingRules.lookupType == SKS_LB_MatchType::UnstrData;
+
+        select NumberType from sKS_LB_RemitTxtParse where sKS_LB_RemitTxtParse.SKS_LB_RemitTxtAnalysis == sKS_LB_MatchingRules.UnstrRuleID;
+
+        return sKS_LB_RemitTxtParse.NumberType;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

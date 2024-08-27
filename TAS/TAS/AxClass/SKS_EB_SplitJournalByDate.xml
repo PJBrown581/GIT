@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EB_SplitJournalByDate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EB_SplitJournalByDate
+{
+    LedgerJournalTable      ledgerJournalTableCreate;
+    LedgerJournalTrans      ledgerJournalTrans, splitNoJournalTrans;
+    LedgerJournalTableData  journalTableData;
+    LedgerJournalTable      ledgerJournalTableDate;
+    LedgerJournalTrans      ledgerJournalTransDate;
+    boolean                 splitJournal;  
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>splitJournalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Splits the journal lines
+    /// </summary>
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Necessary to allow the processing of every inner loop for every relevant transaction record(outer loop)")] //TAS_CAR
+    public Map splitJournalLines(LedgerJournalTable _ledgerJournalTable)
+    {
+        TransDate               journalCurrentDate;
+        TransDate               journalSplitDate;
+        int                     linesCount;        
+        //SKS_FDD_11060 -->
+        boolean                 linesSplitted;
+        CustPaymModeTable       custPaymModeTable, custPaymModeTableLoc;
+        SKS_EFT_FileFormat      sks_FileFormat, sks_FileFormatLoc;
+        boolean                 splitJournalNotExists = false;        
+        boolean                 journalCreated;        
+        boolean                 firstRec;      
+        Map                     splitJournalsMap = new Map(Types::Record, Types::String);        
+        //SKS_FDD_11060 <--
+
+        // check if the Origin journal contains SplitJournalByDate no records
+        select count(RecId) from  splitNoJournalTrans
+                where splitNoJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+        join SKS_EFT_FormatID from custPaymModeTable
+            order by SKS_EFT_FormatID
+                where custPaymModeTable.PaymMode == splitNoJournalTrans.PaymMode
+        join SplitJournalByDate from sks_FileFormat
+            order by SplitJournalByDate
+                where sks_FileFormat.FormatId == custPaymModeTable.SKS_EFT_FormatId &&
+                sks_FileFormat.SplitJournalByDate == NoYes::No;       
+        if(splitNoJournalTrans.RecId > 0)
+        {
+            splitJournalNotExists = true;
+                    
+        }
+
+        ttsbegin;
+        // iterate only SplitJournalByDate = yes
+        while select TransDate, PaymMode from ledgerJournalTrans
+            group by TransDate, PaymMode
+                where ledgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+        join SKS_EFT_FormatID, PaymMode from custPaymModeTable
+                where custPaymModeTable.PaymMode == ledgerJournalTrans.PaymMode
+        join SplitJournalByDate from sks_FileFormat
+                where sks_FileFormat.FormatId == custPaymModeTable.SKS_EFT_FormatId &&
+            sks_FileFormat.SplitJournalByDate == NoYes::Yes
+        {
+            while select forupdate * from ledgerJournalTransDate
+                    where ledgerJournalTransDate.TransDate == ledgerJournalTrans.TransDate &&
+                    ledgerJournalTransDate.PaymMode == ledgerJournalTrans.PaymMode && 
+                    ledgerJournalTransDate.JournalNum == _ledgerJournalTable.JournalNum                  
+                {                 
+                    if (journalCurrentDate == dateNull())
+                    {
+                        journalCurrentDate = ledgerJournalTransDate.TransDate;
+                    }
+                    // if Origin journal contains both SplitJournalByDate Yes and No records, then SplitJournalByDate Yes Payments has to split
+                    if (journalCurrentDate != ledgerJournalTransDate.TransDate || splitJournalNotExists)
+                    {
+                        splitJournal = true;
+                        if (!journalSplitDate || journalSplitDate != ledgerJournalTransDate.TransDate)
+                        {
+                            if (linesSplitted)
+                            {
+                                splitJournalsMap.insert(ledgerJournalTableCreate, strFmt("@SKS:SKGJournalCreation",ledgerJournalTableCreate.JournalNum, journalSplitDate, linesCount));                                
+                                linesCount = 0;
+                                linesSplitted = false;
+                            }
+                            if(!firstRec)
+                            {
+                                firstRec = true;
+                                this.createJournalHeader(_ledgerJournalTable.JournalName);
+                                journalSplitDate = ledgerJournalTransDate.TransDate;
+                                journalCreated = true;
+                            }
+                        }
+                        if (splitJournal)
+                        {
+                            ttsbegin;
+                            ledgerJournalTransDate.JournalNum = ledgerJournalTableCreate.JournalNum;
+                            ledgerJournalTransDate.update();
+                            linesSplitted = true;
+                            linesCount++;
+                            ttscommit;
+                        }
+                    }
+                else
+                {
+                    break;
+                }                
+            }
+            firstRec = false;
+            if(journalCreated)
+            {                                    
+                journalCreated = false;
+                if (splitJournal && linesSplitted)
+                {                    
+                    splitJournalsMap.insert(ledgerJournalTableCreate, strFmt("@SKS:SKGJournalCreation",ledgerJournalTableCreate.JournalNum,journalSplitDate, linesCount));                    
+                    linesCount = 0;
+                    linesSplitted = false;
+                    splitJournal = false;                  
+                }                             
+                ledgerJournalTableCreate = null;
+            }                                       
+        }           
+        ttscommit;   
+        return splitJournalsMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create journal header
+    /// </summary>
+    /// <param name = "_journalName">Journal name</param>
+    private void createJournalHeader(LedgerJournalNameId _journalName)
+    {        
+
+        ledgerJournalTableCreate.clear();
+        journalTableData = JournalTableData::newTable(ledgerJournalTableCreate);
+        journalTableData.initFromJournalName(journalTableData.journalStatic().findJournalName(_journalName));
+        ledgerJournalTableCreate.SKS_EFT_JournalState = SKS_EFT_JournalState::Ready;
+        ledgerJournalTableCreate.insert();       
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

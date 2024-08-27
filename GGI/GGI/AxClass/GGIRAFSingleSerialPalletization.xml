@@ -1,0 +1,617 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIRAFSingleSerialPalletization</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[WHSWorkExecuteMode(WHSWorkExecuteMode::GGIRAFSingleSerial)]
+class GGIRAFSingleSerialPalletization extends  WHSWorkExecuteDisplay
+{
+    InventDim                   productionDimensions;
+    Private const InventQty     SerialQty = 1;
+    private WHSRFPassthrough    fieldValues = new WHSRFPassthrough(Types::String, Types::String);
+    container                   serialCon;
+    int                         i = 1;
+    ListIterator                serialIterator;
+    str                         serial, firstSerial, lastSerial;
+    InventDim                   inventDim;
+    InventSerialId              serialId;
+    List                        serialList = new List(Types::String);    
+    int                         qty;
+    Private const string255     RFRange = 'Range serial scan';
+    Private const string255     RFSingle = 'Single serial scan';
+    Private const string255     RFConfirm = 'Confirm';
+    Private const string255     FirstSerialId = 'First serial number';
+    Private const string255     LastSerialId = 'Last serial number';
+    private const int           postion = 2;
+    private const int           workPosition = 1;
+    Private const String255     pipeSeperator = '|';
+    Private const String255     ampSeperator = '@'; 
+    boolean                     isError = false;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>displayForm</Name>
+				<Source><![CDATA[
+    container displayForm(container _con, str _buttonClicked = '')
+    {
+        container               ret = conNull();
+        container               con = _con;
+        container               tmpFieldValues = conNull();
+        int                     hasError = 0;
+        boolean                 complete = false;
+        boolean                 error = false;
+        WHSLicensePlateId       licensePlateId;
+        WHSWorkTemplateCode     workTemplateCode;
+        ProdTable               prodTableLoc;
+
+        pass = WHSRFPassthrough::create(conPeek(_con,postion));
+
+        hasError = this.hasError(_con);
+
+        if (pass.exists(#UserId))
+        {
+            userId = pass.lookup(#UserId);
+
+            if (!pass.exists(#InventLocationId))
+            {
+                pass.insert(#InventLocationId, WHSWorkUserSession::find(userId).InventLocationId);
+            }          
+        }
+
+        
+        if (_buttonClicked == RFConfirm)
+        {
+            serial = pass.exists(#SelectedValue) ? pass.lookup(#SelectedValue): "";
+            serialCon = str2con(serial);
+            if(serialCon != conNull())
+            {
+                prodTableLoc        = ProdTable::find(pass.lookup(#ProdId));
+                licensePlateId      = WHSLicensePlate::createLicensePlate(pass.lookup(#ParentLP)).LicensePlateId;
+                workTemplateCode    = WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).WorkTemplateCode;
+
+                this.createPostRAF(serialCon, licensePlateId, prodTableLoc);
+                ret = this.handleWorkCompletedMessage(ret);
+
+                pass.remove(FirstSerialId);
+                pass.remove(#ParentLp);
+                pass.remove(LastSerialId);
+                pass.remove(#Qty);
+                pass.remove(#SelectedValue);
+                step = 1;
+            }
+           
+        }
+        if (_buttonClicked == RFSingle)
+        {
+            pass.remove(FirstSerialId);
+            pass.remove(LastSerialId);
+            pass.remove(#Qty);
+            pass.remove(#SelectedValue);
+
+            step = 5;
+        }
+        switch (step)
+        {
+            case 0:
+                ret = this.buildGetProductionOrder(ret);
+                step = 1;
+                break;
+
+            case 1:
+                error = false;
+
+                [con, error] = this.processData(con);
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(#ProdId) && pass.lookup(#ProdId)  == "")
+                {
+                    ret = this.buildGetProductionOrder(ret);
+                }
+                else 
+                {                    
+                    ret = this.buildGetParentLicensePlate(ret);
+                    step = 2;
+                }
+                break;
+
+            case 2:
+               
+                 error = false;
+                [con, error] = this.processData(con);
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(#ParentLP) && pass.lookup(#ParentLP)  == "")
+                {
+                    ret = this.buildGetParentLicensePlate(ret);
+                }
+                else
+                {
+                    ret  = this.buildFirstSerialNumber(ret);
+                    step = 3;
+                 }
+                break;
+
+            case 3:
+                error = false;
+                [con, error] = this.processData(con);
+
+                serialId = pass.exists(#SerialId) ? pass.lookup(#SerialId) : '';
+                pass.insert(FirstSerialId, serialId);
+                pass.remove(#SerialId);
+
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(FirstSerialId) && pass.lookup(FirstSerialId)  == "")
+                {
+                    ret = this.buildFirstSerialNumber(ret);
+                }
+                else
+                {
+                    ret = this.buildLastSerialNumber(ret);
+                    step = 4;
+                }
+                break;
+            case 4:
+                error = false;
+                [con, error] = this.processData(con);
+
+                serialId = pass.exists(#SerialId) ? pass.lookup(#SerialId) : '';
+                pass.insert(LastSerialId, serialId);
+                pass.remove(#SerialId);
+
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(LastSerialId) && pass.lookup(LastSerialId)  == "")
+                {
+                    ret = this.buildLastSerialNumber(ret);
+                }
+                else
+                {
+                    
+                    firstSerial = pass.lookup(FirstSerialId);
+                    lastSerial  = pass.lookup(LastSerialId);
+                    
+
+                    while select inventDim
+                        group by inventSerialId
+                    where inventDim.inventSerialId >=  firstSerial
+                        && inventDim.inventSerialId <= lastSerial
+                    {
+                        if(inventDim)
+                        {
+                            ProdId   prodId = pass.exists(#ProdId) ? pass.lookup(#ProdId) : '';
+                            [con, error]  = this.validateSerialNumber(con, inventDim.inventSerialId, prodId);
+                            if(error)
+                            {
+                                ret = con;
+                            }
+                            else
+                            {
+                                qty ++;
+                                serialCon = conIns(serialCon,conLen(serialCon)+1,inventDim.inventSerialId);
+                            }
+                            
+                        }
+                    }
+
+                    if(!Qty && !error)
+                    {
+                        while select inventDim
+                        group by inventSerialId
+                            where inventDim.inventSerialId  >=  lastSerial
+                                && inventDim.inventSerialId <=  firstSerial
+                        {
+                            if(inventDim)
+                            {
+                                ProdId   prodId = pass.exists(#ProdId) ? pass.lookup(#ProdId) : '';
+                                [con, error]  = this.validateSerialNumber(con, inventDim.inventSerialId, prodId);
+                                if(error)
+                                {
+                                    ret = con;
+                                }
+                                else
+                                {
+                                    qty ++;
+                                    serialCon = conIns(serialCon,conLen(serialCon)+1,inventDim.inventSerialId);
+                                }
+                            }
+                        }
+                       
+                    }
+
+                    
+                    if(!error && qty)
+                    {
+                        pass.insert(#SelectedValue, con2Str(serialCon));
+                        ret  = this.buildConfirmQtySerialNumber(ret);
+                        step = 0;
+                    }
+
+                    
+                }
+                break;
+            case 5:
+
+                error = false;
+                [con, error] = this.processData(con);
+
+                 serialId = pass.exists(#SerialId) ? pass.lookup(#SerialId) : '';
+                 if(serialId != '')
+                 {
+                    ProdId   prodId = pass.exists(#ProdId) ? pass.lookup(#ProdId) : '';
+                    [con, error]  = this.validateSerialNumber(con, serialId, prodId);
+                    if(error)
+                    {
+                        ret = con;
+                    }
+                    else
+                    {
+                        ret = this.buildSerialNumber(ret);
+
+                        if(pass.exists(#selectedValue))
+                        {
+                            serial += pass.lookup(#SelectedValue) + pipeSeperator + serialId;
+                            pass.insert(#SelectedValue, serial);
+                        }
+                        else
+                        {
+                            pass.insert(#SelectedValue, serialId);
+                        }
+                        step = 5;
+                    }
+                       
+                }
+                else if(_buttonClicked == #RFFinished)
+                {
+                    ret  = this.buildFirstSerialNumber(ret);
+                    pass.remove(#SerialId);
+                    pass.remove(#SelectedValue);
+                    step = 3;
+                }
+                else if(_buttonClicked != #RFDone && serialId == "")
+                {
+                    ret = this.buildSerialNumber(ret);
+                    step = 5;
+                }
+                else if(_buttonClicked == RFSingle)
+                {
+                    ret = this.buildSerialNumber(ret);
+                    step = 5;
+                }
+                else if(_buttonClicked == #RFDone && pass.exists(#SelectedValue))
+                {
+                    serialList = strSplit(pass.lookup(#SelectedValue),pipeSeperator);
+                    serialIterator      = new ListIterator(serialList);
+                    licensePlateId      = WHSLicensePlate::createLicensePlate(pass.lookup(#ParentLP)).LicensePlateId;
+                    workTemplateCode    = WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).WorkTemplateCode;
+                    prodTableLoc        = ProdTable::find(pass.lookup(#ProdId));
+                    while (serialIterator.more())
+                    {
+                        this.createRAF(serialIterator.value(), licensePlateId, workTemplateCode, prodTableLoc);
+                        serialIterator.next();
+                    }
+                    ret = this.handleWorkCompletedMessage(ret);
+                    ret = this.buildGetProductionOrder(ret);
+
+                    pass.remove(#SerialId);
+                    pass.remove(#ParentLP);
+                    pass.remove(#SelectedValue);
+                    step = 1;
+                }
+                else if(_buttonClicked != #RFFinished && serialId == "")
+                {
+                    ret = this.buildSerialNumber(ret);
+                    step = 5;
+                }
+                else if(_buttonClicked != RFSingle)
+                {
+                    ret = this.buildSerialNumber(ret);
+                    step = 5;
+                }
+                break;
+           
+
+
+        }
+        ret = this.updateModeStepPass(ret, mode, step, pass);
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPostRAF</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates and posts a RAF journal with the specified collection of serial numbers.
+    /// </summary>
+    /// <param name = "_serialNumberCollection">
+    ///     A collection of serial numbers to include in the RAF journal.
+    /// </param>
+    /// <param name = "_licensePlateId">
+    ///     License plate number to represent the RAF journal.
+    /// </param>
+    /// <param name = "_prodTable">
+    ///     The production order the RAF journal is based on.
+    /// </param>
+    public void createPostRAF(container _serialNumberCollection, WHSLicensePlateId _licensePlateId, ProdTable _prodTable)
+    {
+        productionDimensions = ProdTable::find(pass.lookup(#ProdId)).inventDim();
+
+        ttsbegin;
+
+        NumberOf                numberOfSerialIds       = conLen(_serialNumberCollection);
+        ProdParmReportFinished  prodParmReportFinished  = GGIRAFJournalManager::createProdParmReportFinished(_prodTable);
+
+        prodParmReportFinished.EndJob           = NoYes::No;
+        prodParmReportFinished.BOMAutoConsump   = BOMAutoConsump::Always;
+        prodParmReportFinished.QtyGood          = numberOfSerialIds;
+
+        InventDim inventDimCriteria = InventDim::find(prodParmReportFinished.InventDimId);
+
+        inventDimCriteria.LicensePlateId    = WHSLicensePlate::createLicensePlate(_licensePlateId).LicensePlateId;
+        prodParmReportFinished.InventDimId  = InventDim::findOrCreate(inventDimCriteria).inventDimId;
+        prodParmReportFinished.update();
+        
+        GGIInventoryManager::registerSerialNumberCon(_serialNumberCollection, _prodTable, inventDimCriteria);
+        GGIRAFJournalManager::post(prodParmReportFinished);
+
+        ttscommit;
+
+        pass.insert(#WorkComplete, workPosition);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRAF</Name>
+				<Source><![CDATA[
+    public void createRAF(InventSerialId _SerialId, WHSLicensePlateId _LicensePlateId, WHSWorkTemplateCode _workTemplateCode, ProdTable _prodTableLoc)
+    {
+        productionDimensions = ProdTable::find(pass.lookup(#ProdId)).inventDim();
+        WHSWorkCreateProdPut workCreateProdPut = this.initializeWHSWorkCreateProdPut(productionDimensions, _SerialId, _LicensePlateId, _workTemplateCode, _prodTableLoc);
+        workCreateProdPut.createReportFinished();
+        pass.insert(#WorkComplete, workPosition);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeWHSWorkCreateProdPut</Name>
+				<Source><![CDATA[
+    protected WHSWorkCreateProdPut initializeWHSWorkCreateProdPut(InventDim _productionDimensions, InventSerialId _SerialId,  WHSLicensePlateId _LicensePlateId, WHSWorkTemplateCode _workTemplateCode, ProdTable _prodTableLoc)
+    {
+
+        WHSWorkCreateProdPut workCreateProdPut = new WHSWorkCreateProdPut(_prodTableLoc);
+        workCreateProdPut.parmCreatedBy(userId);
+        workCreateProdPut.parmTargetLicensePlateId(_LicensePlateId);
+        workCreateProdPut.parmWorkTemplateCode(_workTemplateCode);
+        workCreateProdPut.parmInventSerialId(_SerialId);
+        workCreateProdPut.parmWHSWorkExecuteMode(WHSWorkExecuteMode::GGIRAFSingleSerial);
+        WorkCreateProdPut.parmInventHandlingQty(SerialQty);
+
+        return workCreateProdPut;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processData</Name>
+				<Source><![CDATA[
+    private container processData(container _con)
+    {
+        container con = _con;
+
+        if (this.hasError(con))
+        {
+            con = this.deleteControlDataFromContainer(con, #RFError);
+        }
+        container  tmpFieldValues;
+        [con, tmpFieldValues] = WHSRFControlData::processData(con, pass);
+        fieldValues = WHSRFPassthrough::create(tmpFieldValues);
+        pass = this.combineMaps(pass, fieldValues);
+
+        return [con, this.hasError(con)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSerialNumber</Name>
+				<Source><![CDATA[
+    public container validateSerialNumber(container _con, WHSSerialId _serialId, ProdId _prodId)
+    {
+        ProdId                  prodIdReturn = '';
+        ItemId                  itemIdReturn = '';
+        container               con = _con;
+        
+
+        InventTrans             inventTrans;
+        InventDim               inventDimLocal;
+        InventTransOrigin       inventTransOrigin;
+
+        select firstonly  inventTransOrigin
+            where inventTransOrigin.ReferenceCategory == InventTransType::Production
+             && inventTransOrigin.ReferenceId == _prodId
+            join inventTrans
+             where inventTrans.inventTransOrigin == inventTransOrigin.RecId
+              && inventTrans.StatusReceipt == StatusReceipt::Ordered
+             exists join inventDimLocal
+              where inventDimLocal.inventDimId == inventTrans.inventDimId
+               && inventDimLocal.inventSerialId == _serialId;
+
+        if(!inventTransOrigin.ReferenceId && !isError)
+        {
+           isError = true;
+           con = this.addErrorLabel(_con, strFmt("@GGI:InvalidSequence", _serialId), WHSRFColorText::Error);
+        }
+
+        return [con, this.hasError(con)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGetParentLicensePlate</Name>
+				<Source><![CDATA[
+    container buildGetParentLicensePlate(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@WAX1198";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #ParentLP, "@WAX1198", 1, '', extendedTypeNum(WHSLicensePlateId), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGetProductionOrder</Name>
+				<Source><![CDATA[
+    container buildGetProductionOrder(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@WAX725";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #ProdId, "@WAX725", 1, '', extendedTypeNum(ProdId), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSerialNumber</Name>
+				<Source><![CDATA[
+    container buildSerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:SerialNumberInput";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, enum2Str(WHSWorkCreationProcess::ReportAsFinishedBySerial), finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #SerialId, "@SYS124420", 1, '', extendedTypeNum(InventSerialId), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFDone, "@SYS4784", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFFinished, "@GGI:RangeSerialScan", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConfirmQtySerialNumber</Name>
+				<Source><![CDATA[
+    container buildConfirmQtySerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:SerialNumberInput";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, strFmt("@GGI:FirstSerial",pass.lookup(FirstSerialId)), 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, strFmt("@GGI:LastSerial",pass.lookup(LastSerialId)), 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFText, #Qty, "@SYS105177", 1, int2Str(qty) , extendedTypeNum(InventSerialId), '', 0, false)];
+
+        ret += [this.buildControl(#RFButton, RFConfirm, "@SYS4784", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, RFSingle, "@GGI:SingleSerialScan", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildFirstSerialNumber</Name>
+				<Source><![CDATA[
+    container buildFirstSerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:SerialNumberInput";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, enum2Str(WHSWorkCreationProcess::ReportAsFinishedBySerial), finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #SerialId, "@GGI:FirstSerialNumber", 1, '', extendedTypeNum(InventSerialId), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, RFSingle, "@GGI:SingleSerialScan", 1, '', #WHSRFUndefinedDataType, '', 1)];
+
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLastSerialNumber</Name>
+				<Source><![CDATA[
+    container buildLastSerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:SerialNumberInput";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, enum2Str(WHSWorkCreationProcess::ReportAsFinishedBySerial), finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #SerialId, "@GGI:LastSerialNumber", 1, '', extendedTypeNum(InventSerialId), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, RFSingle, "@GGI:SingleSerialScan", 1, '', #WHSRFUndefinedDataType, '', 1)];
+
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleWorkCompletedMessage</Name>
+				<Source><![CDATA[
+    private container handleWorkCompletedMessage(container _con)
+    {
+        container ret = conNull();
+        if (pass.exists(#WorkComplete))
+        {
+            ret = this.addErrorLabel(ret, "@WAX866", WHSRFColorText::Success);
+            pass.remove(#WorkComplete);
+        }
+        ret += _con;
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

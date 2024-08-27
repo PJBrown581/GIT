@@ -1,0 +1,1621 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocSharePointHelperV2</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Platform.Integration.SharePoint;
+using Docentric.AX.Storage.SharePoint;
+using Docentric.AX.Storage.SharePoint.Common;
+using Docentric.AX.Storage.SharePoint.Credentials;
+using Docentric.AX.Storage.SharePoint.Model;
+using Docentric.AX.Storage.SharePoint.Exceptions;
+
+/// <summary>
+/// Docentric SharePoint helper class.
+/// </summary>
+[SysObsoleteAttribute('The DocSharePointHelperV2 class is obsolete. Please use the DocSharePointHelperV3 class instead.', false, 30\11\2021)]
+public class DocSharePointHelperV2
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getAccessToken</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get SharePoint access token used by D365FO.
+    /// NOTE: This method is used by Docentric.AX .Net assembly to get the internal D365FO SharePoint credentials for each request.
+    /// </summary>
+    /// <param name = "_spSiteHost">The SharePoint host name you are accessing</param>
+    /// <param name = "_spSiteName">The SharePoint site name you are accessing</param>
+    /// <param name = "_externaUserId">The user's Azure AD external ID used for session impersonation</param>
+    /// <returns>The SharePoint access token</returns>
+    internal static str getAccessToken(str _spSiteHost, str _spSiteName, str _externaUserId)
+    {
+        SharePointProxy proxy = SharePointHelper::CreateProxy(_spSiteHost, _spSiteName, _externaUserId);
+        return proxy.AccessToken;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSharePointProxy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of DocSharePointProxy class.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_extUserId">The user's Azure AD external ID used for session impersonation</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>An instance of DocSharePointProxy class</returns>
+    public static DocSharePointProxy createSharePointProxy(
+        str _spSiteUrl,
+        str _extUserId = DocGlobalHelper::getExternalId(curUserId()),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSharePointProxy spProxy = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+
+        if (_spSiteUrl == '' || _extUserId == '')
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParametersNotSet", strFmt('%1, %2', identifierStr(_spSiteUrl), identifierStr(_extUserId))), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str errMsg = strFmt("@DocentricAX4:SharePointCreateSharePointProxyErr", _spSiteUrl, _extUserId);
+
+        try
+        {
+            // if DocSPOnPremiseCredentials is used exception will be thrown
+            // Feature is part of the FULL edition
+            IDocSPCredentials spCredentials = DocSharePointHelperV2::getSharePointProvider(_spSiteUrl, _extUserId);
+            spProxy = new DocSharePointProxy(_spSiteUrl, spCredentials);
+
+            // if we are connecting to SharePoint on-premises we allow the untrusted connection to sites.
+            // REASON: Server does not trust the certificate chain or the server certificate is not installed in the Trusted Root Authorites machine certificate store
+            if (spCredentials is DocSPOnPremiseCredentials)
+            {
+                spProxy.AllowUntrustedConnectionToSites = true;
+            }
+
+            if (spProxy == null && _showErrorMsg)
+            {
+                DocGlobalHelper::handleError(errMsg, true, funcName(), _throwError);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spProxy;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSharePointProvider</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of DocSPDynamicsInternalCredentials class.
+    /// </summary>
+    /// <param name = "_siteUrl">The site hostname or url</param>
+    /// <param name = "_extUserId">The user's Azure AD external ID used for session impersonation</param>
+    /// <returns>An instance of DocSPDynamicsInternalCredentials class</returns>
+    private static IDocSPCredentials getSharePointProvider(str _siteUrl, str _extUserId)
+    {
+        DocParameters docParameters = DocParameters::find();
+
+        // SharePoint D365FO internal credentials
+        IDocSPCredentials sharePointCredentials = null;
+
+        switch (docParameters.SharePointAuthorizationType)
+        {
+            // SharePoint D365FO internal credentials
+            case DocSharePointAuthorizationType::Integrated:
+                sharePointCredentials = new DocSPDynamicsInternalCredentials(_siteUrl, _extUserId);
+                break;
+            // SharePoint on line credentials
+            case DocSharePointAuthorizationType::Online:
+                sharePointCredentials = new DocSPOnlineCredentials(docParameters.SharePointUsername, docParameters.getSharePointPassword());
+                break;
+            // SharePoint on premise credentials
+            case DocSharePointAuthorizationType::OnPremise:
+                sharePointCredentials = new DocSPOnPremiseCredentials(docParameters.SharePointUsername, docParameters.getSharePointPassword());
+                break;
+        }
+
+        return sharePointCredentials;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDefaultServer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the host name of the default SharePoint server if one exists.
+    /// </summary>
+    /// <returns>The default SharePoint server</returns>
+    public static str getDefaultServer()
+    {
+        str serverName;
+        DocuParameters parameters = DocuParameters::find();
+        if (parameters)
+        {
+            serverName = parameters.DefaultSharePointServer;
+        }
+
+        if (!serverName)
+        {
+            str tenantId = DocGlobalHelper::getAADTenantId();
+            if (tenantId != '')
+            {
+                serverName = DocSharePointHelperV2::constructDefaultServerName(tenantId);
+            }
+        }
+
+        return serverName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructDefaultServerName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs the default SharePoint server name.
+    /// </summary>
+    /// <param name = "_tenantId">Azure AD tenant Id</param>
+    /// <returns>SharePoint server name</returns>
+    private static str constructDefaultServerName(str _tenantId)
+    {
+        str serverName = '';
+        if (_tenantId)
+        {
+            str suffix;
+            int tenantNumber = strLen(_tenantId);
+            int endingIndex = strScan(_tenantId, '.onmicrosoft.com', 1, tenantNumber);
+            if (endingIndex > 0)
+            {
+                suffix = 'sharepoint.com';
+            }
+            else
+            {
+                endingIndex = strScan(_tenantId, '.ccsctp.net', 1, tenantNumber);
+                suffix = 'spoppe.com';
+            }
+
+            if (endingIndex > 0)
+            {
+                str tenant = subStr(_tenantId, 0, endingIndex);
+                serverName = tenant + suffix;
+            }
+        }
+
+        return serverName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDocumentLibraries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a list of SharePoint document libraries for provided SharePoint site.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>A list of SharePoint document libraries</returns>
+    public static DocSPDocumentLibraryCollection getDocumentLibraries(
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPDocumentLibraryCollection spDocumentLibraries = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetDocumentLibraryCollectionError", _spSiteUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spDocumentLibraries = spProxy.GetDocumentLibraries();
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spDocumentLibraries;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDocumentLibraryByUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SharePoint document library by provided relative url.
+    /// </summary>
+    /// <param name = "_spRelativeUrl">SharePoint relative url without hostname</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>SharePoint document library</returns>
+    public static DocSPDocumentLibrary getDocumentLibraryByUrl(
+        str _spRelativeUrl,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPDocumentLibrary spDocumentLibrary = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spRelativeUrl)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spRelativeUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str spDocumentLibraryUrl = DocSharePointHelperV2::getDocumentLibraryUrl(_spRelativeUrl, _spSiteUrl);
+
+        str errMsg = strFmt("@DocentricAX4:SharePointGetDocumentLibraryError", spDocumentLibraryUrl, _spSiteUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spDocumentLibrary = spProxy.GetDocumentLibraryByUrl(spDocumentLibraryUrl);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spDocumentLibrary;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSharePointSiteByUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SharePoint site by provided url.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>SharePoint site</returns>
+    public static DocSPSite getSharePointSiteByUrl(
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPSite spSite = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetSharePointSiteError", _spSiteUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spSite = spProxy.GetSiteByUrl(_spSiteUrl);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spSite;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>siteExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the SharePoint site by provided url exists.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>True, if SharePoint site exists; otherwise false</returns>
+    public static boolean siteExists(
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        boolean spSiteExists = false;
+
+        DocSPSite spSite = DocSharePointHelperV2::getSharePointSiteByUrl(_spSiteUrl, _userId, _showErrorMsg, _throwError);
+        spSiteExists = spSite != null;
+
+        return spSiteExists;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSharePointSites</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Searches for sites on SharePoint server.
+    /// </summary>
+    /// <param name = "_spSearchOptions">Site search options</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>An instance of DocSPSiteResult class</returns>
+    public static DocSPSiteResult findSharePointSites(
+        DocSPSiteSearchOptions _spSearchOptions,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPSiteResult spSiteResult = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spSearchOptions)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spSearchOptions)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetSharePointSitesError", _spSiteUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spSiteResult = spProxy.FindSites(_spSearchOptions);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spSiteResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFolderItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets folder containing folders or files..
+    /// </summary>
+    /// <param name = "_spRelativeUrl">Relative path of a document library or folder</param>
+    /// <param name = "_spSearchOptions">Search options used to filter the resultsSearch options used to filter the results</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>An instance of DocSPFolderItemResult class</returns>
+    /// <remarks>
+    /// SharePoint supports only next page (endless scrolling of folder items).
+    /// If you need to fetch the next page, pass the _spSearchOptions from the result to the next method call.
+    /// </remarks>
+    public static DocSPFolderItemResult getFolderItems(
+        str _spRelativeUrl,
+        DocSPFolderSearchOptions _spSearchOptions,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPFolderItemResult spFolderItemResult = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spSearchOptions || !_spRelativeUrl)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParametersNotSet", strFmt('%1, %2', identifierStr(_spSearchOptions), identifierStr(_spRelativeUrl))), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetSharePointFolderItemsError", _spSiteUrl, _spRelativeUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spFolderItemResult = spProxy.GetFolderItems(_spRelativeUrl, _spSearchOptions);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spFolderItemResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFolderByUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SharePoint folder by provided folder path url.
+    /// </summary>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>SharePoint folder</returns>
+    public static DocSPFolder getFolderByUrl(
+        str _spFolderPath,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPFolder spFolder = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spFolderPath)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spFolderPath)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetFolderByUrlError", _spSiteUrl, _spFolderPath, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spFolder = spProxy.GetFolder(_spFolderPath);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spFolder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>uploadToSharePoint</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uploads file to SharePoint.
+    /// </summary>
+    /// <param name = "_stream">File content</param>
+    /// <param name = "_fileName">File name</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_overwriteFile">Should the uploading file be overwritten</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <param name = "_createNonExistingFolders">Should the non-existing folders in the provided folder path be created</param>
+    /// <param name = "_spMetadataFieldMap">SharePoint metadata field map</param>
+    /// <param name = "_uploadFileAllowedWithoutMetadata">Is file allowed to be uploaded without metadata</param>
+    /// <returns>The uploaded file URL</returns>
+    public static str uploadToSharePoint(
+        System.IO.MemoryStream _stream,
+        str _fileName,
+        str _spSiteUrl, 
+        str _spFolderPath,
+        str _userId = curUserId(),
+        boolean _overwriteFile = true, 
+        boolean _throwError = true, 
+        boolean _createNonExistingFolders = true, 
+        Map _spMetadataFieldMap = null,
+        boolean _uploadFileAllowedWithoutMetadata = true)
+    {
+        str filePathUrl = '';
+
+        if (_stream == null || _fileName == '' || _spFolderPath == '')
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParametersNotSet", strFmt('%1, %2, %3', identifierStr(_stream), identifierStr(_fileName), identifierStr(_spFolderPath))), true, funcName(), _throwError);
+            return '';
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            return '';
+        }
+
+        boolean errorThrown = false;
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        boolean updateFileMetadata = (_spMetadataFieldMap != null && _spMetadataFieldMap.elements() > 0);
+        str spDocumentLibraryUrl = DocSharePointHelperV2::getDocumentLibraryUrl(_spFolderPath, _spSiteUrl);
+
+        str fileErrMsg = strFmt("@DocentricAX4:SharePointUploadFileError", _filename, _spSiteUrl, _spFolderPath, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId), _overwriteFile, _createNonExistingFolders, updateFileMetadata);
+        str metadataErrMsg = strFmt("@DocentricAX4:SharePointUploadFileWithMetadataError", _filename, _spSiteUrl, _spFolderPath);
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, true, _throwError))
+            {
+                // Set file upload options
+                DocSPFileUploadOptions spFileUploadOptions = new DocSPFileUploadOptions();
+                spFileUploadOptions.OverwriteIfExists = _overwriteFile;
+                spFileUploadOptions.CreateNonExistingFolders = _createNonExistingFolders;
+                spFileUploadOptions.CleanUpWhenUploadFails = !_uploadFileAllowedWithoutMetadata;
+                spFileUploadOptions.Columns = null;
+
+                if (updateFileMetadata)
+                {
+                    // Prepare file metadata
+                    DocSPDocumentLibrary spDocumentLibrary = spProxy.GetDocumentLibraryByUrl(spDocumentLibraryUrl);
+                    spFileUploadOptions.Columns = DocSharePointHelperV2::setSharePointMetadataForUpload(spDocumentLibrary, _spMetadataFieldMap);
+                }
+
+                System.Exception ex;
+                DocSPFile spFile = null;
+                _stream.Position = 0;
+                try
+                {
+                    // Upload file with file upload options set
+                    spFile = spProxy.UploadFile(_spFolderPath, _fileName, _stream, spFileUploadOptions);
+
+                    filePathUrl = DocSPUrlHelper::GetFullUrl(_spSiteUrl, spFile.ServerRelativeUrl);
+                }
+                catch (ex)
+                {
+                    errorThrown = true;
+
+                    DocGlobalHelper::handleClrError(funcName(), _uploadFileAllowedWithoutMetadata ? '' : fileErrMsg, false);
+
+                    if (ex is DocSPUpdateMetadataException)  // Update of metadata fail
+                    {
+                        // Update of metadata can fail after the file was uploaded. The uploaded file is deleted 
+                        // if the flag _uploadFileAllowedWithoutMetadata is false.
+
+                        // Check if the file was uploaded without metadata
+                        var spUpdateMetadataException = ex as DocSPUpdateMetadataException;
+                        spFile = spUpdateMetadataException.File;
+
+                        if (_uploadFileAllowedWithoutMetadata)
+                        {
+                            if (spFile != null)
+                            {
+                                filePathUrl = DocSPUrlHelper::GetFullUrl(_spSiteUrl, spFile.ServerRelativeUrl);
+
+                                DocGlobalHelper::handleWarning(metadataErrMsg, false, funcName(), false);
+                            }
+                        }
+                    }
+                    else if (ex is DocSPAggregateColumnValidationException) // The metadata validation fails
+                    {
+                        // The metadata validation is done before the file upload. If it fails the file is not uploaded.
+                        // The file has to be uploaded, if the flag _uploadFileAllowedWithoutMetadata is true.
+
+                        // Check if the file has to be uploaded
+                        if (_uploadFileAllowedWithoutMetadata)
+                        {
+                            try
+                            {
+                                // Upload the file without metadata
+                                spFileUploadOptions.Columns = null;
+                                spFile = spProxy.UploadFile(_spFolderPath, _fileName, _stream, spFileUploadOptions);
+
+                                filePathUrl = DocSPUrlHelper::GetFullUrl(_spSiteUrl, spFile.ServerRelativeUrl);
+
+                                DocGlobalHelper::handleWarning(metadataErrMsg, false, funcName(), false);
+                            }
+                            catch (Exception::CLRError)
+                            {
+                                DocGlobalHelper::handleClrError(funcName(), fileErrMsg, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrError(funcName(), fileErrMsg, _throwError);
+        }
+
+        if (errorThrown && _throwError)
+        {
+            throw Exception::Error;
+        }
+
+        return filePathUrl;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSharePointFileMetadata</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates SharePoint file's metadata.
+    /// </summary>
+    /// <param name = "_spRelativeFilePath">Relative file path to be updated</param>
+    /// <param name = "_spMetadataFieldMap">SharePoint metdata field map</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <param name = "_uploadFileAllowedWithoutMetadata">Is file allowed to be uploaded without metadata</param>
+    /// <returns>The updated file URL</returns>
+    public static str updateSharePointFileMetadata(
+        str _spRelativeFilePath,
+        Map _spMetadataFieldMap,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _throwError = true,
+        boolean _uploadFileAllowedWithoutMetadata = true)
+    {
+        str filePathUrl = '';
+
+        if (_spRelativeFilePath == '' || _spMetadataFieldMap == null)
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParametersNotSet", strFmt('%1, %2', identifierStr(_spRelativeFilePath), identifierStr(_spMetadataFieldMap))), true, funcName(), _throwError);
+            return '';
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            return '';
+        }
+
+        boolean errorThrown = false;
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str spDocumentLibraryUrl = DocSharePointHelperV2::getDocumentLibraryUrl(_spRelativeFilePath, _spSiteUrl);
+
+        str spFilePath = DocSPUrlHelper::GetFullUrl(_spSiteUrl, _spRelativeFilePath);
+        str spFileName = System.IO.Path::GetFileName(spFilePath);
+        str spFolder = strReplace(DocSPUrlHelper::GetResourceAbsolutePath(_spSiteUrl, _spRelativeFilePath), spFileName, '');
+        spFolder = strFind(spFolder, DocConstantFile::UrlDelimiter, 1, 1) == 1 ? strLRTrim(strPoke(spFolder, ' ', 1)) : spFolder;
+        spFolder = strFind(spFolder, DocConstantFile::UrlDelimiter, strLen(spFolder), -1) == strLen(spFolder) ? strLRTrim(strPoke(spFolder, ' ', strLen(spFolder))) : spFolder;
+
+        str errorMsg = strFmt("@DocentricAX4:SharePointUpdateMetadataError", spFileName, _spSiteUrl, spFolder, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+        if (!_uploadFileAllowedWithoutMetadata)
+        {
+            errorMsg += "@DocentricAX4:SharePointUpdateMetadataFileDeleteError";
+        }
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, true, _throwError))
+            {
+                DocSPColumnCollection spColumnCollection = null;
+                // Prepare file metadata
+                if (_spMetadataFieldMap != null && _spMetadataFieldMap.elements() > 0)
+                {
+                    DocSPDocumentLibrary spDocumentLibrary = spProxy.GetDocumentLibraryByUrl(spDocumentLibraryUrl);
+                    spColumnCollection = DocSharePointHelperV2::setSharePointMetadataForUpload(spDocumentLibrary, _spMetadataFieldMap);
+                }
+
+                try
+                {
+                    // Update file metadata
+                    DocSPFile spFile = spProxy.UpdateFileMetadata(_spRelativeFilePath, spColumnCollection);
+
+                    filePathUrl = spFile.ServerRelativeUrl;
+                }
+                catch (Exception::CLRError)
+                {
+                    errorThrown = true;
+
+                    DocGlobalHelper::handleClrError(funcName(), _uploadFileAllowedWithoutMetadata ? '' : errorMsg, false);
+
+                    if (!_uploadFileAllowedWithoutMetadata)
+                    {
+                        try
+                        {
+                            // Restore uploaded file to previous version or delete it if there is no version 
+                            spProxy.RestoreFileToPreviousVersion(_spRelativeFilePath, null, true);
+                        }
+                        catch (Exception::CLRError)
+                        {
+                            DocGlobalHelper::handleClrError(funcName(), '', false);
+                        }
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleWarning(errorMsg, false, funcName(), false);
+                    }
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrError(funcName(), _uploadFileAllowedWithoutMetadata ? '' : errorMsg, _throwError);
+            if (_uploadFileAllowedWithoutMetadata)
+            {
+                DocGlobalHelper::handleWarning(errorMsg, false, funcName(), _throwError);
+            }
+        }
+
+        if (errorThrown && _throwError)
+        {
+            throw Exception::Error;
+        }
+
+        return filePathUrl;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setSharePointMetadataForUpload</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the SharePoint metadata for upload.
+    /// </summary>
+    /// <param name = "_spDocumentLibrary">SharePoint document library</param>
+    /// <param name = "_spMetadataFieldMap">SharePoint metadata field map</param>
+    /// <returns>An instance of DocSPColumnCollection class</returns>
+    public static DocSPColumnCollection setSharePointMetadataForUpload(DocSPDocumentLibrary _spDocumentLibrary, Map _spMetadataFieldMap)
+    {
+        DocSPColumnCollection spColumnCollection = null;
+
+        if (_spDocumentLibrary == null || _spDocumentLibrary.UpdatableFields == null || _spDocumentLibrary.UpdatableFields.Count == 0)
+        {
+            return spColumnCollection;
+        }
+
+        if (_spMetadataFieldMap == null || _spMetadataFieldMap.elements() == 0)
+        {
+            return spColumnCollection;
+        }
+
+        DocSPFieldCollection spFieldCollection = _spDocumentLibrary.UpdatableFields;
+        spColumnCollection = new DocSPColumnCollection();
+        MapEnumerator spMetadataFieldMapEnumerator = _spMetadataFieldMap.getEnumerator();
+        while (spMetadataFieldMapEnumerator.moveNext())
+        {
+            DocSharePointMetadataField spMetadataField = spMetadataFieldMapEnumerator.currentValue();
+
+            DocSPField spField = spFieldCollection.GetByInternalName(spMetadataFieldMapEnumerator.currentKey());
+            if (spField != null)
+            {
+                DocSPColumn spColumn = new DocSPColumn(spField);
+                if (spColumn != null)
+                {
+                    spColumn.SetTextValue(spMetadataField.parmFieldValue(), spMetadataField.parmCultureInfo(), spMetadataField.parmDateTimeFormats());
+                    spColumnCollection.add(spColumn);
+                }
+            }
+            else
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:SharePointMetadataSetForUploadFieldNotExistsWarning", spMetadataField.parmFieldName(), _spDocumentLibrary.FullServerPath), false);
+            }
+        }
+
+        if (spColumnCollection.Count == 0)
+        {
+            spColumnCollection = null;
+        }
+
+        return spColumnCollection;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fileExistsByUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given file exists on SharePoint.
+    /// </summary>
+    /// <param name = "_spRelativeFilePath">Relative file path url</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>
+    /// Returns true if file exists on SharePoint. Returns false if file does not exist,
+    /// or if an error occurs and the _throwError parameter set to false.
+    /// </returns>
+    public static boolean fileExistsByUrl(
+        str _spRelativeFilePath,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        boolean fileExists = false;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spRelativeFilePath)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spRelativeFilePath)), true, funcName(), _throwError);
+            }
+            return false;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return false;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointFileExistsByUrlError", _spRelativeFilePath, _spSiteUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                fileExists = spProxy.FileExists(_spRelativeFilePath);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return fileExists;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes a file from SharePoint.
+    /// </summary>
+    /// <param name = "_spFilePath">SharePoint file path url</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>True if file was successfully deleted; otherwise false</returns>
+    public static boolean deleteFile(
+        str _spFilePath,
+        str _spSiteUrl,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        boolean fileDeleted = false;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spFilePath)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spFilePath)), true, funcName(), _throwError);
+            }
+            return false;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return false;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointDeleteFileError", _spFilePath, _spSiteUrl, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spProxy.DeleteFile(_spFilePath);
+                fileDeleted = true;
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return fileDeleted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>folderPathExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given folder path exists on SharePoint.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>
+    /// Returns true if the provided folder path exists on SharePoint.
+    /// Returns false if any of the folder specified in the given folder path does not exist,
+    /// or if an error occurs and the _throwError parameter set to false (otherwise the error is thrown).
+    /// </returns>
+    public static boolean folderPathExists(
+        str _spSiteUrl,
+        str _spFolderPath, 
+        str _userId = curUserId(), 
+        boolean _showErrorMsg = true, 
+        boolean _throwError = true)
+    {
+        boolean folderPathExists = false;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return false;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointFolderPathExistsError", _spFolderPath, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                folderPathExists = spProxy.FolderExists(_spFolderPath);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return folderPathExists;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ensureFolder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ensures full folder structure in Sharepoint.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>
+    /// Returns a DocSPCreateFolderResult object if the provided folder was created on SharePoint.
+    /// Returns null if any of the folder specified in the given folder path does not exist,
+    /// or if an error occurs and the _throwError parameter set to false (otherwise the error is thrown).
+    /// </returns>
+    public static DocSPCreateFolderResult ensureFolder(
+        str _spSiteUrl,
+        str _spFolderPath,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPCreateFolderResult spCreateFolderResult = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointCreateFolderError", _spFolderPath, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spCreateFolderResult = spProxy.CreateFolder(_spFolderPath);
+            }
+        }
+        catch(Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spCreateFolderResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFolder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a folder in the given folder path on SharePoint.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>
+    /// Returns true if the provided folder was created on SharePoint.
+    /// Returns false if any of the folder specified in the given folder path does not exist,
+    /// or if an error occurs and the _throwError parameter set to false (otherwise the error is thrown).
+    /// </returns>
+    public static boolean createFolder(
+        str _spSiteUrl,
+        str _spFolderPath,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        boolean folderWasCreated = false;
+
+        DocSPCreateFolderResult spCreateFolderResult = DocSharePointHelperV2::ensureFolder(_spSiteUrl, _spFolderPath, _userId, _showErrorMsg, _throwError);
+        folderWasCreated = spCreateFolderResult != null;
+
+        return folderWasCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileInfoByUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the SharePoint File object with file info.
+    /// </summary>
+    /// <param name = "_spFilePath">SharePoint file path url</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>File info. Returns null if file does not exist, or if an error occurs and the _throwError parameter set to false.</returns>
+    public static DocSPFile getFileInfoByUrl(
+        str _spFilePath,
+        str _spSiteUrl, 
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPFile spFile = null;
+
+        if (!_showErrorMsg && _throwError)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:InvalidParameterCombination", identifierStr(_showErrorMsg), _showErrorMsg, identifierStr(_throwError), _throwError));
+        }
+        if (!_spFilePath)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spFilePath)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), _throwError);
+            }
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetFileInfoByUrlError", _spFilePath, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, _showErrorMsg, _throwError))
+            {
+                spFile = spProxy.GetFile(_spFilePath);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (_showErrorMsg)
+            {
+                DocGlobalHelper::handleClrError(funcName(), errMsg, _throwError);
+            }
+        }
+
+        return spFile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileInfoByName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the SharePoint File object with file info.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_fileName">File name</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>File info. Returns null if file does not exist, or if an error occurs and the _throwError parameter set to false.</returns>
+    public static DocSPFile getFileInfoByName(
+        str _spSiteUrl,
+        str _spFolderPath,
+        str _fileName,
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        DocSPFile spFile = null;
+
+        if (strEndsWith(_spFolderPath, DocConstantFile::UrlDelimiter))
+        {
+            _spFolderPath = subStr(_spFolderPath, 1, strLen(_spFolderPath) - 1);
+        }
+        str spFilePath = _spFolderPath + DocConstantFile::UrlDelimiter + _fileName;
+
+        spFile = DocSharePointHelperV2::getFileInfoByUrl(spFilePath, _spSiteUrl, _userId, _showErrorMsg, _throwError);
+
+        return spFile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fileExistsByName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given file exists on SharePoint.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_fileName">File name</param>
+    /// <param name = "_userId">User Id</param>
+    /// <param name = "_showErrorMsg">Should error message be shown if an error occur</param>
+    /// <param name = "_throwError">If error occurs, throw an exception</param>
+    /// <returns>
+    /// Returns true if file exists on SharePoint. Returns false if file does not exist,
+    /// or if an error occurs and the _throwError parameter set to false.
+    /// </returns>
+    public static boolean fileExistsByName(
+        str _spSiteUrl,
+        str _spFolderPath,
+        str _fileName, 
+        str _userId = curUserId(),
+        boolean _showErrorMsg = true,
+        boolean _throwError = true)
+    {
+        boolean fileExists = false;
+
+        DocSPFile spFile = DocSharePointHelperV2::getFileInfoByName(_spSiteUrl, _spFolderPath, _fileName, _userId, _showErrorMsg, _throwError);
+        fileExists = spFile != null;
+        
+        return fileExists;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileContentByUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a file content from SharePoint.
+    /// </summary>
+    /// <param name = "_spFilePath">SharePoint file path url</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_userId">User Id</param>
+    /// <returns>File content. Returns null if file does not exist.</returns>
+    public static System.IO.Stream getFileContentByUrl(
+        str _spFilePath,
+        str _spSiteUrl,
+        str _userId = curUserId())
+    {
+        System.IO.Stream fileContent = null;
+
+        if (_spFilePath == '')
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSet", identifierStr(_spFilePath)), true, funcName(), true);
+            return null;
+        }
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ParameterNotSetOrInvalid", identifierStr(_spSiteUrl)), true, funcName(), true);
+            return null;
+        }
+
+        str extUserId = DocGlobalHelper::getExternalId(_userId);
+        str errMsg = strFmt("@DocentricAX4:SharePointGetFileContrentByUrlError", _spFilePath, strFmt("@DocentricAX4:SharePointCredentialsIntegratedToString", _userId, extUserId));
+
+        try
+        {
+            using (DocSharePointProxy spProxy = DocSharePointHelperV2::createSharePointProxy(spSiteUri.AbsoluteUri, extUserId, true, true))
+            {
+                fileContent = new System.IO.MemoryStream();
+                spProxy.DownloadFile(_spFilePath, fileContent);
+                if (fileContent != null)
+                {
+                    fileContent.Position = 0;
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            if (fileContent != null)
+            {
+                fileContent.Dispose();
+            }
+            DocGlobalHelper::handleClrException(funcName(), errMsg);
+        }
+
+        return fileContent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileContentByName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a file content from SharePoint.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_fileName">File name</param>
+    /// <param name = "_userId">User Id</param>
+    /// <returns>File content. Returns null if the file does not exist.</returns>
+    public static System.IO.Stream getFileContentByName(
+        str _spSiteUrl,
+        str _spFolderPath,
+        str _fileName,
+        str _userId = curUserId())
+    {
+        System.IO.Stream fileContent = null;
+
+        if (strEndsWith(_spFolderPath, DocConstantFile::UrlDelimiter))
+        {
+            _spFolderPath = subStr(_spFolderPath, 1, strLen(_spFolderPath) - 1);
+        }
+        str spFilePath = _spFolderPath + DocConstantFile::UrlDelimiter + _fileName;
+
+        fileContent = DocSharePointHelperV2::getFileContentByUrl(spFilePath, _spSiteUrl, _userId);
+
+        return fileContent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSharePointHostNameFromUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SharePoint hostname from provided SharePoint site url.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <returns>SharePoint hostname</returns>
+    public static str getSharePointHostNameFromUrl(str _spSiteUrl)
+    {
+        str hostName = '';
+
+        System.Uri spSiteUri;
+        if (System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            hostName = spSiteUri.Host;
+        }
+        
+        return hostName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSharePointSiteNameFromUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets SharePoint site name from provided SharePoint site url.
+    /// </summary>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <returns>SharePoint site name</returns>
+    public static str getSharePointSiteNameFromUrl(str _spSiteUrl)
+    {
+        int length = strLen(_spSiteUrl);
+        int lastPos = length - 1;
+
+        int targetPos = strFind(_spSiteUrl, DocConstantFile::UrlDelimiter, lastPos, -lastPos);
+        str spSiteName = subStr(_spSiteUrl, targetPos + 1, length);
+
+        if (strEndsWith(spSiteName, DocConstantFile::UrlDelimiter))
+        {
+            spSiteName = subStr(spSiteName, 1, strLen(spSiteName) - 1);
+        }
+
+        return spSiteName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidSharePointFolderPath</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given SharePoint folder path is valid.
+    /// </summary>
+    /// <param name="_spFolderPath">SharePoint folder path.</param>
+    /// <returns>True if the given SharePoint folder path is valid.</returns>
+    public static boolean isValidSharePointFolderPath(str _spFolderPath)
+    {
+        str regex = '[a-zA-Z0-9]+';
+
+        if (_spFolderPath == '')
+        {
+            return true;
+        }
+
+        // SharePoint folder path doesn't start with '/'
+        if (strStartsWith(_spFolderPath, DocConstantFile::SharePointFolderPathDelimiter))
+        {
+            return false;
+        }
+    
+        // Check if the file path contains invalid path characters.
+        System.Char[] invalidCharactersArray = System.IO.Path::GetInvalidPathChars();
+    
+        str folderPath = System.Text.RegularExpressions.Regex::Replace(_spFolderPath, regex, '');
+        int lenOfFilePath = strlen(folderPath);
+    
+        System.String strInvalidChars = new System.String(invalidCharactersArray);
+        // Adding additional invalid characters
+        strInvalidChars = strInvalidChars + '#%*:?';
+
+        int indexOfArray = 1;
+        while (indexOfArray <= lenOfFilePath)
+        {
+            System.String filePathChar = substr(folderPath, indexOfArray, 1);
+            if (filePathChar == DocConstantFile::SharePointFolderPathDelimiter)
+            {
+                indexOfArray++;
+                continue;
+            }
+
+            if (strInvalidChars.Contains(filePathChar))
+            {
+                return false;
+            }
+
+            indexOfArray++;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDocumentLibraryUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the SharePoint document library url from provided 
+    /// SharePoint relative folder path url and SharePoint site url.
+    /// </summary>
+    /// <param name = "_spFolderRelativeUrl">SharePoint relative folder path url</param>
+    /// <param name = "_spSiteUrl">SharePoint site url</param>
+    /// <returns>SharePoint document library url</returns>
+    public static str getDocumentLibraryUrl(str _spFolderRelativeUrl, str _spSiteUrl)
+    {
+        str spDocumentLibraryUrl = '';
+
+        System.Uri spSiteUri;
+        if (!_spSiteUrl || !System.Uri::TryCreate(_spSiteUrl, System.UriKind::Absolute, byref spSiteUri))
+        {
+            return spDocumentLibraryUrl;
+        }
+
+        // Get SharePoint folder path url
+        System.String spFolderUrl = DocSPUrlHelper::GetFullUrl(spSiteUri.AbsoluteUri, _spFolderRelativeUrl);
+
+        // Fill delimiters
+        System.String[] delimiters = new System.String[2]();
+        delimiters.Set(0, '/');
+        delimiters.Set(1, '\\');
+  
+        // Remove SharePoint site url from folder path url and split the remain folder path url
+        System.String[] spFolderUrlArray = spFolderUrl.Replace(spSiteUri.AbsoluteUri, '').Split(delimiters, System.StringSplitOptions::RemoveEmptyEntries);
+        if (spFolderUrlArray.Length > 0)
+        {
+            // Get the first element which represents the document library url
+            spDocumentLibraryUrl = spFolderUrlArray.Get(0);
+        }
+
+        return spDocumentLibraryUrl;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

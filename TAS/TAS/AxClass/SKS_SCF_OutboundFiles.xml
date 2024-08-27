@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_SCF_OutboundFiles</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_SCF_OutboundFiles extends SKS_EB_Batch
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning('BPCheckNestedLoopinCode','Nested loop of for and while loop cannot be joined.For loop iterator all batches using containers,same container is used in while select.Joining will provide incorrect results and will impact functionality.')]    //TAS_CAR
+    public void run()
+    {
+        //SKS_EB_FileHub locSKS_EB_FileHub = SKS_EB_FileHub::construct();
+        //SKS_EB_Send locSKS_EB_Send;
+        Batch bat;
+
+        SKS_SCF_Provider locSKS_SCF_Provider;
+        VendTransOpen locVendTransOpen, vendTransOpenUpdate;
+        VendTrans locVendTrans,locVendTransUpdate;
+        SKS_SCF_File locSKS_SCF_File,SKS_SCF_FileUpdate;
+        SKS_SCF_Processing sks_scf_Processing;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+        RefRecId locRefRecID;
+        boolean isHoliday;
+    
+        bat = this.parmCurrentBatch();
+        locRefRecID = bat.RecId;
+        
+        while select locSKS_EB_CommProcess where locSKS_EB_CommProcess.BatchJobId == locRefRecID  && locSKS_EB_CommProcess.SCF_FileCreateType == SKS_SCF_FileCreate::FixedTime
+        {
+            while select crosscompany ProviderId,PaymMode,OutCommID, BankHolidayGroupID from locSKS_SCF_Provider where locSKS_SCF_Provider.OutCommID == locSKS_EB_CommProcess.CommID
+            {
+                isHoliday = SKS_SCF_Processing::dateWeekendHoliday(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()), locSKS_SCF_Provider.BankHolidayGroupID);
+
+                if(isHoliday)
+                {
+                    info(strFmt("@SKS:SCFTodayIsWeekend", locSKS_SCF_Provider.ProviderID , locSKS_SCF_Provider.DataAreaId));
+                }
+
+                if(!isHoliday)
+                {
+                    changecompany(locSKS_SCF_Provider.DataAreaId)
+                    {
+                        locVendTransOpen = null;
+                        locVendTrans = null;
+                        SKS_SCF_FileUpdate = null;
+                        locSKS_SCF_File = null;
+                        vendTransOpenUpdate = null;
+                        locVendTransUpdate = null;
+
+                        while select count(RecId), sum(AmountCur) from locVendTransOpen join locVendTrans
+                            group by locVendTrans.PaymMode
+                             where locVendTrans.PaymMode == locSKS_SCF_Provider.PaymMode
+                                && locVendTransOpen.RefRecId == locVendTrans.RecId
+                                && locVendTrans.Invoice !=''
+                                && locVendTransOpen.SKS_SCF_FileNbr ==''
+                                && locVendTransOpen.AmountCur!=0
+                                && locVendTransOpen.AccountNum != locSKS_SCF_Provider.ProviderID
+                                && locVendTrans.Approved == NoYes::Yes  // DevOps - 16514
+                        {
+                            select forupdate Selected, ProviderID,InvoiceTotal,InvoiceCount,FileNbr,RecId from SKS_SCF_FileUpdate  order by FileNbr desc
+                                 where SKS_SCF_FileUpdate.ProviderID == locSKS_SCF_Provider.ProviderId
+                                && SKS_SCF_FileUpdate.FileStatus == SKS_SCF_FileStatus::NotProcessed;
+
+                            if(SKS_SCF_FileUpdate.RecId)
+                            {
+                                ttsbegin;
+                                SKS_SCF_FileUpdate.ProviderID = locSKS_SCF_Provider.ProviderId;
+                                SKS_SCF_FileUpdate.InvoiceTotal = locVendTransOpen.AmountCur *-1;
+                                SKS_SCF_FileUpdate.InvoiceCount =any2Int(locVendTransOpen.RecId);
+                                SKS_SCF_FileUpdate.Filename = SKS_SCF_Common::getFileName(SKS_SCF_FileUpdate.FileNbr, locSKS_SCF_Provider.ProviderId);
+                                SKS_SCF_FileUpdate.update();
+                                ttscommit;
+
+                                update_recordSet vendTransOpenUpdate
+                                setting
+                                 SKS_SCF_FileNbr = SKS_SCF_FileUpdate.FileNbr,
+                                 SKS_SCF_File_RecId = SKS_SCF_FileUpdate.RecId,
+                                 SKS_SCF_Selected = true                              // DevOps - 15276
+                                    join locVendTransUpdate
+                                     where locVendTransUpdate.PaymMode == locSKS_SCF_Provider.PaymMode
+                                        && vendTransOpenUpdate.RefRecId == locVendTransUpdate.RecId
+                                        && locVendTransUpdate.Invoice !=''
+                                        && vendTransOpenUpdate.SKS_SCF_FileNbr ==''
+                                        && vendTransOpenUpdate.AmountCur!=0
+                                        && vendTransOpenUpdate.AccountNum != locSKS_SCF_Provider.ProviderID
+                                        && locVendTransUpdate.Approved == NoYes::Yes;   // DevOps - 16514
+
+                                sks_scf_Processing = new SKS_SCF_Processing();
+                                sks_scf_Processing.AProcess_SCF(SKS_SCF_FileUpdate.FileNbr,
+                                                        SKS_PP_NextActionDisplay::CreateSendFile,
+                                                        locSKS_EB_CommProcess,
+                                                        false);
+                            }
+                            else
+                            {
+                                // else create new record in SKS_SCF_File
+                                ttsbegin;
+                                locSKS_SCF_File.FileNbr = NumberSeq::newGetNum(SKS_PP_Setup::numRefSCFNextFileNumb()).num();
+                                locSKS_SCF_File.ProviderID = locSKS_SCF_Provider.ProviderId;
+                                locSKS_SCF_File.InvoiceTotal = locVendTransOpen.AmountCur *-1;
+                                locSKS_SCF_File.InvoiceCount = any2Int(locVendTransOpen.RecId);
+                                locSKS_SCF_File.CommID = locSKS_SCF_Provider.OutCommID;
+                                locSKS_SCF_File.Filename = SKS_SCF_Common::getFileName(locSKS_SCF_File.FileNbr, locSKS_SCF_Provider.ProviderId);
+                                locSKS_SCF_File.insert();
+                                ttscommit;
+
+                                update_recordSet vendTransOpenUpdate
+                                setting
+                                 SKS_SCF_FileNbr = locSKS_SCF_File.FileNbr,
+                                 SKS_SCF_File_RecId = locSKS_SCF_File.RecId,
+                                 SKS_SCF_Selected = true                     // DevOps - 15276
+                                    join locVendTransUpdate
+                                     where locVendTransUpdate.PaymMode == locSKS_SCF_Provider.PaymMode
+                                        && vendTransOpenUpdate.RefRecId == locVendTransUpdate.RecId
+                                        && locVendTransUpdate.Invoice !=''
+                                        && vendTransOpenUpdate.SKS_SCF_FileNbr ==''
+                                        && vendTransOpenUpdate.AmountCur!=0
+                                        && vendTransOpenUpdate.AccountNum != locSKS_SCF_Provider.ProviderID
+                                        && locVendTransUpdate.Approved == NoYes::Yes;    // DevOps - 16514
+
+                                sks_scf_Processing = new SKS_SCF_Processing();
+                                sks_scf_Processing.AProcess_SCF(locSKS_SCF_File.FileNbr,
+                                                        SKS_PP_NextActionDisplay::CreateSendFile,
+                                                        locSKS_EB_CommProcess,
+                                                        false);
+                            }
+
+                        }
+                    }
+                }
+            }
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static client server ClassDescription description()
+    {
+        return "@SKS:SCFOutboundProcessing";
+    
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

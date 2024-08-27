@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_LedgerPostingPreEventHandler</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_IHB_LedgerPostingPreEventHandler
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>LedgerJournalPost_Pre_post</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// update the transdate and valuedate on post event.
+    /// </summary>
+    /// <param name="args"></param>
+    [PreHandlerFor(classStr(LedgerJournalPost), staticMethodStr(LedgerJournalPost, post))]
+    public static void LedgerJournalPost_Pre_post(XppPrePostArgs args)
+    {
+        Common                                      record = args.getArg('_record');
+        LedgerJournalTrans                          ledgerjournalTransUpdate;
+        LedgerJournalTrans                          ledgerjournalTrans = record as LedgerJournalTrans;
+        // SKS_Bug_10391 -->
+        LedgerJournalTable                          ledgerJournalTable = record as LedgerJournalTable;
+        LedgerJournalId                             journalNum;
+        // SKS_Bug_10391 <--
+
+        if (SKS_PP_Setup::find().IHB_Active)
+        {
+            // SKS_Bug_10391 -->
+            if(!ledgerjournalTrans.JournalNum)
+            {
+                journalNum = ledgerJournalTable.JournalNum;
+            }
+            else
+            {
+                journalNum = ledgerjournalTrans.JournalNum;
+            }
+            // SKS_Bug_10391 <--
+            while select forupdate ledgerjournalTransUpdate
+                    where ledgerjournalTransUpdate.JournalNum == journalNum // SKS_Bug_10391
+            {
+                if(SKS_IHB_LedgerPostingPreEventHandler::IHBDateAdjust(LedgerJournalTransUpdate)) // SKS_Bug_10555
+                {
+                    ledgerjournalTransUpdate.update();
+                }
+            }
+
+            //SKS_Bug_21551--->
+            LedgerJournalTrans lLedgerJournalTrans;
+
+            while select count(RecId) from lLedgerJournalTrans
+                group by lLedgerJournalTrans.Voucher
+                where lLedgerJournalTrans.JournalNum == journalNum
+                && lLedgerJournalTrans.SKS_EFTGL_IHBBankAccount
+            {
+                if(lLedgerJournalTrans.RecId > 0)
+                {
+                    LedgerJournalTrans locLedgerJournalTrans;
+                    LedgerJournalTrans tmpLedgerJournalTrans;
+
+                    select maxof(TransDate) from tmpLedgerJournalTrans where
+                        tmpLedgerJournalTrans.JournalNum == journalNum &&
+                        tmpLedgerJournalTrans.Voucher == lLedgerJournalTrans.Voucher;
+
+                    ttsbegin;
+                    update_recordset locLedgerJournalTrans
+                        setting TransDate = tmpLedgerJournalTrans.TransDate
+                        where locLedgerJournalTrans.JournalNum == journalNum
+                        && locLedgerJournalTrans.Voucher == lLedgerJournalTrans.Voucher;
+                    ttscommit;
+                }
+            }
+            //SKS_Bug_21551<---
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>IHBDateAdjust</Name>
+				<Source><![CDATA[
+    public static boolean IHBDateAdjust(LedgerJournalTrans ledgerjournalTransUpdate, LedgerJournalTrans    ledgerJournalTrans = null , boolean _isCallFromPaymJour = false)
+    {
+        TransDate                                   transDateOrig, nextDate, TmpDate, IHBDetailsStmtDate;
+        CompanyBankAccountId                        bankAccountId;
+        SKS_IHB_InhouseBankAccountsStatementDetails inhouseBankStatementDetails;
+        boolean                                     IHBDateCheck;
+        boolean                                     updateRecord = false;
+        boolean                                     checkOffsetIsIHBBank = false; // SKS_10392 CR
+        if(!LedgerJournalTrans)
+        {
+            LedgerJournalTrans = ledgerjournalTransUpdate;
+        }
+
+        transDateOrig = ledgerjournalTransUpdate.TransDate;
+        IHBDateCheck = false;
+        if(ledgerjournalTransUpdate.OffsetAccountType == LedgerJournalACType::Bank)
+        {
+            transDateOrig = ledgerjournalTransUpdate.TransDate; // SKS_Bug_10555
+            IHBDateCheck = true;
+            bankAccountId = DimensionAttributeValueCombination::find(ledgerjournalTransUpdate.OffsetLedgerDimension).DisplayValue;
+            nextDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(bankAccountId);
+            inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(bankAccountId);
+            IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate;
+            // SKS_10392 CR -->
+            if(nextDate != dateNull())
+            {
+                checkOffsetIsIHBBank = true;
+            }
+            // SKS_10392 CR <--
+        }
+
+        if(ledgerjournalTransUpdate.AccountType == LedgerJournalACType::Bank)
+        {
+            IHBDateCheck = true;
+            bankAccountId = DimensionAttributeValueCombination::find(ledgerjournalTransUpdate.LedgerDimension).DisplayValue;
+            TmpDate = SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(bankAccountId);
+            nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+            inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(bankAccountId);
+            IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+        }
+                
+        if(LedgerJournalTransUpdate.SKS_EFTAP_IHBBankAccount != '' || ledgerJournalTrans.SKS_EFTAP_IHBBankAccount != '') // SKS_10392 CR
+        {
+            IHBDateCheck = true;
+            // SKS_10392 CR -->
+            if(ledgerJournalTrans)
+            {
+                changecompany(ledgerJournalTrans.DataAreaId)
+                {
+                    TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTAP_IHBBankAccount);
+                    nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                    inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTAP_IHBBankAccount);
+                    IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+                }
+            }
+            else
+            {
+                TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTAP_IHBBankAccount);
+                nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTAP_IHBBankAccount);
+                IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+            }
+            // SKS_10392 CR <--
+        }
+
+        if(LedgerJournalTransUpdate.SKS_EFTAR_IHBBankAccount != '' || ledgerJournalTrans.SKS_EFTAR_IHBBankAccount != '')
+        {
+            IHBDateCheck = true;
+
+            if(ledgerJournalTrans)
+            {
+                changecompany(ledgerJournalTrans.DataAreaId)
+                {
+                    TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTAR_IHBBankAccount);
+                    nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                    inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTAR_IHBBankAccount);
+                    IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+                }
+            }
+            else
+            {
+                TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTAR_IHBBankAccount);
+                nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTAR_IHBBankAccount);
+                IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+            }
+
+            if(nextDate != dateNull())
+            {
+                checkOffsetIsIHBBank = true;
+            }
+        }
+
+        if(LedgerJournalTransUpdate.SKS_EFTGL_IHBBankAccount != '' || ledgerJournalTrans.SKS_EFTGL_IHBBankAccount != '')
+        {
+            IHBDateCheck = true;
+
+            if(ledgerJournalTrans)
+            {
+                changecompany(ledgerJournalTrans.DataAreaId)
+                {
+                    TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTGL_IHBBankAccount);
+                    nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                    inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTGL_IHBBankAccount);
+                    IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+                }
+            }
+            else
+            {
+                TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTGL_IHBBankAccount);
+                nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTGL_IHBBankAccount);
+                IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+            }
+
+            if(nextDate != dateNull())
+            {
+                checkOffsetIsIHBBank = true;
+            }
+        }
+
+        if(LedgerJournalTransUpdate.SKS_EFTInv_IHBBankAccount != '' || ledgerJournalTrans.SKS_EFTInv_IHBBankAccount != '')
+        {
+            IHBDateCheck = true;
+
+            if(ledgerJournalTrans)
+            {
+                changecompany(ledgerJournalTrans.DataAreaId)
+                {
+                    TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTInv_IHBBankAccount);
+                    nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                    inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTInv_IHBBankAccount);
+                    IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+                }
+            }
+            else
+            {
+                TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTInv_IHBBankAccount);
+                nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTInv_IHBBankAccount);
+                IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+            }
+
+            if(nextDate != dateNull())
+            {
+                checkOffsetIsIHBBank = true;
+            }
+        }
+
+        if(LedgerJournalTransUpdate.SKS_EFTAsset_IHBBankAccount != '' || ledgerJournalTrans.SKS_EFTAsset_IHBBankAccount != '')
+        {
+            IHBDateCheck = true;
+
+            if(ledgerJournalTrans)
+            {
+                changecompany(ledgerJournalTrans.DataAreaId)
+                {
+                    TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTAsset_IHBBankAccount);
+                    nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                    inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTAsset_IHBBankAccount);
+                    IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+                }
+            }
+            else
+            {
+                TmpDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(LedgerJournalTrans.SKS_EFTAsset_IHBBankAccount);
+                nextDate = TmpDate > nextDate ? TmpDate : nextDate;
+                inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccLastStatementDate(LedgerJournalTrans.SKS_EFTAsset_IHBBankAccount);
+                IHBDetailsStmtDate = inhouseBankStatementDetails.StatementDate > IHBDetailsStmtDate ? inhouseBankStatementDetails.StatementDate : IHBDetailsStmtDate;
+            }
+
+            if(nextDate != dateNull())
+            {
+                checkOffsetIsIHBBank = true;
+            }
+        }
+
+        if ((transDateOrig <= IHBDetailsStmtDate) && IHBDateCheck) 
+        {
+            //ttsbegin;
+            // SKS_10392 CR -->
+            if(!checkOffsetIsIHBBank && (ledgerjournalTransUpdate.SKS_EFTAP_IHBBankAccount || ledgerjournalTransUpdate.SKS_EFTGL_IHBBankAccount || ledgerjournalTransUpdate.SKS_EFTAR_IHBBankAccount))
+            {
+                ledgerjournalTransUpdate.TransDate = ledgerjournalTransUpdate.TransDate;
+            }
+            else
+            {
+                ledgerjournalTransUpdate.TransDate = nextDate;//Bug 10347
+            }
+            // SKS_10392 CR <--
+            LedgerJournalTransUpdate.DocumentDate = transDateOrig;  //SKS_Bug_20554
+            LedgerJournalTransUpdate.SKS_IHB_ValueDate = LedgerJournalTransUpdate.DocumentDate; // SKS_Bug_10555
+            //ttscommit;
+            if(!_isCallFromPaymJour && transDateOrig != ledgerjournalTransUpdate.TransDate)
+            {
+                info(strfmt("@SKS:SKSDateChanged",  ledgerjournalTransUpdate.Voucher,
+                                                                transDateOrig, // SKS_Bug_10555
+                                                                ledgerjournalTransUpdate.TransDate));
+            }
+        }
+
+        if(IHBDetailsStmtDate != dateNull() && IHBDateCheck)
+        {
+            
+            // SKS_10392 CR -->
+            if(ledgerjournalTransUpdate.TransDate <= IHBDetailsStmtDate && checkOffsetIsIHBBank) 
+            {
+                ledgerjournalTransUpdate.TransDate = nextDate; 
+                updateRecord = true;
+            }
+            // SKS_10392 CR -->
+
+            ledgerjournalTransUpdate.SKS_IHB_ValueDate = ledgerjournalTransUpdate.DocumentDate;//Bug 10347
+            
+            //updateRecord = true;
+            if (!updateRecord && ledgerjournalTransUpdate)
+            {
+                ttsbegin;
+                ledgerjournalTransUpdate.doUpdate();
+                ttscommit;
+            }
+            
+        }
+
+        if(IHBDetailsStmtDate == dateNull())
+        {
+            if(ledgerjournalTransUpdate.DocumentDate == dateNull())
+            {
+                ledgerjournalTransUpdate.SKS_IHB_ValueDate = transDateOrig;
+                ledgerjournalTransUpdate.DocumentDate = transDateOrig;
+            }
+            else
+            {
+                ledgerjournalTransUpdate.SKS_IHB_ValueDate = ledgerjournalTransUpdate.DocumentDate;//Bug 10347
+            }
+            //updateRecord = true;
+            if (ledgerjournalTransUpdate)
+            {
+                ttsbegin;
+                ledgerjournalTransUpdate.doUpdate();
+                ttscommit;
+            }
+        }
+        return updateRecord;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

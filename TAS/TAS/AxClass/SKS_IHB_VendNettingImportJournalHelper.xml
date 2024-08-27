@@ -1,0 +1,1509 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_VendNettingImportJournalHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Helper class for journal import
+/// </summary>
+class SKS_IHB_VendNettingImportJournalHelper
+{
+    SKS_IHB_VendNettingFilesHeader  vendNettingFilesHeader;
+    SKS_PP_Setup                    setup;
+    CustTransOpen                   transOpen;
+    SKS_PP_Bank                     ppBank;
+    SKS_IHB_VendorNettingJournalAction error;
+    LedgerJournalId                 errorJourId, GLJourId;
+    LedgerJournalTable              journalTableGL;
+    Voucher                         voucher;    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct
+    /// </summary>
+    /// <param name = "_vendNettingFilesHeader"> vend netting header </param>
+    /// <returns> returns SKS_IHB_VendNettingImportJournalHelper instance </returns>
+    public static SKS_IHB_VendNettingImportJournalHelper construct(SKS_IHB_VendNettingFilesHeader _vendNettingFilesHeader)
+    {
+        SKS_IHB_VendNettingImportJournalHelper helper = new SKS_IHB_VendNettingImportJournalHelper();
+        helper.parmVendNettingFilesHeader(_vendNettingFilesHeader);
+        return helper;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmVendNettingFilesHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set/get vend netting header record
+    /// </summary>
+    /// <param name = "_vendNettingFilesHeader"> returns VendNettingFilesHeader records </param>
+    /// <returns> returns VendNettingFilesHeader buffer </returns>
+    public SKS_IHB_VendNettingFilesHeader parmVendNettingFilesHeader(SKS_IHB_VendNettingFilesHeader _vendNettingFilesHeader = vendNettingFilesHeader)
+    {
+        vendNettingFilesHeader = _vendNettingFilesHeader;
+        return vendNettingFilesHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create gernal journal
+    /// </summary>
+    /// <param name = "_isFileImport"> if running for batch import</param>
+    /// <param name = "_recidCon"> Records container, runs vend netting import for selective records </param>
+    public void createJournal(boolean _isFileImport, container _recidCon = conNull())
+    {
+        if (vendNettingFilesHeader)
+        {
+            LedgerJournalTable ledgerJournalTable;
+            int linesCount =0;
+
+            try
+            {
+                ledgerJournalTable = this.createGLJournalHeader();
+                ledgerJournalTable.insert();
+
+                ttsbegin;
+                // Line Creation
+                if (_isFileImport)
+                {
+                    linesCount = this.createGLJournalLineFromBatch(ledgerJournalTable, vendNettingFilesHeader);
+                }
+                else
+                {
+                    linesCount = this.createGLJournalLineForm(ledgerJournalTable, vendNettingFilesHeader, _recidCon);
+                }
+                ttscommit;
+
+                if (ledgerJournalTable && linesCount > 0)
+                {                   
+                    // History table
+                    this.insertJournalHistory(ledgerJournalTable.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourCreated);
+                }
+
+                this.parmLedgerJournalTableGL(ledgerJournalTable);
+                
+            }
+            
+            catch (Exception::Error)
+            {                
+                this.insertErrorLog(vendNettingFilesHeader.FileId, infolog().text());
+                this.insertJournalHistory(ledgerJournalTable.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourCreateFailed);
+                this.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, true);
+                this.updateHeaderErrorNotes(vendNettingFilesHeader, SKS_IHB_VendorNettingJournalAction::GenJourCreateFailed);
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLedgerJournalTableGL</Name>
+				<Source><![CDATA[
+    public LedgerJournalTable parmLedgerJournalTableGL(LedgerJournalTable _journalTable = journalTableGL)
+    {
+        journalTableGL = _journalTable;
+        return journalTableGL;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createGLJournalHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creat general journal header
+    /// </summary>
+    /// <returns> returns ledgerJournalTable </returns>
+    public LedgerJournalTable createGLJournalHeader()
+    {
+        LedgerJournalTable journalHeader;
+
+        setup = SKS_PP_Setup::find();
+
+        journalHeader.JournalName = setup.IHBVendorNettingJournalName;
+        journalHeader.IsExtVendNettingJournal = NoYes::Yes;
+        journalHeader.initValue();
+        journalHeader.initFromLedgerJournalName(journalHeader.JournalName);
+        journalHeader.JournalNum =  JournalTableData::newTable(journalHeader).nextJournalId();
+
+        return journalHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postGLJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post general journal transactions
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> Journal table </param>
+    /// <param name = "_vendNettingFilesHeader"> Vend netting files header </param>
+    /// <param name = "_postTransfer"> boolean </param>
+    public void postGLJournal(LedgerJournalTable _ledgerJournalTable, SKS_IHB_VendNettingFilesHeader _vendNettingFilesHeader, NoYes _postTransfer = NoYes::Yes)
+    {
+        try
+        {
+            //posting
+            if (_ledgerJournalTable)
+            {
+                LedgerJournalCheckPost jourCheckPost;
+
+                jourCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(_ledgerJournalTable, NoYes::Yes, _postTransfer);
+                jourCheckPost.runOperation();
+
+                if (LedgerJournalTable::find(jourCheckPost.parmJournalNum()).Posted == NoYes::Yes)
+                {
+                    LedgerJournalTrans ledgerJournalTrans;
+                    SKS_IHB_VendNettingFileDetails vendNettingDetails, vendNettingDetailsLoc;
+
+                    LedgerJournalTable ledgerJournalTable = LedgerJournalTable::find(jourCheckPost.parmJournalNum());
+
+                    update_recordset vendNettingDetails
+                        setting TransactionStatus = SKS_IHB_TransactionStatus::Complete,
+                                JournalNum = ledgerJournalTable.JournalNum,
+                                ErrorNotes = ''
+                        join ledgerJournalTrans
+                        where ledgerJournalTrans.SKS_IHB_VendNettingLineRecid == vendNettingDetails.RecId
+                        && ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum;
+
+                    // Insert history
+                    this.insertJournalHistory(_ledgerJournalTable.JournalNum, _vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourPosted);
+
+                    // Check whether any lines with 'Requires review' status, if not set Transfer status to complete otherwise; requires review
+                    select firstonly vendNettingDetailsLoc
+                        where vendNettingDetailsLoc.VendNettingHeaderRecid == _vendNettingFilesHeader.RecId
+                        && vendNettingDetailsLoc.TransactionStatus == SKS_IHB_TransactionStatus::RequiresReview;
+                    
+                    if (vendNettingDetailsLoc)
+                    {
+                        // Update error note for file header if vendFileDetails transaction has 'Required review' line and error note is empty.
+                    
+                        if (vendNettingFilesHeader.ErrorNotes == '')
+                        {
+                            vendNettingFilesHeader.ErrorNotes = "@SKS:SKGIHBVendNettingTransStatus";
+                        }
+                        this.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, true);
+                    }
+                    else
+                    {                        
+                        this.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, false);
+                    }
+
+                    this.updateVoucherLink_outsideCust(ledgerJournalTable.JournalNum, ledgerJournalTable.company());
+                }
+            }
+        }
+        catch (Exception::Error)
+        {
+            this.insertErrorLog(_vendNettingFilesHeader.FileId, infolog().text());
+            this.insertJournalHistory(_ledgerJournalTable.JournalNum, _vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourPostFailed);
+            this.updateVendNettingFilesheaderStatus(_vendNettingFilesHeader, true);
+            this.updateHeaderErrorNotes(vendNettingFilesHeader, SKS_IHB_VendorNettingJournalAction::GenJourPostFailed);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createGLJournalLineForm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create general journal from form 'import' action
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> Journal buffer </param>
+    /// <param name = "_vendNettingHeader"> Vend netting files header </param>
+    /// <param name = "_recIdCon"> Selected records </param>
+    /// <returns> returns lines created count </returns>
+    public int createGLJournalLineForm(LedgerJournalTable _ledgerJournalTable, SKS_IHB_VendNettingFilesHeader _vendNettingHeader, container _recIdCon)
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingLines;
+        RecordInsertList ledgerJournalTransList = new RecordInsertList(tableNum(LedgerJournalTrans));
+        NumberSeq             numberseq;
+        LedgerJournalName   ledgerJournalName;
+
+        LedgerJournalEngine ledgerJournalEngine;
+        int Counter = 1;
+
+        ledgerJournalName = LedgerJournalName::find(_ledgerJournalTable.JournalName);
+
+        // Generate the voucher based on the 'new voucher' selection in journal name
+        voucher = '';
+        if (ledgerJournalName.NewVoucher == NewVoucher::OneVoucher)
+        {
+            numberseq = NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence);
+            voucher = numberseq.voucher();
+
+            numberseq.used();
+        }
+        else if (ledgerJournalName.NewVoucher == NewVoucher::BalanceSheet)
+        {
+            ledgerJournalEngine =  new LedgerJournalEngine();
+            ledgerJournalEngine.ledgerJournalTable(_ledgerJournalTable);
+        }
+
+        while (Counter <= conLen(_recIdCon))
+        {
+            select vendNettingLines
+            where vendNettingLines.VendNettingHeaderRecid == _vendNettingHeader.RecId
+                && vendNettingLines.JournalNum == ''
+                && vendNettingLines.RecId == conPeek(_recIdCon, Counter)
+                && vendNettingLines.IsCustPaymJournal == NoYes::No;
+
+            // Validation
+            if (this.validateNettingLines(vendNettingLines))
+            {
+                ledgerJournalTransList.add(this.createRecord(_ledgerJournalTable, vendNettingLines, ledgerJournalEngine));
+            } 
+            Counter++;
+        }
+        
+        ledgerJournalTransList.insertDatabase();
+       
+        return Counter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create ledger jorunal trans records
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> ledger journal header </param>
+    /// <param name = "_vendNettingLines"> Vend netting files header </param>
+    /// <param name = "_voucherNum"> Voucher number </param>
+    /// <param name = "_journalDesc"> Journal description </param>
+    /// <returns> returns journal trans </returns>
+    public LedgerJournalTrans createRecord(LedgerJournalTable _ledgerJournalTable,
+                                                    SKS_IHB_VendNettingFileDetails _vendNettingLines, 
+                                                    LedgerJournalEngine _ledgerJournalEngine)
+    {
+        LedgerJournalTrans transJournal;
+
+        transJournal.clear();
+        //Select the voucher on the new voucher selection
+        transJournal.Voucher = voucher;
+        if (LedgerJournalName::find(_ledgerJournalTable.JournalName).NewVoucher == NewVoucher::BalanceSheet)
+        {
+            _ledgerJournalEngine.initValue(transJournal);
+        }
+        transJournal.initValue();
+        transJournal.JournalNum               =  _ledgerJournalTable.JournalNum;
+        transJournal.TransDate                =  DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        transJournal.DocumentDate             =  _vendNettingLines.DueDate;
+        transJournal.AccountType              =  LedgerJournalACType::Bank;
+        transJournal.LedgerDimension          =  LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_vendNettingLines.VendIHBAccount, LedgerJournalACType::Bank);
+        transJournal.DefaultDimension         =  LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(transJournal.LedgerDimension );
+        transJournal.CurrencyCode             =  _vendNettingLines.CurrencyCode;
+        transJournal.OffsetAccountType        =  LedgerJournalACType::Bank;
+        transJournal.OffsetLedgerDimension    =  LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_vendNettingLines.CustIHBAccount, LedgerJournalACType::Bank);
+        transJournal.BankTransType            =  SKS_PP_Setup::find().IHBVendorNettingBankTransType;
+        transJournal.ExchRate                 = ExchangeRateHelper::exchRate(transJournal.CurrencyCode, transJournal.TransDate);
+
+        if(_vendNettingLines.InvoiceAmount < 0)
+        {
+            transJournal.AmountCurDebit       = _vendNettingLines.InvoiceAmount * -1;
+        }
+        else
+        {
+            transJournal.AmountCurCredit      = _vendNettingLines.InvoiceAmount;
+        }
+
+        transJournal.Txt = _vendNettingLines.VendorCompany + ', '
+                                    + _vendNettingLines.VendorAccount + ', '
+                                    + _vendNettingLines.VendorName + ', '
+                                    + _vendNettingLines.InvoiceNum;
+
+        transJournal.SKS_IHB_VendNettingLineRecid = _vendNettingLines.RecId;
+
+        return transJournal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createGLJournalLineFromBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create journal lines from batch call.
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> ledger journal header </param>
+    /// <param name = "_vendNettingHeader"> Vend netting files header </param>
+    /// <returns> returns created records count </returns>
+    public int createGLJournalLineFromBatch(LedgerJournalTable _ledgerJournalTable, SKS_IHB_VendNettingFilesHeader _vendNettingHeader)
+    {
+        SKS_IHB_VendNettingFileDetails  vendNettingLines;
+        NumberSeq                       numberseq;
+        LedgerJournalName               ledgerJournalName;
+        LedgerJournalEngine             ledgerJournalEngine;
+        RecordInsertList                ledgerJournalTransList = new RecordInsertList(tableNum(LedgerJournalTrans));
+        int Counter =0;
+
+        ledgerJournalName = LedgerJournalName::find(_ledgerJournalTable.JournalName);
+
+        voucher = '';
+        if (ledgerJournalName.NewVoucher == NewVoucher::OneVoucher)
+        {
+            numberseq = NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence);
+            voucher = numberseq.voucher();
+            numberseq.used();
+        }
+        else if (ledgerJournalName.NewVoucher == NewVoucher::BalanceSheet)
+        {
+            ledgerJournalEngine =  new LedgerJournalEngine();
+            ledgerJournalEngine.ledgerJournalTable(_ledgerJournalTable);
+        }
+
+        // Create general journal only for 'outside customer'
+        while select vendNettingLines
+            where vendNettingLines.VendNettingHeaderRecid == _vendNettingHeader.RecId
+            && vendNettingLines.IsValidationOK == NoYes::Yes
+            && vendNettingLines.IsCustPaymJournal == NoYes::No
+        {
+            ledgerJournalTransList.add(this.createRecord(_ledgerJournalTable, vendNettingLines, ledgerJournalEngine));
+
+            Counter++;
+        }
+
+        ledgerJournalTransList.insertDatabase();
+       
+        return Counter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertJournalHistory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert histroy records for given transact.
+    /// </summary>
+    /// <param name = "_journalId"> Journal id </param>
+    /// <param name = "_fileId"> File id </param>
+    /// <param name = "_action"> Result of transact </param>
+    public void insertJournalHistory(str _journalId, str _fileId, SKS_IHB_VendorNettingJournalAction _action)
+    {
+        SKS_IHB_VendorNettingJournalHistory journalHistory;
+
+        journalHistory.Action = _action;
+        journalHistory.JournalId = _journalId;
+        journalHistory.FileId = _fileId;
+        journalHistory.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertErrorLog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert error log.
+    /// </summary>
+    /// <param name = "_fileId"> File id </param>
+    /// <param name = "_errorMsg"> error message </param>
+    public void insertErrorLog(str _fileId, str _errorMsg)
+    {
+        SKS_IHB_VendNettingJournalErrorLog errorLog;
+
+        errorLog.FileId = _fileId;
+        errorLog.ErrorText = _errorMsg;
+        errorLog.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVendNettingFilesheaderStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update vend netting header status
+    /// </summary>
+    /// <param name = "_vendNettingFilesheader"> Vend netting files header </param>
+    /// <param name = "_updateComplete"> boolean value to set status to 'Complete' </param>
+    public void updateVendNettingFilesheaderStatus(SKS_IHB_VendNettingFilesHeader _vendNettingFilesheader, boolean _updateComplete)
+    {
+        ttsbegin;
+        _vendNettingFilesheader.selectForUpdate(true);
+
+        if (_updateComplete)
+        {
+            _vendNettingFilesheader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::RequiresReview;
+        }
+        else
+        {
+            _vendNettingFilesheader.ErrorNotes = '';
+            _vendNettingFilesheader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::Complete;
+        }
+
+        _vendNettingFilesheader.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateNettingLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate file lines
+    /// </summary>
+    /// <param name = "_vendNettingDetails"> Vend netting files trans </param>
+    /// <returns> returns true if lines are OK otherwise; false </returns>
+    public boolean validateNettingLines(SKS_IHB_VendNettingFileDetails _vendNettingDetails)
+    {
+        boolean ret =  true;
+       
+        if (!_vendNettingDetails)
+        {
+            ret = false;
+        }
+
+        if (_vendNettingDetails)
+        {
+            if (!_vendNettingDetails.VendorAccount || !_vendNettingDetails.VendorCompany        || !_vendNettingDetails.VendorName ||
+                !_vendNettingDetails.CurrencyCode  || _vendNettingDetails.DueDate == dateNull())
+            {
+                ret = false;
+                _vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                _vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingValuesMissing";
+            }
+
+            if (ret && _vendNettingDetails.ErrorNotes == "@SKS:SKGIHBVendNettingInvalidAmnt")
+            {
+                ret = false;
+                _vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;                
+            }
+
+            if (ret && this.validateNettingLineCurrency(_vendNettingDetails.CurrencyCode))
+            {
+                ret = false;
+                _vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                _vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingCurrencyInvalid";
+            }
+            else if (ret && this.validateSwitchBoard(_vendNettingDetails.VendorAccount, _vendNettingDetails.VendorCompany))
+            {
+                ret = false;
+                _vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                _vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingSwitchBoardFailed";
+            }
+            else if (ret && _vendNettingDetails.InvoiceNum == '')
+            {
+                ret = false;
+                _vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                _vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingValuesMissing";
+            }
+        }
+
+        if (!ret)
+        {
+            ttsbegin;
+            _vendNettingDetails.selectForUpdate(true);
+            _vendNettingDetails.IsValidationOK = NoYes::Yes;
+            _vendNettingDetails.update();
+            ttscommit;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateNettingLineCurrency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate line currency
+    /// </summary>
+    /// <param name = "_currecyCode"> currency to validate </param>
+    /// <returns> returns true if currency exists; otherwise false </returns>
+    public boolean validateNettingLineCurrency(str _currecyCode)
+    {
+        boolean ret =  true;
+
+        if (Currency::exist(_currecyCode))
+        {
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSwitchBoard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate Switch board record
+    /// </summary>
+    /// <param name = "_vendAccount"> vend account </param>
+    /// <param name = "_vendCompany"> vendor company </param>
+    /// <returns> returns true if record exist otherwise; false </returns>
+    public boolean validateSwitchBoard(VendAccount _vendAccount, SelectableDataArea _vendCompany)
+    {
+        boolean ret = true;
+
+        SKS_IHB_SwitchboardExternalVendor switchBoardExtVend = SKS_IHB_SwitchboardExternalVendor::find(_vendAccount,_vendCompany);
+
+        if (switchBoardExtVend)
+        {
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustPaymJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create Customer payment/intercompany journal
+    /// </summary>
+    /// <returns> returns the customer paym journal map </returns>
+    public Map createCustPaymJournal()
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingFileDetails;
+        LedgerJournalTable journalHeaderCustPaym;
+        CustTable       custTable;
+
+        Map jounralNumMap = new Map(Types::String, Types::String);
+
+        setup = SKS_PP_Setup::find();
+
+        this.deleteSpecTrans();
+
+        while select vendNettingFileDetails
+            order by CustomerCompany desc
+            where vendNettingFileDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+            && vendNettingFileDetails.IsCustPaymJournal == NoYes::Yes
+            && vendNettingFileDetails.IsValidationOK == NoYes::Yes            
+        {
+            select firstonly crosscompany custTable
+            where custTable.AccountNum == vendNettingFileDetails.CustomerAccount
+                && custTable.DataAreaId == vendNettingFileDetails.CustomerCompany;
+            
+            select firstonly SKS_IHBLinkedinhousebankaccount from ppBank
+            where ppBank.BankAccountId == vendNettingFileDetails.CustIHBAccount
+                && ppBank.SKS_IHBLinkedinhousebankcompany == vendNettingFileDetails.CustomerCompany
+                && ppBank.DataAreaId == curExt();
+
+            this.parmPPBank(ppBank);
+
+            changecompany(custTable.company())
+            {
+                journalHeaderCustPaym = this.findJournalForCompany(journalHeaderCustPaym.JournalNum, custTable.company());
+
+                // Load the map with the journal created and associated company
+                if (!journalHeaderCustPaym)
+                {
+                    journalHeaderCustPaym = this.createCustPaymLedgerJournalTable();
+
+                    jounralNumMap.add(journalHeaderCustPaym.company(), journalHeaderCustPaym.JournalNum);
+                }
+
+                this.createCustPaymJournalLine(journalHeaderCustPaym, vendNettingFileDetails, custTable);
+                
+            }// End customer company context
+   
+        } //end while
+
+        return jounralNumMap;
+  
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateAndPostCustPaymJour</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate and post the customer payment journal for inside customer records
+    /// </summary>
+    /// <param name = "_jounralNumMap"> Joural id map </param>
+    public void validateAndPostCustPaymJour(Map _jounralNumMap)
+    {
+        LedgerJournalTable journalHeaderCustPaym;
+
+        MapEnumerator enumerator = _jounralNumMap.getEnumerator();
+        while(enumerator.moveNext())
+        {
+            select firstonly crosscompany journalHeaderCustPaym
+                where journalHeaderCustPaym.DataAreaId == enumerator.currentKey()
+                    && journalHeaderCustPaym.JournalNum == enumerator.currentValue();
+            
+            changecompany(journalHeaderCustPaym.company())
+            {
+                if (journalHeaderCustPaym && journalHeaderCustPaym.numOfLines() > 0)
+                {
+                    changecompany(vendNettingFilesHeader.company())
+                    {
+                        this.insertJournalHistory(journalHeaderCustPaym.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::CustPaymJourCreated);
+                    }
+
+                    //Auto post the journal
+                    this.autoCustPaymPostJournal(journalHeaderCustPaym);
+                }
+                else
+                {
+                    this.parmErrorJournalId(journalHeaderCustPaym.JournalNum);
+                    this.parmError(SKS_IHB_VendorNettingJournalAction::CustPaymJourCreateFailed);
+
+                    throw error("@SKS:SKGIHBCustPaymCreationFailed");
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>autoCustPaymPostJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Auto-post the customer payment journal
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> Ledger journal table buffer </param>
+    public void autoCustPaymPostJournal(LedgerJournalTable _ledgerJournalTable)
+    {
+        LedgerJournalCheckPost jourCheckPost;
+
+        // Posting
+        if (_ledgerJournalTable)
+        {
+            this.parmErrorJournalId(_ledgerJournalTable.JournalNum);
+            this.parmError(SKS_IHB_VendorNettingJournalAction::CustPaymJourPostFailed);
+
+            jourCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(_ledgerJournalTable, NoYes::Yes, NoYes::Yes);
+            jourCheckPost.runOperation();
+        }
+
+        LedgerJournalTable journalTable = LedgerJournalTable::find(jourCheckPost.parmJournalNum());
+
+        if (jourCheckPost && journalTable.Posted == NoYes::Yes)
+        {
+            LedgerJournalTrans ledgerJournalTrans;
+            SKS_IHB_VendNettingFileDetails vendNettingDetails, vendNettingDetailsLoc;
+
+            changecompany(vendNettingFilesHeader.company())
+            {
+                // Update netting lines 
+                while select crosscompany SKS_IHB_VendNettingLineRecid from ledgerJournalTrans
+                    where ledgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+                    && ledgerjournaltrans.DataAreaId == journalTable.company()
+                {                    
+                    select forupdate firstonly vendNettingDetails
+                        where vendNettingDetails.RecId == ledgerJournalTrans.SKS_IHB_VendNettingLineRecid;
+                    if (vendNettingDetails)
+                    {
+                        ttsbegin;
+                        vendNettingDetails.TransactionStatus    = SKS_IHB_TransactionStatus::Complete;
+                        vendNettingDetails.JournalNum           = this.parmGLJournalId();
+                        vendNettingDetails.JournalNumCustPaym   = journalTable.JournalNum;//Customer payment journal id
+                        vendNettingDetails.ErrorNotes = '';
+
+                        vendNettingDetails.update();
+                        ttscommit;
+                    }
+                }
+
+                // Insert history
+                this.insertJournalHistory(_ledgerJournalTable.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::CustPaymJourPosted);
+
+                // Check whether any lines with 'Requires review' status, if not set Transfer status to complete otherwise; requires review
+                select firstonly vendNettingDetailsLoc
+                        where vendNettingDetailsLoc.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+                        && vendNettingDetailsLoc.TransactionStatus == SKS_IHB_TransactionStatus::RequiresReview;
+                    
+                if (vendNettingDetailsLoc)
+                {
+                    // Update error note for file header if vendFileDetails transaction has 'Required review' line and error note is empty.                    
+                    if (vendNettingFilesHeader.ErrorNotes == '')
+                    {
+                        vendNettingFilesHeader.ErrorNotes = "@SKS:SKGIHBVendNettingTransStatus";
+                    }
+                    this.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, true);
+                }
+                else
+                {
+                    this.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, false);
+                }
+
+                LedgerJournalName ledgerJournalName;
+                
+                select firstonly crosscompany NewVoucher from ledgerJournalName
+                    where ledgerJournalName.JournalName == journalTable.JournalName
+                    && ledgerJournalName.DataAreaId     == journalTable.DataAreaId;
+
+                if (ledgerJournalName.NewVoucher == NewVoucher::BalanceSheet)
+                {
+                    this.updateVoucherLinkForGLIHBTrans(journalTable.JournalNum, journalTable.company());
+                }
+                else if (ledgerJournalName.NewVoucher == NewVoucher::OneVoucher)
+                {
+                    this.updateVoucherLinkForGL_OneVoucher(journalTable.JournalNum, journalTable.company());
+                }
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustPaymLedgerJournalTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create payment journal header
+    /// </summary>
+    /// <returns> returns created payment journal header </returns>
+    public LedgerJournalTable createCustPaymLedgerJournalTable()
+    {
+        LedgerJournalTable journalHeader;
+
+        journalHeader.JournalName = SKS_PP_Setup::find().IHB_GLJournalName;
+        journalHeader.initValue();
+        journalHeader.initFromLedgerJournalName(journalHeader.JournalName);
+        journalHeader.JournalNum =  JournalTableData::newTable(journalHeader).nextJournalId();
+        journalHeader.IsExtVendNettingJournal = NoYes::Yes;
+        journalHeader.insert();
+        return journalHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustPaymJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create customer payment journal line
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> Ledger journal table </param>
+    /// <param name = "_vendNettingLine"> vendor netting lines </param>
+    /// <param name = "_custTable"> custTable buffer </param>
+    public void createCustPaymJournalLine(LedgerJournalTable _ledgerJournalTable, SKS_IHB_VendNettingFileDetails _vendNettingLine, CustTable _custTable)
+    {
+        NumberSeq           numberseq;
+        LedgerJournalName   ledgerJournalName;
+        LedgerJournalEngine ledgerJournalEngine_custPayment;
+        LedgerJournalTrans  ledgerJournalTrans;
+
+        ledgerJournalName = LedgerJournalName::find(_ledgerJournalTable.JournalName);
+
+        voucher = '';
+        if (ledgerJournalName.NewVoucher == NewVoucher::OneVoucher)
+        {
+            // Select the old voucher if journal line is already created in first iteration
+            select firstonly crosscompany Voucher from ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum;
+
+            if (!ledgerJournalTrans.Voucher)
+            {
+                numberseq = NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence);
+                voucher = numberseq.voucher();
+
+                numberseq.used();
+            }
+            else
+            {
+                voucher = ledgerJournalTrans.Voucher;
+            }
+        }
+        else if (ledgerJournalName.NewVoucher == NewVoucher::BalanceSheet)
+        {
+            ledgerJournalEngine_custPayment =  new LedgerJournalEngine();
+            ledgerJournalEngine_custPayment.ledgerJournalTable(_ledgerJournalTable);
+        }
+
+        this.createCustPaymJournalTrans(_ledgerJournalTable, _vendNettingLine, ledgerJournalEngine_custPayment, _custTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustPaymJournalTrans</Name>
+				<Source><![CDATA[
+    private void createCustPaymJournalTrans(LedgerJournalTable _ledgerJournalTable, SKS_IHB_VendNettingFileDetails _vendNettingLines, LedgerJournalEngine _ledgerJournalEngine, CustTable _custTable)
+    {
+        LedgerJournalTrans transJournal;        
+        Amount settleAmount =0;
+
+        transJournal.clear();
+        transJournal.initValue();
+
+        transJournal.Voucher = voucher;
+        if (LedgerJournalName::find(_ledgerJournalTable.JournalName).NewVoucher == NewVoucher::BalanceSheet)
+        {
+            _ledgerJournalEngine.initValue(transJournal);
+        }
+        transJournal.JournalNum               =  _ledgerJournalTable.JournalNum;
+        transJournal.TransDate                =  DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        transJournal.DocumentDate             =  _vendNettingLines.DueDate;
+        transJournal.AccountType              =  LedgerJournalACType::Cust;
+        transJournal.LedgerDimension          =  LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_custTable.AccountNum, LedgerJournalACType::Cust);
+        transJournal.DefaultDimension         =  _custTable.DefaultDimension;
+        transJournal.CurrencyCode             =  _vendNettingLines.CurrencyCode;
+        transJournal.OffsetAccountType        =  LedgerJournalACType::Bank;
+        transJournal.OffsetLedgerDimension    =  LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(ppBank.SKS_IHBLinkedinhousebankaccount, LedgerJournalACType::Bank);
+        transJournal.ExchRate                 =  ExchangeRateHelper::exchRate(transJournal.CurrencyCode, transJournal.TransDate);
+        transJournal.Approver                 =  HcmWorkerLookup::currentWorker();
+        transJournal.Approved                 =  NoYes::Yes;
+        transJournal.TransactionType          =  LedgerTransType::Payment;
+        transJournal.BankTransType            =  this.getBankTransType();
+
+        if(_vendNettingLines.InvoiceAmount < 0)
+        {
+            transJournal.AmountCurCredit = _vendNettingLines.InvoiceAmount * -1;
+            settleAmount = _vendNettingLines.InvoiceAmount;
+        }
+        else
+        {
+            transJournal.AmountCurDebit = _vendNettingLines.InvoiceAmount;
+            settleAmount = _vendNettingLines.InvoiceAmount;
+        }
+
+        transJournal.Txt = _vendNettingLines.VendorCompany + ', '
+                                    + _vendNettingLines.VendorAccount + ', '
+                                    + _vendNettingLines.VendorName + ', '
+                                    + _vendNettingLines.InvoiceNum;
+
+        transJournal.SKS_IHB_VendNettingLineRecid = _vendNettingLines.RecId;
+
+        transJournal.insert();
+
+
+        //Check for customer open invoice for incoming invoice
+        if (_vendNettingLines.InvoiceNum)
+        {
+            CustTrans custTrans;
+            CustTransOpen custTransOpen;
+
+            select firstonly custTrans
+                where custTrans.Invoice == _vendNettingLines.InvoiceNum
+                join custTransOpen
+                where custTransOpen.RefRecId == custTrans.RecId
+                && custTrans.AccountNum == _vendNettingLines.CustomerAccount;
+
+            Amount invoiceBalance;
+
+            SpecTrans specTransLoc;
+            boolean canSettle;
+
+            if (custTrans)
+            {
+                if ((custTrans.AmountCur < 0.0 && settleAmount > 0.0)
+                    || (custTrans.AmountCur > 0.0 && settleAmount < 0.0))
+                {
+                    select sum(Balance01) from
+                    specTransLoc
+                    where
+                        specTransLoc.RefCompany     == custTransOpen.DataAreaId &&
+                        specTransLoc.RefTableId     == custTransOpen.TableId &&
+                        specTransLoc.RefRecId       == custTransOpen.RecId &&
+                        specTransLoc.SpecCompany    == transJournal.DataAreaId &&
+                        specTransLoc.SpecTableId    == transJournal.TableId &&
+                        specTransLoc.SpecRecId      == 0;
+
+                    if (abs(custTransOpen.AmountCur) >= abs(specTransLoc.Balance01 + settleAmount))
+                    {
+                        canSettle = true;
+                    }
+                }
+            }
+
+            if (custTrans && canSettle)
+            {
+                this.updateLedgerTransact(transJournal);
+
+                //Insert Spec trans
+                SpecTrans specTrans;
+
+                specTrans.clear();
+                specTrans.SpecCompany = transJournal.DataAreaId;
+                specTrans.SpecTableId = transJournal.TableId;
+                specTrans.RefCompany = custTransOpen.DataAreaId;
+                specTrans.RefTableId = custTransOpen.TableId;
+                specTrans.RefRecId = custTransOpen.RecId;
+                specTrans.Balance01 = settleAmount;
+                specTrans.Code = transJournal.CurrencyCode;
+                specTrans.Payment = NoYes::Yes;
+                specTrans.SelectedDateUsedToCalcCashDisc = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                specTrans.insert();
+                
+                Amount settlementAmountToUse;
+
+                invoiceBalance = abs(custTransOpen.AmountCur) - abs(specTransLoc.Balance01 + specTrans.Balance01);
+
+                if (abs(custTransOpen.AmountCur) >= abs(specTransLoc.Balance01 + specTrans.Balance01))
+                {
+                    settlementAmountToUse = settleAmount;
+                }
+                else
+                {
+                    settlementAmountToUse = abs(settleAmount) - abs(invoiceBalance);
+
+                    if (settleAmount < 0)
+                    {
+                        settlementAmountToUse = settlementAmountToUse;
+                    }
+                    else
+                    {
+                        settlementAmountToUse = settlementAmountToUse * -1;
+                    }
+                }
+
+                CustVendOpenTransManager manager = CustVendOpenTransManager::construct(transJournal);
+                manager.updateTransMarked(custTransOpen,true);
+                manager.updateSettleAmount(custTransOpen, settlementAmountToUse);
+            }
+        }
+  
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateHeaderErrorNotes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update header error notes
+    /// </summary>
+    /// <param name = "_vendNettingFilesHeader"> Vend netting files header </param>
+    /// <param name = "_errorMsg"> Error note </param>
+    public void updateHeaderErrorNotes(SKS_IHB_VendNettingFilesHeader _vendNettingFilesHeader, SKS_IHB_VendorNettingJournalAction _errorMsg)
+    {
+        ttsbegin;
+        _vendNettingFilesHeader.selectForUpdate(true);
+        _vendNettingFilesHeader.ErrorNotes = enum2Str(_errorMsg);
+        _vendNettingFilesHeader.update();
+        ttscommit;        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLedgerTransact</Name>
+				<Source><![CDATA[
+    private void updateLedgerTransact(LedgerJournalTrans _journalTrans)
+    {
+        ttsbegin;
+        _journalTrans.selectForUpdate(true);
+        _journalTrans.SettleVoucher  =  SettlementType::SelectedTransact;
+        _journalTrans.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateGLJourforInsideCust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create GL journal for inside customer
+    /// </summary>
+    /// <returns> returns created journal </returns>
+    public LedgerJournalTable CreateGLJourforInsideCust()
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingFileDetails;
+        NumberSeq               numberseq;
+        LedgerJournalName       ledgerJournalName;
+        LedgerJournalTrans      transJour;
+        RecordInsertList        journalTransList = new RecordInsertList(tableNum(LedgerJournalTrans));
+
+        LedgerJournalEngine     ledgerJournalEngine;
+
+        LedgerJournalTable journalHeader = this.createGLJournalHeader();
+        journalHeader.insert();
+
+        ledgerJournalName = LedgerJournalName::find(journalHeader.JournalName);
+
+        ttsbegin;
+        voucher = '';
+        if (ledgerJournalName.NewVoucher == NewVoucher::OneVoucher)
+        {
+            numberseq = NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence);
+            voucher   = numberseq.voucher();
+            numberseq.used();
+        }
+        else if (ledgerJournalName.NewVoucher == NewVoucher::BalanceSheet)
+        {
+            ledgerJournalEngine =  new LedgerJournalEngine();
+            ledgerJournalEngine.ledgerJournalTable(journalHeader);
+        }
+        ttscommit;
+
+        try
+        {
+            ttsbegin;
+            while select vendNettingFileDetails
+                where vendNettingFileDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+                && vendNettingFileDetails.IsValidationOK == NoYes::Yes
+                && vendNettingFileDetails.IsCustPaymJournal == NoYes::Yes
+            {
+                transJour = this.createRecord(journalHeader, vendNettingFileDetails, ledgerJournalEngine);
+                journalTransList.add(transJour);
+            }
+
+            journalTransList.insertDatabase();
+
+            if (journalHeader.numOfLines() > 0)
+            {
+                this.insertJournalHistory(journalHeader.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourCreated);         
+            }
+            else
+            {
+                LedgerJournalTable locjournalHeader;
+
+                delete_from locjournalHeader where locjournalHeader.JournalNum == journalHeader.JournalNum; //Devops- 21319
+            }
+            ttscommit;
+        }
+        catch(Exception::Error)
+        {
+            this.insertErrorLog(vendNettingFilesHeader.FileId, infolog().text());
+            this.insertJournalHistory(journalHeader.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourCreateFailed);
+            this.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, true);
+            this.updateHeaderErrorNotes(vendNettingFilesHeader, SKS_IHB_VendorNettingJournalAction::GenJourCreateFailed);
+        }
+
+        return journalHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postGLForInsideCustomer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post GL for inside customer 
+    /// </summary>
+    /// <param name = "_ledgerJournalTable"> journal record to process </param>
+    /// <returns> returns true if posted otherwise; false </returns>
+    public boolean postGLForInsideCustomer(LedgerJournalTable _ledgerJournalTable)
+    {
+        LedgerJournalTable journalHeader;
+        boolean isJourPosted;
+
+        if (_ledgerJournalTable)
+        {
+            LedgerJournalCheckPost jourCheckPost;
+               
+            // Update messgage in advance to posting so that if posting fails we could handle our process in catch.
+            this.parmErrorJournalId(_ledgerJournalTable.JournalNum);
+            this.parmError(SKS_IHB_VendorNettingJournalAction::GenJourPostFailed);
+
+            jourCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(_ledgerJournalTable, NoYes::Yes, NoYes::Yes);
+            jourCheckPost.runOperation();
+
+            journalHeader = LedgerJournalTable::find(jourCheckPost.parmJournalNum());
+
+            if (journalHeader.Posted == NoYes::Yes)
+            {
+                // Insert history
+                this.insertJournalHistory(journalHeader.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourPosted);
+                isJourPosted = true;
+            }
+        }
+
+        return isJourPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateNettingLinesForInsideCustomer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update vendor netting lines fields for inside customer records/customer payment records
+    /// </summary>
+    public void updateNettingLinesForInsideCustomer()
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingDetails;
+
+        ttsbegin;
+        update_recordset vendNettingDetails
+            setting ErrorNotes          = vendNettingFilesHeader.ErrorNotes,
+                    TransactionStatus   = SKS_IHB_TransactionStatus::RequiresReview,
+                    JournalNum          = this.parmGLJournalId()
+            where vendNettingDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+            && vendNettingDetails.TransactionStatus != SKS_IHB_TransactionStatus::Complete
+            && vendNettingDetails.IsCustPaymJournal == NoYes::Yes
+            && vendNettingDetails.IsValidationOK    == NoYes::Yes;
+        ttscommit;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateNettingLinesForOutsideCustomer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update vendor netting lines fields for outside customer records
+    /// </summary>
+    /// <param name = "_journalId"> journal id </param>
+    public void updateNettingLinesForOutsideCustomer(LedgerJournalId _journalId)
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingDetails;
+
+        ttsbegin;
+        update_recordset vendNettingDetails
+            setting ErrorNotes          = vendNettingFilesHeader.ErrorNotes,
+                    TransactionStatus   = SKS_IHB_TransactionStatus::RequiresReview,
+                    JournalNum          = _journalId
+            where vendNettingDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+                && vendNettingDetails.TransactionStatus != SKS_IHB_TransactionStatus::Complete
+                && vendNettingDetails.IsCustPaymJournal == NoYes::No
+                && vendNettingDetails.IsValidationOK    == NoYes::Yes;
+        ttscommit;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmError</Name>
+				<Source><![CDATA[
+    public SKS_IHB_VendorNettingJournalAction parmError(SKS_IHB_VendorNettingJournalAction _error = error)
+    {
+        error = _error;
+        return error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmErrorJournalId</Name>
+				<Source><![CDATA[
+    public LedgerJournalId parmErrorJournalId(LedgerJournalId _errorJourId = errorJourId)
+    {
+        errorJourId =_errorJourId;
+        return errorJourId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmGLJournalId</Name>
+				<Source><![CDATA[
+    public LedgerJournalId parmGLJournalId(LedgerJournalId _GLJourId = GLJourId)
+    {
+        GLJourId = _GLJourId;
+        return GLJourId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findJournalForCompany</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find journal for required company
+    /// </summary>
+    /// <param name = "_journalId"> journal id to search </param>
+    /// <param name = "_company"> company to search </param>
+    /// <returns> returns ledgerjournalTable buffer if found oterwise; false </returns>
+    public LedgerJournalTable findJournalForCompany(LedgerJournalId _journalId, SelectableDataArea _company)
+    {
+        LedgerJournalTable journalTable;
+
+        select firstonly crosscompany journalTable
+            where journalTable.JournalNum == _journalId
+            && journalTable.DataAreaId == _company;
+
+        return journalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPPBank</Name>
+				<Source><![CDATA[
+    public SKS_PP_Bank parmPPBank(SKS_PP_Bank _ppBank = ppBank)
+    {
+        ppBank = _ppBank;
+        return ppBank;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVoucherLinkForGLIHBTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update original voucher link in voucher transactions
+    /// </summary>
+    /// <param name = "_journalNum"> journal number </param>
+    /// <param name = "_dataareaid"> Data area id </param>
+    public void updateVoucherLinkForGLIHBTrans(LedgerJournalID _journalNum, DataAreaId _dataareaid)
+    {
+        GeneralJournalEntry  generalJournalEntry, generalJournalEntry1;
+        LedgerEntryJournal   ledgerEntryJournal, ledgerEntryJournal1;
+
+        LedgerJournalId jourId_GL, jourId_CustIntCom;
+
+        if (this.parmGLJournalId())
+        {
+            jourId_GL = this.parmGLJournalId();
+        }
+        
+        if (jourId_GL)
+        {
+            jourId_CustIntCom = _journalNum;
+        }
+
+        LedgerJournalTrans ledgerJournalTrans, ledgerJournalTrans_Voucher, ledgerJournalTrans_GJE;
+        
+        while select  crosscompany ledgerJournalTrans_GJE
+            where ledgerJournalTrans_GJE.JournalNum == jourId_CustIntCom
+             && ledgerJournalTrans_GJE.DataAreaId == _dataareaid
+        {
+            //Cust paym
+            select forupdate SubledgerVoucher from generalJournalEntry1
+            join ledgerEntryJournal
+            where generalJournalEntry1.LedgerEntryJournal == ledgerEntryJournal.RecId
+                && ledgerEntryJournal.JournalNumber == jourId_CustIntCom
+                && generalJournalEntry1.SubledgerVoucherDataAreaId == _dataareaid
+                && generalJournalEntry1.SubledgerVoucher == ledgerJournalTrans_GJE.Voucher;
+
+            //For GL
+            select firstonly crosscompany ledgerJournalTrans_Voucher
+                where  ledgerJournalTrans_Voucher.SKS_IHB_VendNettingLineRecid == ledgerJournalTrans_GJE.SKS_IHB_VendNettingLineRecid
+                && ledgerJournalTrans_Voucher.JournalNum == jourId_GL;
+
+            //For Gl
+            select forupdate generalJournalEntry
+                    where generalJournalEntry.SubledgerVoucherDataAreaId == curExt()
+                        && generalJournalEntry.SubledgerVoucher == ledgerJournalTrans_Voucher.Voucher
+                    join ledgerEntryJournal1
+                    where ledgerEntryJournal1.recid == generalJournalEntry.LedgerEntryJournal &&
+                        ledgerEntryJournal1.JournalNumber == jourId_GL;
+
+                ttsbegin;
+                if (generalJournalEntry)
+                {
+                    if (generalJournalEntry1)
+                    {
+                        generalJournalEntry1.SKS_EFTAR_OrigPaymVouch = generalJournalEntry.SubledgerVoucher;
+                        generalJournalEntry1.update();
+                    }
+                    if (generalJournalEntry)
+                    {
+                        generalJournalEntry.SKS_EFTAR_OrigPaymVouch = generalJournalEntry.SubledgerVoucher;
+                        generalJournalEntry.update();
+                    }
+                }
+                ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVoucherLinkForGL_OneVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Link GL voucher to  customer intercompany voucher
+    /// </summary>
+    /// <param name = "_journalNum"> Journal id to process </param>
+    /// <param name = "_dataareaid"> Dataarea id </param>
+    public void updateVoucherLinkForGL_OneVoucher(LedgerJournalID _journalNum, DataAreaId _dataareaid)
+    {
+        GeneralJournalEntry  generalJournalEntry, generalJournalEntry1;
+        LedgerEntryJournal   ledgerEntryJournal, ledgerEntryJournal1;
+        LedgerJournalId jourId;
+
+        Voucher voucherNum;
+        int i =1;
+
+        if (this.parmGLJournalId())
+        {
+            jourId = this.parmGLJournalId();
+        }
+        else
+        {
+            jourId = _journalNum;
+        }
+
+        ttsbegin;
+        while select forupdate  SubledgerVoucher from generalJournalEntry1
+            join ledgerEntryJournal
+            where generalJournalEntry1.LedgerEntryJournal == ledgerEntryJournal.RecId
+                && ledgerEntryJournal.JournalNumber == jourId
+                && generalJournalEntry1.SubledgerVoucherDataAreaId == curExt()
+                && generalJournalEntry1.SKS_EFTAR_OrigPaymVouch == ''
+        {
+            if (i == 1)
+            {
+                voucherNum = generalJournalEntry1.SubledgerVoucher;
+            }
+
+            generalJournalEntry1.SKS_EFTAR_OrigPaymVouch = voucherNum;
+            generalJournalEntry1.update();
+            i++;
+        }
+        ttscommit;
+
+        ttsbegin;
+        update_recordset generalJournalEntry
+            setting SKS_EFTAR_OrigPaymVouch = voucherNum
+                where generalJournalEntry.SubledgerVoucherDataAreaId == _dataareaid
+            join ledgerEntryJournal1
+                where ledgerEntryJournal1.recid == generalJournalEntry.LedgerEntryJournal &&
+                    ledgerEntryJournal1.JournalNumber == _journalNum
+                    && generalJournalEntry.SKS_EFTAR_OrigPaymVouch == '';
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVoucherLink_outsideCust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update GL voucher link
+    /// </summary>
+    /// <param name = "_journalNum"> Journal id </param>
+    /// <param name = "_dataareaid"> Dataarea id</param>
+    public void updateVoucherLink_outsideCust(LedgerJournalID _journalNum, DataAreaId _dataareaid)
+    {
+        GeneralJournalEntry  generalJournalEntry, generalJournalEntry1;
+        LedgerEntryJournal   ledgerEntryJournal, ledgerEntryJournal1;
+        LedgerJournalId jourId;
+
+        Voucher voucherNum;
+
+        ttsbegin;
+        while select forupdate  SubledgerVoucher from generalJournalEntry1
+            join ledgerEntryJournal
+            where generalJournalEntry1.LedgerEntryJournal == ledgerEntryJournal.RecId
+                && ledgerEntryJournal.JournalNumber == _journalNum
+                && generalJournalEntry1.SubledgerVoucherDataAreaId == curExt()
+                && generalJournalEntry1.SKS_EFTAR_OrigPaymVouch == ''
+        {
+            generalJournalEntry1.SKS_EFTAR_OrigPaymVouch = generalJournalEntry1.SubledgerVoucher;
+            generalJournalEntry1.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateInvoiceAmountFormat</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate the amount format
+    /// </summary>
+    /// <param name = "_invoiceAmountStr">invoice</param>
+    /// <returns>true/false</returns>
+    public boolean validateInvoiceAmountFormat(anytype _invoiceAmountStr)
+    {
+        #define.Comma(',')
+        #define.Hyphen('-')
+        str amt = any2Str(_invoiceAmountStr);
+
+        int found       = strFind(amt,"@#$%^&*()_+=[{]};:'<>/?/*+",1,strLen(amt));
+        int commFound   = strFind(amt,#Comma,1,strLen(amt));
+        int commaPos    = strFind(amt,#Comma,1,strLen(amt));
+
+        boolean ok;
+
+        int commaPosNegFound = strFind(amt,#Hyphen,1,strLen(amt)); // to check -ve symbol in the amount
+        str commaPosNeg = subStr(amt,1,1);                // to check -ve symbol at the prefix in the amount
+
+        // validate if comma is present other than as decimal separator
+        if (str2num(amt) == 0 || (strLen(amt) -2 != commaPos && commFound) || (commaPosNeg != #Hyphen && commaPosNegFound))
+        {
+            ok = false;
+        }
+        else if (found != 0)
+        {
+            ok = false;            
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSpecTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the spectrans records
+    /// </summary>
+    public void deleteSpecTrans()
+    {
+        SpecTrans specTrans;
+        SKS_IHB_VendNettingFileDetails vendNettingFileDetails;
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+
+        while select vendNettingFileDetails
+            group by CustomerCompany, CustomerAccount, InvoiceNum desc
+            where vendNettingFileDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+            && vendNettingFileDetails.IsCustPaymJournal == NoYes::Yes
+            && vendNettingFileDetails.IsValidationOK == NoYes::Yes
+        {            
+            select firstonly crosscompany custTrans
+                where custTrans.Invoice == vendNettingFileDetails.InvoiceNum
+                join custTransOpen
+                where custTransOpen.RefRecId == custTrans.RecId
+                && custTrans.AccountNum == vendNettingFileDetails.CustomerAccount;
+
+            if (custTrans.RecId)
+            {
+                ttsbegin;
+                delete_from specTrans
+                    where specTrans.RefCompany == custTransOpen.DataAreaId &&
+                    specTrans.RefTableId    == custTransOpen.TableId &&
+                    specTrans.RefRecId      == custTransOpen.RecId &&
+                    specTrans.SpecTableId   == tableNum(LedgerJournalTrans);
+                ttscommit;
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBankTransType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check bankTransType in customer company associated with the customer.
+    /// </summary>
+    /// <returns> returns bankTransType if present in customer company otherwise; empty </returns>
+    private BankTransactionType getBankTransType()
+    {
+        SKS_PP_Setup   sks_PP_SetUp;        
+        BankTransactionType bankTransType;
+
+        select firstonly crosscompany sks_PP_SetUp where sks_PP_SetUp.DataAreaId == vendNettingFilesHeader.company();
+
+        bankTransType =  BankTransType::find(sks_PP_SetUp.IHBVendorNettingBankTransType).BankTransType;
+
+        return bankTransType;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,458 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocEmailTokensHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class DocEmailTokensHelper
+{
+    SRSPrintDestinationSettings         pds;
+    DocReportTable                      docReport;
+    DocEmailTokensParams                tokensParams;
+    List                                messageList;
+    int                                 passCount;
+
+    DocEmailTokensPDRedirection         tokenSetting;
+    Set                                 redirectConditions;
+    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static DocEmailTokensHelper construct(DocReportId _reportId)
+    {
+        return new DocEmailTokensHelper(_reportId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(DocReportId _reportId)
+    {
+        docReport = DocReportTable::findReportId(_reportId);
+        if (docReport.RecId == 0 || docReport.IsActiveSRS == false)
+        {
+            // If the executing report is not found in Docentric report setup, or it is found but
+            // it is not active, we don't need to process the redirection or warning messages.
+            return;
+        }
+
+        tokenSetting = DocEmailTokensPDRedirection::findByReportAndCompany(docReport.RecId, curExt());
+        messageList = new List(Types::Container);
+        passCount = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    public void init(SRSPrintDestinationSettings _pds, DocEmailTokensParams _tokensParams)
+    {
+        if (!this.isTokensSetupFound())
+        {
+            return;
+        }
+
+        pds = _pds;
+        tokensParams = _tokensParams;
+        redirectConditions = new Set(Types::Enum);
+        passCount++;
+        
+        this.createWarningMessages();
+        this.processRedirectConditions();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTokensSetupFound</Name>
+				<Source><![CDATA[
+    public boolean isTokensSetupFound()
+    {
+        return (docReport.RecId && docReport.IsActiveSRS && tokenSetting.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWarningMessages</Name>
+				<Source><![CDATA[
+    protected void createWarningMessages()
+    {
+        if (!this.isTokensSetupFound())
+        {
+            return;
+        }
+
+        // Read setting - should we print warning message?
+        if (tokenSetting.ShowErrorMessageIf == DocEmailTokensShowWarningMessage::Never)
+        {
+            return;
+        }
+        
+        // We should print warning messages for To field and perhaps also for Cc, Bcc
+        this.processWarningMessagesForField(tokensParams.parmReplacementInfoTo());
+        if (tokenSetting.ShowErrorMessageIf == DocEmailTokensShowWarningMessage::ForAllFields)
+        {
+            this.processWarningMessagesForField(tokensParams.parmReplacementInfoCc());
+            this.processWarningMessagesForField(tokensParams.parmReplacementInfoBcc());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processWarningMessagesForField</Name>
+				<Source><![CDATA[
+    private void processWarningMessagesForField(DocEmailTokensReplacementInfo _replacementInfo)
+    {
+        // If there were some tokens in this field, and there is at least one token unresolved,
+        // print error message
+        if (!_replacementInfo.parmPrintMgmtTokensMap().empty() && _replacementInfo.parmIsAnyUnresolved())
+        {
+            str warningMsg = '';
+
+            // Information about the document type and Id
+            warningMsg += tokensParams.parmDocumentId() ? strFmt("@SYS76498", tokensParams.parmDocumentType(), tokensParams.parmDocumentId()) : '';
+
+            // Information about account type and Id
+            if (tokensParams.parmAccountNum() && tokensParams.parmPartyType() != PrintMgmtPrintDestinationPartyType::Unknown)
+            {
+                warningMsg += warningMsg != '' ? ', ' : '';
+                warningMsg += strFmt("@SYS76498", tokensParams.parmPartyType(), tokensParams.parmAccountNum());
+                warningMsg += ': ';
+            }
+            else
+            {
+                warningMsg += warningMsg != '' ? ': ' : '';
+            }
+            warningMsg += strFmt("@DocentricAX2:CouldNotResolveTokensInfield", _replacementInfo.parmAddressField());
+            
+            // Information about the unresolved tokens
+            Map tokensMap = _replacementInfo.parmPrintMgmtTokensMap();
+            MapEnumerator me = tokensMap.getEnumerator();
+            int cnt = 0;
+            while (me.moveNext())
+            {
+                if (me.currentValue() != '')
+                {
+                    // tokensMap contains all tokens, both resolved and unresolved.
+                    // Create the warning message only for the unresolved tokens.
+                    continue;
+                }
+
+                cnt++;
+                warningMsg += (cnt == 1) ? ' ' : '; ';
+                if (me.currentKey() == '')
+                {
+                    // Primary email address was not found
+                    warningMsg += "@DocentricAX2:PrimaryEmailAddressNotFound";
+                }
+                else if (me.currentKey() == DocConstant::EmailTokenOrder)
+                {
+                    // Order email address was not found
+                    str salesId, purchId, orderEmail;
+                    [salesId, purchId, orderEmail] = DocPrintMgmtHelper::getOrderIdAndEmail(tokensParams.parmJour());
+
+                    if (salesId == '' && purchId == '')
+                    {
+                        // This document doesn't have the related order
+                        warningMsg += "@DocentricAX3:OrderEmailAddressNotApplicable";
+                    }
+                    else if (salesId != '')
+                    {
+                        warningMsg += strFmt("@DocentricAX3:OrderEmailAddressNotFoundOnOrder", 'Sales', salesId);
+                    }
+                    else
+                    {
+                        warningMsg += strFmt("@DocentricAX3:OrderEmailAddressNotFoundOnOrder", 'Purchase', purchId);
+                    }
+                }
+                else if (me.currentKey() == DocConstant::EmailTokenProj)
+                {
+                    // Proj email address was not found
+                    str projId, projEmail;
+                    int projNum;
+                    [projNum, projId, projEmail] = DocPrintMgmtHelper::getProjIdAndEmail(tokensParams.parmJour());
+
+                    if (projId == '')
+                    {
+                        // This document doesn't have related project
+                        warningMsg += "@DocentricAX3:ProjectEmailAddressNotApplicable";
+                    }
+                    else
+                    {
+                        warningMsg += strFmt("@DocentricAX3:ProjectEmailAddressNotFound", projId);
+                    }
+                }
+                else if (me.currentKey() == DocConstant::EmailTokenRFQ)
+                {
+                    // RFQ Vendor email address was not found
+                    str rfqId, rfqEmail;
+                    [rfqId, rfqEmail] = DocPrintMgmtHelper::getRFQIdAndEmail(tokensParams.parmJour());
+
+                    if (rfqId == '')
+                    {
+                        // This document doesn't have related RFQ
+                        warningMsg += "@DocentricAX3:RFQEmailAddressNotApplicable";
+                    }
+                    else
+                    {
+                        warningMsg += strFmt("@DocentricAX3:RFQEmailAddressNotFound", rfqId);
+                    }
+                }
+                else if (me.currentKey() == DocConstant::EmailTokenDeliveryAddressPrimaryContact)
+                {
+                    // Delivery address primary email address was not found
+                    warningMsg += "@DocentricAX4:DeliveryAddressPrimaryEmailNotFound";
+                }
+                else if (strScan(me.currentKey(), DocConstant::EmailTokenDeliveryAddressPurposePrefix, 1, strLen(me.currentKey())))
+                {
+                    // Delivery address email address with purpose <...> was not found
+                    str dlvAddressPurpose = strReplace(me.currentKey(), DocConstant::EmailTokenDeliveryAddressPurposePrefix, '');
+                    warningMsg += strFmt("@DocentricAX4:DeliveryAddressPurposeEmailNotFound", dlvAddressPurpose);
+                }
+                else
+                {
+                    // Email address with purpose <...> was not found
+                    warningMsg += strFmt("@DocentricAX2:EmailAddressWithPurposeNotFound", me.currentKey());
+                }
+            }
+            warningMsg += (cnt > 0) ? '' : (' ' + "@DocentricAX2:NoTokenAvailable");
+            
+            boolean isRedirectionMessage = false;
+            messageList.addEnd([passCount, isRedirectionMessage, DocMessageType::Warning, warningMsg]);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRedirectConditions</Name>
+				<Source><![CDATA[
+    protected void processRedirectConditions()
+    {
+        if (!this.isTokensSetupFound())
+        {
+            return;
+        }
+
+        // We are checking only To address for redirection
+        DocEmailTokensReplacementInfo replacementInfo = tokensParams.parmReplacementInfoTo();
+
+        if (replacementInfo.parmPrintMgmtTokensMap().empty())
+        {
+            // There were no tokens, no redirection needed
+            return;
+        }
+
+        // To field empty?
+        if (replacementInfo.parmIsAddressFieldEmpty())
+        {
+            redirectConditions.add(DocEmailTokensPDRedirectCondition::ToFieldEmpty);
+        }
+
+        // No token resolved?
+        if (!replacementInfo.parmIsAnyResolved())
+        {
+            redirectConditions.add(DocEmailTokensPDRedirectCondition::NoTokenResolved);
+        }
+
+        // At least one token is unresolved?
+        if (replacementInfo.parmIsAnyUnresolved())
+        {
+            redirectConditions.add(DocEmailTokensPDRedirectCondition::HasUnresolvedTokens);
+        }
+
+        // No Purpose token resolved?
+        if (replacementInfo.parmIsAnyPurposeFound() && !replacementInfo.parmIsAnyPurposeResolved())
+        {
+            redirectConditions.add(DocEmailTokensPDRedirectCondition::NoPurposeTokenResolved);
+        }
+
+        // Primary contact token unresolved?
+        if (replacementInfo.parmIsPrimaryContactFound() && !replacementInfo.parmIsPrimaryContactResolved())
+        {
+            redirectConditions.add(DocEmailTokensPDRedirectCondition::PrimaryContactTokenUnresolved);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRedirectionConditions</Name>
+				<Source><![CDATA[
+    public Set getRedirectionConditions()
+    {
+        return redirectConditions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>redirectPrintDestination</Name>
+				<Source><![CDATA[
+    public boolean redirectPrintDestination(boolean _checkOnly = false)
+    {
+        if (!this.isTokensSetupFound())
+        {
+            return false;
+        }
+
+        if (redirectConditions.empty())
+        {
+            // No redirection condition met
+            return false;
+        }
+        
+        SRSPrintDestinationSettings redirectionPds = new SRSPrintDestinationSettings();
+        redirectionPds.unpack(tokenSetting.PrintJobSettings);
+
+        if (_checkOnly && tokenSetting.ShowInfoMessage && redirectConditions.in(tokenSetting.RedirectIf))
+        {
+            // We come here only if:
+            //  - the first redirection occurred
+            //  - redirected print destination was again Docentric Email
+            //  - redirection reason is fulfiled
+            str warningMsg = strFmt("@DocentricAX2:PDCantRedirectMsg",
+                                    docReport.ReportId,
+                                    enum2Str(tokenSetting.RedirectIf));
+            
+            boolean isRedirectionMessage = true;
+            messageList.addEnd([passCount, isRedirectionMessage, DocMessageType::Warning, warningMsg]);
+
+            return false;
+        }
+
+        boolean redirectionOccurred = false;
+
+        // At this point we know that the executing report is found in Docentric report setup.
+        // Check if there is a redirection rule for the current company and this report,
+        // which fulfills the provided redirect condition.
+        if (redirectConditions.in(tokenSetting.RedirectIf))
+        {
+            // Redirection rule exists, so apply it.
+                   
+            str previousPDDescription = DocSrsReportRunUtil::getDocentricPrintDestDescription(pds);
+            if (redirectionPds == null)
+            {
+                // Should not ever happen!
+                DocGlobalHelper::handleException(funcName(),
+                     strFmt("@DocentricAX2:InvalidRedirectionPD", docReport.ReportId, previousPDDescription));
+            }
+
+            switch (redirectionPds.printMediumType())
+            {
+                case SRSPrintMediumType::Screen_DC:
+                case SRSPrintMediumType::Archive_DC:
+                    // Nothing to be done.
+                    break;
+                    
+                case SRSPrintMediumType::Email_DC:
+                    pds.parmEmailPrintDestSettings_DC().unpack(redirectionPds.parmEmailPrintDestSettings_DC().pack());
+                    break;
+                    
+                case SRSPrintMediumType::File_DC:
+                    pds.parmFilePrintDestSettings_DC().unpack(redirectionPds.parmFilePrintDestSettings_DC().pack());
+                    break;
+                    
+                case SRSPrintMediumType::Printer_DC:
+                    pds.parmPrinterPrintDestSettings_DC().unpack(redirectionPds.parmPrinterPrintDestSettings_DC().pack());
+                    break;
+            }
+
+            pds.printMediumType(redirectionPds.printMediumType());
+            pds.parmSrsPrintReportSettings_DC().parmSaveToArchive(redirectionPds.parmSrsPrintReportSettings_DC().parmSaveToArchive());
+            pds.parmSrsPrintReportSettings_DC().parmSaveToArchiveDocuTypeId(redirectionPds.parmSrsPrintReportSettings_DC().parmSaveToArchiveDocuTypeId());
+            pds.parmSrsPrintReportSettings_DC().parmSaveToArchiveNote(redirectionPds.parmSrsPrintReportSettings_DC().parmSaveToArchiveNote());
+            pds.parmSrsPrintReportSettings_DC().parmPdfAConformanceLevel(redirectionPds.parmSrsPrintReportSettings_DC().parmPdfAConformanceLevel());
+            pds.parmSrsPrintReportSettings_DC().parmTemplateId(redirectionPds.parmSrsPrintReportSettings_DC().parmTemplateId());
+            pds.parmSrsPrintReportSettings_DC().parmPreviewBeforePrint(redirectionPds.parmSrsPrintReportSettings_DC().parmPreviewBeforePrint());
+            pds.parmSrsPrintReportSettings_DC().parmAttachmentRuleList(redirectionPds.parmSrsPrintReportSettings_DC().parmAttachmentRuleList());
+            
+            pds.parmPrintToArchive(false);
+
+            redirectionOccurred = true;
+
+            // Should we print information about redirection?
+            if (tokenSetting.ShowInfoMessage)
+            {
+                str warningMsg = strFmt("@DocentricAX2:PDRedirectionMsg",
+                        docReport.ReportId,
+                        previousPDDescription,
+                        DocSrsReportRunUtil::getDocentricPrintDestDescription(redirectionPds),
+                        enum2Str(tokenSetting.RedirectIf));
+
+                boolean isRedirectionMessage = true;
+                messageList.addEnd([passCount, isRedirectionMessage, DocMessageType::Info, warningMsg]);
+            }
+        }
+        
+        return redirectionOccurred;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printWarningMessages</Name>
+				<Source><![CDATA[
+    public void printWarningMessages()
+    {
+        if (!this.isTokensSetupFound())
+        {
+            return;
+        }
+
+        if (!tokenSetting.ShowInfoMessage && tokenSetting.ShowErrorMessageIf == DocEmailTokensShowWarningMessage::Never)
+        {
+            // Nothing to be printed
+            return;
+        }
+
+        DocMessageType messageType;
+        str message;
+        boolean isRedirectionMessage;
+
+        int cnt = 0;
+        int passNumber;
+        ListEnumerator le = messageList.getEnumerator();
+        while (le.moveNext())
+        {
+            cnt++;
+            [passNumber, isRedirectionMessage, messageType, message] = le.current();
+            if (passCount > 1)
+            {
+                if (isRedirectionMessage && messageType == DocMessageType::Info)
+                {
+                    messageType = DocMessageType::Warning;
+                }
+                message = strFmt("@DocentricAX2:EmailTokenProcessingPassMsg", passNumber, message);
+            }
+
+            switch (messageType)
+            {
+                case DocMessageType::Info:
+                    DocGlobalHelper::handleInfo(message);
+                    break;
+                    
+                case DocMessageType::Warning:
+                    DocGlobalHelper::handleWarning(message);
+                    break;
+                    
+                case DocMessageType::Error:
+                    DocGlobalHelper::handleError(message);
+                    break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

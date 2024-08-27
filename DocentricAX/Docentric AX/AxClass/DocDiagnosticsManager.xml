@@ -1,0 +1,1430 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocDiagnosticsManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.BusinessPlatform.ProductInformation.Provider;
+using Microsoft.Dynamics.ApplicationPlatform.Environment;
+using Microsoft.Dynamics.ApplicationPlatform.Environment.Settings;
+using Docentric.AX.Framework.Cache;
+using Docentric.AX.Logging;
+using System.Diagnostics;
+
+/// <summary>
+/// The DocDiagnosticsManager class is a manager for diagnostics.
+/// </summary>
+public class DocDiagnosticsManager
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getLoggerInstance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets an instance of the logger object.
+    /// </summary>
+    /// <returns>An instance of the logger object</returns>
+    public static DocAxLogManager getLoggerInstance()
+    {
+        return DocAxLogManager::GetInstance();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>d365Version</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the D365 Platform and Application versions.
+    /// </summary>
+    /// <returns>D365 Platform and Application versions</returns>
+    public static str d365Version()
+    {
+        ProductInfoProvider provider = ProductInfoProvider::get_Provider();
+
+        if (!provider)
+        {
+            return '';
+        }
+
+        str platformName = provider.get_PlatformVersion();
+        str platformBuildVersion = provider.get_PlatformBuildVersion();
+        str appVersion = provider.get_ApplicationVersion();
+        str appBuildVersion = provider.get_ApplicationBuildVersion();
+
+        if (!appVersion)  // we have seen the situations at early startup phase where all version strings were empty
+        {
+            return '';
+        }
+
+        return strFmt('%1 (%2), %3 (%4)', appVersion, appBuildVersion, platformName, platformBuildVersion);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deploymentType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the environment deployment type.
+    /// </summary>
+    /// <returns>Possible values: Cloud/OnPrem</returns>
+    public static str deploymentType()
+    {
+        const int CacheExpirationInSeconds = 24*60*60;  // Cache expiration is set to 1 day
+        
+        DocCacheManager cache = DocCacheManager::GetInstance();
+        str key = strFmt('%1_%2', classStr(DocDiagnosticsManager), staticMethodStr(DocDiagnosticsManager, deploymentType));
+
+        str deploymentType = cache.Get(key);
+        if (deploymentType == null)
+        {
+            deploymentType = (DocConstantGlobal::isOnPremEnvironment() ? DocConstantDiagnostics::EnvironmentOnPremise : DocConstantDiagnostics::EnvironmentInCloud);
+            cache.Add(key, deploymentType, CacheExpirationInSeconds);
+        }
+
+        return deploymentType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hostingEnvironment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the hosting environment.
+    /// </summary>
+    /// <returns>Hosting environment</returns>
+    public static str hostingEnvironment()
+    {
+        // Code copied from SrsReportRunUtil::isServicFabricHostingEnvironment()
+        var hostingEnvironment = HostingEnvironment::Unknown;
+
+        try
+        {
+            var environment = EnvironmentFactory::GetApplicationEnvironment();
+            if(environment)
+            {
+                hostingEnvironment = environment.Common.HostingEnvironment;
+            }
+        }
+        catch
+        {
+            hostingEnvironment = HostingEnvironment::Unknown;
+        }
+
+        return enum2Str(hostingEnvironment);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>d365UserLicenseCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the actual/licensed users per license type.
+    /// </summary>
+    /// <returns>e.g. Operations=5/20;Activity=10/30;Team member=15/10</returns>
+    public static str d365UserLicenseCount()
+    {
+        str ret = '';
+                
+        DictEnum dictEnumUserLicenseType = new DictEnum(enumNum(UserLicenseType));
+        if (dictEnumUserLicenseType)
+        {
+            // Change the language to 'en-us' to get the enum labels in english
+            str curLanguage = infolog.language();
+            infolog.language('en-us');
+
+            SysUserLicenseCount userLicenseCount;
+
+            Enumerator enumUserLicenseType = dictEnumUserLicenseType.getEnumerator();
+            while (enumUserLicenseType.moveNext())
+            {
+                UserLicenseType userLicenseType = enumUserLicenseType.current();
+                if (userLicenseType == UserLicenseType::None)
+                {
+                    continue;
+                }
+
+                // Adds actual per license type from last run of SysUserLicenseMiner (batch job Named user license count reports processing)
+                // Licensed user count cannot be obtained (SysUserLicenseCount.LicensedCount is not correct).
+                select firstonly userLicenseCount 
+                    order by ValidFrom desc 
+                    where userLicenseCount.UserLicenseType == userLicenseType;
+
+                if (userLicenseCount.ActualCount)
+                {
+                    ret += (ret ? ';' : '');
+                    ret += strFmt('%1=%2', userLicenseType, userLicenseCount.ActualCount);
+                }
+            }
+            // Restore the langauage to previous value
+            infolog.language(curLanguage);
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>installedModels</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the installed models on ISV and higher layers.
+    /// </summary> 
+    /// <returns>Installed models</returns>
+    public static str installedModels()
+    {
+        str ret = '';
+
+        try
+        {
+            CLRObject modules = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetInstalledModuleNamesInSortedOrder();
+            ClrObject modulesEnumerator = modules.GetEnumerator();
+        
+            while (modulesEnumerator.MoveNext())
+            {
+                str60 moduleName = modulesEnumerator.get_Current();
+            
+                var moduleModels = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetModelsInModuleSortedByDisplayName(moduleName);
+                var modelEnumerator = moduleModels.GetEnumerator();
+                while (modelEnumerator.MoveNext())
+                {
+                    Microsoft.Dynamics.AX.Metadata.MetaModel.ModelInfo modelInfo = modelEnumerator.get_Current();
+
+                    if (modelInfo.Layer < enum2int(UtilEntryLevel::isv))
+                    {
+                        continue;
+                    }
+
+                    str moduleVersion = strfmt('%1 %2.%3.%4.%5', modelInfo.DisplayName, modelInfo.VersionMajor, modelInfo.VersionMinor, modelInfo.VersionBuild, modelInfo.VersionRevision);
+
+                    ret += (ret ? '; ' : '') + moduleVersion;
+                }
+            }
+        }
+        catch
+        {
+            ret += (ret ? '; ' : '') + 'Exception occurred while retrieving the installed models.';
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fullyQualifiedDomainName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the environment full domain name.
+    /// </summary>
+    /// <returns>Possible values:
+    ///             XYZ.sandbox.ax.dynamics.com = Any Tier1 box (development / build) running from within your MS subscription.
+    ///             XYZ.sandbox.operations.dynamics.com = Any Tier2+ (NOT PROD) running from within your MS subscription.
+    ///             XYZ.cloudax.dynamics.com = Any Tier1 (Development / Build / Demo / Test) running from an Azure Subscription deployed by LCS.
+    ///             XYZ.cloud.onebox.dynamics.com = Onebox / Local VHD.
+    ///             other = probably Prod
+    /// </returns>
+    public static str fullyQualifiedDomainName()
+    {
+        const int CacheExpirationInSeconds = 24*60*60;  // Cache expiration is set to 1 day
+
+        DocCacheManager cache = DocCacheManager::GetInstance();
+        str key = strFmt('%1_%2', classStr(DocDiagnosticsManager), staticMethodStr(DocDiagnosticsManager, fullyQualifiedDomainName));
+
+        str fullyQualifiedDomainName = cache.Get(key);
+        if (fullyQualifiedDomainName == null)
+        {
+            IApplicationEnvironment env = EnvironmentFactory::GetApplicationEnvironment();
+
+            if (env == null || env.Infrastructure == null)
+            {
+                fullyQualifiedDomainName = '';
+            }
+            else
+            {
+                fullyQualifiedDomainName = (env.Infrastructure.FullyQualifiedDomainName ? env.Infrastructure.FullyQualifiedDomainName : env.Infrastructure.HostName);   // OnPrem environments return blank FullyQualifiedDomainName
+            }
+            cache.Add(key, fullyQualifiedDomainName, CacheExpirationInSeconds);
+        }
+
+        return fullyQualifiedDomainName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>language</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current user language.
+    /// </summary>
+    /// <returns>Current language, e.g. en-us. Note that report runtime language can differ.</returns>
+    public static str language()
+    {
+        return currentUserLanguage();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>company</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the company name and ID.
+    /// </summary>
+    /// <returns>Company name and ID, e.g. Contoso Entertainment System USA (USMF)</returns>
+    public static str company()
+    {
+        CompanyInfo companyInfo = CompanyInfo::find();
+        
+        return strFmt('%1 (%2)', companyInfo.Name, companyInfo.DataArea);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>user</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current user ID.
+    /// </summary>
+    /// <returns>Current user Id, e.g. Admin</returns>
+    public static UserId user()
+    {
+        return curUserId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>userRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets current user UserInfo.RecId.
+    /// </summary>
+    /// <returns>RecId of UserInfo record for current user</returns>
+    public static RecId userRecId()
+    {
+        return (select RecId from UserInfo where UserInfo.id == DocDiagnosticsManager::user()).RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startMeasurement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts the measurement.
+    /// </summary>
+    /// <returns>An instance of stopwatch object</returns>
+    public static Stopwatch startMeasurement()
+    {
+        Stopwatch sw = new Stopwatch();
+        sw.Start();
+        return sw;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stopMeasurement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stops the measurement of document generation execution time.
+    /// </summary>
+    /// <param name = "_sw">Stopwatch</param>
+    /// <param name = "_printReportSettings">Print report settings</param>
+    public static void stopMeasurement(Stopwatch _sw, DocPrintReportSettings _printReportSettings)
+    {
+        if (_sw != null)
+        {
+            _sw.Stop();
+        
+            int docGenTime = int642int(_sw.ElapsedMilliseconds);
+
+            _printReportSettings.parmDocGenExecutionTime(docGenTime);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stopMeasurement_DspExecTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stops the measurement of DSP execution time.
+    /// </summary>
+    /// <param name = "_sw">Stopwatch</param>
+    /// <param name = "_reportExecutionInfo">Report execution info</param>
+    public static void stopMeasurement_DspExecTime(Stopwatch _sw, DocReportExecutionInfo _reportExecutionInfo)
+    {
+        if (_sw != null)
+        {
+            _sw.Stop();
+        
+            int dspExecTime = int642int(_sw.ElapsedMilliseconds);
+
+            _reportExecutionInfo.parmDspExecutionTime(dspExecTime);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stopMeasurement_TotalExecTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stops the measurement of total execution time.
+    /// </summary>
+    /// <param name = "_sw">Stopwatch</param>
+    /// <param name = "_reportExecutionInfo">Report execution info</param>
+    public static void stopMeasurement_TotalExecTime(Stopwatch _sw, DocReportExecutionInfo _reportExecutionInfo)
+    {
+        if (_sw != null)
+        {
+            _sw.Stop();
+        
+            int totalExecTime = int642int(_sw.ElapsedMilliseconds);
+
+            _reportExecutionInfo.parmTotalExecutionTime(totalExecTime);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findErrorCodeAndMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Extract the most inner error code and the whole error message from the infolog.
+    /// </summary>
+    /// <param name = "_docReportExecutionInfo">DocReportExecutionInfo object</param>
+    /// <param name = "_targetPrintDestination">Target print destination</param>
+    /// <param name = "_unknownPrintDestination">Is the target print destination unknown</param>
+    /// <returns>Container [errorCode, errorMessage]</returns>
+    private static container findErrorCodeAndMessage(DocReportExecutionInfo _docReportExecutionInfo, DocPrintDestination _targetPrintDestination, boolean _unknownPrintDestination = false)
+    {
+        str errorCode, finalErrorMsg;
+
+        int numberOfInfologLines = infologLine();
+        container allInfologLines = infolog.copy(1, numberOfInfologLines);
+
+        int processToLine = _docReportExecutionInfo.parmInfologLineBeforeReportStarts() + 1;
+        if (processToLine < 1)
+        {
+            processToLine = 1;
+        }
+        if (numberOfInfologLines - processToLine > 10)
+        {
+            processToLine = numberOfInfologLines - 9;
+        }
+
+        for (int i = numberOfInfologLines; i >= processToLine; i--)
+        {
+            container infoLogLine = conPeek(allInfologLines, i + 1);
+                
+            str errorMsg = conPeek(infologLine, 2);
+            if (errorMsg)
+            {
+                if (finalErrorMsg)
+                {
+                    finalErrorMsg = errorMsg + ' >> ' + finalErrorMsg;
+                }
+                else
+                {
+                    finalErrorMsg = errorMsg;
+                }
+            }
+
+            str infoLogErrorCode = conPeek(infologLine, 3);
+            if (infoLogErrorCode != '')
+            {
+                // Use the most inner error code.
+                errorCode = infoLogErrorCode;
+            }
+        }
+
+        if (!_unknownPrintDestination && _targetPrintDestination == DocPrintDestination::Printer)
+        {
+            finalErrorMsg = subStr(finalErrorMsg, 1, 2048);
+        }
+        else
+        {
+            finalErrorMsg = subStr(finalErrorMsg, 1, 1024);
+        }
+
+        return [errorCode, finalErrorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logReportExecutionSuccess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs the report execution success information.
+    /// </summary>
+    /// <param name = "_docReportExecutionInfo">Report execution info</param>
+    public static void logReportExecutionSuccess(DocReportExecutionInfo _docReportExecutionInfo)
+    {
+        str errorCode, resultMessage;
+        DocPrintDestination targetDestination;
+        boolean saveToArchive, saveToArchiveSucceeded, saveToArchiveSharepointMetadataIsEnabled;
+        boolean saveToSharepoint, saveToSharepointSucceeded, saveToSharepointMetadataIsEnabled;
+        boolean saveToAzure, saveToAzureSucceeded, saveToAzureExternalAccount;
+        boolean saveToAzureFiles, saveToAzureFilesSucceeded, saveToAzureFilesExternalAccount;
+        boolean saveToAttachment, saveToAttachmentSucceeded, saveToAttachmentSharepointMetadataIsEnabled;
+        boolean saveToFileSystem, saveToFileSystemSucceeded;
+
+
+        void updateErrorCodeAndResultMessage()
+        {
+            boolean nonFatalErrorOccurred =  
+                (saveToArchive && !saveToArchiveSucceeded) ||
+                (saveToSharepoint && !saveToSharepointSucceeded) ||
+                (saveToAzure && !saveToAzureSucceeded) ||
+                (saveToAzureFiles && !saveToAzureFilesSucceeded) ||
+                (saveToAttachment && !saveToAttachmentSucceeded) ||
+                (saveToFileSystem && !saveToFileSystemSucceeded);
+
+            if (!nonFatalErrorOccurred)
+            {
+                return;
+            }
+
+            // Find the error code and error message.
+            str finalErrorMsg;
+            [errorCode, finalErrorMsg] = DocDiagnosticsManager::findErrorCodeAndMessage(_docReportExecutionInfo, targetDestination);
+
+            // Update the result message.
+            if (resultMessage)
+            {
+                resultMessage = resultMessage + '; ' + finalErrorMsg;
+            }
+            else
+            {
+                resultMessage = finalErrorMsg;
+            }
+        }
+
+
+        if (!DocParameters::find().UseAppInsight)
+        {
+            return;
+        }
+
+        try
+        {
+            DocPrintReportSettings printReportSettings = _docReportExecutionInfo.parmPrintReportSettings();
+            DocPrintDestSettingsFile filePrintDestSettings = _docReportExecutionInfo.parmFilePrintDestSettings();
+            targetDestination = printReportSettings.parmPrintDestination();
+
+            // Report Run ID, Execution ID, report ID, template ID.
+            str reportRunId = _docReportExecutionInfo.getReportRunIdStr();
+            str executionId = _docReportExecutionInfo.getExecutionIdStr();
+            str reportId    = printReportSettings.parmReportId();
+            str templateId  = printReportSettings.parmTemplateId();
+
+            // Is template ER based.
+            boolean isTemplateERBased = false;
+            if (DocParameters::find().EnableCbdDs)
+            {
+                if (DocReportTable::findActiveReport(reportId).isTemplateERBased(templateId, printReportSettings.parmCompanyId(), printReportSettings.parmLanguageId()))
+                {
+                    isTemplateERBased = true;
+                }
+            }
+
+            // Print destination.
+            str printDestination = DocDiagnosticsManager::getPrintDestination(targetDestination);
+
+            // Output format.
+            str outputFormat = DocDiagnosticsManager::getOutputFormat(targetDestination, _docReportExecutionInfo);
+
+            // Result, result message, error code.
+            str result = DocConstantDiagnostics::ResultCodeSuccess;
+            // str resultMessage; > We will calculate it later and update it afterwards in updateErrorCodeAndResultMessage().
+            // str errorCode;     > We will calculate it later in updateErrorCodeAndResultMessage().
+
+            // Update the result in the case that report execution was canceled.
+            if (_docReportExecutionInfo.getPrintingResult() == DocPrintingResult::ExecutionCanceled)
+            {
+                result = DocConstantDiagnostics::ResultCodeCancellation;
+                if (_docReportExecutionInfo.isPreviewBeforePrintPrintingCanceled())
+                {
+                    resultMessage = 'Preview before print: User canceled';
+                }
+            }
+
+            // Printed from.
+            DocReportPrintedFrom printedFrom = printReportSettings.parmPrintedFrom();
+
+            // Default report DSP class.
+            boolean isDefaultDSP = true;
+            DocReportTable report = DocReportTable::findReportId(reportId);
+            if (report)
+            {
+                isDefaultDSP = report.hasDefaultDSPClass();
+            }
+        
+            // Preview before print.
+            boolean previewBeforePrint = printReportSettings.parmPreviewBeforePrint();
+
+            // Save to Archive.
+            saveToArchive = printReportSettings.parmSaveToArchive();
+            if (targetDestination == DocPrintDestination::GenerateDataSource)
+            {
+                saveToArchive = false;
+            }
+            saveToArchiveSucceeded = false;
+            if (saveToArchive)
+            {
+                saveToArchiveSucceeded = _docReportExecutionInfo.getSaveToArchiveSuccess();
+            }
+            saveToArchiveSharepointMetadataIsEnabled = printReportSettings.isEnabledSaveToArchiveSharePointMetadata();
+
+            // Was PDF encryption applied - applicable only for File and Email print destination.
+            boolean isReportPrintedAsEncryptedPdf = false;
+            str pdfEncryptionConditions = '';
+            
+            // Was PDF signature applied.
+            boolean isReportPrintedAsSignedPdf = _docReportExecutionInfo.isPdfReportSigned();
+
+            // PDF/A conformance level.
+            DocPdfAConformanceLevel pdfAConformanceLevel = printReportSettings.parmPdfAConformanceLevel();
+
+            // Number of pages of the generated report.
+            int numberOfReportPages = _docReportExecutionInfo.getNumberOfPages();
+
+            // Applicable only for the File print destination.
+            saveToSharepoint = false;
+            saveToSharepointSucceeded = false;
+            saveToSharepointMetadataIsEnabled = false; 
+            saveToAzure = false;
+            saveToAzureExternalAccount = false;
+            saveToAzureSucceeded = false;
+            saveToAzureFiles = false;
+            saveToAzureFilesExternalAccount = false;
+            saveToAzureFilesSucceeded = false;
+            saveToAttachment = false;
+            saveToAttachmentSucceeded = false;
+            saveToAttachmentSharepointMetadataIsEnabled = false;
+            saveToFileSystem = false;
+            saveToFileSystemSucceeded = false;
+
+            // Applicable ony for the SharePoint File print destination.
+            str saveToSharePointAuthorizationType = '';
+            str saveToSharePointIntegratedReportUser = '';
+
+            if (targetDestination == DocPrintDestination::File)
+            {
+                DocPrintReportToFileExecutionInfo fileExecutionInfo = _docReportExecutionInfo.parmPrintToFileExecutionInfo();
+                saveToSharepoint = filePrintDestSettings.parmSaveToSharePoint();
+                saveToSharepointSucceeded = fileExecutionInfo.parmSaveToSharePointSuccess();
+                saveToSharepointMetadataIsEnabled = _docReportExecutionInfo.parmFilePrintDestSettings().isEnabledSaveToSharePointMetadata();
+                if (saveToSharepoint)
+                {
+                    saveToSharePointAuthorizationType = enum2Symbol(enumNum(DocSharePointAuthorizationType), fileExecutionInfo.parmSaveToSharePointAuthorizationType());
+                    saveToSharePointIntegratedReportUser = fileExecutionInfo.parmSaveToSharePointIntegratedReportUser();
+                }
+                saveToAzure = filePrintDestSettings.parmSaveToAzureBlobStorage();
+                saveToAzureExternalAccount = (filePrintDestSettings.parmAzureBsAccountId() != '');
+                saveToAzureSucceeded = fileExecutionInfo.parmSaveToAzureBlobStorageSuccess();
+                saveToAzureFiles = filePrintDestSettings.parmSaveToAzureFiles();
+                saveToAzureFilesExternalAccount = (filePrintDestSettings.parmAzureFilesAccountId() != '');
+                saveToAzureFilesSucceeded = fileExecutionInfo.parmSaveToAzureFilesSuccess();
+                saveToAttachment = filePrintDestSettings.parmSaveToAttachments();
+                saveToAttachmentSucceeded = fileExecutionInfo.parmSaveToAttachmentsSuccess();
+                saveToAttachmentSharepointMetadataIsEnabled = _docReportExecutionInfo.parmFilePrintDestSettings().isEnabledSaveToAttachmentsSharePointMetadata();
+                saveToFileSystem = filePrintDestSettings.parmSaveToFileSystem();
+                saveToFileSystemSucceeded = fileExecutionInfo.parmSaveToFileSystemSuccess();
+                // PDF encryption.
+                isReportPrintedAsEncryptedPdf = fileExecutionInfo.parmIsPdfReportEncrypted();
+                if (isReportPrintedAsEncryptedPdf)
+                {
+                    pdfEncryptionConditions = fileExecutionInfo.pdfEncryptionConditionSetToString();
+                }
+            }
+
+            // Applicable only for the Email print destination.
+            int emailAttachmentRulesCount = 0;
+            DocReportEmailTemplateId emailTemplateId = '';
+            if (targetDestination == DocPrintDestination::Email)
+            {
+                if (printReportSettings.parmAttachmentRuleList() != null)
+                {
+                    emailAttachmentRulesCount = printReportSettings.parmAttachmentRuleList().elements();
+                }
+
+                // PDF encryption and signature.
+                DocPrintReportToEmailExecutionInfo emailExecutionInfo = _docReportExecutionInfo.parmPrintToEmailExecutionInfo();
+                isReportPrintedAsEncryptedPdf = emailExecutionInfo.parmIsPdfReportEncrypted();
+                // Note that pdfEncryptionConditions here is not needed - we always encrypt only generated PDF,
+                // which was attached to the outgoing email.
+
+                // Email template
+                DocPrintDestSettingsEmail emailPrintDestSettings = _docReportExecutionInfo.parmEmailPrintDestSettings();
+                if (emailPrintDestSettings.parmUseEmailTemplate() && emailPrintDestSettings.parmEmailTemplateId() != '')
+                {
+                    emailTemplateId = emailPrintDestSettings.parmEmailTemplateId();
+                }
+            }
+
+            // Find the most inner error code (errorCode) and update the result message (resultMessage).
+            updateErrorCodeAndResultMessage();
+
+            // Execution times.
+            int totalDuration   = _docReportExecutionInfo.parmTotalExecutionTime();
+            int dspDuration     = _docReportExecutionInfo.parmDspExecutionTime();
+            int docGenDuration  = _docReportExecutionInfo.getReportDocGenExecutionTime();
+            if (totalDuration == 0)
+            {
+                totalDuration = dspDuration + docGenDuration;
+            }
+
+            // Log the event.
+            DocReportExecutionData data = new DocReportExecutionData();
+            data.ReportRunId = reportRunId;
+            data.ExecutionId = executionId;
+            data.ReportId = reportId;
+            data.TemplateId = templateId;
+            
+            var customData = data.CustomData;  // Properties
+            customData.Add(DocConstantDiagnostics::TelemetryIsTemplateERBased, isTemplateERBased);
+            customData.Add(DocConstantDiagnostics::TelemetryPrintDestination, printDestination);
+            customData.Add(DocConstantDiagnostics::TelemetryOutputFormat, outputFormat);
+            customData.Add(DocConstantDiagnostics::TelemetryPrintedFrom, enum2Symbol(enumNum(DocReportPrintedFrom), printedFrom));
+            customData.Add(DocConstantDiagnostics::TelemetryResult, result);
+            customData.Add(DocConstantDiagnostics::TelemetryResultMessage, resultMessage);
+            customData.Add(DocConstantDiagnostics::TelemetryErrorCode, errorCode);
+            customData.Add(DocConstantDiagnostics::TelemetryIsDefaultDSP, isDefaultDSP);
+            customData.Add(DocConstantDiagnostics::TelemetryPreviewBeforePrint, previewBeforePrint);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToArchive, saveToArchive);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToArchiveSucceeded, saveToArchiveSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToArchiveSharepointMetadataIsEnabled, saveToArchiveSharepointMetadataIsEnabled);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharepoint, saveToSharepoint);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharepointSucceeded, saveToSharepointSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharepointMetadataIsEnabled, saveToSharepointMetadataIsEnabled);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharePointAuthorizationType, saveToSharePointAuthorizationType);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharePointIntegratedReportUser, saveToSharePointIntegratedReportUser);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzure, saveToAzure);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureExternalAccount, saveToAzureExternalAccount);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureSucceeded, saveToAzureSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureFiles, saveToAzureFiles);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureFilesExternalAccount, saveToAzureFilesExternalAccount);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureFilesSucceeded, saveToAzureFilesSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAttachment, saveToAttachment);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAttachmentSucceeded, saveToAttachmentSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAttachmentSharepointMetadataIsEnabled, saveToAttachmentSharepointMetadataIsEnabled);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToFileSystem, saveToFileSystem);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToFileSystemSucceeded, saveToFileSystemSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetryEmailAttachmentRulesCount, emailAttachmentRulesCount);
+            customData.Add(DocConstantDiagnostics::TelemetryIsRunningInBatch, DocGlobalHelper::isRunningInBatch());
+            customData.Add(DocConstantDiagnostics::TelemetryUserRecId, DocDiagnosticsManager::userRecId());  // Used for user count
+            customData.Add(DocConstantDiagnostics::TelemetryIsReportPrintedAsEncryptedPdf, isReportPrintedAsEncryptedPdf);
+            customData.Add(DocConstantDiagnostics::TelemetryPdfEncryptionConditions, pdfEncryptionConditions);
+            customData.Add(DocConstantDiagnostics::TelemetryIsReportPrintedAsSignedPdf, isReportPrintedAsSignedPdf);
+            customData.Add(DocConstantDiagnostics::TelemetryPdfAConformanceLevel, enum2Symbol(enumNum(DocPdfAConformanceLevel), pdfAConformanceLevel));
+            customData.Add(DocConstantDiagnostics::TelemetryEmailTemplateId, emailTemplateId);
+            customData.Add(DocConstantDiagnostics::TelemetryNumberOfReportPages, numberOfReportPages);
+            
+            var measurementData = data.MeasurementData;  // Metrics
+            measurementData.Add(DocConstantDiagnostics::TelemetryTotalDuration, totalDuration);
+            measurementData.Add(DocConstantDiagnostics::TelemetryDspDuration, dspDuration);
+            measurementData.Add(DocConstantDiagnostics::TelemetryDocGenDuration, docGenDuration);
+            
+            DocDiagnosticsManager::getLoggerInstance().LogReportExecutionEvent(data);
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logReportExecutionFailure</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs the report execution failure information.
+    /// </summary>
+    /// <param name = "_docReportExecutionInfo">Report execution info</param>
+    /// <param name = "_srsReportDataContract">Report data contract</param>
+    /// <param name = "_unknownPrintDestination">Is print destination unknown</param>
+    public static void logReportExecutionFailure(DocReportExecutionInfo _docReportExecutionInfo, SrsReportDataContract _srsReportDataContract, boolean _unknownPrintDestination)
+    {
+        if (!DocParameters::find().UseAppInsight)
+        {
+            return;
+        }
+        
+        if (_docReportExecutionInfo == null)
+        {
+            // This method should will never be called with this object set to null.
+            return;
+        }
+
+        try
+        {
+            DocPrintReportSettings printReportSettings = _docReportExecutionInfo.parmPrintReportSettings();
+            DocPrintDestSettingsFile filePrintDestSettings = _docReportExecutionInfo.parmFilePrintDestSettings();
+            DocPrintDestination targetDestination = printReportSettings.parmPrintDestination();
+
+            // Report Run ID, Execution ID, report ID, template ID.
+            str reportRunId = _docReportExecutionInfo.getReportRunIdStr();
+            str executionId = _docReportExecutionInfo.getExecutionIdStr();
+            str reportId    = printReportSettings.parmReportId();
+            str templateId  = printReportSettings.parmTemplateId();
+
+            // Is template ER based.
+            boolean isTemplateERBased = false;
+            if (DocParameters::find().EnableCbdDs)
+            {
+                if (DocReportTable::findActiveReport(reportId).isTemplateERBased(templateId, printReportSettings.parmCompanyId(), printReportSettings.parmLanguageId()))
+                {
+                    isTemplateERBased = true;
+                }
+            }
+
+            // Print destination.
+            str printDestination = DocDiagnosticsManager::getPrintDestination(targetDestination, _unknownPrintDestination);
+
+            // Output format.
+            str outputFormat = DocDiagnosticsManager::getOutputFormat(targetDestination, _docReportExecutionInfo, _unknownPrintDestination);
+
+            // Result, result message, error code.
+            str result = DocConstantDiagnostics::ResultCodeFailure;
+            str errorCode, resultMessage;
+            [errorCode, resultMessage] = DocDiagnosticsManager::findErrorCodeAndMessage(_docReportExecutionInfo, targetDestination, _unknownPrintDestination);
+
+            // Printed from.
+            DocReportPrintedFrom printedFrom = _docReportExecutionInfo.parmPrintReportSettings().parmPrintedFrom();
+        
+            // Default report DSP class.
+            boolean isDefaultDSP = true;
+            DocReportTable report = DocReportTable::findReportId(reportId);
+            if (report)
+            {
+                isDefaultDSP = report.hasDefaultDSPClass();
+            }
+
+            // Preview before print.
+            boolean previewBeforePrint = printReportSettings.parmPreviewBeforePrint();
+
+            // Save to Archive.
+            boolean saveToArchive = printReportSettings.parmSaveToArchive();
+            if (_unknownPrintDestination || targetDestination == DocPrintDestination::GenerateDataSource)
+            {
+                saveToArchive = false;
+            }
+            boolean saveToArchiveSharepointMetadataIsEnabled = printReportSettings.isEnabledSaveToArchiveSharePointMetadata();
+
+            boolean saveToArchiveSucceeded = false;
+            if (saveToArchive)
+            {
+                saveToArchiveSucceeded = _docReportExecutionInfo.getSaveToArchiveSuccess();
+            }
+
+            // Was PDF encryption applied - applicable only for File and Email print destination.
+            boolean isReportPrintedAsEncryptedPdf = false;
+            str pdfEncryptionConditions = '';
+
+            // Was PDF signature applied.
+            boolean isReportPrintedAsSignedPdf = _docReportExecutionInfo.isPdfReportSigned();
+
+            // PDF/A conformance level.
+            DocPdfAConformanceLevel pdfAConformanceLevel = printReportSettings.parmPdfAConformanceLevel();
+
+            // Number of pages of the generated report.
+            int numberOfReportPages = _docReportExecutionInfo.getNumberOfPages();
+
+            // Applicable only for the File print destination.
+            boolean saveToSharepoint = false;
+            boolean saveToSharepointSucceeded = false;
+            boolean saveToSharepointMetadataIsEnabled = false;
+            boolean saveToAzure = false;
+            boolean saveToAzureExternalAccount = false;
+            boolean saveToAzureSucceeded = false;
+            boolean saveToAzureFiles = false;
+            boolean saveToAzureFilesSucceeded = false;
+            boolean saveToAzureFilesExternalAccount = false;
+            boolean saveToAttachment = false;
+            boolean saveToAttachmentSucceeded = false;
+            boolean saveToAttachmentSharepointMetadataIsEnabled = false;
+            boolean saveToFileSystem = false;
+            boolean saveToFileSystemSucceeded = false;
+
+            // Applicable ony for the SharePoint File print destination.
+            str saveToSharePointAuthorizationType = '';
+            str saveToSharePointIntegratedReportUser = '';
+
+            if (!_unknownPrintDestination && targetDestination == DocPrintDestination::File)
+            {
+                DocPrintReportToFileExecutionInfo fileExecutionInfo = _docReportExecutionInfo.parmPrintToFileExecutionInfo();
+                saveToSharepoint = filePrintDestSettings.parmSaveToSharePoint();
+                saveToSharepointSucceeded = fileExecutionInfo.parmSaveToSharePointSuccess();
+                saveToSharepointMetadataIsEnabled = _docReportExecutionInfo.parmFilePrintDestSettings().isEnabledSaveToSharePointMetadata();
+                if (saveToSharepoint)
+                {
+                    saveToSharePointAuthorizationType = enum2Symbol(enumNum(DocSharePointAuthorizationType), fileExecutionInfo.parmSaveToSharePointAuthorizationType());
+                    saveToSharePointIntegratedReportUser = fileExecutionInfo.parmSaveToSharePointIntegratedReportUser();
+                }
+                saveToAzure = filePrintDestSettings.parmSaveToAzureBlobStorage();
+                saveToAzureExternalAccount = (filePrintDestSettings.parmAzureBsAccountId() != '');
+                saveToAzureSucceeded = fileExecutionInfo.parmSaveToAzureBlobStorageSuccess();
+                saveToAzureFiles = filePrintDestSettings.parmSaveToAzureFiles();
+                saveToAzureFilesExternalAccount = (filePrintDestSettings.parmAzureFilesAccountId() != '');
+                saveToAzureFilesSucceeded = fileExecutionInfo.parmSaveToAzureFilesSuccess();
+                saveToAttachment = filePrintDestSettings.parmSaveToAttachments();
+                saveToAttachmentSucceeded = fileExecutionInfo.parmSaveToAttachmentsSuccess();
+                saveToAttachmentSharepointMetadataIsEnabled = _docReportExecutionInfo.parmFilePrintDestSettings().isEnabledSaveToAttachmentsSharePointMetadata();
+                saveToFileSystem = filePrintDestSettings.parmSaveToFileSystem();
+                saveToFileSystemSucceeded = fileExecutionInfo.parmSaveToFileSystemSuccess();
+                // PDF encryption.
+                isReportPrintedAsEncryptedPdf = fileExecutionInfo.parmIsPdfReportEncrypted();
+                if (isReportPrintedAsEncryptedPdf)
+                {
+                    pdfEncryptionConditions = fileExecutionInfo.pdfEncryptionConditionSetToString();
+                }
+            }
+
+            // Applicable only for the Email print destination.
+            int emailAttachmentRulesCount = 0;
+            DocReportEmailTemplateId emailTemplateId = '';
+            if (!_unknownPrintDestination && targetDestination == DocPrintDestination::Email)
+            {
+                if (printReportSettings.parmAttachmentRuleList() != null)
+                {
+                    emailAttachmentRulesCount = printReportSettings.parmAttachmentRuleList().elements();
+                }
+
+                // PDF encryption and signature.
+                DocPrintReportToEmailExecutionInfo emailExecutionInfo = _docReportExecutionInfo.parmPrintToEmailExecutionInfo();
+                isReportPrintedAsEncryptedPdf = emailExecutionInfo.parmIsPdfReportEncrypted();
+                // Note that pdfEncryptionConditions here is not needed - we always encrypt only generated PDF,
+                // which was to the outgoing email.();
+
+                // Email template
+                DocPrintDestSettingsEmail emailPrintDestSettings = _docReportExecutionInfo.parmEmailPrintDestSettings();
+                if (emailPrintDestSettings.parmUseEmailTemplate() && emailPrintDestSettings.parmEmailTemplateId() != '')
+                {
+                    emailTemplateId = emailPrintDestSettings.parmEmailTemplateId();
+                }
+            }
+
+            // Execution times.
+            int totalDuration   = _docReportExecutionInfo.parmTotalExecutionTime();
+            int dspDuration     = _docReportExecutionInfo.parmDspExecutionTime();
+            int docGenDuration  = _docReportExecutionInfo.getReportDocGenExecutionTime();
+            if (totalDuration == 0)
+            {
+                totalDuration = dspDuration + docGenDuration;
+            }
+
+            // Log the event.
+            DocReportExecutionData data = new DocReportExecutionData();
+            data.ReportRunId = reportRunId;
+            data.ExecutionId = executionId;
+            data.ReportId = reportId;
+            data.TemplateId = templateId;
+            
+            var customData = data.CustomData;  // Properties
+            customData.Add(DocConstantDiagnostics::TelemetryIsTemplateERBased, isTemplateERBased);
+            customData.Add(DocConstantDiagnostics::TelemetryPrintDestination, printDestination);
+            customData.Add(DocConstantDiagnostics::TelemetryOutputFormat, outputFormat);
+            customData.Add(DocConstantDiagnostics::TelemetryPrintedFrom, enum2Symbol(enumNum(DocReportPrintedFrom), printedFrom));
+            customData.Add(DocConstantDiagnostics::TelemetryResult, result);
+            customData.Add(DocConstantDiagnostics::TelemetryResultMessage, resultMessage);
+            customData.Add(DocConstantDiagnostics::TelemetryErrorCode, errorCode);
+            customData.Add(DocConstantDiagnostics::TelemetryIsDefaultDSP, isDefaultDSP);
+            customData.Add(DocConstantDiagnostics::TelemetryPreviewBeforePrint, previewBeforePrint);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToArchive, saveToArchive);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToArchiveSucceeded, saveToArchiveSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToArchiveSharepointMetadataIsEnabled, saveToArchiveSharepointMetadataIsEnabled);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharepoint, saveToSharepoint);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharepointSucceeded, saveToSharepointSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharepointMetadataIsEnabled, saveToSharepointMetadataIsEnabled);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharePointAuthorizationType, saveToSharePointAuthorizationType);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToSharePointIntegratedReportUser, saveToSharePointIntegratedReportUser);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzure, saveToAzure);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureExternalAccount, saveToAzureExternalAccount);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureSucceeded, saveToAzureSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureFiles, saveToAzureFiles);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureFilesExternalAccount, saveToAzureFilesExternalAccount);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAzureFilesSucceeded, saveToAzureFilesSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAttachment, saveToAttachment);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAttachmentSucceeded, saveToAttachmentSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToAttachmentSharepointMetadataIsEnabled, saveToAttachmentSharepointMetadataIsEnabled);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToFileSystem, saveToFileSystem);
+            customData.Add(DocConstantDiagnostics::TelemetrySaveToFileSystemSucceeded, saveToFileSystemSucceeded);
+            customData.Add(DocConstantDiagnostics::TelemetryEmailAttachmentRulesCount, emailAttachmentRulesCount);
+            customData.Add(DocConstantDiagnostics::TelemetryIsRunningInBatch, DocGlobalHelper::isRunningInBatch());
+            customData.Add(DocConstantDiagnostics::TelemetryUserRecId, DocDiagnosticsManager::userRecId());  // Used for user count
+            customData.Add(DocConstantDiagnostics::TelemetryIsReportPrintedAsEncryptedPdf, isReportPrintedAsEncryptedPdf);
+            customData.Add(DocConstantDiagnostics::TelemetryPdfEncryptionConditions, pdfEncryptionConditions);
+            customData.Add(DocConstantDiagnostics::TelemetryIsReportPrintedAsSignedPdf, isReportPrintedAsSignedPdf);
+            customData.Add(DocConstantDiagnostics::TelemetryPdfAConformanceLevel, enum2Symbol(enumNum(DocPdfAConformanceLevel), pdfAConformanceLevel));
+            customData.Add(DocConstantDiagnostics::TelemetryEmailTemplateId, emailTemplateId);
+            customData.Add(DocConstantDiagnostics::TelemetryNumberOfReportPages, numberOfReportPages);
+
+            var measurementData = data.MeasurementData;  // Metrics
+            measurementData.Add(DocConstantDiagnostics::TelemetryTotalDuration, totalDuration);
+            measurementData.Add(DocConstantDiagnostics::TelemetryDspDuration, dspDuration);
+            measurementData.Add(DocConstantDiagnostics::TelemetryDocGenDuration, docGenDuration);
+
+            DocDiagnosticsManager::getLoggerInstance().LogReportExecutionEvent(data);
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOutputFormat</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the report output format.
+    /// </summary>
+    /// <param name = "_targetPrintDestination">Target print destination</param>
+    /// <param name = "_docReportExecutionInfo">Report execution info</param>
+    /// <param name = "_unknownPrintDestination">Specifies whether to return unknown report output format</param>
+    /// <returns>Report output format</returns>
+    private static str getOutputFormat(
+        DocPrintDestination _targetPrintDestination,
+        DocReportExecutionInfo _docReportExecutionInfo,
+        boolean _unknownPrintDestination = false)
+    {
+        str outputFormat;
+        DocPrintDestSettingsFile filePrintDestSettings;
+        DocPrintDestSettingsEmail emailPrintDestSettings;
+        DocPrintDestSettingsMemory memoryPrintDestSettings;
+
+        if (_unknownPrintDestination)
+        {
+            return DocConstantDiagnostics::ReportOutputFormatUnknown;
+        }
+
+        switch (_targetPrintDestination)
+        {
+            case DocPrintDestination::Archive:
+            case DocPrintDestination::Screen:
+                outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                break;
+
+            case DocPrintDestination::Printer:
+                outputFormat = DocConstantDiagnostics::ReportOutputFormatEmf;
+                break;
+
+            /* EMAIL */
+            case DocPrintDestination::Email:
+                emailPrintDestSettings = _docReportExecutionInfo.parmEmailPrintDestSettings();
+                if (emailPrintDestSettings.parmEmailAttachmentUseSsrsBuiltInDesign())
+                {
+                    switch (emailPrintDestSettings.parmEmailAttachmentFileFormatSrs())
+                    {
+                        case SRSReportFileFormat::CSV:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatCsv;
+                            break;
+                        case SRSReportFileFormat::Excel:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatExcel;
+                            break;
+                        case SRSReportFileFormat::HTML4_0:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatHtml4_0;
+                            break;
+                        case SRSReportFileFormat::Image:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatImage;
+                            break;
+                        case SRSReportFileFormat::MHTML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatMhtml;
+                            break;
+                        case SRSReportFileFormat::PDF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                            break;
+                        case SRSReportFileFormat::XML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXml;
+                            break;
+                        case 7: // SRSReportFileFormat::Word:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatWord;
+                            break;
+                        default:
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format (%1)', emailPrintDestSettings.parmEmailAttachmentFileFormatSrs()));
+                    }
+                }
+                else
+                {
+                    switch (emailPrintDestSettings.parmEmailAttachmentFileFormat())
+                    {
+                        case DocOutputFileFormat::DOCX:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatWord;
+                            break;
+                        case DocOutputFileFormat::PDF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                            break;
+                        case DocOutputFileFormat::XML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXml;
+                            break;
+                        case DocOutputFileFormat::XPS:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXps;
+                            break;
+                        case DocOutputFileFormat::TIFF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatTiff;
+                            break;
+                        default:
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format (%1)', emailPrintDestSettings.parmEmailAttachmentFileFormatSrs()));
+                    }
+                }
+                break;
+
+            /* FILE */
+            case DocPrintDestination::File:
+                filePrintDestSettings = _docReportExecutionInfo.parmFilePrintDestSettings();
+                if (filePrintDestSettings.parmUseSsrsBuiltInDesign())
+                {
+                    switch (filePrintDestSettings.parmOutputFileFormatSrs())
+                    {
+                        case SRSReportFileFormat::CSV:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatCsv;
+                            break;
+                        case SRSReportFileFormat::Excel:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatExcel;
+                            break;
+                        case SRSReportFileFormat::HTML4_0:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatHtml4_0;
+                            break;
+                        case SRSReportFileFormat::Image:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatImage;
+                            break;
+                        case SRSReportFileFormat::MHTML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatMhtml;
+                            break;
+                        case SRSReportFileFormat::PDF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                            break;
+                        case SRSReportFileFormat::XML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXml;
+                            break;
+                        case 7: // SRSReportFileFormat::Word:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatWord;
+                            break;
+                        default:
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format (%1)', filePrintDestSettings.parmOutputFileFormatSrs()));
+                    }
+                }
+                else
+                {
+                    switch (filePrintDestSettings.parmOutputFileFormat())
+                    {
+                        case DocOutputFileFormat::DOCX:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatWord;
+                            break;
+                        case DocOutputFileFormat::PDF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                            break;
+                        case DocOutputFileFormat::XML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXml;
+                            break;
+                        case DocOutputFileFormat::XPS:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXps;
+                            break;
+                        case DocOutputFileFormat::TIFF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatTiff;
+                            break;
+                        default:
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format (%1)', filePrintDestSettings.parmOutputFileFormat()));
+                    }
+                }
+                break;
+
+            /* MEMORY */
+            case DocPrintDestination::Memory:
+                memoryPrintDestSettings = _docReportExecutionInfo.parmMemoryPrintDestSettings();
+                if (memoryPrintDestSettings.parmUseSsrsBuiltInDesign())
+                {
+                    switch (memoryPrintDestSettings.parmOutputFileFormatSrs())
+                    {
+                        case SRSReportFileFormat::CSV:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatCsv;
+                            break;
+                        case SRSReportFileFormat::Excel:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatExcel;
+                            break;
+                        case SRSReportFileFormat::HTML4_0:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatHtml4_0;
+                            break;
+                        case SRSReportFileFormat::Image:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatImage;
+                            break;
+                        case SRSReportFileFormat::MHTML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatMhtml;
+                            break;
+                        case SRSReportFileFormat::PDF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                            break;
+                        case SRSReportFileFormat::XML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXml;
+                            break;
+                        case 7: // SRSReportFileFormat::Word:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatWord;
+                            break;
+                        default:
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format (%1)', memoryPrintDestSettings.parmOutputFileFormatSrs()));
+                    }
+                }
+                else
+                {
+                    switch (memoryPrintDestSettings.parmOutputFileFormat())
+                    {
+                        case DocOutputFileFormat::DOCX:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatWord;
+                            break;
+                        case DocOutputFileFormat::PDF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatPdf;
+                            break;
+                        case DocOutputFileFormat::XML:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXml;
+                            break;
+                        case DocOutputFileFormat::XPS:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatXps;
+                            break;
+                        case DocOutputFileFormat::TIFF:
+                            outputFormat = DocConstantDiagnostics::ReportOutputFormatTiff;
+                            break;
+                        default:
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format (%1)', memoryPrintDestSettings.parmOutputFileFormat()));
+                    }
+                }
+                break;
+
+            case DocPrintDestination::GenerateDataSource:
+                outputFormat = DocConstantDiagnostics::ReportOutputFormatDdsp;
+                break;
+
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported print destination (%1)', _targetPrintDestination));
+        }
+
+        return outputFormat;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrintDestination</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the print destination.
+    /// </summary>
+    /// <param name = "_targetDestination">Print destination</param>
+    /// <param name = "_unknownPrintDestination">Specifies whether to return unknown print destination</param>
+    /// <returns>Print destination</returns>
+    private static str getPrintDestination(DocPrintDestination _targetDestination, boolean _unknownPrintDestination = false)
+    {
+        if (_unknownPrintDestination)
+        {
+            return DocConstantDiagnostics::PrintDestUnknown;
+        }
+
+        switch (_targetDestination)
+        {
+            case DocPrintDestination::Memory:
+                return DocConstantDiagnostics::PrintDestMemory;
+
+            case DocPrintDestination::Archive:
+                return DocConstantDiagnostics::PrintDestArchive;
+
+            case DocPrintDestination::Screen:
+                return DocConstantDiagnostics::PrintDestScreen;
+
+            case DocPrintDestination::File:
+                return DocConstantDiagnostics::PrintDestFile;
+
+            case DocPrintDestination::Email:
+                return DocConstantDiagnostics::PrintDestEmail;
+
+            case DocPrintDestination::Printer:
+                return DocConstantDiagnostics::PrintDestPrinter;
+
+            case DocPrintDestination::GenerateDataSource:
+                return DocConstantDiagnostics::PrintDestGenerateDs;
+
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported print destination (%1)', _targetDestination));
+        }
+
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logDiagnosticsTurnedOn</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Turns on the log diagnostics.
+    /// </summary>
+    public static void logDiagnosticsTurnedOn()
+    {
+        DocDiagnosticsManager::getLoggerInstance().LogSendFeedbackChangedEvent(true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logDiagnosticsTurnedOff</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Turns off the log diagnostics.
+    /// </summary>
+    public static void logDiagnosticsTurnedOff()
+    {
+        DocDiagnosticsManager::getLoggerInstance().LogSendFeedbackChangedEvent(false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logNewInstallation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs the new installation of Docentric product.
+    /// </summary>
+    /// <param name = "_toVersion">New Docentric product version</param>
+    public static void logNewInstallation(DocDBVersion _toVersion)
+    {        
+        DocDiagnosticsManager::getLoggerInstance().LogInstallationEvent('', _toVersion, 'Initial', enum2Str(Exception::Info), 'Clean installation.');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logUpgrade</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs the upgrade of Docentric product. 
+    /// </summary>
+    /// <param name = "_fromVersion">Current Docentric product version</param>
+    /// <param name = "_toVersion">New Docentric product version</param>
+    /// <param name = "_status">Upgrade status</param>
+    /// <param name = "_msg">Message</param>
+    public static void logUpgrade(DocDBVersion _fromVersion, DocDBVersion _toVersion, Exception _status, str _msg)
+    {
+        DocDiagnosticsManager::getLoggerInstance().LogInstallationEvent(_fromVersion, _toVersion, 'Upgrade', enum2Str(_status), _msg);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logLicenseEvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs the licensing event.
+    /// </summary>
+    /// <param name = "_eventType">Load, Remove, Export, RenewalSent or RenewalDownloaded (use DocConstantDiagnostics::License*)</param>
+    public static void logLicenseEvent(str _eventType)
+    {
+        try
+        {
+            // Log the event.
+            DocLicensingData data = new DocLicensingData();
+            data.EventType = _eventType;
+
+            DocLicenseParameters licenseParameters = DocLicenseParameters::find();
+            boolean isPerpetual = (licenseParameters.LicenseExpirationDate == dateMax());
+            
+            var customData = data.CustomData;  // Properties            
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseSerialNo,            licenseParameters.LicenseSerialNo);
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseType,                strFmt((isPerpetual ? '%1 (Perpetual)' : '%1') , licenseParameters.LicenseType));
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseCode,                licenseParameters.LicenseCode);
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseDetails,             licenseParameters.LicenseDetails);
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseStartDate,           licenseParameters.LicenseStartDate);        // dates are stored in AppInsights as DateTime
+
+            if (!isPerpetual)
+            {
+                customData.Add(DocConstantDiagnostics::TelemetryLicenseExpirationDate,  licenseParameters.LicenseExpirationDate);
+            }
+
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseSubscriptionStart,   licenseParameters.LicenseSubscriptionStart);
+            customData.Add(DocConstantDiagnostics::TelemetryLicenseSubscriptionEnd,     licenseParameters.LicenseSubscriptionEnd);
+
+            customData.Add(DocConstantDiagnostics::TelemetryD365UserLicenseCount, DocDiagnosticsManager::d365UserLicenseCount());
+
+            DocDiagnosticsManager::getLoggerInstance().LogLicensingEvent(data);
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCurrentEnvironmentCustomName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current environment custom name from Docentric AX parameters > Diagnostics.
+    /// </summary>
+    /// <returns>Current environment custom name</returns>
+    public static DocEnvironmentName getCurrentEnvironmentCustomName()
+    {
+        return DocEnvironmentSettings::find(DocDiagnosticsManager::fullyQualifiedDomainName()).EnvironmentName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCurrentEnvironmentMode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current environment mode from Docentric AX parameters > Diagnostics.
+    /// </summary>
+    /// <returns>Current environment mode</returns>
+    public static DocEnvironmentMode getCurrentEnvironmentMode()
+    {
+        return DocEnvironmentSettings::find(DocDiagnosticsManager::fullyQualifiedDomainName()).EnvironmentMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEnvironmentMode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the environment mode for the current environment LCS Id from System administration > Setup > Monitoring and telemetry parameters.
+    /// </summary>
+    /// <returns>Environment mode for the current environment</returns>
+    public static str getEnvironmentMode()
+    {
+        str environmentMode = '';
+        
+        const str sysEnvironmentModeMapTable = 'SysEnvironmentModeMap';
+
+        if (tableName2Id(sysEnvironmentModeMapTable))
+        {
+            const str sysEnvironmentIdField = 'SysEnvironmentId';
+            const str environmentModeField = 'EnvironmentMode';
+
+            // Table SysEnvironmentModeMap was introduced with 10.0.30 version,
+            // so we will select it via reflection (in order to compile on lower D365FO versions).
+            SysDictTable dictTable = new SysDictTable(tableName2Id(sysEnvironmentModeMapTable));
+            Common environmentModeMap = dictTable.makeRecord();
+            select firstonly environmentModeMap where environmentModeMap.(dictTable.fieldName2Id(sysEnvironmentIdField)) == DocGlobalHelper::getLcsEnvironmentId();
+            environmentMode = environmentModeMap.RecId ? enum2Str(any2Enum(environmentModeMap.(dictTable.fieldName2Id(environmentModeField)))) : '';
+        }
+
+        return environmentMode;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

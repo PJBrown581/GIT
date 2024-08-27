@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocEmailProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Net.Mail;
+
+class DocEmailProcessor
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>emailReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Saving report to the SysOutgoingEmailTable table (Email sending status).
+    /// </summary>
+    /// <param name="_printReportSettings">Print report settings</param>
+    /// <param name="_emailPrintDestSettings">Email print destination settings</param>
+    /// <param name="_generatedReportContent">The attachment file content, i.e. printed report</param>
+    /// <param name="_emailExecutionInfo">Email execution info</param>
+    public static server void emailReport(DocPrintReportSettings _printReportSettings,
+                                          DocPrintDestSettingsEmail _emailPrintDestSettings, 
+                                          container _generatedReportContent,
+                                          DocPrintReportToEmailExecutionInfo _emailExecutionInfo)
+    {
+        if (_emailPrintDestSettings.parmEmailFrom() == '')
+        {
+            _emailPrintDestSettings.parmEmailFrom(DocEmailMngHelper::getDefaultEmailProviderEmailAddress());
+        }
+
+        if (!_emailPrintDestSettings.validate(_printReportSettings.parmReportId(), true, true, true))
+        {
+            DocGlobalHelper::handleException(funcName(), "@DocentricAX:EmailPrintDestInvalid");
+        }
+        
+        // Create a wrapper-object around the generated report content, which might be signed and encrypted,
+        // to enable subscribers to the events that follow to change it.
+        DocPrintedReport reportContent = DocReportingHelper::createPrintedReportFromEmailPrintSettings(_emailPrintDestSettings, _generatedReportContent);
+
+        // Save the mail message in SysOutgoingEmailTable.
+        SysOutgoingEmailTable   outgoingEmailTable;
+        SysOutgoingEmailData    outgoingEmailData;
+        RecordInsertList        outgoingEmailDataInsertList = new RecordInsertList(tableNum(SysOutgoingEmailData));
+        Filename                filePath;
+        
+        ttsBegin;
+
+        outgoingEmailTable.EmailItemId = EventInbox::nextEventId();
+        outgoingEmailTable.TemplateId = '';             // Used with Email templates (SysEmailTable/SysEmailSystemTable.EmailId).
+        outgoingEmailTable.IsSystemEmail = NoYes::No;
+
+        outgoingEmailTable.Sender = _emailPrintDestSettings.parmEmailFrom();
+        outgoingEmailTable.SenderName = _emailPrintDestSettings.parmEmailFromDisplayName() ? _emailPrintDestSettings.parmEmailFromDisplayName() : _emailPrintDestSettings.parmEmailFrom();
+        outgoingEmailTable.Recipient = _emailPrintDestSettings.parmEmailTo();
+        outgoingEmailTable.Origin = _printReportSettings.parmReportCaption();
+        outgoingEmailTable.Subject = _emailPrintDestSettings.parmEmailSubject();
+        outgoingEmailTable.Message = _emailPrintDestSettings.parmEmailBody();
+        
+        outgoingEmailTable.Priority = _emailPrintDestSettings.getEmailPriority();
+        outgoingEmailTable.WithRetries = NoYes::Yes;     
+        outgoingEmailTable.RetryNum = 0;
+        outgoingEmailTable.UserId = _printReportSettings.parmUserId();
+        outgoingEmailTable.Status = SysEmailStatus::Unsent;
+
+        // Fill Docentric fields.
+        outgoingEmailTable.ContextInfo_DC = _printReportSettings.parmReportId();
+        outgoingEmailTable.CompanyId_DC = _printReportSettings.parmCompanyId();
+        outgoingEmailTable.EmailCc_DC = _emailPrintDestSettings.parmEmailCc();
+        outgoingEmailTable.EmailBcc_DC = _emailPrintDestSettings.parmEmailBcc();
+        outgoingEmailTable.EmailReplyTo_DC = _emailPrintDestSettings.parmEmailReplyTo();
+        outgoingEmailTable.EmailBounceTo_DC = _emailPrintDestSettings.parmEmailBounceTo();
+        outgoingEmailTable.EmailDeliveryReceiptCondition_DC = _emailPrintDestSettings.parmDeliveryReceiptCondition();
+        // Resolve token @FROM_ADDRESS@ in Read receipt address.
+        if (_emailPrintDestSettings.parmReadReceiptAddress() == DocConstant::EmailFromAddressPlaceholder)
+        {
+            outgoingEmailTable.EmailReadReceiptAddress_DC = _emailPrintDestSettings.parmEmailFrom();
+        }
+        else
+        {
+            outgoingEmailTable.EmailReadReceiptAddress_DC = _emailPrintDestSettings.parmReadReceiptAddress();
+        }
+
+        DocArchiveContract archiveContract = _printReportSettings.parmArchiveContract();
+        if (archiveContract)
+        {
+            // Customer/Vendor account number
+            outgoingEmailTable.AccountNum_DC = archiveContract.parmAccountNum();
+            // N/A, Vendor or Customer
+            outgoingEmailTable.AccountType_DC = archiveContract.parmAccountRole();
+            // Generated Report DocumentID
+            outgoingEmailTable.DocumentId_DC = archiveContract.parmDocumentId();
+        }
+
+        // Publish the event where a subscriber will have a chance to change some fields in the inserting outgoingEmailTable record.
+        boolean cancelExecution = DocOutputManagerPublisher::publishEvent_beforeSaveToOutgoingEmailTable(
+            outgoingEmailTable, _printReportSettings, _emailPrintDestSettings, _emailExecutionInfo, reportContent);
+        if (cancelExecution)
+        {
+            // Abort and return if a subscriber demands so.
+            ttsabort;
+            return;
+        }
+       
+        // Embed images.
+        SysEmailDataId newDataId = 1;
+        MapEnumerator  e = _emailPrintDestSettings.parmEmailImageMap().getEnumerator();
+        while (e.moveNext())
+        {
+            str placeholderCode = e.currentKey();
+            
+            // Skip used CIDs with missing parts.
+            while (strScan(outgoingEmailTable.Message, strFmt('src="cid:%1"', newDataId), 1, strLen(outgoingEmailTable.Message)))
+            {
+                newDataId++;
+            }
+            
+            outgoingEmailTable.Message = strReplace(outgoingEmailTable.Message, strFmt('src="cid:%1"', placeholderCode), strFmt('src="cid:%1"', newDataId));
+
+            outgoingEmailData.clear();
+            outgoingEmailData.EmailItemId = outgoingEmailTable.EmailItemId;
+            outgoingEmailData.DataId = newDataId;
+            outgoingEmailData.EmailDataType = SysEmailDataType::Embedded;
+            outgoingEmailData.Data = e.currentValue();
+            outgoingEmailData.FileName = placeholderCode;       // Empty filename will cause an error on SysOutgoingEmailMessage form, so we just set one.
+                    
+            str contentType = DocGlobalHelper::getImageMIMEContentType(DocGlobalHelper::convertContainerToMemoryStream(outgoingEmailData.Data));
+            outgoingEmailData.FileExtension = (strStartsWith(contentType, 'image/') ? strReplace(contentType, 'image/', '.') : '.png');
+
+            outgoingEmailDataInsertList.add(outgoingEmailData);
+            newDataId++;
+        }
+
+        // Attach the report output file.
+        outgoingEmailData.clear();
+        outgoingEmailData.EmailItemId = outgoingEmailTable.EmailItemId;
+        outgoingEmailData.DataId = newDataId;
+        outgoingEmailData.EmailDataType = SysEmailDataType::Attachment;
+        outgoingEmailData.Data = reportContent.getReportContentContainer();
+        [filePath, outgoingEmailData.FileName, outgoingEmailData.FileExtension] = Global::fileNameSplit(_emailPrintDestSettings.parmEmailAttachmentName());
+        outgoingEmailData.insert();
+        newDataId++;
+
+        // Attach additional attachments.
+        container additionalAttachments =_emailPrintDestSettings.parmEmailAdditionalAttachments();
+        for (int i=1; i<=conLen(additionalAttachments); i++)
+        {
+            str     attachmentName;
+            Bitmap  attachmentContent;
+            
+            [attachmentName, attachmentContent] = conPeek(additionalAttachments, i);
+
+            outgoingEmailData.clear();
+            outgoingEmailData.EmailItemId = outgoingEmailTable.EmailItemId;
+            outgoingEmailData.DataId = newDataId;
+            outgoingEmailData.EmailDataType = SysEmailDataType::Attachment;
+            outgoingEmailData.Data = attachmentContent;
+            [filePath, outgoingEmailData.FileName, outgoingEmailData.FileExtension] = Global::fileNameSplit(attachmentName);
+            outgoingEmailDataInsertList.add(outgoingEmailData);
+            newDataId++;
+        }
+
+        outgoingEmailDataInsertList.insertDatabase();
+        
+        
+        // Save and commit.
+        outgoingEmailTable.LatestStatusChangeDateTime = DateTimeUtil::getSystemDateTime();
+        outgoingEmailTable.insert();
+
+        ttsCommit;
+
+        // Store RecId of the inserted outgoingEmailTable record.
+        _emailExecutionInfo.parmSysOutgoingEmailTableRecId(outgoingEmailTable.RecId);
+
+        // Publish the event that the email message is saved to the Outgoing email table.
+        DocOutputManagerPublisher::publishEvent_afterSaveToOutgoingEmailTable(outgoingEmailTable, _printReportSettings, _emailPrintDestSettings, _emailExecutionInfo, reportContent);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

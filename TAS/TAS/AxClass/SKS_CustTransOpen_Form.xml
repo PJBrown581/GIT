@@ -1,0 +1,681 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CustTransOpen_Form</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CustTransOpen_Form
+{
+        
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ExternalSettlement_OnClicked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    [FormControlEventHandler(formControlStr(CustOpenTrans, ExternalSettlement), FormControlEventType::Clicked)]
+    public static void ExternalSettlement_OnClicked(FormControl sender, FormControlEventArgs e)
+    {
+        FormRun                 formRun = sender.formRun();
+        Filename                filename;        
+        str                     lFilePath;
+        FormDataSource          CustTransOpen_ds = formRun.dataSource();
+        FormDataSource          CustTrans_ds = FormRun.dataSource(identifierStr(CustTrans));
+        CUstTransOpen           TmpCustTransOpen;
+        CustTrans               TmpCustTrans;
+        boolean                 PmtInFocus = false;
+        real                    PmtTotal;
+        CustVendOpenTransManager    Manager;
+
+        SKS_EB_BankIntegOptWithNoLicense bankIntOption = SKS_EB_FileStorage::find().StorageOption_LB;
+        SKS_BF_BankIntType SKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+
+        if(bankIntOption == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+                SKS_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType);
+
+        SKS_CustTransOpen_Form  CTOForm = new SKS_CustTransOpen_Form();
+        Manager = formRun.ParmManager();
+
+        if(SKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal)
+        {
+           
+            lFilePath = SKS_LB_Depositor::find(curExt(), Manager.getCustVendAccountNum()).LBExternalPath;
+
+            if(!lFilePath)
+            {
+                lFilePath = SKS_PP_Setup::find().LBExternalPath + '\\' + 'Remit' + '\\' + curext() + '\\' + Manager.getCustVendAccountNum();
+                if (!fileHub.runDirectoryExists(lFilePath))
+                {
+                    fileHub.runDirectoryCreate(lFilePath);
+                }
+            }
+
+            SKS_FileUploadDialogForm fileUploadDialog = new SKS_FileUploadDialogForm();
+            fileUploadDialog.parmFileDialogCaptionForForm("@SKS900");
+            fileUploadDialog.parmFileTypesAccepted('');
+            fileUploadDialog.parmStrategyClassName(classstr(FileUploadTemporaryStorageStrategy));
+            FileUploadTemporaryStorageResult fileUploadResult = fileUploadDialog.getFileUploadResult();
+            if (fileUploadResult != null && fileUploadResult.getUploadStatus())
+            {
+                if (!fileHub.runDirectoryExists(lFilePath))
+                {
+                    error(strfmt("@SYS55831", lFilePath));
+                    return;
+                }
+
+                // Get file from temp storage
+                filename = fileUploadResult.getDownloadUrl();
+                System.IO.Stream readStream = fileUploadResult.openResult();
+                System.IO.StreamReader reader = new System.IO.StreamReader(readStream);
+                str text = reader.ReadToEnd();
+
+                // Save file to external file path
+                str saveFileName = System.IO.Path::Combine(lFilePath, fileUploadResult.getFileName());
+                fileHub.runFileCreate(saveFileName,text);
+                info(strFmt("@SKS:SKGFileSave", saveFileName));
+
+                TmpCustTransOpen = CustTransOpen_ds.cursor();
+                select firstonly TmpCustTrans where TmpCustTrans.recid == TmpCustTransOpen.RefRecId && TmpCustTrans.transType == LedgerTransType::Payment;
+                if(TmpCustTrans)
+                {
+                    PmtTotal += TmpCustTransOpen.AmountCur * -1;
+                    PmtInFocus = true;
+                }
+
+                // Process file
+                CTOForm.ProcessExternalFile(saveFileName, Manager, PmtTotal, PmtInFocus);
+            }
+        }
+        else
+        {            
+            TmpCustTransOpen = CustTransOpen_ds.cursor();
+            select firstonly TmpCustTrans where TmpCustTrans.recid == TmpCustTransOpen.RefRecId;
+
+            Args args = new args();
+            args.record(TmpCustTrans);
+            args.name(formstr(SKS_LB_ImportFilesExt));
+            FormRun formRun1 = classFactory.formRunClass(Args);
+            formRun1.run();
+            formRun1.wait(True); // Modal
+
+            SKS_LB_ImportFilesExt   importFiles;
+            select firstonly importFiles where importFiles.Selected == NoYes::Yes;
+                       
+            if(importFiles)
+            { 
+                if(TmpCustTrans)
+                {
+                    PmtTotal += TmpCustTransOpen.AmountCur * -1;
+                    PmtInFocus = true;
+                }
+
+                // Process file
+                CTOForm.ProcessExternalFile(importFiles.Filename, Manager, PmtTotal, PmtInFocus);
+            }
+        }
+
+        CustTransOpen_ds.refresh();
+        CustTransOpen_ds.research();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProcessExternalFile</Name>
+				<Source><![CDATA[
+    void ProcessExternalFile(str _FileName, CustVendOpenTransManager _Manager, RealBase _PmtTotal, boolean _pmtInFocus)
+    {
+        TmpSKS_LB_Importing     tmp_LB_Importing;
+        Str                     FileFormat;
+        Real                    importTotalAmount;
+        boolean                 InvAmtMapped;
+        SKS_LB_Depositor        Depositor;
+        FileFormat = SKS_LB_Depositor::find(curExt(), _Manager.getCustVendAccountNum()).LBExternalFormatId;
+
+        if(!this.FieldTypeCHeck(FileFormat, SKS_LB_FieldType::InvNumber))
+        {
+            //Lockbox file formats used for settlements must have invoice number mapped
+            error("@SKS910");
+            return;
+        }
+
+        InvAmtMapped = this.FieldTypeCheck(FileFormat, SKS_LB_FieldType::InvAmt);
+
+        tmp_LB_Importing = this.ReadFile(FileFormat, _FileName);
+
+        if(tmp_LB_Importing != null)
+        {
+            this.ValidateSettlement(tmp_LB_Importing, _Manager, _PmtTotal, _pmtInFocus, InvAmtMapped);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ReadFile</Name>
+				<Source><![CDATA[
+    public TmpSKS_LB_Importing ReadFile(Str1260 _FileFormat, str _FileName)
+    {
+        SKS_LB_FileFormat       rec_SKS_LB_FileFormat;
+        SKS_LB_ReadFileCSV      cls_SKS_LB_ReadFileCSV;
+        SKS_LB_ReadFileFixed    cls_SKS_LB_ReadFileFixed;
+        TmpSKS_LB_Importing     tmp_LB_Importing;
+
+        Select * from rec_SKS_LB_FileFormat where rec_SKS_LB_FileFormat.FormatID == _FileFormat;
+
+        switch ( rec_SKS_LB_FileFormat.FileType)
+        {
+            case SKS_LB_FileType::TabDelimited:
+            case SKS_LB_FileType::CSV:
+                cls_SKS_LB_ReadFileCSV =  new SKS_LB_ReadFileCSV();
+                If (rec_SKS_LB_FileFormat.FileType == SKS_LB_FileType::TabDelimited)
+                {
+                    cls_SKS_LB_ReadFileCSV.useTabDelimiter();
+                }
+                cls_SKS_LB_ReadFileCSV.setFormatId(rec_SKS_LB_FileFormat.FormatID);
+                cls_SKS_LB_ReadFileCSV.setFileName(_FileName);
+                cls_SKS_LB_ReadFileCSV.openFile();
+                tmp_LB_Importing = cls_SKS_LB_ReadFileCSV.readFile();
+                cls_SKS_LB_ReadFileCSV = null;
+                break;
+            case SKS_LB_FileType::FixedField:
+                cls_SKS_LB_ReadFileFixed = new SKS_LB_ReadFileFixed();
+                cls_SKS_LB_ReadFileFixed.setFormatId(rec_SKS_LB_FileFormat.FormatID);
+                cls_SKS_LB_ReadFileFixed.setFileName(_FileName);
+                cls_SKS_LB_ReadFileFixed.openFile();
+                tmp_LB_Importing = cls_SKS_LB_ReadFileFixed.readFile();
+                cls_SKS_LB_ReadFileFixed = null;
+                break;
+            default:
+                error("@SKS560"); //"Invalid format type for external settlements" message
+                break;
+        }
+        return tmp_LB_Importing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FieldTypeCheck</Name>
+				<Source><![CDATA[
+    public boolean FieldTypeCheck(str _FileFormat, SKS_LB_FieldType  _FieldType)
+    {
+        SKS_LB_FileFormatDet    rec_SKS_LB_FileFormatDet;
+        boolean ret = true;
+        //Make sure fileformat will work for external settlements.
+        Select firstonly recid from rec_SKS_LB_FileFormatDet
+            where rec_SKS_LB_FileFormatDet.FormatID == _FileFormat &&
+                    rec_SKS_LB_FileFormatDet.FieldType == _fieldType;
+
+        if (!rec_SKS_LB_FileFormatDet)
+        {
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateSettlement</Name>
+				<Source><![CDATA[
+    public void ValidateSettlement(TmpSKS_LB_Importing _importing, CustVendOpenTransManager _Manager, amount _PmtTotal, boolean _pmtInFocus, boolean _invAmtMapped)
+    {
+        SKS_LB_OpenTransMatchData   OpenTransMatchData = new SKS_LB_OpenTransMatchData();
+        SKS_LB_Process_IMPORTTEMP_Records tmpImport = new SKS_LB_Process_IMPORTTEMP_Records();
+        CustAccount             lCust;
+        Container       diffCustInvAmt;
+        Container       diffCustAccts;
+        Amount          SettleTotalFound;
+
+        lCust = _Manager.getCustVendAccountNum();
+
+        ttsbegin;
+        if(_pmtInFocus)
+        {
+            OpenTransMatchData = this.InvoiceSearchAndMark(_importing, lCust, _Manager, _invAmtMapped, false);
+            SettleTotalFound = OpenTransMatchData.SettleTotalFound();
+            if (SettleTotalFound != _PmtTotal)
+            {
+                if (Box::yesNo(strFmtLB(strfmt("@SKS957",_PmtTotal, SettleTotalFound)),DialogButton::No,"@SYS4946") == DialogButton::No)
+                {
+                    ttsabort;
+                    return;
+                }
+            }
+
+            OpenTransMatchData = this.SortByDueDate(OpenTransMatchData);
+            this.PartialSettle(OpenTransMatchData, _Manager, _PmtTotal, lCust);
+
+            if(SettleTotalFound == 0)
+            {
+                info("@SKS:SKGNoValidInvoices");
+            }
+        }
+        else
+        {
+            OpenTransMatchData = this.InvoiceSearchAndMark(_importing, lCust, _Manager, _invAmtMapped, true);
+            SettleTotalFound = OpenTransMatchData.SettleTotalFound();
+            if(SettleTotalFound == 0)
+            {
+                info("@SKS:SKGNoValidInvoices");
+            }
+        }
+        
+        diffCustInvAmt = OpenTransMatchData.diffCustInvAmt();
+        diffCustAccts = OpenTransMatchData.diffCustAccts();
+        if(diffCustInvAmt != conNull())
+        {
+            setPrefix("@SKS:SKGFoundInvForDiffCust");
+            for (int i = 1; i <= conlen(diffCustAccts); i++)
+            {
+                info(strFmt("@SKS:SKGCustomerTotalCompare", conPeek(diffCustAccts, i), conPeek(diffCustInvAmt, i)));
+            }
+        }
+        
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InvoiceSearchAndMark</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer _importing is selected forUpdate and is passed to other methods where it is modified.")]
+    SKS_LB_OpenTransMatchData InvoiceSearchAndMark(TmpSKS_LB_Importing _importing, CustAccount _Cust, CustVendOpenTransManager _Manager, boolean _InvAmtMapped, boolean _Mark)
+    {
+        CustTransOpen   findCustTransOpen = null;
+        CustTrans       findCustTrans     = null;
+        Container       virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+        SKS_LB_SecondaryMatch   SKS_LB_SecondaryMatch = new SKS_LB_SecondaryMatch();
+        Container       diffCustInvAmt;
+        Container       diffCustAccts;
+        container       ConDueDates;
+        Container       goodInvs;
+        Container       ConCredits;
+        Container       ConAmtToSettle;
+        Amount          SettleTotalFound;
+        SKS_LB_MatchParms       lMatchParms;
+        SKS_PP_Setup            localPPSetup = SKS_PP_Setup::find();
+        int                     conindex;
+        Amount                  totalAmountforCust;
+        SKS_LB_WriteoffDetails  SKS_LB_WriteOffDetails;
+        SKS_LB_Depositor        tmpSKS_LB_Depositor;
+        SKS_LB_OpenTransMatchData   OpenTransMatchData = new SKS_LB_OpenTransMatchData();
+        SKS_LB_Process_IMPORTTEMP_Records   ProcessimportTempRecords = new SKS_LB_Process_IMPORTTEMP_Records();
+        SKS_LB_AutoCreateCreditDebitGroup sks_lb_AutoCreateCreditDebitGroup;
+        TaxGroup                lTaxGroup;
+        InvoiceId               m_InvcNbr;
+        SKS_LB_PaymentAmt       sks_lb_paymentAmt;
+        Amount                  invApplyAmt;
+        Amount                  discApplyAmt;
+
+        while select forupdate _importing order by _importing.RecId
+        {
+            Select crosscompany:virtualCompanycompanies Invoice, DefaultDimension, AccountNum from findCusttrans
+                    order by findCusttrans.DueDate
+                    where findCusttrans.Invoice == _importing.InvoiceNumber
+                        && findCusttrans.AccountNum == _Cust
+                        && findCusttrans.TransType == LedgerTransType::Cust
+                join findCusttransopen
+                    where findCusttrans.RecId == findCusttransopen.RefRecId;
+            findCusttrans = findCusttransopen.custTrans();
+            if (!findCusttransopen)
+            {
+                lMatchParms = SKS_LB_SecondaryMatch.ReferenceMatch(''
+                    , ''
+                    , ''
+                    , ''
+                    , dateNull()
+                    , ''
+                    , virtualCompanycompanies
+                    , localPPSetup.MatchingRulesGroupId
+                    , _importing
+                    , true
+                    );
+
+                findCusttransopen = lMatchParms.matchTransOpen();
+                findCusttrans = findCusttransopen.custTrans();
+                if(findCusttransopen && findCustTrans.AccountNum != _Cust)
+                {
+                    conindex = confind(diffCustAccts, findCustTrans.accountnum);
+                    if(conindex == 0)
+                    {
+                        diffCustAccts += findCustTrans.AccountNum;
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //diffCustinvAmt += findCustTransOpen.AmountCur;
+                        diffCustinvAmt += findCustTransOpen.sksGetRemainingAmount();
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    }
+                    else
+                    {
+                        totalAmountforCust = conPeek(diffCustinvAmt, conindex);
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //totalAmountforCust += findCustTransOpen.AmountCur;
+                        totalAmountforCust += findCustTransOpen.sksGetRemainingAmount();
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        diffCustinvAmt = conIns(diffCustinvAmt, conindex, totalAmountforCust);
+                    }
+                    findCusttransopen = null;
+                }
+                else if(findCusttransopen)
+                {
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    //if(!_Manager.getSpecTrans(findCusttransopen))
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    {
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //SettleTotalFound += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.AmountCur;
+                        SettleTotalFound += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.sksGetRemainingAmount();
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        if(_Mark)
+                        {
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            //_Manager.updateTransMarked(findCusttransopen, NoYes::Yes);
+                            if(!_Manager.getSpecTrans(findCusttransopen))
+                            {
+                                _Manager.updateTransMarked(findCusttransopen, NoYes::Yes);
+                            }
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            if(_invAmtMapped)
+                            {
+                                _Manager.updateSettleAmount(findCusttransopen, _importing.InvAmount);
+                            }
+                        }
+                        else
+                        {
+                            goodinvs += findCustTransOpen;
+                            ConDueDates += findCustTransOpen.DueDate;
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            //ConAmtToSettle += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.AmountCur;
+                            ConAmtToSettle += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.sksGetRemainingAmount();
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        }
+                    }
+                }
+                else
+                {
+                    //Check for qualifying credits here
+                    if(_importing.InvAmount < 0 //Credit note match
+                        && localPPSetup.AutoCR)
+                    {
+                        // Find SKS_LB_Depositor or Create if it doesn't exist
+                        tmpSKS_LB_Depositor = SKS_EFT_CustomerLoad::CreateFindCustomerRecord(_Cust, null, true, true, true, curExt());
+
+                        select firstonly SKS_LB_WriteoffDetails order by SKS_LB_WriteoffDetails.ThresholdAmount asc
+                            where SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules == tmpSKS_LB_Depositor.WriteOffId
+                                && SKS_LB_WriteoffDetails.ThresholdAmount > abs(_importing.InvAmount)
+                                && SKS_LB_WriteoffDetails.CustomerCompany == curExt()
+                                && SKS_LB_WriteoffDetails.ThresholdAmount != 0 && sks_lb_writeoffdetails.AutoCR == NoYes::Yes;
+
+                        if(SKS_LB_WriteoffDetails.AutoCR == NoYes::Yes)
+                        {
+                            SettleTotalFound += _importing.InvAmount;
+                            if(_Mark)
+                            {
+                                lTaxGroup = SKS_LB_Setup_AutoCRParms::find(sks_lb_writeoffdetails.CustomerCompany).TaxGroup;
+
+                                sks_lb_AutoCreateCreditDebitGroup = new SKS_LB_AutoCreateCreditDebitGroup();
+                                m_InvcNbr = sks_lb_AutoCreateCreditDebitGroup.AutoCreateCredit(CustTable::find(_cust).InvoiceAccount, _cust,
+                                SKS_LB_WriteoffDetails.CRLedgerDimension, _importing.InvAmount,
+                                _importing.InvoiceNumber, CustTable::find(_cust).Currency, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+                                sks_lb_writeoffdetails.CROffsetLedgerDimension, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), lTaxGroup,
+                                CustTable::find(_cust).PaymMode);
+
+                                if(m_invcNbr)
+                                {
+                                    findCusttrans = null;
+                                    findCusttransopen = null;
+                                    Select findCusttrans
+                                        where (findCusttrans.Invoice == m_invcNbr )
+                                        join  findCusttransopen
+                                        where (findCusttrans.RecId == findCusttransopen.RefRecId);
+
+                                    _Manager.updateTransMarked(findCusttransopen, NoYes::Yes);
+                                }
+                            }
+                            else
+                            {
+                                ConCredits += _importing.InvAmount;
+                            }
+                        }
+                    }
+
+                    //Not searching by cust id here
+                    Select crosscompany:virtualCompanycompanies Invoice, DefaultDimension, AccountNum from findCusttrans
+                    order by findCusttrans.DueDate
+                    where findCusttrans.Invoice == _importing.InvoiceNumber
+                        && findCusttrans.TransType == LedgerTransType::Cust
+                        join findCusttransopen
+                            where findCusttrans.RecId == findCusttransopen.RefRecId;
+
+                    if(findCusttransopen)
+                    {
+                        conindex = confind(diffCustAccts, findCustTrans.accountnum);
+                        if(conindex == 0)
+                        {
+                            diffCustAccts += findCustTrans.AccountNum;
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            //diffCustinvAmt += findCustTransOpen.AmountCur;
+                            diffCustinvAmt += findCustTransOpen.sksGetRemainingAmount();
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        }
+                        else
+                        {
+                            totalAmountforCust = conPeek(diffCustinvAmt, conindex);
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            //totalAmountforCust += findCustTransOpen.AmountCur;
+                            totalAmountforCust += findCustTransOpen.sksGetRemainingAmount();
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            diffCustinvAmt = conIns(diffCustinvAmt, conindex, totalAmountforCust);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                //if(!_Manager.getSpecTrans(findCusttransopen))
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                {
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    //SettleTotalFound += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.AmountCur;
+                    SettleTotalFound += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.sksGetRemainingAmount();
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    if(_Mark)
+                    {
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //_Manager.updateTransMarked(findCusttransopen, NoYes::Yes);
+                        if(!_Manager.getSpecTrans(findCusttransopen))
+                        {
+                            _Manager.updateTransMarked(findCusttransopen, NoYes::Yes);
+                        }
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        _Manager.updateSettleAmount(findCusttransopen, _importing.InvAmount);
+                    }
+                    else
+                    {
+                        goodinvs += findCustTransOpen;
+                        ConDueDates += findCustTransOpen.DueDate;
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //ConAmtToSettle += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.AmountCur;
+                        ConAmtToSettle += _InvAmtMapped ? _importing.InvAmount : findCustTransOpen.sksGetRemainingAmount();
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    }
+                }
+            }
+        }
+
+        OpenTransMatchData.SettleTotalFound(SettleTotalFound);
+        OpenTransMatchData.diffCustAccts(diffCustAccts);
+        OpenTransMatchData.diffCustInvAmt(diffCustInvAmt);  
+        OpenTransMatchData.ConCredits(concredits);
+        OpenTransMatchData.goodInvs(goodInvs);
+        OpenTransMatchData.ConDueDates(ConDueDates);
+        OpenTransMatchData.ConAmtToSettle(ConAmtToSettle);
+
+        return OpenTransMatchData;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProceedWithPartialSettle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    private void ProceedWithPartialSettle(SKS_LB_OpenTransMatchData _OpenTransMatchData)
+    {
+        container lGoodInvs;
+        container lCreditAmts;
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SortByDueDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    private SKS_LB_OpenTransMatchData SortByDueDate(SKS_LB_OpenTransMatchData _OpenTransMatchData)
+    {
+        date        tempdate1, tempdate2;
+        CustTransOpen   CTO1, CTO2;
+        AmountCur   Amount1, Amount2;
+        int         i, j;
+        Container ConDate = _OpenTransMatchData.ConDueDates();
+        Container GoodInvs = _OpenTransMatchData.goodInvs();
+        Container ConAmtToSettle = _OpenTransMatchData.ConAmtToSettle();
+
+        //Sort containers by date
+        for (i = 1; i <= conlen(ConDate); i++)
+        {
+            for (j = i + 1; j <= conlen(ConDate); j++)
+            {
+                tempdate1 = conpeek(ConDate, j);
+                tempdate2 = conpeek(ConDate, i);
+                CTO1 = conpeek(GoodInvs, j);
+                CTO2 = conpeek(GoodInvs, i);
+                Amount1 = conpeek(ConAmtToSettle, j);
+                Amount2 = conpeek(ConAmtToSettle, i);
+
+                if (tempdate1 < tempdate2)
+                {
+                    ConDate = condel(ConDate, j, 1);
+                    ConDate = conins(ConDate, j, tempdate2);
+                    ConDate = condel(ConDate, i, 1);
+                    ConDate = conins(ConDate, i, tempdate1);
+
+                    GoodInvs = condel(GoodInvs, j, 1);
+                    GoodInvs = conins(GoodInvs, j, CTO2);
+                    GoodInvs = condel(GoodInvs, i, 1);
+                    GoodInvs = conins(GoodInvs, i, CTO1);
+
+                    ConAmtToSettle = condel(ConAmtToSettle, j, 1);
+                    ConAmtToSettle = conins(ConAmtToSettle, j, Amount2);
+                    ConAmtToSettle = condel(ConAmtToSettle, i, 1);
+                    ConAmtToSettle = conins(ConAmtToSettle, i, Amount1);
+                }
+            }
+        }
+        _OpenTransMatchData.ConDueDates(ConDate);
+        _OpenTransMatchData.goodInvs(GoodInvs);
+        _OpenTransMatchData.ConAmtToSettle(ConAmtToSettle);
+        return _OpenTransMatchData;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PartialSettle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    private void PartialSettle(SKS_LB_OpenTransMatchData    _OpenTransMatchData, CustVendOpenTransManager _Manager, AmountCur _PmtTotal, CustAccount _Cust)
+    {
+        container   goodInvs = _OpenTransMatchData.goodInvs();
+        container   conAmtToSettle = _OpenTransMatchData.ConAmtToSettle();
+        container   concredit = _OpenTransMatchData.ConCredits();
+        SKS_LB_AutoCreateCreditDebitGroup sks_lb_AutoCreateCreditDebitGroup;
+        SKS_LB_WriteoffDetails  SKS_LB_WriteoffDetails;
+        SKS_LB_Depositor    tmpSKS_LB_Depositor;
+        AmountCur   TotalSettled;
+        CustTransOpen   findCustTransOpen = null;
+        CustTrans       findCustTrans     = null;
+        TaxGroup                lTaxGroup;
+        InvoiceId               m_InvcNbr;
+        /*for(int iter; iter <= conLen(goodInvs); iter++)
+        {
+
+        }*/
+        if(concredit != conNull())
+        {
+            for (int iter = 1; iter <= conlen(concredit); iter++)
+            {
+                tmpSKS_LB_Depositor = SKS_EFT_CustomerLoad::CreateFindCustomerRecord(_Cust, null, true, true, true, curExt());
+                select firstonly SKS_LB_WriteoffDetails order by SKS_LB_WriteoffDetails.ThresholdAmount asc
+                                where SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules == tmpSKS_LB_Depositor.WriteOffId
+                                    && SKS_LB_WriteoffDetails.ThresholdAmount > abs(conPeek(concredit,iter))
+                                    && SKS_LB_WriteoffDetails.CustomerCompany == curExt()
+                                    && SKS_LB_WriteoffDetails.ThresholdAmount != 0 && sks_lb_writeoffdetails.AutoCR == NoYes::Yes;
+                lTaxGroup = SKS_LB_Setup_AutoCRParms::find(sks_lb_writeoffdetails.CustomerCompany).TaxGroup;
+
+                sks_lb_AutoCreateCreditDebitGroup = new SKS_LB_AutoCreateCreditDebitGroup();
+                m_InvcNbr = sks_lb_AutoCreateCreditDebitGroup.AutoCreateCredit(CustTable::find(_cust).InvoiceAccount, _cust,
+                                        SKS_LB_WriteoffDetails.CRLedgerDimension, conPeek(concredit, iter),
+                                        '', CustTable::find(_cust).Currency, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+                                        sks_lb_writeoffdetails.CROffsetLedgerDimension, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), lTaxGroup,
+                                        CustTable::find(_cust).PaymMode);
+
+                if(m_invcNbr)
+                {
+                    findCusttrans = null;
+                    findCusttransopen = null;
+                    Select findCusttrans
+                        where (findCusttrans.Invoice == m_invcNbr )
+                        join  findCusttransopen
+                        where (findCusttrans.RecId == findCusttransopen.RefRecId);
+
+                    _Manager.updateTransMarked(findCusttransopen, NoYes::Yes);
+                }
+                TotalSettled += conPeek(concredit, iter);
+            }
+        }
+
+        if(goodInvs != conNull())
+        {
+            for (int iter = 1; iter <= conlen(goodinvs); iter++)
+            {
+                if(_PmtTotal >= (TotalSettled + conPeek(conAmtToSettle, iter)))
+                {
+                    _Manager.updateTransMarked(conPeek(goodInvs, iter), NoYes::Yes);
+                    _Manager.updateSettleAmount(conPeek(goodInvs, iter), conPeek(conAmtToSettle, iter));
+                    TotalSettled += conPeek(conAmtToSettle, iter);
+                }
+                else
+                {
+                    _Manager.updateTransMarked(conPeek(goodInvs, iter), NoYes::Yes);
+                    _Manager.updateSettleAmount(conPeek(goodInvs, iter), (_PmtTotal - TotalSettled));
+                    iter = conLen(goodInvs) + 1;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

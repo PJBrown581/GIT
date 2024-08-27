@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_SplitARBRMatchingGroups</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_SplitARBRMatchingGroups
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>splitARBRMatchingGroups</Name>
+				<Source><![CDATA[
+    public static void splitARBRMatchingGroups()
+    {
+        SKS_PP_Setup    setupTable;  
+
+        // go over setup table in all companies
+        while select crosscompany setupTable           
+        {
+            // process matching group found in setyup table
+            if(setupTable.MatchingRulesGroupIdCustSettle  != '')
+            {
+                SKS_SplitARBRMatchingGroups::processMatchingGroup(setupTable.MatchingRulesGroupIdCustSettle, setupTable.DataAreaId);
+            }
+
+            // process matching group found in bank table
+            SKS_PP_Bank bankTable;
+            while select bankTable
+                where bankTable.MatchingRulesGroupIdCustSettle != ''
+            {
+                SKS_SplitARBRMatchingGroups::processMatchingGroup(bankTable.MatchingRulesGroupIdCustSettle, setupTable.DataAreaId);
+            }
+        } 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processMatchingGroup</Name>
+				<Source><![CDATA[
+    private static void processMatchingGroup(SKS_LB_MatchingRulesGroupID _matchingGroup, DataAreaId _company)
+    {             
+        SKS_LB_MatchingGroups   matchingGroupsTable;
+        SKS_LB_MatchingGroups   matchingGroupsTableBR;       
+
+        SKS_LB_MatchingRules    matchingRulesTable;
+        SKS_LB_MatchingRules    matchingRulesTableBR;
+
+        SKS_LB_MatchingRulesGroupID groupId;
+
+
+        // check if that rule group is used as eSettlement rule group in setup table  or bank table
+        SKS_LB_Bank     eSettlementBankTable;
+        SKS_PP_Setup    setupTableLoc;
+        select firstonly eSettlementBankTable where eSettlementBankTable.MatchingRulesGroupId ==  _matchingGroup;
+        select firstonly crosscompany setupTableLoc where setupTableLoc.MatchingRulesGroupId ==  _matchingGroup;
+         
+        // if used
+        if(setupTableLoc || eSettlementBankTable)
+        {
+            // check if the BR matching group exists            
+            if(strLen(_matchingGroup) > 17)
+            {
+                groupId = subStr(_matchingGroup, 1, 17) + '-BR';
+            }
+            else
+            {
+                groupId =  _matchingGroup + '-BR';
+            }
+
+            select matchingGroupsTableBR where matchingGroupsTableBR.GroupId == groupId;
+            // if BR matching group doesn't exist,
+            if(!matchingGroupsTableBR)
+            {                           
+                // create new BR matching group
+                select firstonly matchingGroupsTable
+                        where matchingGroupsTable.GroupId == _matchingGroup;
+                matchingGroupsTableBR.data(matchingGroupsTable);
+                matchingGroupsTableBR.GroupId = groupId;
+                matchingGroupsTableBR.MatchingRulesGroupType = SKS_LB_MatchingRulesGroupType::BR;
+                matchingGroupsTableBR.insert();
+
+                // create new BR matching rules
+                while select matchingRulesTable
+                        where matchingRulesTable.GroupID ==  _matchingGroup
+                {
+                    if(SKS_SplitARBRMatchingGroups::checkMatchingRule(matchingRulesTable.lookupType))
+                    {
+                        matchingRulesTableBR.data(matchingRulesTable);
+                        matchingRulesTableBR.GroupId = matchingGroupsTableBR.GroupId;
+                        matchingRulesTableBR.insert();
+                    }
+                } 
+            }
+   
+            // Assign newly created matching group to setup and bank
+            changecompany(_company)
+            {
+                SKS_PP_Setup setupTable;
+                ttsbegin;
+                select forupdate setupTable 
+                    where setupTable.DataAreaId == _company
+                    && setupTable.MatchingRulesGroupIdCustSettle == _matchingGroup;
+                if(setupTable)
+                {
+                    setupTable.MatchingRulesGroupIdCustSettle = matchingGroupsTableBR.GroupId;
+                    setupTable.doUpdate();
+                }
+                ttscommit;
+
+                SKS_PP_Bank bankTable;
+                ttsbegin;
+                while select forupdate bankTable
+                        where bankTable.MatchingRulesGroupIdCustSettle ==  _matchingGroup
+                {
+                    bankTable.selectForUpdate(true);
+                    bankTable.MatchingRulesGroupIdCustSettle = matchingGroupsTableBR.GroupId;
+                    bankTable.doUpdate();
+                }
+                ttscommit;
+            }
+        }
+        else    // not used as eSettlement rule group - move as BR matching rule group
+        {             
+             // update matching rule group type
+            ttsbegin;
+            select forupdate matchingGroupsTable
+                    where matchingGroupsTable.GroupId == _matchingGroup
+                    && matchingGroupsTable.MatchingRulesGroupType != SKS_LB_MatchingRulesGroupType::BR;
+            if( matchingGroupsTable)
+            {
+                matchingGroupsTable.MatchingRulesGroupType = SKS_LB_MatchingRulesGroupType::BR;
+                matchingGroupsTable.doUpdate();
+            }
+            ttscommit;
+
+            // update matching rules associated with rule group
+            while select matchingRulesTable
+                    where matchingRulesTable.GroupID == _matchingGroup
+            {
+                if(!SKS_SplitARBRMatchingGroups::checkMatchingRule(matchingRulesTable.lookupType))
+                {
+                    delete_from matchingRulesTableBR where matchingRulesTableBR.RecId == matchingRulesTable.RecId;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitARBRMatchingGroupsOld</Name>
+				<Source><![CDATA[
+    public static boolean splitARBRMatchingGroupsOld()
+    {
+        boolean ret = false;
+                
+        SKS_PP_Setup    setupTable;
+        
+        SKS_LB_MatchingRulesGroupID origGroupId;
+
+        // for each matching rule group defined in setup
+        while select crosscompany setupTable
+            where setupTable.MatchingRulesGroupIdCustSettle != ''
+        {
+            origGroupId = setupTable.MatchingRulesGroupIdCustSettle;
+
+            // check if matching rule group is used as eSettlement rule group            
+            SKS_LB_MatchingGroups   matchingGroupsTable;
+            SKS_LB_MatchingGroups   matchingGroupsTableBR;
+
+            // check if that rule group is used as eSettlement rule group in setup table  or bank table
+            SKS_LB_Bank     eSettlementBankTable;
+            SKS_PP_Setup    setupTableLoc;
+            select firstonly eSettlementBankTable where eSettlementBankTable.MatchingRulesGroupId ==  setupTable.MatchingRulesGroupIdCustSettle;
+            select firstonly crosscompany setupTableLoc where setupTableLoc.MatchingRulesGroupId ==  setupTable.MatchingRulesGroupIdCustSettle;
+            
+            if(setupTableLoc || eSettlementBankTable)
+            {           
+                // check if the BR matching group exists
+                SKS_LB_MatchingRulesGroupID groupId;
+                if(strLen(setupTable.MatchingRulesGroupIdCustSettle) > 17)
+                {
+                    groupId = subStr(setupTable.MatchingRulesGroupIdCustSettle , 1, 17) + '-BR';
+                }
+                else
+                {
+                    groupId =  setupTable.MatchingRulesGroupIdCustSettle + '-BR';
+                }
+
+                select matchingGroupsTableBR where matchingGroupsTableBR.GroupId == groupId;
+                if(!matchingGroupsTableBR)
+                {
+                    // create new matching group
+                    select firstonly matchingGroupsTable
+                        where matchingGroupsTable.GroupId == setupTable.MatchingRulesGroupIdCustSettle;
+                    matchingGroupsTableBR.data(matchingGroupsTable);                    
+                    matchingGroupsTableBR.GroupId = groupId;
+                    matchingGroupsTableBR.MatchingRulesGroupType = SKS_LB_MatchingRulesGroupType::BR;
+                    matchingGroupsTableBR.insert();
+
+                    // create new matching rules
+                    SKS_LB_MatchingRules    matchingRulesTable;
+                    SKS_LB_MatchingRules    matchingRulesTableBR;
+
+                    while select matchingRulesTable
+                        where matchingRulesTable.GroupID ==  setupTable.MatchingRulesGroupIdCustSettle
+                    {
+                        if(SKS_SplitARBRMatchingGroups::checkMatchingRule(matchingRulesTable.lookupType))
+                        {
+                            matchingRulesTableBR.data(matchingRulesTable);
+                            matchingRulesTableBR.GroupId = matchingGroupsTableBR.GroupId;
+                            matchingRulesTableBR.insert();                       
+                        }
+                    }      
+                }
+
+                // Assign newly created matching group to setup and bank
+                changecompany(setupTable.DataAreaId)
+                {
+                    ttsbegin;
+                    setupTable.selectForUpdate(true);
+                    setupTable.MatchingRulesGroupIdCustSettle = groupId;
+                    setupTable.doUpdate();                   
+                    ttscommit;
+
+                    SKS_PP_Bank bankTable;
+                    ttsbegin;
+                    while select forupdate bankTable 
+                        where bankTable.MatchingRulesGroupIdCustSettle ==  origGroupId
+                    {
+                        bankTable.selectForUpdate(true);
+                        bankTable.MatchingRulesGroupIdCustSettle = groupId;
+                        bankTable.doUpdate();
+                    }
+                    ttscommit;
+                }
+            }
+            else
+            {
+                // matching group found
+                // update matching rule group type
+                ttsbegin;
+                select forupdate matchingGroupsTable
+                    where matchingGroupsTable.GroupId == setupTable.MatchingRulesGroupIdCustSettle
+                    && matchingGroupsTable.MatchingRulesGroupType != SKS_LB_MatchingRulesGroupType::BR;
+                if( matchingGroupsTable)
+                {
+                    matchingGroupsTable.MatchingRulesGroupType = SKS_LB_MatchingRulesGroupType::BR;
+                    matchingGroupsTable.doUpdate();
+                }
+                ttscommit;
+
+                // update matching rules
+                SKS_LB_MatchingRules    matchingRulesTable;
+                SKS_LB_MatchingRules    matchingRulesTableBR;
+
+                while select matchingRulesTable
+                    where matchingRulesTable.GroupID ==  setupTable.MatchingRulesGroupIdCustSettle
+                {
+                    if(!SKS_SplitARBRMatchingGroups::checkMatchingRule(matchingRulesTable.lookupType))
+                    {
+                        delete_from matchingRulesTableBR where matchingRulesTableBR.RecId == matchingRulesTable.RecId;
+                    }
+                }
+            }
+            
+          
+
+            ret = true;
+        }                     
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkMatchingRule</Name>
+				<Source><![CDATA[
+    public static boolean checkMatchingRule(SKS_LB_MatchType _matchType)
+    {
+        if( _matchType == SKS_LB_MatchType::InvoiceNumber ||
+            _matchType == SKS_LB_MatchType::CustomerReq ||
+            _matchType == SKS_LB_MatchType::BillOfLading ||
+            _matchType == SKS_LB_MatchType::SalesOrderNumber ||
+            _matchType == SKS_LB_MatchType::PaymentReference ||
+            _matchType == SKS_LB_MatchType::PaymentID ||
+            _matchType == SKS_LB_MatchType::CustomerRef ||
+            _matchType == SKS_LB_MatchType::DocNum
+            )
+        {
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>filterMatchingGroupLookup</Name>
+				<Source><![CDATA[
+    public static void filterMatchingGroupLookup(FormControl _formControl, SKS_LB_MatchingRulesGroupType _groupType)
+    {
+        Query query = new Query();
+        QueryBuildDataSource queryBuildDataSource;
+        QueryBuildRange queryBuildRange;
+
+        SysTableLookup sysTableLookup = SysTableLookup::newParameters(tableNum(SKS_LB_MatchingGroups), _formControl);
+          
+        queryBuildDataSource = query.addDataSource(tableNum(SKS_LB_MatchingGroups));
+        queryBuildDataSource.addRange(fieldNum(SKS_LB_MatchingGroups, MatchingRulesGroupType)).value(sysquery::value(_groupType));
+ 
+        sysTableLookup.parmQuery(query);
+        sysTableLookup.addLookupField(fieldNum(SKS_LB_MatchingGroups, GroupId));
+        sysTableLookup.addLookupField(fieldNum(SKS_LB_MatchingGroups, Description));
+        sysTableLookup.performFormLookup();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchingGroupJumpRef</Name>
+				<Source><![CDATA[
+    public static void matchingGroupJumpRef(SKS_LB_MatchingRulesGroupID _groupId, FormRun _formRun)
+    {
+        SKS_LB_MatchingGroups matchingGroupsTable;
+        select matchingGroupsTable where matchingGroupsTable.GroupId == _groupId; 
+        if(!matchingGroupsTable)
+        {
+            return;
+        }
+
+        Args args = new Args();
+        MenuFunction menuFunction;
+                                   
+        args.caller(_formRun);
+        args.record(matchingGroupsTable);
+
+        if(matchingGroupsTable.MatchingRulesGroupType == SKS_LB_MatchingRulesGroupType::AR)
+        {
+            menuFunction = new MenuFunction( menuitemdisplaystr(SKS_LB_MatchingRulesGroup), MenuItemType::Display);
+        }
+        else if(matchingGroupsTable.MatchingRulesGroupType == SKS_LB_MatchingRulesGroupType::BR)
+        {
+            menuFunction = new MenuFunction( menuitemdisplaystr(SKS_BR_MatchingRulesGroup), MenuItemType::Display);
+        }
+
+        menuFunction.run(args);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

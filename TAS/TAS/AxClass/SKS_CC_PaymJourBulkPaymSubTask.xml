@@ -1,0 +1,520 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_PaymJourBulkPaymSubTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_PaymJourBulkPaymSubTask extends RunBaseBatch
+{
+    #OCCRetryCount
+    LedgerJournalTable  ledgerJournalTableCaller;
+    LedgerJournalId     journalNum;
+    container           recordList;
+    str                 threadCaption;
+    boolean             isBatchMode;    
+    Counter             captureRecCnt, refundRecCnt, declinedRecCnt;
+    int                 procStartTime;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        journalNum,
+        recordList,
+        threadCaption,
+        isBatchMode
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>newSubTask</Name>
+				<Source><![CDATA[
+    public static SKS_CC_PaymJourBulkPaymSubTask newSubTask(
+        LedgerJournalId _journalNum,
+        container _recordList,
+        str _threadCaption,
+        boolean _isBatchMode = false)
+    {
+        SKS_CC_PaymJourBulkPaymSubTask paymJourBulkPaymSubTask = SKS_CC_PaymJourBulkPaymSubTask::construct();
+
+        paymJourBulkPaymSubTask.parmJournalNum(_journalNum);
+        paymJourBulkPaymSubTask.parmRecordList(_recordList);
+        paymJourBulkPaymSubTask.parmThreadCaption(_threadCaption);
+        paymJourBulkPaymSubTask.parmIsBatchMode(_isBatchMode);
+
+        return paymJourBulkPaymSubTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmJournalNum</Name>
+				<Source><![CDATA[
+    public LedgerJournalId parmJournalNum(LedgerJournalId _journalNum = journalNum)
+    {
+        journalNum = _journalNum;
+        return journalNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsBatchMode</Name>
+				<Source><![CDATA[
+    public boolean parmIsBatchMode(boolean _isBatchMode = isBatchMode)
+    {
+        isBatchMode = _isBatchMode;
+
+        return isBatchMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecordList</Name>
+				<Source><![CDATA[
+    public container parmRecordList(container _recordList = recordList)
+    {
+        recordList = _recordList;
+
+        return recordList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmThreadCaption</Name>
+				<Source><![CDATA[
+    public str parmThreadCaption(str _threadCaption = threadCaption)
+    {
+        threadCaption = _threadCaption;
+
+        return threadCaption;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCreditCardPaymentForJournalLine</Name>
+				<Source><![CDATA[
+    public void processCreditCardPaymentForJournalLine(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        AmountCur paymentAmount = SKS_CC_CustPaymTable::getCreditCardAmountRemainFromSource(_ledgerJournalTrans.TableId, _ledgerJournalTrans.RecId);
+        if (!paymentAmount)
+        {
+            return;
+        }
+
+        if (!SKS_CC_PaymJourBulkPaym::checkJournalLineBeforeProcessing(_ledgerJournalTrans))
+        {
+            return;
+        }
+
+        CustTable custTable = CustTable::find(_ledgerJournalTrans.accountDisplay());
+        if (!custTable)
+        {
+            return;
+        }
+
+        CreditCardCust  creditCardCust;
+        select creditCardCust
+            where creditCardCust.CustAccount == custTable.AccountNum
+            && creditCardCust.SKS_CC_DefaultCard == NoYes::Yes;
+
+        if (!creditCardCust || !CreditCard::checkExpireDate(creditCardCust.ExpiryDate))
+        {
+            RecId creditCardRecIdToUse;
+            Counter creditCardCnt;
+            while select creditCardCust
+                where creditCardCust.CustAccount == custTable.AccountNum
+            {
+                if (!CreditCard::checkExpireDate(creditCardCust.ExpiryDate))
+                {
+                    continue;
+                }
+
+                creditCardCnt++;
+                if (creditCardCnt > 1)
+                {
+                    break;
+                }
+                
+                creditCardRecIdToUse = creditCardCust.RecId;
+            }
+             
+            creditCardCust = null;
+            if (creditCardCnt == 1 && creditCardRecIdToUse)
+            {
+                select creditCardCust
+                    where creditCardCust.RecId == creditCardRecIdToUse;
+            }
+        }
+
+        if (!creditCardCust)
+        {
+            return;
+        }
+
+        SKS_CC_CustPaymTable    sKS_CC_CustPaymTable;
+
+        try
+        {
+            ttsbegin;
+            sKS_CC_CustPaymTable.initValue();
+            sKS_CC_CustPaymTable.CreditCardCustRefId = creditCardCust.RecId;
+            sKS_CC_CustPaymTable.CreditCardTypeName = creditCardCust.CreditCardTypeName;        
+            sKS_CC_CustPaymTable.CreditCardTransAmountCur = paymentAmount;        
+
+            if (sKS_CC_CustPaymTable.CreditCardTransAmountCur > 0)
+            {
+                sKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Capture;
+            }
+            else
+            {
+                sKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Refund;
+            }
+
+            sKS_CC_CustPaymTable.CreditCardTransTypeOrig = sKS_CC_CustPaymTable.CreditCardTransType;
+            sKS_CC_CustPaymTable.CustAccount = custTable.AccountNum;
+            sKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::JournalLine;
+            sKS_CC_CustPaymTable.CreditCardCurrency = _ledgerJournalTrans.CurrencyCode;
+            sKS_CC_CustPaymTable.RefTableId = _ledgerJournalTrans.TableId;
+            sKS_CC_CustPaymTable.RefRecId = _ledgerJournalTrans.RecId;
+            sKS_CC_CustPaymTable.RefOriginId = _ledgerJournalTrans.JournalNum;
+            sKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::NA;
+            sKS_CC_CustPaymTable.insert();
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            error("@SKS:SKGCCDuplicateKeyErrorOccurredDuringInsert");
+            return;
+        }
+        catch (Exception::Error)
+        {
+            ttsabort;
+            error(strFmt("@SKS:SKGCCErrorMsgDuringCCPaymRecInsert",
+                _ledgerJournalTrans.LineNum, _ledgerJournalTrans.Voucher, _ledgerJournalTrans.JournalNum));
+            return;
+        }
+
+        #define.refund('refund')
+        #define.capture('capture')
+        boolean captureOrRefundSuccess = false;
+        str transType;       
+        
+        if (sKS_CC_CustPaymTable.CreditCardTransAmountCur < 0)
+        {
+            transType = #refund;
+            captureOrRefundSuccess = SKS_CC_CreditCardProcess::sKS_CC_DoRefund(sKS_CC_CustPaymTable);
+        }
+        else
+        {
+            transType = #capture;
+            captureOrRefundSuccess = SKS_CC_CreditCardProcess::sKS_CC_DoCapture(
+                sKS_CC_CustPaymTable,
+                '', 
+                null,
+                sKS_CC_CustPaymTable.CreditCardTransAmountCur);
+        }
+
+        try
+        {
+            ttsBegin;
+            sKS_CC_CustPaymTable.selectForUpdate(true);
+            if (!captureOrRefundSuccess)
+            {
+                sKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::Declined;
+                error(strFmt("@SKS:SKGCCErrorMsgCreditCardProcessDeclined",
+                    transType, _ledgerJournalTrans.LineNum, _ledgerJournalTrans.Voucher, _ledgerJournalTrans.JournalNum));                
+                declinedRecCnt++;
+            }
+            else
+            {
+                sKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::Approved;
+                CreditCardAuthTrans creditCardAuthTransApproval = CreditCardAuthTrans::sKS_CC_FindValidCaptureOrRefundApproval(sKS_CC_CustPaymTable.RecId);
+                if (creditCardAuthTransApproval)
+                {
+                    sKS_CC_CustPaymTable.ApprovedDateTime = creditCardAuthTransApproval.ApprovedDateTime;
+                    sKS_CC_CustPaymTable.AuthorizationCode = creditCardAuthTransApproval.Authorization;
+                    sKS_CC_CustPaymTable.ApprovalCode = creditCardAuthTransApproval.SKS_CC_ApprovalCode;
+                }
+
+                if (sKS_CC_CustPaymTable.CreditCardTransAmountCur < 0)
+                {
+                    refundRecCnt++;
+                }
+                else
+                {
+                    captureRecCnt++;
+                }
+                
+            }
+            sKS_CC_CustPaymTable.update();
+            ttsCommit;
+
+            if (captureOrRefundSuccess)
+            {
+                CreditCard::sKS_CC_updateLedgerJournalTrans(sKS_CC_CustPaymTable.RefRecId, null, true);
+
+                // send email
+                SKS_CC_CustPaymTable    custPaymTableForEmail;
+                Args                    argsSelected = new Args();
+                Set                     recordsToEmailSet = new Set(Types::Int64);
+                RecId                   custPaymTableRecIdForEmail;
+                MenuFunction            menuFunction;
+
+                SysEmailRecipients      emailRecipient = custTable.email();
+  
+                custPaymTableRecIdForEmail = sKS_CC_CustPaymTable.RecId;
+                recordsToEmailSet.add(sKS_CC_CustPaymTable.RecId);
+  
+                if (SKS_PP_Setup::find().CCDefaultSendEmailReceipt && emailRecipient)
+                {
+                    if (recordsToEmailSet != null && recordsToEmailSet.elements() > 0)
+                    {
+                        custPaymTableForEmail = SKS_CC_CustPaymTable::findByRecID(custPaymTableRecIdForEmail);
+    
+                        menuFunction = new MenuFunction(menuitemOutputStr(SKS_CC_TransConfirm), MenuItemType::Output);
+                        argsSelected.parm(emailRecipient);
+                        argsSelected.parmObject(recordsToEmailSet);
+                        argsSelected.record(custPaymTableForEmail);
+                        menuFunction.run(argsSelected);
+                    }
+                }
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            error("@SKS:SKGCCDuplicateKeyErrorOccurredDuringUpdate");
+            return;
+        }
+        catch (Exception::Error)
+        {
+            ttsabort;
+            error(strFmt("@SKS:SKGCCErrorMsgDuringCCPaymRecUpdate",
+                _ledgerJournalTrans.LineNum, _ledgerJournalTrans.Voucher, _ledgerJournalTrans.JournalNum));
+            return;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayLogResults</Name>
+				<Source><![CDATA[
+    public void displayLogResults()
+    {
+        boolean recordsProcessed;
+        if (captureRecCnt)
+        {
+            info(strFmt("@SKS:SKGCCJourLinesCaptureSuccessCountMsg", captureRecCnt));
+            recordsProcessed = true;
+        }
+
+        if (refundRecCnt)
+        {
+            info(strFmt("@SKS:SKGCCJourLinesRefundSuccessCountMsg", refundRecCnt));
+            recordsProcessed = true;
+        }        
+
+        if (declinedRecCnt)
+        {
+            info(strFmt("@SKS:SKGCCJourLinesDeclinedCountMsg", declinedRecCnt));
+            recordsProcessed = true;
+        }        
+
+        if (!recordsProcessed)
+        {
+            info("@SKS:SKGCCNoJourLineWithCCPaymToProcessWereFound");
+        }
+
+        int procEndTime = WinAPIServer::getTickCount();
+        int procExecutionTime = (procEndTime-procStartTime) div 1000;
+        if (procExecutionTime)
+        {
+            str execTimeUnit = "@SKS:SKGCCSecondsProcUnit";
+            if (procExecutionTime > 180)
+            {
+                // Greater than 180 seconds then convert to minutes
+                procExecutionTime = any2Int(procExecutionTime / 60);
+                execTimeUnit = "@SKS:SKGCCMinutesProcUnit";
+            }
+            info(strFmt("@SKS:SKGCCProcElapsedTimeWithProcUnit", procExecutionTime, execTimeUnit));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {        
+        LedgerJournalTrans      ledgerJournalTrans;
+        int                     counterIdx;
+        RecId                   recIdToProcess;
+
+        ledgerJournalTableCaller = LedgerJournalTable::find(journalNum);
+        if (!ledgerJournalTableCaller)
+        {
+            throw error(strFmt("@SKS:SKGCCCustPaymJourNotFound", journalNum));
+        }
+
+        if (ledgerJournalTableCaller.Posted)
+        {
+            throw error(strFmt("@SKS:SKGCCUnableToProcBulkPaymJourIsPosted", ledgerJournalTableCaller.JournalNum));
+        }
+
+        procStartTime = WinAPIServer::getTickCount();
+        for (counterIdx = 1; counterIdx <= conLen(recordList); counterIdx++)
+        {
+            recIdToProcess = conPeek(recordList, counterIdx);
+            if (!recIdToProcess)
+            {
+                continue;
+            }
+
+            ledgerJournalTrans = LedgerJournalTrans::findRecId(recIdToProcess, false);
+            if (!ledgerJournalTrans)
+            {
+                continue;
+            }
+
+            this.processCreditCardPaymentForJournalLine(ledgerJournalTrans);            
+        }
+
+        this.displayLogResults();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_PaymJourBulkPaymSubTask construct()
+    {
+        return new SKS_CC_PaymJourBulkPaymSubTask();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS:SKGCCProcessAllCreditCards";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public ClassDescription caption()
+    {
+        ClassDescription ret;
+    
+        ret = super();
+
+        if (threadCaption)
+        {
+            ret = threadCaption;
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

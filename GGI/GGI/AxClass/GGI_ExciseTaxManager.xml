@@ -1,0 +1,426 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGI_ExciseTaxManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     Excise Tax Manager
+/// </summary>
+
+class GGI_ExciseTaxManager
+{
+    public SalesTable salesTable;
+    public SalesLine  exciseLine;
+    const str EA ='EA';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static GGI_ExciseTaxManager construct()
+    {
+        return new GGI_ExciseTaxManager();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesOrder_SalesLineAdded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Called when a sales line is added
+    /// </summary>
+    /// <param name="_salesLine">Saleline added</param>
+    public void SalesOrder_SalesLineAdded(SalesLine _salesLine)
+    {
+        this.SalesOrder_AddorUpdate(_salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesOrder_SalesLineUpdated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Called when a sales line is updated
+    /// </summary>
+    /// <param name="_salesLine">Saleline updated</param>
+    public void SalesOrder_SalesLineUpdated(SalesLine _salesLine)
+    {
+        this.SalesOrder_AddorUpdate(_salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesOrder_AddorUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Called when a sales line is added or updated
+    /// </summary>
+    /// <param name="_salesLine">Saleline updated</param>
+    private void SalesOrder_AddorUpdate(SalesLine _salesLine)
+    {
+        GGI_ExciseTaxRates taxRates;
+        salesTable = _salesLine.salesTable();
+        TTBPermitTable permitTable = salesTable.ttbPermitTable();
+        if (GGI_ExciseTaxManager::isExciseTaxEnabled())
+        {
+            TTBWineGallon  siteProofGallons = this.calculateProofGallonsForSite(_salesLine.inventDim().InventSiteId);
+            TTBWineGallon  orderProofGallons = this.calcuateProofGallonsForSalesOrder();
+            if (orderProofGallons > 0)
+            {
+                this.FindExciseLine(salesTable.SalesId);
+
+                select firstonly taxRates 
+                    where taxRates.Year == year(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+                    &&    taxRates.PermitType == permitTable.PermitType
+                    &&    taxRates.InventSiteId == _salesLine.inventDim().InventSiteId
+                    &&    siteProofGallons  >= taxRates.MinValue 
+                    &&    siteProofGallons  <= taxRates.MaxValue;
+
+                InventDim  inventDimSite = this.GetSiteDim(taxRates.InventSiteId);
+                
+                if (!exciseLine && taxRates)
+                {
+                    ttsbegin;
+                    exciseLine.clear();
+                    exciseLine.SalesId = _salesLine.SalesId;
+                    exciseLine.initFromSalesTable(salesTable);
+                    exciseLine.SalesCategory = taxRates.SalesCategory;
+                    exciseLine.initLineFromItemOrCategory();
+                    exciseLine.inventDimId = inventDimSite.inventDimId;
+                    exciseLine.SalesQty = orderProofGallons;
+                    exciseLine.RemainSalesPhysical = orderProofGallons;
+                    exciseLine.SalesUnit = EA;
+                    exciseLine.SalesPrice = taxRates.ExciseTaxRate;
+                    exciseLine.LineAmount = exciseLine.calcLineAmountExclTax(orderProofGallons, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+                    
+                    exciseLine.LineNum = 99;
+                    exciseLine.insert();
+                    ttscommit;
+                }
+                else if (taxRates && this.hasNetExciseTax())
+                {
+                    ttsbegin;
+                    exciseLine.selectForUpdate(true);
+                    exciseLine.initFromSalesTable(salesTable);
+                    exciseLine.SalesCategory = taxRates.SalesCategory;
+                    exciseLine.initLineFromItemOrCategory();
+                    exciseLine.inventDimId = inventDimSite.inventDimId;
+                    exciseLine.SalesQty = orderProofGallons;
+                    exciseLine.RemainSalesPhysical = orderProofGallons;
+                    exciseLine.SalesUnit = EA;
+                    exciseLine.SalesPrice = taxRates.ExciseTaxRate;
+                    exciseLine.LineAmount = exciseLine.calcLineAmountExclTax(orderProofGallons, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+                   
+                    exciseLine.LineNum = 99;
+                    exciseLine.update();
+                    ttscommit;
+                }
+            }
+            else if (this.hasNetExciseTax())
+            {
+                
+                //check to see if we have an excise tax that's not not supposed to be there
+                select firstonly exciseLine
+                    where exciseLine.SalesId == salesTable.SalesId
+                    join taxRates
+                    where exciseLine.SalesCategory == taxRates.SalesCategory;
+
+                if (exciseLine)
+                {
+                    throw error("@GGI:ExciseTaxNotRequired");
+                }
+                                
+            }
+       }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasNetExciseTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if there is a net excise tax quantity on the order.
+    /// </summary>
+    /// <returns>
+    /// True, if has net excise tax; otherwise, false.
+    /// </returns>
+    public boolean hasNetExciseTax()
+    {
+        SalesLine           salesLineExciseTax;
+        GGI_ExciseTaxRates  taxRates;      
+
+        select sum(SalesQty) from salesLineExciseTax
+            where salesLineExciseTax.SalesId        == salesTable.SalesId
+                && salesLineExciseTax.SalesCategory 
+            exists join taxRates
+            where salesLineExciseTax.SalesCategory  == taxRates.SalesCategory;
+
+        return (salesLineExciseTax.SalesQty != 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesOrder_SalesLineDeleted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Handles excise tax for add/update sales line
+    /// </summary>
+    /// <param name="_salesTable">Sales order</param>
+    public void SalesOrder_SalesLineDeleted(SalesTable _salesTable)
+    {
+        GGI_ExciseTaxRates taxRates;
+        salesTable = _salesTable;
+        TTBPermitTable permitTable = salesTable.ttbPermitTable();
+
+        if (GGI_ExciseTaxManager::isExciseTaxEnabled())
+        {
+            this.FindExciseLine(salesTable.SalesId);
+            
+            TTBWineGallon  siteProofGallons = this.calculateProofGallonsForSite(taxRates.InventSiteId);
+            TTBWineGallon  orderProofGallons = this.calcuateProofGallonsForSalesOrder();
+
+            if (!exciseLine && orderProofGallons <= 0)
+            {
+                return;
+            }
+            
+            InventDim  inventDimSite = this.GetSiteDim(taxRates.InventSiteId);
+                       
+            if (orderProofGallons > 0)
+            {
+                select firstonly taxRates
+                where taxRates.Year == year(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+                &&    taxRates.PermitType == permitTable.PermitType
+                &&    taxRates.InventSiteId == inventDimSite.InventsiteId   
+                &&    siteProofGallons  >= taxRates.MinValue
+                &&    siteProofGallons  <= taxRates.MaxValue;
+
+                if (taxRates)
+                {
+                    ttsbegin;
+                    exciseLine.selectForUpdate(true);
+                    exciseLine.initFromSalesTable(salesTable);
+                    exciseLine.SalesCategory = taxRates.SalesCategory;
+                    exciseLine.initLineFromItemOrCategory();
+                    exciseLine.inventDimId = inventDimSite.inventDimId;
+                    exciseLine.SalesQty = orderProofGallons;
+                    exciseLine.RemainSalesPhysical = orderProofGallons;
+                    exciseLine.SalesUnit = EA;
+                    exciseLine.SalesPrice = taxRates.ExciseTaxRate;
+                    exciseLine.LineAmount = exciseLine.calcLineAmountExclTax(orderProofGallons,  DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+                    exciseLine.LineNum = 99;
+                    exciseLine.update();
+                    ttscommit;
+                }
+            }
+            else
+            {
+                ttsbegin;
+                exciseLine.selectForUpdate(true);
+                exciseLine.delete();
+                ttscommit;
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindExciseLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Find the Excise tax sales line on the sales order
+    /// </summary>
+    /// <param name="_salesId">Sales order Id</param>
+    private void FindExciseLine(SalesId _salesId)
+    {
+        GGI_ExciseTaxRates taxRates;
+        
+        select firstonly exciseLine
+            where exciseLine.SalesId == _salesId
+            join taxRates
+            where exciseLine.SalesCategory == taxRates.salesCategory;
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSiteDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Get Site Dimension
+    /// </summary>
+    /// <param name="_siteId">Site Id</param>
+    private InventDim GetSiteDim(InventSiteId _siteId)
+    {
+        InventDim  inventDimSite = InventDim::find(InventDim::inventDimIdBlank());
+        inventDimSite.InventSiteId = _siteId;
+        inventDimSite = InventDim::findOrCreate(InventDimSite);
+        return inventDimSite;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcuateProofGallonsForSalesOrder</Name>
+				<Source><![CDATA[
+    private TTBWineGallon calcuateProofGallonsForSalesOrder()
+    {
+        GGISalesLineProofGallon salesLinePG;
+
+        select sum(ProofGallon) from salesLinePG
+            where salesLinePG.SalesId == salesTable.SalesId;
+
+        return salesLinePG.ProofGallon;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateProofGallonsForSite</Name>
+				<Source><![CDATA[
+    public TTBWineGallon calculateProofGallonsForSite(InventSiteId _siteId)
+    {
+        GGIDateTimeManager      dateTimeManager = GGIDateTimeManager::construct();
+        FromDate                fromDate        = dateTimeManager.getStartOfYearDate();
+        ToDate                  toDate          = dateTimeManager.getEndOfYearDate();
+        GGISalesLineProofGallon salesLinePG;
+
+        select sum(ProofGallon) from salesLinePG
+            where salesLinePG.InventSiteId == _siteId
+                && (!salesLinePG.DatePhysical
+                    || (salesLinePG.DatePhysical
+                        && salesLinePG.DatePhysical >= fromDate
+                        && salesLinePG.DatePhysical <= toDate));
+
+        return salesLinePG.ProofGallon;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetExciseTaxAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Find the Excise tax amount for the sales order
+    /// </summary>
+    /// <param name="_salesId">Sales order Id</param>
+    public static LineAmount GetExciseTaxAmount(SalesId _salesId)
+    {
+        GGI_ExciseTaxRates taxRates;
+        SalesLine          salesLine;
+
+        select firstonly LineAmount from salesLine
+            where salesLine.SalesId == _salesId
+            join taxRates
+            where salesLine.SalesCategory == taxRates.salesCategory;
+
+        return salesLine.LineAmount;
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isExciseTaxEnabled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Returns true, if Excise Tax is enabled for the current company
+    /// </summary>
+   ///<returns>returns true if Excise is enabled; otherwise false</returns>
+    public static NoYes isExciseTaxEnabled()
+    {
+        return LedgerParameters::find().GGI_ExciseTax;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reCalcLineTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    recalculates the excise tax on sales lines
+    /// </summary>
+    public static void reCalcLineTax(SalesId _salesId)
+    {
+        SalesLine locSalesLine;
+        GGI_ExciseTaxManager exciseTaxManager = GGI_ExciseTaxManager::construct();
+        exciseTaxManager.removeTaxLines(_salesId);
+
+        while select locSalesLine
+            where locSalesLine.SalesId == _salesId
+        {     
+            if(exciseTaxManager.isSalesLineExiseTaxable(locSalesLine))
+            {
+                exciseTaxManager.SalesOrder_SalesLineAdded(locSalesLine);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeTaxLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// remove excise taxes line from sales order.
+    /// </summary>
+    /// <param name = "salesId"> sales order number </param>
+    private  void removeTaxLines(SalesId _salesId)
+    {
+        SalesLine   line;
+        GGI_ExciseTaxRates taxRates;
+
+        ttsbegin;
+        while select forupdate line
+            where line.SalesId == _salesId
+                join taxRates
+                    where line.SalesCategory == taxRates.SalesCategory
+        {
+            line.delete();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSalesLineExiseTaxable</Name>
+				<Source><![CDATA[
+    private boolean isSalesLineExiseTaxable(SalesLine _Line)
+    {
+        TTBFormluaName formulaName;
+        InventTable inventTable = inventTable::find(_Line.ItemId);
+
+        select firstonly RecId from formulaName
+            where formulaName.FormulaId == inventTable.TTBFormulaID
+            && formulaName.AlcoholType == TTBAlcoholType::PURE;
+ 
+        return formulaName.RecId;
+       
+        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

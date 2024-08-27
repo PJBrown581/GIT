@@ -1,0 +1,290 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIProcessGuideBOMCreateStep</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ProdProcessGuideStartProductionOrderStep</c> represents a step that creates the BOM journal and Gauge record
+/// </summary>
+[ProcessGuideStepName(classStr(GGIProcessGuideBOMCreateStep))]
+public class GGIProcessGuideBOMCreateStep extends ProcessGuideStepWithoutPrompt
+{
+    public const UnitOfMeasureSymbol lbUnit = 'LB';
+    public const str CHEMICAL = 'CHEMICAL';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>doExecute</Name>
+				<Source><![CDATA[
+    protected final void doExecute()
+    {
+        InventJournalTable		journalTable;
+        InventJournalTrans		journalTrans;
+        InventJournalTableData	journalTableData;
+        InventJournalTransData	journalTransData;
+        InventTransId			inventTransId;
+        BOMVersion				bomVersion;
+        BOM						bomLines;
+        Qty						gaugeQty;
+        Qty                     ggiWeight;
+        Qty                     finalQty;
+        InventTable             bomLineInventTable;
+
+        InventTable				inventTable, inventTableLine;
+        InventBatch				inventBatch;
+        TTBFormluaName			ttbFormulaName;
+        TTBAlcoholType          bomLineAlcoholType;
+        InventDim				inventDim;
+        PdsDispositionMaster    pdsDispMaster;
+
+        WhsrfPassthrough pass = controller.parmSessionState().parmPass();
+        EcoResReleasedProductUnitConverter releasedProductUnitConverter = EcoResReleasedProductUnitConverter::construct();
+        
+        inventTable = InventTable::find(pass.lookup(ProcessGuideDataTypeNames::ItemId));
+        ttbFormulaName = TTBFormluaName::find(inventTable.TTBFormulaID);
+
+        journalTableData = JournalTableData::newTable(journalTable);
+        journalTransData = journalTableData.journalStatic().newJournalTransData(journalTrans, journalTableData);
+
+        ggiWeight = pass.lookupReal(ProcessGuideDataTypeNames::GGIWeight);
+        // WG & PG partial quantity values; results in 1.00 for BULK and 0.#### fraction for partial
+        gaugeQty = ggiWeight / inventTable.NetWeight;
+        
+        ttsbegin;
+        // init JournalTable
+        journalTable.clear();
+        journalTable.JournalId = journalTableData.nextJournalId();
+        journalTable.JournalType = InventJournalType::BOM;
+        if (InventParameters::find().GGIBOMBulkJournalNameId
+            && ggiWeight == inventTable.NetWeight)
+        {
+            journalTable.JournalNameId = InventParameters::find().GGIBOMBulkJournalNameId;
+        }
+        else if (InventParameters::find().GGIBOMPartialJournalNameId
+            && ggiWeight != inventTable.NetWeight)
+        {
+            journalTable.JournalNameId = InventParameters::find().GGIBOMPartialJournalNameId;
+        }
+        else
+        {
+            throw error("@SYS55001");
+        }
+        journalTableData.initFromJournalName(journalTableData.journalStatic().findJournalName(journalTable.JournalNameId));
+
+        journalTrans.clear();
+        journalTrans.initFromInventJournalTable(journalTable);
+        journalTrans.initFromInventTable(inventTable);
+        journalTrans.InventDimId = pass.lookup(ProcessGuideDataTypeNames::GGIDimId);
+        journalTrans.Qty = -1;
+        journalTrans.PriceUnit = InventTableModule::find(inventTable.ItemId, ModuleInventPurchSales::Invent).pcsPrice();
+        journalTrans.CostAmount = CurrencyExchangeHelper::amount(journalTrans.Qty * journalTrans.PriceUnit);
+        journalTrans.InventTransId = NumberSeq::newGetNum(InventParameters::numRefInventTransId()).num();
+        journalTrans.TransDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+        journalTrans.Voucher = NumberSeq::newGetNumFromId(journalTable.VoucherNumberSequenceTable).num();
+        journalTrans.BOMLine = NoYes::No;
+        journalTrans.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(inventTable.DefaultDimension, journalTrans.inventDim().inventSite().DefaultDimension);
+        journalTrans.insert();
+
+        journalTable.NumOfLines = 1;
+
+        if (WHSZone::find(WMSLocation::find(journalTrans.inventDim().wMSLocationId, journalTrans.inventDim().InventSiteId).ZoneId).GGIGaugeControlled
+            && inventTable.TTBAlcoholType() != TTBAlcoholType::none)
+        {
+            TTBInventGaugeTableCreate::createFromInventJournalPost(journalTrans, gaugeQty, journalTrans.Unit);
+        }
+
+        inventTransId = journalTrans.InventTransId;
+
+        bomVersion = this.selectApplicableBOMVersion(inventTable);
+       
+        while select bomLines             
+            where bomLines.BOMId == bomVersion.BOMId
+        {
+            inventTableLine     = bomLines.inventTable();
+            ttbFormulaName      = TTBFormluaName::find(inventTable.TTBFormulaID);
+            bomLineAlcoholType  = inventTableLine.TTBAlcoholType();
+
+
+            if (inventTableLine.Phantom || inventTableLine.PackagingGroupId != CHEMICAL)                                
+            {
+                continue;
+            }
+
+            if (ttbFormulaName.AlcoholType != TTBAlcoholType::none && bomLineAlcoholType != ttbFormulaName.AlcoholType)
+            {
+                continue;
+            }
+
+            if (ttbFormulaName.AlcoholType      == TTBAlcoholType::PURE
+                        && inventTable.TTBProof != inventTableLine.TTBProof)
+            {
+                continue;
+            }            
+
+           
+            journalTrans.clear();
+            journalTrans.initFromInventJournalTable(journalTable);
+            journalTrans.initFromInventTable(inventTableLine);
+
+            //build dimensions
+            inventDim = InventDim::find(pass.lookup(ProcessGuideDataTypeNames::GGIDimId));
+            inventDim.InventStyleId = bomLines.inventDim().InventStyleId;
+            inventDim.InventSerialId = '';
+            inventDim.LicensePlateId = '';
+            if (WMSLocation::find(inventDim.wMSLocationId, inventDim.InventLocationId).whsLocationIsLPControlled())
+            {
+                inventDim.LicensePlateId = WHSLicensePlate::generateLicensePlateId(bomLines.ItemId, bomLines.UnitId);
+
+                if (inventDim.LicensePlateId)
+                {
+                    WHSLicensePlate::createLicensePlate(inventDim.LicensePlateId);
+                }
+            }
+
+            inventBatch.initValue();
+            inventBatch.InventBatchId = InventNumGroup::find(inventTableLine.BatchNumGroupId).buildNumberParameters(
+                                                                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                '',
+                                                                '',
+                                                                extendedTypeNum(InventBatchId));
+
+            select firstonly pdsDispMaster
+                where pdsDispMaster.Status == PdsStatus::Available;
+
+            inventBatch.ItemId = bomLines.ItemId;
+            inventBatch.ProdDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            if (pdsDispMaster)
+            {
+                inventBatch.PdsDispositionCode = pdsDispMaster.DispositionCode;
+            }
+            inventBatch.insert();
+            inventDim.inventBatchId = inventBatch.InventBatchId;
+
+            journalTrans.InventDimId = InventDim::findOrCreate(inventDim).inventDimId;
+                
+            if (bomLines.UnitId == lbUnit)
+            {
+                finalQty = gaugeQty * bomLines.BOMQty;                 
+            }
+            else
+            {
+                finalQty = gaugeQty * releasedProductUnitConverter.convert(bomLines.BOMQty,
+                                                                    UnitOfMeasure::unitOfMeasureIdBySymbol(bomLines.UnitId),
+                                                                    UnitOfMeasure::unitOfMeasureIdBySymbol(lbUnit),
+                                                                    NoYes::No,
+                                                                    journalTrans.ItemId,
+                                                                    journalTrans.InventDimId,
+                                                                    NoYes::No);
+            }
+            journalTrans.Unit       = bomLines.UnitId;
+            journalTrans.UnitQty    = decRound(releasedProductUnitConverter.convert(finalQty,
+                                                                    UnitOfMeasure::unitOfMeasureIdBySymbol(lbUnit),
+                                                                    UnitOfMeasure::unitOfMeasureIdBySymbol(bomLines.UnitId),
+                                                                    NoYes::No,
+                                                                    journalTrans.ItemId,
+                                                                    journalTrans.InventDimId,
+                                                                    NoYes::No),
+                                                                    UnitOfMeasure::findBySymbol(lbUnit).DecimalPrecision);                
+
+            journalTrans.modifyInventJournalTransQty();
+                
+            journalTrans.PriceUnit = InventTableModule::find(bomLines.ItemId, ModuleInventPurchSales::Invent).pcsPrice();
+            journalTrans.CostAmount = CurrencyExchangeHelper::amount(journalTrans.Qty * journalTrans.PriceUnit);
+            journalTrans.InventTransId = NumberSeq::newGetNum(InventParameters::numRefInventTransId()).num();
+            journalTrans.TransDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            journalTrans.Voucher = NumberSeq::newGetNumFromId(journalTable.VoucherNumberSequenceTable).num();
+            journalTrans.BOMLine = NoYes::Yes;
+            journalTrans.InventTransIdFather = inventTransId;
+            journalTrans.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(inventTable.DefaultDimension, inventDim.inventSite().DefaultDimension);
+            journalTrans.insert();
+
+            journalTable.NumOfLines++;
+            
+        }
+
+        journalTable.insert();
+
+        // Call the static method to post the journal
+        if(InventJournalCheckPost::newPostJournal(journalTable).validate())
+        {
+            InventJournalCheckPost::newPostJournal(journalTable).runOperation();
+        }
+
+        ttscommit;
+
+        this.addProcessCompletionMessage();
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectApplicableBOMVersion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the appropriate BOM version that is applicable.
+    /// </summary>
+    /// <param name = "_inventTable">
+    /// The item scanned.
+    /// </param>
+    /// <returns>
+    /// The formula version that is applicable.
+    /// </returns>
+    public BOMVersion selectApplicableBOMVersion(InventTable _inventTable)
+    {
+        BOMVersion      bomVersion;
+        BOM             bomLine;
+        InventTable     bomLineInventTable;
+        TTBFormluaName  formulaName;
+        TTBAlcoholType  alcoholType = _inventTable.TTBAlcoholType(); 
+      
+        if (formulaName.AlcoholType  == TTBAlcoholType::none)
+        {
+            select firstonly bomVersion
+            join bomLine
+            where bomLine.BOMId                         == bomVersion.BOMId
+            join bomLineInventTable
+            where bomLineInventTable.ItemId             == bomLine.ItemId
+            join formulaName
+            where bomLineInventTable.TTBFormulaID       == formulaName.FormulaId
+                && bomVersion.ItemId                    == _inventTable.ItemId
+                && bomVersion.Active
+                && bomVersion.FromDate                  <= DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())
+                && (!bomVersion.ToDate
+                    || bomVersion.ToDate                >= DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))                
+                && bomLineInventTable.PackagingGroupId  == CHEMICAL;
+               
+        }
+        else
+        {
+            select firstonly bomVersion
+            join bomLine
+            where bomLine.BOMId                         == bomVersion.BOMId
+            join bomLineInventTable
+            where bomLineInventTable.ItemId             == bomLine.ItemId
+            join formulaName
+            where bomLineInventTable.TTBFormulaID       == formulaName.FormulaId
+                && bomVersion.ItemId                    == _inventTable.ItemId
+                && bomVersion.Active
+                && bomVersion.FromDate                  <= DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())
+                && (!bomVersion.ToDate
+                    || bomVersion.ToDate                >= DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))
+                && formulaName.AlcoholType              == alcoholType
+                && bomLineInventTable.PackagingGroupId  == CHEMICAL
+                && (alcoholType                         != TTBAlcoholType::PURE
+                    || (alcoholType                     == TTBAlcoholType::PURE
+                        && _inventTable.TTBProof        == bomLineInventTable.TTBProof));
+        } 
+
+        return bomVersion;
+        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

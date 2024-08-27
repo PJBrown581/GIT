@@ -1,0 +1,654 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_Format_US_BOA_CPPX</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// SKS_EFT_Format_US_BOA_CPPX extends SKS_EFT_Format
+/// </summary>
+class SKS_EFT_Format_US_BOA_CPPX extends SKS_EFT_Format
+{
+   // BOA Comprehensive Payables and Paymode - X
+    
+    #define.FormatVersion('20230428')
+    #define.Separator('|')
+    #define.CheckStandard('CHK-S')
+    #define.PAYMODEX('CDA')
+    #define.CCC('CCC')
+    #define.WIRE('WIRE')
+
+    int mPaymentCount;
+    int mRemittanceCount;
+    Amount mPaymentAmount;
+    BankAccountTable mBankAccountTable;
+    str customerID;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getFormatVersion</Name>
+				<Source><![CDATA[
+    protected str getFormatVersion()
+    {
+        return #FormatVersion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatStructure</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Selecting a local table buffer based on a global table buffer attribute)")]
+    protected void formatStructure()
+    {
+        SKS_EFT_FileDetail invSKS_EFT_FileDetail;
+        LedgerJournalTrans lLedgerJournalTrans;
+        ;
+    
+        while(mSKS_EFT_FileDetail)
+        {
+            customerID = SKS_PP_Setup::find().RegCustomerID;
+
+            // Get SKS_EFT_Bank
+            this.getSKS_EFT_Bank();
+    
+            if(mBankAccountTable.AccountID != mSKS_EFT_FileDetail.BankAccountId)
+            {
+                // Get Bank Account Table
+                mBankAccountTable = BankAccountTable::find(mSKS_EFT_FileDetail.BankAccountId);
+            }
+    
+            // Get SKS_EFT_VendorPaym
+            this.getSKS_EFT_VendorPaym();
+    
+            // Get SKS_EFT_FileFormatPaymSpec
+            this.getSKS_EFT_FileFormatPaymSpec();
+    
+            //Payment Data
+            this.rec_PM();
+    
+            //Remittance Data
+            while select invSKS_EFT_FileDetail where invSKS_EFT_FileDetail.RecordSummaryRecId == mSKS_EFT_FileDetail.RecId
+            {
+                //Get Buyer ID
+                lLedgerJournalTrans = null;
+                select crossCompany PaymId from lLedgerJournalTrans where lLedgerJournalTrans.VendTransId == invSKS_EFT_FileDetail.VendTransRecId;
+                this.rec_REM(invSKS_EFT_FileDetail, lLedgerJournalTrans);
+            }
+            next mSKS_EFT_FileDetail;
+        }
+    
+        //Control total Data
+        this.rec_CD();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>get_POInfo</Name>
+				<Source><![CDATA[
+    private str get_POInfo(SKS_EFT_FileDetail _invSKS_EFT_FileDetail)
+    {
+        VendInvoiceJour vendInvoiceJour;
+        Container companyInfo;
+        str PONum = '';
+        ;
+    
+        companyInfo += _invSKS_EFT_FileDetail.InvoiceCompany;
+    
+        // See if PO exists
+        if(conPeek(companyInfo, 1) != '')
+        {
+            select firstOnly crossCompany:companyInfo PurchId, InvoiceAccount, InvoiceDate, InvoiceId from vendInvoiceJour where
+                vendInvoiceJour.InvoiceAccount == _invSKS_EFT_FileDetail.AccountNum &&
+                vendInvoiceJour.InvoiceDate == _invSKS_EFT_FileDetail.InvoiceDate &&
+                vendInvoiceJour.InvoiceId == _invSKS_EFT_FileDetail.InvoiceNumber &&
+                vendInvoiceJour.PurchId != '';
+    
+            if(vendInvoiceJour)
+            {
+                //SKG_Custom_Begin_19287-->
+                if(customerID == '9f3a8e')
+                {
+                    PONum = 'PO#' + vendInvoiceJour.PurchId;
+                }
+                //SKG_Custom_End_19287<--
+                else
+                {
+                    PONum = vendInvoiceJour.PurchId;
+                }
+            }
+        }
+        return this.CharacterReplacement(PONum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_CD</Name>
+				<Source><![CDATA[
+    boolean rec_CD()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //Each Field separated by pipe Delimiter
+        //Nbr   Description
+        // 1    Record type
+        // 2    Total Payment Amount
+        // 3    Total Number of Payments
+        // 4    Total Number of Remittances
+        //------------------------------------------------------------------------------------------------------
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+    
+        // 1    Record type
+        sb.Append(this.wrapField('C'));
+    
+        // 2    Total Payment Amount
+        sb.Append(this.wrapField(num2str(-1*mPaymentAmount,0,2,1,0)));
+    
+        // 3    Total Number of Payments
+        sb.Append(this.wrapField(int2str(mPaymentCount)));
+    
+        // 4    Total Number of Remittances
+        sb.Append(this.wrapField(int2str(mRemittanceCount), false));
+    
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_PM</Name>
+				<Source><![CDATA[
+    boolean rec_PM()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //Each Field separated by pipe delimiter
+        //Nbr   Description
+        // 1    Record type
+        // 2    Payment type
+        // 3    Disbursing (i.e. your) Paymode-X Account ID
+        // 4    Disbursing Bank ID (ABA Routing Transit #)
+        // 5    Disbursing Bank Account #
+        // 6    Collecting (i.e. your vendor's) Paymode-X Account ID
+        // 7    Payment Reference Number
+        // 8    Payment Amount
+        // 9    Vendor Name
+        //10    Vendor Number
+        //11    Vendor Address Line 1
+        //12    Vendor Address Line 2
+        //13    Vendor Address Line 3
+        //14    Vendor City
+        //15    Vendor State
+        //16    Vendor Zip
+        //17    Vendor Country
+        //18    Divert Code
+        //-------------------------------------------------------------
+        //19    Originating Bank ID Qualifier
+        //20    Originating Address Line 1
+        //21    Originating Address Line 2
+        //22    Originating City
+        //23    Originating State
+        //24    Originating Postal Code
+        //25    Originating Country Code
+        //26    Effective Date
+        //27    Beneficiary Bank ID Qualifier
+        //28    Beneficiary Bank ID
+        //29    Beneficiary Account Type
+        //30    Beneficiary Account Number
+        //31    Beneficiary Bank Name
+        //32    Beneficiary Bank Address line 1
+        //33    Beneficiary Bank Address line 2
+        //34    Beneficiary Bank City
+        //35    Beneficiary Bank State
+        //36    Beneficiary Bank Zip/Postal Code
+        //37    Beneficiary Bank Country Code
+        //------------------------------------------------------------------------------------------------------
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        str vendAddress = '';
+    
+        mPaymentCount++;
+    
+        // 1    Record type
+        sb.Append(this.wrapField('P'));
+    
+        // 2    Payment type
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #CheckStandard:
+                sb.Append(this.wrapField('CHK'));
+                break;
+            case #PAYMODEX:
+                //SKG_Custom_Begin_19287-->
+                if(customerID == '9f3a8e')
+                {
+                    sb.Append(this.wrapField('A'));
+                }
+                else //SKG_Custom_End_19287<--
+                {
+                    sb.Append(this.wrapField('PMX'));
+                }
+                break;
+            case #CCC:
+                //SKG_Custom_Begin_19287-->
+                if(customerID == '9f3a8e')
+                {
+                    sb.Append(this.wrapField('C'));
+                }
+                else //SKG_Custom_End_19287<--
+                {
+                    sb.Append(this.wrapField('EPY'));
+                }
+                break;
+            case #WIRE:
+                sb.Append(this.wrapField('WIRE'));
+                break;
+        }
+    
+        // 3    Disbursing (i.e. your) Paymode-X Account ID
+        sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('PaymodexId', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank))));
+    
+        // 4    Disbursing Bank ID (ABA Routing Transit #)
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #WIRE)
+        {
+            if(mBankAccountTable.SWIFTNo != '')
+            {
+                sb.Append(this.wrapField(mBankAccountTable.SWIFTNo, true, 11));
+            }
+            else
+            {
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankTransit, true, 11));
+            }
+        }
+        else
+        {
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankTransit, true, 9));
+        }
+    
+        // 5    Disbursing Bank Account #
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankAcct, true, 17));
+    
+        // 6    Collecting (i.e. your vendor's) Paymode-X Account ID
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #PAYMODEX:
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CollctngPaymodexId', mSKS_EFT_FileDetail.RecId))));
+                break;
+            default:
+                sb.Append(this.wrapField(''));
+                break;
+        }
+    
+        // 7    Payment Reference Number
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.PaymentReference)));
+    
+        // 8    Payment Amount
+        mPaymentAmount += mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur;
+        sb.Append(this.wrapField(num2str(-1*mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,0)));
+    
+        // 9    Vendor Name
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), true, 35));
+    
+        //10    Vendor Number
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.AccountNum));
+    
+        //11    Vendor Address Line 1
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), true, 35));
+
+        //12    Vendor Address Line 2
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), true, 35));
+    
+        //13    Vendor Address Line 3
+        sb.Append(this.wrapField(''));
+    
+        //14    Vendor City
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity)));
+    
+        //15    Vendor State
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState)));
+    
+        //16    Vendor Zip
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneZipPostal)));
+    
+        //17    Vendor Country
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail_VendAddress.BeneCountryRegionId));
+    
+        //18    Divert Code
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #CheckStandard)
+        {
+            if(SKS_EFT_Format::getCodelookupvalue('DivertCode', mSKS_EFT_FileDetail.RecId) == 'Yes')
+            {
+                sb.Append(this.wrapField('YES'));
+            }
+            else
+            {
+                sb.Append(this.wrapField('NO'));
+            }
+        }
+        else
+        {
+            sb.Append(this.wrapField(''));
+        }
+    
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #WIRE)
+        {
+            //19    Originating Bank ID Qualifier
+            if(mBankAccountTable.SWIFTNo != '')
+            {
+                sb.Append(this.wrapField('SWIFT'));
+            }
+            else
+            {
+                sb.Append(this.wrapField('ABA'));
+            }
+    
+            //20    Originating Address Line 1
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr)));
+    
+            //21    Originating Address Line 2
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr2)));
+    
+            //22    Originating City
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity)));
+    
+            //23    Originating State
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState)));
+    
+            //24    Originating Postal Code
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyZipCode)));
+    
+            //25    Originating Country Code
+            sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCountryRegionId)));
+    
+            //26    Effective Date
+            sb.Append(this.wrapField(SKS_PP_StringFormats::strDateMMDDYYYY(mSKS_EFT_File.EffectiveDate)));
+    
+            if(mSKS_EFT_FileDetail.DepSwiftNo != '')
+            {
+                //27    Beneficiary Bank ID Qualifier
+                sb.Append(this.wrapField('SWIFT'));
+    
+                //28    Beneficiary Bank ID
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepSwiftNo));
+            }
+            else
+            {
+                //27    Beneficiary Bank ID Qualifier
+                sb.Append(this.wrapField('ABA'));
+    
+                //28    Beneficiary Bank ID
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit));
+            }
+    
+            //29    Beneficiary Account Type
+            if(mSKS_EFT_FileDetail.DepBankAcctType == BankAccountType::SavingsAccount)
+            {
+                sb.Append(this.wrapField('SG'));
+            }
+            else
+            {
+                sb.Append(this.wrapField('DA'));
+            }
+    
+            //30    Beneficiary Account Number
+            if(mSKS_EFT_FileDetail.DepBankIBAN != '')
+            {
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankIBAN));
+            }
+            else
+            {
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankAcct));
+            }
+    
+            //31    Beneficiary Bank Name
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankName)));
+    
+            //32    Beneficiary Bank Address line 1
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankAddr)));
+    
+            //33    Beneficiary Bank Address line 2
+            sb.Append(this.wrapField(''));
+    
+            //34    Beneficiary Bank City
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankCity)));
+    
+            //35    Beneficiary Bank State
+            sb.Append(this.wrapField(''));
+    
+            //36    Beneficiary Bank Zip/Postal Code
+            sb.Append(this.wrapField(''));
+    
+            //37    Beneficiary Bank Country Code
+            sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_FileDetail_BenBank.BenBankCountryRegionId), false));
+        }
+        else
+        {
+            //19    Originating Bank ID Qualifier
+            sb.Append(this.wrapField(''));
+    
+            //20    Originating Address Line 1
+            sb.Append(this.wrapField(''));
+    
+            //21    Originating Address Line 2
+            sb.Append(this.wrapField(''));
+    
+            //22    Originating City
+            sb.Append(this.wrapField(''));
+    
+            //23    Originating State
+            sb.Append(this.wrapField(''));
+    
+            //24    Originating Postal Code
+            sb.Append(this.wrapField(''));
+    
+            //25    Originating Country Code
+            sb.Append(this.wrapField(''));
+    
+            //26    Effective Date
+            sb.Append(this.wrapField(''));
+    
+            //27    Beneficiary Bank ID Qualifier
+            sb.Append(this.wrapField(''));
+    
+            //28    Beneficiary Bank ID
+            sb.Append(this.wrapField(''));
+    
+            //29    Beneficiary Account Type
+            sb.Append(this.wrapField(''));
+    
+            //30    Beneficiary Account Number
+            sb.Append(this.wrapField(''));
+    
+            //31    Beneficiary Bank Name
+            sb.Append(this.wrapField(''));
+    
+            //32    Beneficiary Bank Address line 1
+            sb.Append(this.wrapField(''));
+    
+            //33    Beneficiary Bank Address line 2
+            sb.Append(this.wrapField(''));
+    
+            //34    Beneficiary Bank City
+            sb.Append(this.wrapField(''));
+    
+            //35    Beneficiary Bank State
+            sb.Append(this.wrapField(''));
+    
+            //36    Beneficiary Bank Zip/Postal Code
+            sb.Append(this.wrapField(''));
+    
+            //37    Beneficiary Bank Country Code
+            sb.Append(this.wrapField('', false));
+        }
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_REM</Name>
+				<Source><![CDATA[
+    boolean rec_REM(SKS_EFT_FileDetail _invSKS_EFT_FileDetail, LedgerJournalTrans _LedgerJournalTrans)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //Each Field separated by pipe Delimiter
+        //Nbr   Description
+        // 1    Record type
+        // 2    Payment Refernce Number
+        // 3    Invoice Number
+        // 4    Invoice Date
+        // 5    Paid Invoice Amount
+        // 6    Original Invoice Amount
+        // 7    Discount Amount
+        // 8    Discount Percentage
+        // 9    Buyer Account Number
+        //10    Comment
+        //11    Voucher Number
+        //12    Purchase Order Number
+        //13    Contract Number
+        //14    Tax Amount
+        //15    Tax Rate
+        //------------------------------------------------------------------------------------------------------
+        System.Text.StringBuilder   sb = new System.Text.StringBuilder();
+    
+        mRemittanceCount++;
+    
+        // 1    Record type
+        sb.Append(this.wrapField('R'));
+    
+        // 2    Payment Refernce Number
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.PaymentReference)));
+    
+        // 3    Invoice Number
+        sb.Append(this.wrapField(_invSKS_EFT_FileDetail.InvoiceNumber));
+    
+        // 4    Invoice Date
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(_invSKS_EFT_FileDetail.InvoiceDate)));
+    
+        // 5    Paid Invoice Amount
+        sb.Append(this.wrapField(num2str(-1*_invSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,2)));
+    
+        // 6    Original Invoice Amount
+        sb.Append(this.wrapField(''));
+    
+        // 7    Discount Amount
+        sb.Append(this.wrapField(num2str(-1*_invSKS_EFT_FileDetail.InvoiceDiscAmountPmtCur,0,2,1,2)));
+    
+        // 8    Discount Percentage
+        sb.Append(this.wrapField(''));
+    
+        // 9    Buyer Account Number (Payment ID)
+        sb.Append(this.wrapField(_LedgerJournalTrans.PaymId));
+    
+        //10    Comment
+        //SKG_Custom_Begin_19287-->
+        if(customerID == '9f3a8e')
+        {
+            sb.Append(this.wrapField(this.get_POInfo(_invSKS_EFT_FileDetail)));
+        }
+        else //SKG_Custom_End_19287<--
+        {
+            sb.Append(this.wrapField(''));
+        }
+    
+        //11    Voucher Number
+        sb.Append(this.wrapField(''));
+    
+        //12    Purchase Order Number
+        //SKG_Custom_Begin_19287-->
+        if(customerID == '9f3a8e')
+        {
+            sb.Append(this.wrapField(''));
+        }
+        else  //SKG_Custom_End_19287<--
+        {
+            sb.Append(this.wrapField(this.get_POInfo(_invSKS_EFT_FileDetail)));
+        }
+    
+        //13    Contract Number
+        sb.Append(this.wrapField(''));
+    
+        //14    Tax Amount
+        sb.Append(this.wrapField(''));
+    
+        //15    Tax Rate
+        sb.Append(this.wrapField('', false));
+    
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wrapField</Name>
+				<Source><![CDATA[
+    private str wrapField(str _field = '', boolean _addSeparator = true, int _fieldLength = 0)
+    {
+        str text;
+        ;
+        if(_fieldLength > 0)
+        {
+            text = subStr(_field, 1, _fieldLength);
+        }
+        else
+        {
+            text = _field;
+        }
+        if(_addSeparator)
+        {
+            text += #Separator;
+        }
+        return text;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectPaymentRecords</Name>
+				<Source><![CDATA[
+    protected void selectPaymentRecords()
+    {
+        //------------------------------------------------------------------------------------------------------
+        // Standard payment selction
+        // Override if different selection is need for a format
+        //------------------------------------------------------------------------------------------------------
+    
+        //Order by clause must match the clause in the SKS_EFT_Processing.SumByPayment
+        select * from mSKS_EFT_FileDetail
+            join mSKS_EFT_FileDetail_VendAddress
+            join mSKS_EFT_FileDetail_BenBank
+            join mSKS_EFT_FileDetail_Intermediary
+            join mSKS_EFT_FileDetail_CreditParty
+            join msKS_EFT_FileDetail_Instructions
+            join mSKS_EFT_FileDetail_BankAccount
+                order by mSKS_EFT_FileDetail.PaymentCompany,
+                   mSKS_EFT_FileDetail.RecordSection,
+                   mSKS_EFT_FileDetail.PaymMode,
+                   mSKS_EFT_FileDetail.BankAccountId,
+                   mSKS_EFT_FileDetail.PaymentCurrencyCode,
+                   mSKS_EFT_FileDetail.PaymSpec,
+                   mSKS_EFT_FileDetail.EffectiveDate,
+                   mSKS_EFT_FileDetail.DepCountryRegionId,
+                   mSKS_EFT_FileDetail.RecordType,
+                   mSKS_EFT_FileDetail.AccountNum,
+                   mSKS_EFT_FileDetail.PaymentReference,
+                   mSKS_EFT_FileDetail.RecId
+          where mSKS_EFT_FileDetail.FileRecId == mSKS_EFT_File.RecId &&
+                mSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                mSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_VendAddress.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_BenBank.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_Intermediary.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_CreditParty.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == msKS_EFT_FileDetail_Instructions.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_BankAccount.RefRecId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

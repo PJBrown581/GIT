@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PRA_ProcessAPIs</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_PRA_ProcessAPIs extends SKS_EB_Batch // SKS_EFT_APIBatchInbound
+{
+    #DEFINE.CurrentVersion(1)
+    #define.Empty('<Empty>')
+
+    SKS_EFTAP_File gSKS_EFTAP_File;
+    SKS_EFT_FileDetail gSKS_EFT_FileDetail;
+    SKS_EFT_Bank gSKS_EFT_Bank;
+    SKS_EB_CommProcess locSKS_EB_CommProcess;
+    SKS_EFT_InboundFileFormat gInboundFileFormat;
+    SKS_EFT_InboundFileGroups   gInboundFileGroup;
+    SKG_BF.Models.PaymentRemitAutomationResponse remitStatusResponse = new SKG_BF.Models.PaymentRemitAutomationResponse();
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        Batch bat;
+        RefRecId locRefRecID;
+
+        SKS_EFT_FileFormat          fileFormat;
+        SKG_BF.Models.PaymentRemitAutomationSource  remitStatusImpSrc;
+
+        bat = this.parmCurrentBatch();
+        locRefRecID = bat.RecId;
+
+        while select crossCompany locSKS_EB_CommProcess
+           // where  locSKS_EB_CommProcess.CommID == 'CUST_ENRICH'  ///For testing via runnable class
+            where locSKS_EB_CommProcess.BatchJobId == locRefRecID      
+
+        {
+            changecompany(locSKS_EB_CommProcess.CreateSendCpny)
+            {
+                int       numrecords;
+                int       counter;
+
+                this.getPaymRemitStatus(locSKS_EB_CommProcess);
+
+                numrecords = remitStatusResponse.PaymentRemitAutomationSources.get_count();
+
+                Info(strFmt("Received %1 records", numrecords));
+
+                for(counter = 0; counter < numrecords; Counter++)
+                {
+                    remitStatusImpSrc = remitStatusResponse.PaymentRemitAutomationSources.get_item(Counter);
+                    if(remitStatusImpSrc != null)
+                    {
+                        if (remitStatusImpSrc.Success)
+                        {
+                            Info("Inserting data into tables");
+                            this.importPaymRemitStatus(remitStatusImpSrc);
+                        }
+                        else
+                        {
+                            info(remitStatusImpSrc.Reason);
+                        }
+                    }
+                }         
+            }
+        }
+        Info("Processing tables");
+        SKS_BR_GLProcessing::ProcessRemitPaymDataTable();
+
+        SKS_BR_BankHeader sks_br_bankheader; 
+        while select crosscompany sks_br_bankheader
+            order by RecId desc
+            where (sks_br_bankheader.Status != SKS_BR_ImportStatus::CompletedPostingPending
+                || sks_br_bankheader.Status != SKS_BR_ImportStatus::CompletedWithErrors
+                || sks_br_bankheader.Status != SKS_BR_ImportStatus::Error)
+        { 
+            SKS_BR_GLProcessing processing = new SKS_BR_GLProcessing();           
+            processing.setHeaderRecId(sks_br_bankheader.RecId); 
+            ttsbegin;
+            processing.run();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPaymRemitStatus</Name>
+				<Source><![CDATA[
+    private void getPaymRemitStatus(SKS_EB_CommProcess _locSKS_EB_CommProcess)
+    {
+        SKG_BF.Models.PaymentRemitAutomationRequest  remitReqContract = new SKG_BF.Models.PaymentRemitAutomationRequest();
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType::BankFabric);
+        System.Collections.Generic.List<System.String> paymentIds = new System.Collections.Generic.List<System.String>();
+
+        remitReqContract.BankFabricCommunicationName = _locSKS_EB_CommProcess.BankFabricCommunicationName;  //'CustEnrichSKG' ;//
+        remitReqContract.BankFabricLocation = _locSKS_EB_CommProcess.RelocBankFabricLocation;
+        remitReqContract.DNS = SKS_EB_FileHub::getDNS(SKS_BF_BankIntType::BankFabric);
+        remitReqContract.TASVersion = '';
+        remitReqContract.SecretName = '';
+        remitReqContract.RuntimeUrl = '';
+        Info("Connecting to Bank Fabric to retrieve Payment remit data");
+        remitStatusResponse = filehub.callAPIPaymRemitStatus(remitReqContract);
+
+        str PathFile, ArchivePathFile;
+
+        //PathFile = _locSKS_EB_CommProcess.RelocBankFabricLocation;
+        //ArchivePathFile = PathFile + "\\Archive";
+
+
+        //if(enrichStatusResponse )
+        //{
+        //    SKS_EB_FileHub::fileArchive(PathFile, ArchivePathFile, SKS_BF_BankIntType::BankFabric);
+        //}
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importPaymRemitStatus</Name>
+				<Source><![CDATA[
+private void importPaymRemitStatus(SKG_BF.Models.PaymentRemitAutomationSource  _remitStatusImpSrc)
+    {
+        int       numrecords;
+        int       counter;
+        boolean   outboundDetailupdtd;
+        SKS_EFT_InboundFile locInboundFile;
+        SKS_EFTAP_File locOutboundFile;
+        SKG_BF.Models.PaymentRemitAutomationPayment  remitPaym;
+        SKS_PRA_PaymentTable      remitable;
+
+        numrecords = _remitStatusImpSrc.PaymentRemitAutomationPayments.get_count();
+        //changecompany(
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            remitPaym = _remitStatusImpSrc.PaymentRemitAutomationPayments.get_item(Counter);
+            if(remitPaym != null)
+            {
+                ttsbegin;
+                remitable.clear();
+                remitable.CustIBAN = remitPaym.CustIBAN;
+                remitable.CustBBAN = remitPaym.CustBBAN;
+                remitable.CustAccount = remitPaym.CustAccount;
+                remitable.CustName = remitPaym.CustName;
+                remitable.BankBIC = remitPaym.BankBIC;
+                remitable.BankName = remitPaym.BankName;
+                remitable.CustEmail = remitPaym.CustEmail;
+                remitable.OptInfo = remitPaym.OptInfo;
+                remitable.PmtEntryCount = remitPaym.PaymentEntryCount;
+                remitable.PmtAmtSum = remitPaym.PaymentAmountSum;
+                remitable.PmtAmount = remitPaym.PaymentAmount;
+                remitable.PmtDate = remitPaym.PaymentDate;
+                remitable.PmtRef = remitPaym.PaymentRef;
+                remitable.PmtUstrd = remitPaym.PaymentUstrd;
+                //remitable.UniqueFileId = remitPaym.uniq;
+
+                remitable.insert();
+
+                this.importRemitDetailLines(remitable, remitPaym);
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importRemitDetailLines</Name>
+				<Source><![CDATA[
+    private void importRemitDetailLines(SKS_PRA_PaymentTable _remitPaymTable, SKG_BF.Models.PaymentRemitAutomationPayment _remitPaym)
+    {
+        int       numrecords;
+        int       counter;
+        SKS_EFT_RF locSKS_EFT_RF = new SKS_EFT_RF();
+        SKS_EFT_RF_Transaction locSKS_EFT_RF_Transaction;
+        SKS_EFT_FileDetail locSKS_EFT_FileDetail;
+        SKG_BF.Models.PaymentRemitAutomationDetail    remitDetails;
+        SKS_PRA_DetailsTable  remitDetailsTable;
+    
+        numrecords = _remitPaym.PaymentRemitAutomationDetails.get_count();
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            remitDetails = _remitPaym.PaymentRemitAutomationDetails.get_item(Counter);
+            if(remitDetails != null)
+            {
+                ttsbegin;
+                remitDetailsTable.clear();
+                remitDetailsTable.TxnType = remitDetails.TransactionType;
+                remitDetailsTable.RemitUstrd = remitDetails.RemitUstrd;
+                remitDetailsTable.InvNo = remitDetails.InvoiceNumber;
+                remitDetailsTable.InvDate = remitDetails.InvoiceDate;
+                remitDetailsTable.InvAmtDue = remitDetails.InvoiceAmountDue;
+                remitDetailsTable.DiscAmt = remitDetails.DiscountAmount;
+                remitDetailsTable.TaxAmt = remitDetails.TaxAmount;
+                remitDetailsTable.AmtPaid = remitDetails.AmountPaid;
+                remitDetailsTable.SKS_PRA_PaymentTable = _remitPaymTable.RecId;
+
+                remitDetailsTable.insert();
+                ttscommit;
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

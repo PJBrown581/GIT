@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocUpgradeManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Upgrade manager that detects that Docentric has been upgraded and runs upgrade scripts (classes marked with DocDBUpgrade attribute) to upgrade database if needed.
+/// Database version is stored in DocInstallation.DocDBVersion (from version 3.3.4.0).
+/// 
+/// Note: The system was introduced with version 3.3.4.0. Till then no change in the database was needed.
+/// </summary>
+public class DocUpgradeManager
+{
+    // List of upgrade steps ordered by ascending toVersion
+    private container upgradeSteps;  // [toVersion, classId, staticMethodName]
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>compareVersions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Compares provided versions and returns:
+    /// - -1, if _version1 is smaller than _version2
+    /// - 0, if _version1 is equal to _version2
+    /// - 1, if _version1 is grreater than _version2
+    /// </summary>
+    /// <param name = "_version1">Current version</param>
+    /// <param name = "_version2">New version</param>
+    /// <returns>-1 or 0 or 1</returns>
+    public static int compareVersions(DocDBVersion _version1, DocDBVersion _version2)
+    {
+        _version1 = (_version1 ? _version1 : '0.0.0.0');
+        _version2 = (_version2 ? _version2 : '0.0.0.0');
+
+        return new System.Version(_version1).CompareTo(new System.Version(_version2));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillUpgradeSteps</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fills the upgrade steps.
+    /// </summary>
+    public void fillUpgradeSteps()
+    {
+        // From all classes decorated with DocDBUpgradeAttribute, locate all static methods
+        // decorated with DocDBUpgrade[toVersion].
+        Array classes = DictClass::getAttributedClasses(classStr(DocDBUpgradeAttribute));
+        for (int i = 1; i <= classes.lastIndex(); i++)
+        {
+            DictClass dictClass = new DictClass(classes.value(i));
+
+            for (int j = 1; j <= dictClass.staticMethodCnt(); j++)
+            {
+                DictMethod dictMethod = dictClass.staticMethodObject(j);
+
+                DocDBUpgradeAttribute attr = dictMethod.getAttribute(classStr(DocDBUpgradeAttribute));
+                if (attr)
+                {
+                    this.addUpgradeStep(attr.toVersion, dictClass.id(), dictMethod.name());
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addUpgradeStep</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the upgrade steps to the upgradeSteps container.
+    /// </summary>
+    /// <param name = "_toVersion">To version</param>
+    /// <param name = "_classId">Id of the upgrade class</param>
+    /// <param name = "_staticMethodName">Name of the upgrade method</param>
+    public void addUpgradeStep(DocDBVersion _toVersion, ClassId _classId, str _staticMethodName)
+    {
+        int i;
+
+        // Adding upgrade step will be inserted based on its toVersion.
+        for (i = 1; i <= conLen(upgradeSteps); i++)
+        {
+            DocDBVersion toVersion = conPeek(conPeek(upgradeSteps, i), 1);
+
+            // Check if the current upgrade step's toVersion > the toVersion of the adding step.
+            // If yes, break the loop and insert the adding upgrade step to container containing all upgrade steps.
+            // This way we will build the container with upgrade steps sorted by toVersion ASC (e.g. US 3.3.3., US 3.3.4, ...)
+            if (DocUpgradeManager::compareVersions(toVersion, _toVersion) > 0)
+            {
+                break;
+            }
+        }
+
+        upgradeSteps = conIns(upgradeSteps, i, [_toVersion, _classId, _staticMethodName]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the upgrade.
+    /// </summary>
+    public void run()
+    {
+        DocDBVersion    newVersion = DocGlobalHelper::getDocentricAxModelVersion();
+        DocDBVersion    oldVersion = DocInstallation::getDocDBVersion();    // invokes DocInstallation::ensureSingleRecord();
+        DocInstallation installation;
+        System.Exception ex;
+
+        // if Old version (read from DB) >= New version (read from code), return.
+        // (1) In case of the upgrade, Old version < New version, thus proceed.
+        // (2) In case of clean installation, Old version gets set to New version
+        //     in the DocInstallation::getDocDBVersion() method, thus return.
+        if (DocUpgradeManager::compareVersions(oldVersion, newVersion) >= 0)
+        {
+            return;
+        }
+        
+        try
+        {
+            this.fillUpgradeSteps();    // Collect all upgrade steps for all toVersions.
+
+            boolean upgradeStepFailed = false;
+
+            for(int i=1; i<=conLen(upgradeSteps); i++)
+            {
+                DocDBVersion    toVersion;
+                ClassId         classId;
+                str             staticMethodName;
+
+                [toVersion, classId, staticMethodName] = conPeek(upgradeSteps, i);
+            
+                ttsBegin;
+                
+                select firstOnly pessimisticLock installation where installation.Key == 0;
+                DocGlobalHelper::assert(installation.RecId != 0);
+
+                // Check if the Current DB version < target toVersion.
+                // If not, skip the upgrade step. Otherwise, perform the upgrade step.
+                if (DocUpgradeManager::compareVersions(installation.DocDBVersion, toVersion) < 0)
+                {
+                    // Perform the upgrade step.
+                    DictClass dictClass = new DictClass(classId);
+                    if (dictClass.callStatic(staticMethodName, installation.DocDBVersion, toVersion))
+                    {
+                        // Update the DB version.
+                        installation.DocDBVersion = toVersion;
+                        installation.update();
+
+                        // DocUpgradeLog::log() should be called from the upgrade step method.
+                    }
+                    else
+                    {
+                        // Upgrade step failed, do not continue with the next upgrade steps.
+                        upgradeStepFailed = true;
+                    }
+                }
+
+                ttsCommit;
+
+                // Upgrade step failed, do not continue with the next upgrade steps.
+                if (upgradeStepFailed)
+                {
+                    return;
+                }
+            }
+
+            // if no more upgrade steps is needed, just update the version
+            ttsBegin;
+
+            select firstOnly pessimisticLock installation where installation.Key == 0;
+            DocGlobalHelper::assert(installation.RecId != 0);
+
+            if (DocUpgradeManager::compareVersions(installation.DocDBVersion, newVersion) < 0)
+            {
+                oldVersion = installation.DocDBVersion;
+
+                installation.DocDBVersion = newVersion;
+                installation.update();
+
+                DocUpgradeLog::log(oldVersion, newVersion, Exception::Info, 'No change in the database.');
+            }
+
+            ttsCommit;
+        }
+        catch (ex)  // catches X++ and .NET exceptions
+        {
+            DocUpgradeLog::log(oldVersion, newVersion, Exception::Error, 'Error occurred while upgrading DB: ' + ex.ToString());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Main class entry point.
+    /// </summary>
+    /// <param name = "_args">An instance of the Args class</param>
+    public static void main(Args _args)
+    {
+        DocUpgradeManager instance = new DocUpgradeManager();
+        instance.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showUpgradeLogs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shows the new upgrade log messages only once when Administrator or Docentric Administrator logs in for the first time.
+    /// </summary>
+    public static void showUpgradeLogs()
+    {
+        if (DocGlobalHelper::isUserAdminOrDocentricAdmin(curUserId()))
+        {
+            DocUpgradeLog docUpgradeLog;
+
+            ttsBegin;
+
+            while select pessimisticLock docUpgradeLog
+                order by CreatedDateTime asc 
+                where !docUpgradeLog.SeenBy
+            {
+                docUpgradeLog.show();
+                docUpgradeLog.SeenBy = curUserId();
+                docUpgradeLog.update();
+            }
+
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

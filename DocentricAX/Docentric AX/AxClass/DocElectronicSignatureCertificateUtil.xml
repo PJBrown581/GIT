@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocElectronicSignatureCertificateUtil</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Security.Cryptography.X509Certificates;
+using Docentric.AX.Certificates;
+using Docentric.AX.Security.Azure.KeyVault;
+using DSA = Docentric.AX.Documents.Pdf.DigitalSignature;
+
+public class DocElectronicSignatureCertificateUtil
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>refreshCertificates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Refreshes and validates all certificates. If parameter _certificateId is provided
+    /// then only the selected certificate is refreshed and validated. For each validated
+    /// certificate the validation status and message is updated.
+    /// </summary>
+    /// <param name = "_certificateId">Container with Certificate ID</param>
+    public static void refreshCertificates(container _certificateId = conNull())
+    {
+        X509Certificate2 certificate;
+        DocElectronicSignatureCertificate signatureCertificate;
+        boolean hasError;
+        boolean hasWarning;
+        str statusMsg;
+        System.Exception ex;
+
+        DocCertificateId certificateId = _certificateId == conNull() ? '' : conPeek(_certificateId, 1);
+
+        // Reset the global cache for the AzureKeyVaultCertificate key
+        DocGlobalCache::upsert(DocGlobalCacheKey::AzureKeyVaultCertificate);
+
+        // Loop through the certificates
+        while select signatureCertificate
+            where !certificateId
+               || signatureCertificate.CertificateId == certificateId
+        {
+            certificate = null;
+            hasError = false;
+            hasWarning = false;
+            statusMsg = '';
+
+            try
+            {
+                // Set default validation status to Valid
+                signatureCertificate.ValidationStatus = DocCertificateValidationStatus::Valid;
+
+                switch (signatureCertificate.CertificateStorage)
+                {
+                    case DocCertificateStorage::KeyVault:
+                        // Refresh and validate the Key Vault certificate
+                        KeyVaultCertificateTable keyVaultCertificateTable = KeyVaultCertificateTable::findRecId(signatureCertificate.KeyVaultCertificate);
+                        if (!keyVaultCertificateTable)
+                        {
+                            statusMsg = strFmt("@DocentricAX3:ElectronicSignatureErrorKeyVaultSettingsNotFound", tableId2PName(tableNum(KeyVaultCertificateTable)));
+                            throw Exception::Error;
+                        }
+                        if (keyVaultCertificateTable.KeyVaultCertificateType != KeyVaultCertificateType::Certificate)
+                        {
+                            statusMsg = strFmt("@DocentricAX3:ElectronicSignatureErrorKeyVaultUsupportedSecretType", enum2Value(keyVaultCertificateTable.KeyVaultCertificateType), tableId2PName(tableNum(KeyVaultCertificateTable)));
+                            throw Exception::Error;
+                        }
+
+                        KeyVaultParameters keyVaultParameters = KeyVaultParameters::findRecId(keyVaultCertificateTable.KeyVaultRef);
+                        if (!keyVaultParameters)
+                        {
+                            statusMsg = strFmt("@DocentricAX3:ElectronicSignatureErrorKeyVaultSettingsNotFound", tableId2PName(tableNum(KeyVaultParameters)));
+                            throw Exception::Error;
+                        }
+
+                        str keyVaulSecretUrl = KeyVaultProtocolUtils::GetIdentifierUrlFromKeyVaultProtocol(
+                                                            keyVaultCertificateTable.KeyVaultCertificate,
+                                                            KeyVaultObjectType::Secret,
+                                                            keyVaultParameters.Url);
+
+                        CertificateUtils::VerifyAzureKeyVaultSigningCertificate(
+                                                            keyVaultParameters.AppClientId,
+                                                            keyVaultParameters.getClientSecretKey(),
+                                                            keyVaulSecretUrl);
+
+                        certificate = CertificateUtils::LoadFromAzureKeyVault(
+                                                            keyVaultParameters.AppClientId,
+                                                            keyVaultParameters.getClientSecretKey(),
+                                                            keyVaulSecretUrl);
+
+                        if (certificate)
+                        {
+                            signatureCertificate.fillFromX509Certificate2(certificate);
+                        }
+                        break;
+
+                    case DocCertificateStorage::Database:
+                        // Refresh and validate the PFX certificate
+                        CertificateUtils::VerifySigningCertificate(CertificateUtils::Load(signatureCertificate.getCertificate(), signatureCertificate.Thumbprint));
+                        break;
+                }
+            }
+            catch (Exception::Error)
+            {
+                hasError = true;
+                signatureCertificate.ValidationStatus = DocCertificateValidationStatus::Error;
+            }
+            catch (ex)
+            {
+                if (ex is DSA.Exceptions.DocCertificateVerificationException)
+                {
+                    var vex = ex as DSA.Exceptions.DocCertificateVerificationException;
+                    if (vex.CertificateError == DSA.Common.DocCertificateStatus::HasExpired || vex.CertificateError == DSA.Common.DocCertificateStatus::IssuedInTheFuture)
+                    {
+                        hasWarning = true;
+                        // Set validation status to Wartning
+                        signatureCertificate.ValidationStatus = DocCertificateValidationStatus::Warning;
+                    }
+                }
+                if (!hasWarning)
+                {
+                    hasError = true;
+                    // Set validation stauts to Error
+                    signatureCertificate.ValidationStatus = DocCertificateValidationStatus::Error;
+                }
+
+                // Set error message
+                statusMsg += (statusMsg ? '\n' : '') + DocGlobalHelper::getLastClrExceptionMessage();
+            }
+            finally
+            {
+                // Dispose the certificate
+                if (certificate != null)
+                {
+                    certificate.Reset();
+                    certificate = null;
+                }
+
+                // Set validation status message
+                signatureCertificate.ValidationStatusMessage = statusMsg;
+                
+                try
+                {
+                    ttsbegin;
+                    // Update certificate properties and validation status
+                    signatureCertificate.selectForUpdate(true);
+                    signatureCertificate.doUpdate();
+                    ttscommit;
+                }
+                catch
+                {
+                    Global::exceptionTextFallThrough();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

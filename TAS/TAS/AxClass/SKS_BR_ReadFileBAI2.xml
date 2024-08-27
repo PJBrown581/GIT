@@ -1,0 +1,560 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_ReadFileBAI2</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_BR_ReadFileBAI2 extends SKS_BR_ReadFileStructured
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    boolean openFile()
+    {
+        gReadParseFile = new SKS_BR_BAI2Reader(FileName, 'R',gBRPreReadScript,gBRPreReadScriptParams,gBRPostReadScript,gBRPostReadScriptParams, gSKS_BF_BankIntType, sks_br_fileformat);
+        if (!gReadParseFile || gReadParseFile.status() != IO_Status::Ok )
+        {
+            //file could not be opened
+            this.handleError(bankHeaderRecId, (strfmt("@SYS19312",FileName)), 0);
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readFile</Name>
+				<Source><![CDATA[
+    void readFile()
+    {
+        boolean AccountIdentifierFound = false;
+        boolean doNotImport = false;
+        boolean FileHeaderFound = false;
+        boolean GroupHeaderFound = false;
+        boolean ignoreThisTransaction = false;
+        boolean nextRecordContinuation = false;
+
+        Container line;
+
+        Date AsOfDate;
+        date holdTransactionDate;
+        date locStatementDate;
+        date importedAcctStatementDate;
+
+        int FieldCount;
+        int linecnt = 0;
+        int PrevFieldCount;
+        int TransactionType;
+        int RecordCode;
+        int skipLoc;
+
+        str companyContext = curExt();
+        BankAccountTable locBankAccountTable;
+        str locFileNum;  // the FileNum
+
+        str senderIdentification;
+        str value;
+
+        str bankNumLocal; // SKS 16487
+
+        CompanyBankAccountId bankAccountId;
+        CurrencyCode currency;
+        SKS_BR_TranTypeProcessing tranTypeProcessing;
+        SKS_PP_Bank locSKS_PP_Bank;
+        SKS_PP_Bank sKS_PP_Bank;// TFS 7285
+
+        BankAccountStatementNum locStatementNum;
+        BankAccountStatementNum importedAcctStatementNum;
+
+        BankRecordReady = false;
+        ImportCount = 0;
+
+        if (!this.openFile())
+        {
+            return;
+        }
+
+        ttsbegin;
+        this.initSKS_BR_BankTran();
+        while(gReadParseFile.status() == IO_status::Ok)
+        {
+            line = gReadParseFile.read();
+            linecnt = gReadParseFile.getStartingLineOfCurrentRecord();
+            bankTran.LineNumInFile = linecnt;
+            FieldCount = conlen(line); // Get the number of fields.
+
+            RecordCode = conpeek(line, 1); // Get the record code
+
+            if(nextRecordContinuation && RecordCode != #RecordCodeContinuation)
+            {
+                BankRecordReady = true;
+
+                this.insertBankTran(locBankAccountTable, doNotImport, companyContext);
+                nextRecordContinuation = false;
+            }
+            // TFS 7285 10858  10997 -->
+            if(RecordCode == #RecordCodeAccountTrailer && sKS_PP_Bank.BRCreateBankStatementsIfNoTrans == NoYes::Yes && !TransactionFound)
+            {
+                BankRecordReady = true;
+                noBankTrans = true;
+                ignoreThisTransaction = false;
+            }
+            // TFS 7285 10858  10997 <--
+            if ( RecordCode == #RecordCodeFileHeader)
+            {
+                if (FileHeaderFound == true)
+                {
+                    // only 1 allowed
+                    ttsabort;
+                    ImportCount = 0;
+                    this.handleError(bankHeaderRecId, "@SKS330", linecnt);
+                }
+                FileHeaderFound = true;
+
+                // Get sender identification
+                senderIdentification = global::strLRTrim(conpeek(line,2));
+
+                // Set File Date here.
+                value = conpeek(line,4); // Get file date
+                holdTransactionDate = str2date(value,321); // Default bank date.
+
+                //Set File Num here.
+                locFileNum = conPeek(line,6);
+
+            }
+            else if ( FileHeaderFound == true)
+            {
+                switch(RecordCode)
+                {
+                    case #RecordCodeGroupHeader:
+                        if (FileHeaderFound == false)
+                        {
+                            // missing: 01
+                            this.FormatError( #RecordCodeFileHeader, linecnt);
+                            return;
+                        }
+                        if (GroupHeaderFound == true)
+                        {
+                            // missing: 98
+                            this.FormatError( #RecordCodeGroupTrailer, linecnt);
+                            return;
+                        }
+                        GroupHeaderFound = true;
+                        value = conpeek(line,5); // Get file date
+                        holdTransactionDate = str2date(value,321); // Default bank date.
+                        //Set the StatementNum here.
+                        if(locFileNum != '')
+                        {
+                            locStatementNum = locFileNum;
+                        }
+                        else
+                        {
+                            locStatementNum = date2str(holdTransactionDate, 321, DateDay::Digits2, DateSeparator::None, DateMonth::Digits2, DateSeparator::None, DateYear::Digits4, DateFlags::None);
+                        }
+                        locStatementDate = holdTransactionDate;
+                        AsOfDate = holdTransactionDate; // Used for Bank Balance
+                        currency = conpeek(line,7); // Header currency
+                        break;
+                    case #RecordCodeAccountIdentifier:
+                        noBankTrans = false;
+                        doNotImport = false;
+                        TransactionFound = false;
+                        ignoreThisTransaction = false;
+                        if (GroupHeaderFound == false)
+                        {
+                            // missing: 02
+                            this.FormatError( #RecordCodeGroupHeader, linecnt);
+                            return;
+                        }
+                        if (AccountIdentifierFound == true)
+                        {
+                            // missing: 49
+                            this.FormatError( #RecordCodeAccountTrailer, linecnt);
+                            return;
+                        }
+
+                        AccountIdentifierFound = true;
+
+                        locBankAccountTable = SKS_EB_Bank::getBankAccount( Global::strLRTrim( conpeek(line,2) ) );
+                        sKS_PP_Bank = SKS_PP_Bank::find(locBankAccountTable.AccountID, locBankAccountTable.company());// TFS 7285
+                        if(conpeek(line,3) != '')
+                        {
+                            currency = conpeek(line,3);
+                        }
+                        gBankAccountStatement = null;
+                        gBankAccountStatement.CurrencyCode = currency;
+                        gBankAccountStatement.AccountStatementNum = locStatementNum;
+                        gBankAccountStatement.AccountStatementDate = locStatementDate;
+
+                        if (importedAcctStatementNum == '')
+                        {
+                            importedAcctStatementNum = locStatementNum;
+                            
+                        }
+                        importedAcctStatementDate = locStatementDate;
+                        bankAccountId = locBankAccountTable.AccountID;
+                        companyContext = locBankAccountTable.company();
+                        gBankAccountStatement.AccountId = locBankAccountTable.AccountID;
+                        if(currency == '')
+                        {
+                            currency = locBankAccountTable.CurrencyCode;
+                            gBankAccountStatement.CurrencyCode = currency;
+                        }
+
+                        changeCompany(companyContext)
+                        {
+                            // Make sure this Bank Account is setup for eBankRec
+                            if(!this.validateAccountId(bankAccountId))
+                            {
+                                doNotImport = true;
+                            }
+                            else
+                            {
+                                // Load format for this company
+                                if(sks_br_fileformat.company() != locBankAccountTable.company())
+                                {
+                                    locSKS_PP_Bank = null;
+                                    select firstonly BankAccountId, BRFormatID from locSKS_PP_Bank where locSKS_PP_Bank.BankAccountId == locBankAccountTable.AccountID;
+                                    this.setFormatId(locSKS_PP_Bank.BRFormatID);
+                                }
+
+                                // Set Bank Balance
+                                if(!this.setBankBalance(AsOfDate, bankAccountId, conDel(line,1,3), currency,sKS_PP_Bank))
+                                    return;
+                            }
+                        }
+
+                        break;
+                    case #RecordCodeTransactionDetail:
+                        if (doNotImport)
+                        {
+                            continue;
+                        }
+
+                        ignoreThisTransaction = False;
+                        if (AccountIdentifierFound == false)
+                        {
+                            // missing: 03
+                            this.FormatError( #RecordCodeAccountIdentifier, linecnt);
+                            return;
+                        }
+                        bankTran.AccountId = bankAccountId;
+                        TransactionType = conpeek(line,2);
+                        bankTran.FileTranType = int2str(TransactionType);
+                        if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced)
+                        {
+                            changeCompany(companyContext)
+                            {
+                                tranTypeProcessing = this.processTranType(bankTran.AccountId);
+                                if(tranTypeProcessing.getIgnoreTranType())
+                                {
+                                    ignoreThisTransaction = true;
+                                }
+                            }
+
+                            if(tranTypeProcessing.getErrorText() != '')
+                            {
+                                ttsabort;
+                                this.handleError(bankHeaderRecId, (strfmt("@SKS528", bankTran.FileTranType)), linecnt);
+                                ImportCount = 0;
+                                return;
+                            }
+
+                            bankTran.BankTranType = tranTypeProcessing.getBankTranType();
+
+                            SKS_BR_GLMappingRuleGroup mappingRuleGroup;
+
+                            select firstonly
+                                GLMatchOrCreate
+                            from mappingRuleGroup
+                            where mappingRuleGroup.RuleGroupId == tranTypeProcessing.getGLMappingRuleGroupId()
+                                && mappingRuleGroup.CCR_IsCCReconciliation == NoYes::No;    /// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+
+                            if (tranTypeProcessing.getMatchingRuleGroupId() || tranTypeProcessing.getGLMappingRuleGroupId())
+                            {
+                                bankTran.GLMappingRuleGroupId = tranTypeProcessing.getGLMappingRuleGroupId();
+                                bankTran.MatchingRuleGroupId = tranTypeProcessing.getMatchingRuleGroupId();
+                            }
+                            else // Bug 7219
+                            {
+                                bankTran.GLMappingRuleGroupId = '';
+                                bankTran.MatchingRuleGroupId = '';
+                                bankTran.GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLMatch;
+                            }
+                            bankTran.DefaultDimension = tranTypeProcessing.getDimension();
+                            bankTran.ImportedStatementNum = importedAcctStatementNum;
+                            bankTran.ImportedStatementDate = importedAcctStatementDate;
+                        }
+
+                        bankTran.TranDate = holdTransactionDate;
+                        bankTran.ValueDate = bankTran.TranDate;
+
+                        value = conpeek(line,3); // Get transaction amount
+                        if (strScan(value, '$', 1, 1))
+                        {
+                            value = strDel(value, 1, 1);
+                        }
+                        bankTran.TranAmount = SKS_EB_Currency::formatStringToCurrency(value, currency,false,sKS_PP_Bank.BROverrideDecimalPlaces,sKS_PP_Bank.BROverrideDecimalPlacesNumberOfDecimalPlaces);
+                        changeCompany(companyContext)
+                        {
+                            if(SKS_BR_BAI2Reader::getTranTypeCreditDebitFlag(TransactionType, FormatId) == SKS_BR_BankDebitCredit::BankDebit)
+                            {
+                                bankTran.TranAmount = bankTran.TranAmount * -1;
+                            }
+                        }
+                        value = substr(conpeek(line,4),1,1); // Get Funds Type for next record positions.
+                        if ( value == 'S')
+                            skipLoc = 3;
+                        else if ( value == 'V')
+                            skipLoc = 2;
+                        else if ( value == 'D')
+                        {
+                            skipLoc = conpeek(line,5);
+                            skipLoc = skipLoc * 2; // skipping a value pair.
+                            skipLoc += 1; // and skip the original count entry from 5.
+                        }
+                        else
+                            skipLoc = 0;
+
+                        PrevFieldCount = FieldCount; // Needed if continuation occurs.
+                        if ( FieldCount >= skipLoc + 6)
+                        {
+                            value = conpeek(line,skipLoc + 5);
+                            value = this.stripDelimiters(value); // Get Reference number (Bank)
+
+                            if(substr(value,strLen(value),1) == '/') // Check for forward slash and remove it
+                                value = substr(value,1,strlen(value)-1);
+                            bankTran.BankNum = this.parseRefernceNumber(value);
+
+                            bankNumLocal = strRem(value, '\r\n'); // SKS 16487
+
+                            value = conpeek(line,skipLoc + 6);
+                            value = global::strLRTrim(this.stripDelimiters(value)); // Get Reference number (Customer)
+
+                            if(substr(value,strLen(value),1) == '/') // Check for forward slash and remove it
+                                value = substr(value,1,strlen(value)-1);
+                            bankTran.BankCustomerNum = this.parseRefernceNumber(value);
+
+                            if ( FieldCount >= skipLoc + 7)
+                            {
+                                value = conpeek(line,skipLoc + 7);
+                                // If the first character is a slash, the description is on the 88 continuation record.
+                                if(substr(value,1,1) == '/')
+                                {
+                                    nextRecordContinuation = true;
+                                    break;
+                                }
+
+                                // Populate Original note
+                                bankTran.TranDescription = this.GetTransDescription(line,7,FieldCount,skipLoc);
+
+                                if (bankTran.BankCustomerNum != '')
+                                {
+                                    bankTran.TranDescription = bankTran.TranDescription == '' ? 'BankCustNbr: ' + bankTran.BankCustomerNum : bankTran.TranDescription + ' ' + 'BankCustNbr: ' + bankTran.BankCustomerNum; //SKS 16487
+                                }
+                                
+                                if (bankNumLocal != '')
+                                {
+                                    bankTran.TranDescription = bankTran.TranDescription == '' ? 'BankNbr: ' + bankNumLocal : bankTran.TranDescription + ' ' + 'BankNbr: ' + bankNumLocal; // SKS 16487
+                                }
+
+                                // Populate User note also here
+                                bankTran.TranDescriptionUser = bankTran.TranDescription == '' ? bankTran.BankCustomerNum : bankTran.TranDescription + ' ' + bankTran.BankCustomerNum; //SKS 17411
+                                
+                                // Populate bank number
+                                bankTran.TranDescriptionUser = bankTran.TranDescription == '' ? bankNumLocal : bankTran.TranDescription + ' ' + bankNumLocal; 
+
+                                BankRecordReady = true;
+                            }
+                        }
+
+
+                        changeCompany(companyContext)
+                        {
+                            SKS_BR_ReadFile::setDefaultMatchGroup(bankTran);
+
+                            if(!this.parseValue())
+                            {
+                                return;
+                            }
+                        }
+
+                        // Update records here.
+                        break;
+                    case #RecordCodeAccountTrailer:
+                        if (AccountIdentifierFound == false)
+                        {
+                            // missing: 03
+                            this.FormatError( #RecordCodeAccountIdentifier, linecnt);
+                            return;
+                        }
+                        AccountIdentifierFound = false;
+                        break;
+                    case #RecordCodeContinuation:
+                        // 88 Records should never be passed in from the SKS_BR_BAI2Reader class
+                        break;
+                    case #RecordCodeGroupTrailer:
+                        if (AccountIdentifierFound == true)
+                        {
+                            // missing: 49
+                            this.FormatError( #RecordCodeAccountTrailer, linecnt);
+                            return;
+                        }
+                        if (GroupHeaderFound == false)
+                        {
+                            // missing: 02
+                            this.FormatError( #RecordCodeGroupHeader, linecnt);
+                            return;
+                        }
+                        GroupHeaderFound = false;
+                        break;
+                    case #RecordCodeFileTrailer:
+                        if (GroupHeaderFound == true)
+                        {
+                            // missing: 98
+                            this.FormatError( #RecordCodeGroupTrailer, linecnt);
+                            return;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                // Insert record
+                this.insertBankTran(locBankAccountTable,
+                                        (doNotImport || ignoreThisTransaction),
+                                        companyContext
+                                    );//if either doNotImport or ignoreThisTransaction says true, we don't want to import
+
+            }
+            if (FileHeaderFound == false)
+            {
+                // missing: 01
+                this.FormatError( #RecordCodeFileHeader, linecnt);
+                return;
+            }
+
+        }
+        this.closeFile();
+
+        if(!this.readFileClosePreCommit())
+            return;
+
+        ttscommit;
+
+        this.readFileClosePostCommit();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setBankBalance</Name>
+				<Source><![CDATA[
+    boolean setBankBalance(Date asOfDate,
+                            CompanyBankAccountId bankAcct,
+                            Container line,
+                            CurrencyCode currency,
+                            SKS_PP_Bank _SKS_PP_Bank = null)
+    {
+        boolean typeCodeFound;
+
+        int i;
+        int intD;
+        str locCodesFound;
+        str fundType;
+        str value;
+
+        AmountCur amount;
+        ;
+
+        if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced)
+        {
+            if(sks_br_fileformat.UpdateEndBalance)
+            {
+                i = 1;
+                while( i<=conLen(line))
+                {
+                    value = conPeek(line, i);
+                    i++; //we have the Type Code in var value, so move to the next field
+                    // See if this matches the user defined type code
+                    // If it does, the next value will be the amount
+                    if(value == sks_br_fileformat.EndBalanceTypeCode)
+                    {
+                        amount = SKS_EB_Currency::formatStringToCurrency(conPeek(line, i), currency,false,_SKS_PP_Bank.BROverrideDecimalPlaces,_SKS_PP_Bank.BROverrideDecimalPlacesNumberOfDecimalPlaces);
+                        gBankAccountStatement.EndingBalance = amount;
+                        this.createBankBalance(asOfDate, bankAcct, amount);
+                        typeCodeFound = true;
+                        break;
+                    }
+                    //if it is not the code type, skip to the next code type
+                    else
+                    {
+                        //this block keeps track of codes found in the file.  If not match is found, the error msg displays this list.
+                        if(strLen(locCodesFound) == 0)
+                        {
+                            locCodesFound =  '\"' + value + '\"';
+                        }
+                        else
+                        {
+                            locCodesFound = locCodesFound + ', \"' + value + '\"';
+                        }
+                        i++;//the next field is the amount for the current code and must be skipped
+                        i++;//the next field is the Item Count, and must be skipped.
+                        fundType = conPeek(line, i);//the fund type will determine how may additional
+                                                    //fields we must skip to reach the next typeCode.
+                        i++; //move to the next field
+                        switch(str2Capital(fundType))
+                        {
+                            case 'S':  //in case of "S" the next three fields are immediate availabiliyt
+                                        //one-day amt,  and more than one-day amt.  Skip all of these
+                                {
+                                    i+=3;
+                                    break;
+                                }
+                            case 'V':  //in case of "V", the next two fields are Value Date and Military
+                                        //Time.  Skip both of these
+                                {
+                                    i+=2;
+                                    break;
+                                }
+                            case 'D':  //in case of "D", the next field tells the number of distributions
+                                        //and this is followed by pairs of fields(made of up the number
+                                        //of days and the distribution amount) of a quantity equal to
+                                        //this number
+                                {
+
+                                    intD = str2int(conPeek(line, i));
+                                    i++;  //incrment I past the distubrition quantity field
+                                    i = i + (2 * intD); //move I past all the Distribution Number/Amount pairs
+                                    break;
+                                }
+
+                        }
+                    }
+                }
+                if(!typeCodeFound)
+                {
+                    ttsabort;
+                    ImportCount = 0;
+                    this.handleError(bankHeaderRecId, strFmt("@SKS:SKGSetBankBalanceBAI2Error",
+                                            CurExt(),
+                                            bankAcct,
+                                            sks_br_fileformat.EndBalanceTypeCode,
+                                            locCodesFound), 0);
+                    return false;
+                }
+
+            }
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

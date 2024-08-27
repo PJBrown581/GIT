@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_InhouseBankStatementProcessBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// create Automated statement generate batch.
+/// </summary>
+class SKS_IHB_InhouseBankStatementProcessBatch extends RunBaseBatch
+{
+    TransDate   stmtDate;
+    DialogField dialogstmtDate;    
+    
+    #Define.CurrentVersion(1)
+    #LOCALMACRO.CurrentList
+        stmtDate
+    #ENDMACRO
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version     version = RunBase::getVersion(packedClass);
+        boolean     retVal = true;
+        
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version,#CurrentList] = packedClass;
+                break;
+            default:
+                retVal = false;
+                break;
+        }
+
+        return retVal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion,#CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMultiThreadBatch</Name>
+				<Source><![CDATA[
+    public void createMultiThreadBatch(
+        TransDate   _statementDate)
+    {
+        Batch               Batch;
+        BatchHeader         batHeader;
+        RunBaseBatch        rbbTask;
+        BatchInfo           batInfo;
+
+        stmtDate = _statementDate;
+        ttsBegin;
+        rbbTask = new SKS_IHB_InhouseBankStatementProcessBatch();
+        batInfo = rbbTask.batchInfo();
+        
+        batInfo.parmGroupId('');
+    
+        batHeader = BatchHeader::construct();
+        batInfo.parmAutomaticTransaction(true);
+        batInfo.parmCaption(strFmt("@SKS:SKGBankStatement",date2Str(_statementDate,-1,DateDay::Digits2,-1, DateMonth::Digits2, -1, DateYear::Digits4)));
+        batHeader.addTask(rbbTask);
+        batHeader.save();
+        Batch = batInfo.parmBatch();
+        if(Batch)
+        {
+            Batch.reread();
+            Batch.selectForUpdate(true);
+            Batch.Parameters = [#CurrentVersion, _statementDate];
+            Batch.update();
+        }
+        info("@SKS:SKGSubmittedToBatch");
+        ttsCommit;        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        DialogRunbase   dialog = super();
+
+        dialog.addGroup("@SYS7755");
+        dialogstmtDate = dialog.addField(date2Str(stmtDate,321,-1,-1,-1,-1,-1));
+        dialogstmtDate.value(stmtdate);
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        boolean ret;
+    
+        ret = super();
+
+        stmtdate         = dialogstmtDate.value();
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method will create and send e-mail.
+    /// </summary>
+    public void run()
+    {
+        try
+        {
+            this.generateStatementAndEmail();
+        }
+        catch
+        {
+            throw Exception::Info;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateStatementAndEmail</Name>
+				<Source><![CDATA[
+    public void generateStatementAndEmail()
+    {
+        SKS_IHB_InhouseBankAccountsStatementDetails     InhouseBankStmt;
+        SKS_IHB_InhouseBankAccountsStatementDetails     inhousebankAccountStatementPrev;
+        SKS_IHB_InhouseBanks                            inhouseBanks;
+        BankAccountTrans                                bankAccountTrans;
+        SKS_PP_Bank                                     inhouseTASSetup;
+        SKS_EB_FilePath                                 filepath;
+        SKS_EB_FileName                                 filename;
+        AmountMST                                       prevAmount;
+        SKS_IHB_InhouseBankStatementCAMT053             InhouseBankStatement = new SKS_IHB_InhouseBankStatementCAMT053();
+              
+        while select inhouseBanks
+            where inhouseBanks.mark == NoYes::Yes
+        {
+            inhouseTASSetup = SKS_PP_Bank::find(inhouseBanks.AccountId, curExt());
+            
+            inhousebankAccountStatementPrev.clear();
+            bankAccountTrans.clear();
+            inhousebankAccountStatementPrev =SKS_IHB_InhouseBankAccountsStatementDetails::findByAccAndStatementDatePrev(inhouseBanks.AccountId, stmtDate);
+
+            prevAmount = 0;
+            if (inhousebankAccountStatementPrev)
+            {
+                select sum(AmountCur) from bankAccountTrans
+                    where bankAccountTrans.AccountId == inhouseBanks.AccountId
+                        && bankAccountTrans.TransDate <= stmtDate
+                        && bankAccountTrans.TransDate >inhousebankAccountStatementPrev.StatementDate; // SKS_Bug_10400
+                prevAmount = inhousebankAccountStatementPrev.EndingBalance;
+            }               
+            ttsbegin;
+            InhouseBankStmt.AccountId       = inhouseBanks.AccountId;
+            InhouseBankStmt.StatementDate   = stmtDate;
+            InhouseBankStmt.EndingBalance   = prevAmount + bankAccountTrans.AmountCur; // SKS_Bug_10400
+            InhouseBankStmt.StatementNumber = this.getStmtNumber(stmtDate);//SKS_Bug_10264
+            InhouseBankStmt.insert();
+            ttscommit;
+            // SKS_Bug_10448 -->
+            if(inhouseTASSetup.IHB_CreateFile == NoYes::Yes)
+            {
+                // SKS_Bug_10448 <--
+                InhouseBankStatement.formatStructure(InhouseBankStmt, inhousebankAccountStatementPrev);
+            } // SKS_Bug_10448 
+            // update last statementdate
+            SKS_PP_bank::updateLastStatementDate(inhouseBanks.AccountId,stmtDate);
+            // update bank transaction tables
+            this.updateIHBBankTransaction(inhouseBanks.AccountId,stmtDate, inhousebankAccountStatementPrev.StatementDate);
+               
+        }
+        if(inhouseTASSetup.IHB_SendEmail == NoYes::Yes)
+        {
+            filepath = SKS_PP_bank::find(inhouseBanks.AccountId).IHB_FilePath;
+            filename = curExt()+'-'+inhouseBanks.AccountId+'-'+ BankAccountTable::find(inhouseBanks.AccountId).Name+'-'+
+                        BankAccountTable::find(inhouseBanks.AccountId).AccountNum+'-'+ InhouseBankStmt.StatementNumber +'-'+
+                        date2Str(InhouseBankStmt.StatementDate,213,DateDay::Digits2,DateSeparator::None,
+                        DateMonth::Digits2,DateSeparator::None,DateYear::Digits4)+'.xml';
+
+            SKS_IHB_InhouseBankStatementEmailCreate::emailProcess(InhouseBankStmt.AccountId,
+                                                                InhouseBankStmt.StatementDate,
+                                                                InhouseBankStmt.StatementNumber,
+                                                                InhouseBankStmt.RecId, 
+                                                                filepath, filename);
+        }
+        this.resetMarkedField();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIHBBankTransaction</Name>
+				<Source><![CDATA[
+    public void updateIHBBankTransaction(
+        CompanyBankAccountId    _bankAccount,
+        TransDate               _stmtDate,
+        TransDate               _prevStmtDate)
+    {
+        BankAccountTrans    bankAccountTrans;
+
+        bankAccountTrans.skipDataMethods(true);
+
+        update_recordset bankAccountTrans
+            setting SKS_IHB_StatementNumber = int2Str(year(stmtDate))+int2Str(mthOfYr(stmtDate))+int2Str(dayOfMth(stmtDate)),
+                    SKS_IHB_StatementDate = stmtDate
+        where bankAccountTrans.AccountId == _bankAccount
+            && bankAccountTrans.TransDate <= stmtDate
+            && bankAccountTrans.TransDate >_prevStmtDate;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetMarkedField</Name>
+				<Source><![CDATA[
+    public void resetMarkedField()
+    {
+        SKS_IHB_InhouseBanks    inhousebanks;
+
+        update_recordset inhousebanks
+            setting Mark = NoYes::No
+        where inhousebanks.Mark == NoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getStmtNumber</Name>
+				<Source><![CDATA[
+    //SKS_Bug_10264
+    public BankAccountStatementNum getStmtNumber(TransDate _statementDate)
+    {
+        BankAccountStatementNum stmtNumber;
+
+        stmtNumber = int2Str(year(_statementDate));
+        if(strLen(int2Str(mthOfYr(_statementDate))) < 2)
+        {
+            stmtNumber += ('0'+ int2Str(mthOfYr(_statementDate)));
+        }
+        else
+        {
+            stmtNumber += int2Str(mthOfYr(_statementDate));
+        }
+        if(strLen(int2Str(dayOfMth(_statementDate))) < 2)
+        {
+            stmtNumber += ('0'+ int2Str(dayOfMth(_statementDate)));
+        }
+        else
+        {
+            stmtNumber += int2Str(dayOfMth(_statementDate));
+        }
+        return stmtNumber;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CustCreditCardSync</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_CustCreditCardSync extends RunBaseBatch
+{
+    #OCCRetryCount
+    QueryRun                queryRun;
+    DialogField             dfNumberOfThreads;
+    DialogField             dfDisplayCustSyncResults;
+    PositiveNumber          numberOfThreads;
+    NoYes                   displayCustSyncResults;
+    Map                     recordsToProcessMap;
+    Counter                 customerCounter;
+
+    #define.CurrentVersion(2)
+    #localmacro.CurrentList        
+        numberOfThreads,
+        displayCustSyncResults
+    #endmacro    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        DialogRunbase   dialog;
+
+        dialog = super();        
+
+        dfNumberOfThreads = dialog.addFieldValue(extendedTypeStr(PositiveNumber), numberOfThreads, "@SYS109551");
+        dfDisplayCustSyncResults = dialog.addFieldValue(extendedTypeStr(NoYesId), displayCustSyncResults, "@SKS:SKGCCDisplayCustSyncResults");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        boolean ret;
+
+        ret = super();
+        
+        numberOfThreads = dfNumberOfThreads.value();
+        displayCustSyncResults = dfDisplayCustSyncResults.value();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    public boolean validate(Object calledFrom = null)
+    {
+        boolean     ret = true;
+
+        if (numberOfThreads > 8)
+        {
+            ret = checkFailed("@SKS:SKGCCMaxNbrOfThreadsAllowedIsEight");
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildQuery</Name>
+				<Source><![CDATA[
+    protected Query buildQuery()
+    {        
+        Query qry = new Query();
+         
+        QueryBuildDataSource qbdsCustTable = qry.addDataSource(tableNum(CustTable));
+        qbdsCustTable.addOrderByField(fieldNum(CustTable, RecId));
+
+        qbdsCustTable.addRange(fieldNum(CustTable, AccountNum));
+
+        QueryBuildRange qbrDisableCardSync = qbdsCustTable.addRange(fieldNum(CustTable, SKS_CC_DisableCardSync));
+        qbrDisableCardSync.value(SysQuery::range(SKS_CC_DisableCardSync::DisableSync, SKS_CC_DisableCardSync::DisableSyncAndNewCard));
+
+        return qry;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    public QueryRun queryRun()
+    {
+        if (!queryRun)
+        {
+            queryRun = new QueryRun(this.buildQuery());
+        }
+
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    public void initParmDefault()
+    {
+        super();
+
+        queryRun = new QueryRun(this.buildQuery());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList, queryRun.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Version version = RunBase::getVersion(_packedClass);
+        PackedQueryRun packedQueryRun;        
+
+        switch (version)
+        {
+            case(#CurrentVersion):
+                [version, #Currentlist, packedQueryRun] = _packedClass;
+
+                if (packedQueryRun)
+                {
+                    queryRun = new QueryRun(packedQueryRun);
+                }
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecordList</Name>
+				<Source><![CDATA[
+    protected void processRecordList()
+    {
+        SKS_CC_CustCreditCardSyncSubTask custCreditCardSyncSubTask;
+        BatchHeader batchHeader;
+        container rangesPerThreadCon;
+        container keyRangesCon;
+        container customerList, keysRangeList;
+
+        if (this.isInBatch())
+        {
+            if (!numberOfThreads)
+            {
+                numberOfThreads = 4;
+            }
+
+            if (customerCounter <= numberOfThreads)
+            {
+                numberOfThreads = 1;
+            }
+        }
+        else
+        {
+            numberOfThreads = 1;
+        }
+
+        [rangesPerThreadCon, keyRangesCon] = this.setRangePerThread(customerCounter);
+
+        if (this.isInBatch())
+        {            
+            str batchThreadCaption;
+            int i;
+            for (i = 1; i <= numberOfThreads; i++)
+            {
+                if (!batchHeader)
+                {
+                    batchHeader = BatchHeader::construct(this.parmCurrentBatch().BatchJobId);
+                }
+
+                customerList = conPeek(rangesPerThreadCon, i);
+                if (!customerList)
+                {
+                    continue;
+                }
+                keysRangeList = conPeek(keyRangesCon, i);
+
+                int curTaskRangeFrom, curTaskRangeTo, curTaskNbrOfRecords;
+                curTaskRangeFrom = conPeek(keysRangeList, 1);
+                curTaskNbrOfRecords = conLen(keysRangeList);
+                curTaskRangeTo = conPeek(keysRangeList, curTaskNbrOfRecords);
+
+                batchThreadCaption = strFmt("@SKS:SKGCCPayLinkBatchThreadCaption", SKS_CC_CustCreditCardSyncSubTask::description(), i, curTaskRangeFrom, curTaskRangeTo);
+                custCreditCardSyncSubTask = SKS_CC_CustCreditCardSyncSubTask::newSubTask(customerList, batchThreadCaption, displayCustSyncResults, true);
+
+                batchHeader.addRuntimeTask(custCreditCardSyncSubTask, this.parmCurrentBatch().RecId);
+            }
+
+            if (batchHeader)
+            {
+                batchHeader.save();
+            }
+        }
+        else
+        {
+            // when not in batch
+            customerList = conPeek(rangesPerThreadCon, 1);
+            SKS_CC_CustCreditCardSyncSubTask::newSubTask(customerList, '', displayCustSyncResults, false).run();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setRangePerThread</Name>
+				<Source><![CDATA[
+    private container setRangePerThread(int _nbrToProc)
+    {
+        container       recordsToProcCon, keysToProcCon;
+        container       curRecsCon, curKeysCon;
+        int             intDiv, lastUsedRange, i;
+        int             curKey;
+        int64           curValue;
+        MapEnumerator   me;
+
+        intDiv = _nbrToProc div numberOfThreads;
+
+        i = 1;
+        lastUsedRange = intDiv;
+        me = recordsToProcessMap.getEnumerator();
+        while (me.moveNext())
+        {
+            curKey = me.currentKey();
+            curValue = me.currentValue();
+            curRecsCon += curValue;
+            curKeysCon += curKey;
+
+            if (i < numberOfThreads && curKey == lastUsedRange)
+            {
+                lastUsedRange += intDiv;
+                recordsToProcCon = conIns(recordsToProcCon, i, curRecsCon);
+                keysToProcCon = conIns(keysToProcCon, i, curKeysCon);
+                curRecsCon = conNull();
+                curKeysCon = conNull();
+                i++;
+            }
+        }
+
+        if (curRecsCon && conLen(curRecsCon) != 0)
+        {
+            recordsToProcCon = conIns(recordsToProcCon, i, curRecsCon);
+            keysToProcCon = conIns(keysToProcCon, i, curKeysCon);
+        }
+
+        return [recordsToProcCon, keysToProcCon];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        CustTable custTable;
+
+        recordsToProcessMap = new Map(Types::Integer, Types::Int64);
+        while (queryRun.next())
+        {        
+            custTable = queryRun.get(tableNum(CustTable));
+
+            customerCounter++;
+            recordsToProcessMap.insert(customerCounter, custTable.RecId);
+        }
+
+        if (!customerCounter || !recordsToProcessMap || recordsToProcessMap.empty())
+        {
+            return;
+        }
+
+        info(strFmt("@SKS:SKGCCCustomersToSync", customerCounter));
+
+        this.processRecordList();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_CustCreditCardSync construct()
+    {
+        return new SKS_CC_CustCreditCardSync();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS6027";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        SKS_CC_CustCreditCardSync custCreditCardSync = SKS_CC_CustCreditCardSync::construct();
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS6608");
+        }              
+        
+        if (!SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor())
+        {
+            throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+        }
+
+        if (custCreditCardSync.prompt())
+        {
+            custCreditCardSync.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    public boolean showQueryValues()
+    {    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

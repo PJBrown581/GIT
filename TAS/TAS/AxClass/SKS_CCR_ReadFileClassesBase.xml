@@ -1,0 +1,369 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_ReadFileClassesBase</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_ReadFileClassesBase extends SKS_CCR_Readfile
+{
+    SKS_CCR_ReadparseBase gSKS_CCR_ReadParseX;
+    
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>readFile</Name>
+				<Source><![CDATA[
+    public void readFile()
+    {
+        BankAccountTable locBankAccountTable;
+        BankAccountStatementNum locPrevStatementNum;
+        CompanyBankAccountId locPrevAccountId;
+        CurrencyCode locStatementCurrencyCode;
+        DataAreaId locPrevCompanyContext;
+        SKS_CCR_BankAcctStmt locSKS_CCR_BankAcctStmt;
+        SKS_CCR_InboundFile locSKS_CCR_InboundFile;
+        SKS_CCR_InboundStmt locSKS_CCR_InboundStmt;
+        SKS_CCR_InboundTran locSKS_CCR_InboundTran;
+        SKS_BR_TranTypeProcessing locSKS_BR_TranTypeProcessing;
+        SKS_PP_Bank locSKS_PP_Bank;
+        //SKS_EB_FilePath locPath;
+        date importedAcctStatementDate;
+        BankAccountStatementNum importedAcctStatementNum;
+        boolean   transactionFound;// TFS 7285
+        RecordInsertList locSKS_CCR_BankTranRecordInsertList;
+        str locErrorMessage;
+        CurrencyExchangeHelper  locCurrencyExchangeHelper;
+
+        locSKS_CCR_BankAcctStmt = new SKS_CCR_BankAcctStmt();
+        locSKS_CCR_InboundFile = gSKS_CCR_ReadParseX.GetInboundFile(fileName, gSKS_BF_BankIntType);
+        locSKS_CCR_InboundFile.CreateStmtPointer();
+        locSKS_CCR_InboundStmt = locSKS_CCR_InboundFile.GetStmt();
+        ttsBegin;//START TTS BLOCK 001
+        while(locSKS_CCR_InboundStmt)
+        {
+            info(strFmt("@SKS3478", locSKS_CCR_InboundStmt.GetNbr()));
+
+            locBankAccountTable = null;
+            if(strLen(locSKS_CCR_InboundStmt.GetAccount()) > 0)
+                locBankAccountTable = SKS_EB_Bank::getBankAccount(locSKS_CCR_InboundStmt.GetAccount(), classIdGet(new SKS_CCR_ReadFileClassesBase()));
+            else
+                locBankAccountTable = this.getBankAccountByPath();
+
+            if(!locBankAccountTable)
+            {
+                locSKS_CCR_InboundStmt = locSKS_CCR_InboundFile.GetStmt();
+                continue;
+            }
+
+            changeCompany(locBankAccountTable.Company())
+            {
+                //If account is not setup for ebank rec, we skip this statement.
+                if(!this.validateAccountId(locBankAccountTable.AccountID))
+                {
+                    locSKS_CCR_InboundStmt = locSKS_CCR_InboundFile.GetStmt();
+                    continue;
+                }
+                else if(strLen(locSKS_CCR_InboundStmt.GetCurrency()) > 0)
+                {
+                    if(strUpr(locSKS_CCR_InboundStmt.GetCurrency()) != strUpr(locBankAccountTable.CurrencyCode))
+                    {
+                        SKS_CCR_HistoryTable::insertEvent(SKS_CCR_Action::StatementOmitted,bankHeaderRecId,locBankAccountTable.AccountID,locSKS_CCR_InboundStmt.GetDate(),locSKS_CCR_InboundStmt.GetNbr(),'',strFmt("@SKS:SKGBRStatmentOmittedForCurrency", strUpr(locSKS_CCR_InboundStmt.GetCurrency())));
+                        locSKS_CCR_InboundStmt = locSKS_CCR_InboundFile.GetStmt();
+                        continue;
+                    }
+                }
+                locSKS_BR_TranTypeProcessing = null;
+                bankTran = null;
+                locSKS_CCR_BankAcctStmt = new SKS_CCR_BankAcctStmt();
+                locSKS_PP_Bank = null;
+                SKS_BR_FileFormat = null;
+
+                select CCR_FormatID from locSKS_PP_Bank
+                    where locSKS_PP_Bank.BankAccountId == locBankAccountTable.AccountID
+                    join SKS_BR_FileFormat
+                    where SKS_BR_FileFormat.FormatID == locSKS_PP_Bank.CCR_FormatID;
+
+                BankAccountStatement = null;
+                BankAccountStatement.AccountId = locBankAccountTable.AccountID;
+                BankAccountStatement.AccountStatementDate = locSKS_CCR_InboundStmt.GetDate();
+                BankAccountStatement.AccountStatementNum = locSKS_CCR_InboundStmt.GetNbr();
+                importedAcctStatementNum = BankAccountStatement.AccountStatementNum;
+                importedAcctStatementDate = BankAccountStatement.AccountStatementDate;
+                bankAccountStatement.CurrencyCode = locBankAccountTable.CurrencyCode;
+                if(strLen(locSKS_CCR_InboundStmt.GetCurrency()) > 0)
+                {
+                    if(strUpr(locSKS_CCR_InboundStmt.GetCurrency()) != strUpr(locBankAccountTable.CurrencyCode))
+                    {
+                        ttsAbort;//END TTS BLOCK001
+                        this.handleError(bankHeaderRecId, strFmt("@SKS3479",
+                                            locSKS_CCR_InboundStmt.GetNbr(),
+                                            date2str(locSKS_CCR_InboundStmt.GetDate(),
+                                                        213,2,DateSeparator::Slash,2,DateSeparator::Slash,4, DateFlags::FormatAll),
+                                                        bankAccountStatement.AccountId), 0);
+                        return;
+                    }
+                }//end if(strLen(locSKS_CCR_InboundStmt.GetCurrency()) > 0)
+                else
+                {
+                    locStatementCurrencyCode = locBankAccountTable.CurrencyCode;
+                }//end else
+                if(SKS_BR_FileFormat.UpdateEndBalance == NoYes::Yes)
+                {
+
+                    if(locSKS_CCR_InboundStmt.GetEndingBalanceSet() == NoYes::Yes)
+                    {
+                        if(locSKS_CCR_InboundStmt.GetIsCredit())
+                        {
+                            BankAccountStatement.EndingBalance = locSKS_CCR_InboundStmt.GetEndingBalance();
+                        }
+                        else
+                        {
+                            BankAccountStatement.EndingBalance = -1 * locSKS_CCR_InboundStmt.GetEndingBalance();
+                        }
+
+                        // vvv11980vvv
+                        if(gSKS_CCR_ReadFileClassesCustomActionsBase)
+                        {
+                            gSKS_CCR_ReadFileClassesCustomActionsBase.modifyEndingBalance(BankAccountStatement);
+                        }
+                        //^^^11980^^^
+
+                        BankAccountStatement.EndingBalance = CurrencyExchange::round(BankAccountStatement.EndingBalance, locStatementCurrencyCode);
+                        this.createBankBalance(BankAccountStatement.AccountStatementDate,
+                                    BankAccountStatement.AccountId,
+                                    BankAccountStatement.EndingBalance);
+                    }//end if(locSKS_CCR_InboundStmt.GetEndingBalanceSet() == NoYes::Yes)
+                    //Error if ending balance is missing
+                    else
+                    {
+                        ttsAbort;//END TTS BLOCK001
+                        this.handleError(bankHeaderRecId, strFmt("@SKS3480",
+                                                                BankAccountStatement.AccountId,
+                                                                locSKS_CCR_InboundStmt.GetNbr(),
+                                                                date2str(locSKS_CCR_InboundStmt.GetDate(), 213,2,DateSeparator::Slash,2,DateSeparator::Slash,4,DateFlags::FormatAll)),
+                                        0);
+                        return;
+                    }//end else
+                }//end  if(SKS_BR_FileFormat.UpdateEndBalance == NoYes::Yes)
+                transactionFound = false;
+                locSKS_CCR_InboundStmt.CreateTranPointer();
+                locSKS_CCR_InboundTran = locSKS_CCR_InboundStmt.GetTran();
+                locSKS_CCR_BankTranRecordInsertList = null;
+                locSKS_CCR_BankTranRecordInsertList = new RecordInsertList(tableNum(SKS_CCR_BankTran));
+                while(locSKS_CCR_InboundTran)
+                {
+                    transactionFound =  true; // TFS 7285
+                    this.initSKS_CCR_BankTran();
+                    bankTran.AccountId = locBankAccountTable.AccountID;
+                    bankTran.BankCustomerNum = locSKS_CCR_InboundTran.GetCustRefNbr();
+                    bankTran.BankNum = locSKS_CCR_InboundTran.GetBankRefNbr();
+
+                    // VVVVV BEGIN GROUPING VVVVV
+                    //DO NOT TRIM DESCRIPTION.  PARSERS MAY WANT THE FULL WHITESPACE
+                    bankTran.TranDescription = locSKS_CCR_InboundTran.GetDesc();
+                    // Populate User note also here
+                    bankTran.TranDescriptionUser = locSKS_CCR_InboundTran.GetDescUser();
+                    // ^^^^ END GROUPING ^^^^^
+                    
+                    bankTran.TranDate = (locSKS_CCR_InboundTran.GetDate() != dateNull() ? locSKS_CCR_InboundTran.GetDate() : (locSKS_CCR_InboundTran.GetValueDate() != dateNull() ? locSKS_CCR_InboundTran.GetValueDate() : locSKS_CCR_InboundStmt.GetDate()));
+                    //ValueDate: Trandate Has to be populated by now.  IF locSKS_CCR_InboundTran.GetValueDatef is not populated, use the trandate that was previously
+                    //          determined.  TranDate MUST be already populated, so you don't need to check it for a value.
+                    bankTran.ValueDate = (locSKS_CCR_InboundTran.GetValueDate() != dateNull() ? locSKS_CCR_InboundTran.GetValueDate() : bankTran.TranDate);
+
+                    //The following line, "bankTran.FileTranType = locSKS_CCR_InboundTran.GetTranType();" must PRECEED this.processTranType() call.
+                    bankTran.FileTranType = locSKS_CCR_InboundTran.GetTranType();
+                    locSKS_BR_TranTypeProcessing = this.processTranType(locBankAccountTable.AccountID);
+                    if (SKS_BR_FileFormat.DebitCreditIdentifier == Noyes::Yes)
+                    {
+                        locSKS_CCR_InboundTran.setImportAsPositive(locSKS_BR_TranTypeProcessing.getBankCredit());
+                    }
+                    //We have the currency stored in gSKS_BR_InboundTran, so if we need to add conversions, we can.
+                    //We needed to know of we had credit/debit flags in the trans type mapping so the AMOUNT related code must follow initialization of locSKS_BR_TranTypeProcessing
+                    bankTran.TranCurrencyAmount = (locSKS_CCR_InboundTran.GetImportAsPositive())?locSKS_CCR_InboundTran.GetAmt():(locSKS_CCR_InboundTran.GetAmt() * -1);
+                    bankTran.TranCurrencyAmount = CurrencyExchange::round(bankTran.TranCurrencyAmount, locSKS_CCR_InboundTran.GetCurrency());
+                    // vvv 13903 vvv
+                    if(strLen(locSKS_CCR_InboundTran.GetCurrency()) > 0 && strUpr(locSKS_CCR_InboundTran.GetCurrency()) != strUpr(locBankAccountTable.CurrencyCode))
+                    {
+                        bankTran.TransCurrency = strUpr(locSKS_CCR_InboundTran.GetCurrency());
+                        if(bankTran.TransCurrency != strUpr(locBankAccountTable.CurrencyCode))
+                        {
+                            locCurrencyExchangeHelper = CurrencyExchangeHelper::construct();
+                            locCurrencyExchangeHelper.parmExchangeDate(bankTran.TranDate);
+                            bankTran.TranAmount = locCurrencyExchangeHelper.calculateCurrencyToCurrency(bankTran.TransCurrency, locBankAccountTable.CurrencyCode,bankTran.TranCurrencyAmount, true, true);
+                        }
+                    }
+                    else
+                    {
+                        bankTran.TransCurrency = strUpr(locBankAccountTable.CurrencyCode);
+                        bankTran.TranAmount = bankTran.TranCurrencyAmount;
+                    }
+                    // ^^^ 13903 ^^^
+                    // vvv 12559 & 16008(fee's on the trans line will not be impacted by the "Reverse Sign of fee amount"(that only affects the generated fee LINE)vvv
+                    // fees will have the same credit/debit behavior as the amounts, thus will vary depending if a credit/debit field was specified.
+                    bankTran.TransactionFeesAmt = (locSKS_CCR_InboundTran.GetImportAsPositive())?locSKS_CCR_InboundTran.GetFeeSum():(locSKS_CCR_InboundTran.GetFeeSum() * -1);
+                    bankTran.TransactionFeesAmt = CurrencyExchange::round(bankTran.TransactionFeesAmt, locSKS_CCR_InboundTran.GetCurrency());
+                    // ^^^ 12559 & 16008 ^^^
+
+                    //FDD_15121-->
+                    bankTran.TransactionMarkupAmt = (locSKS_CCR_InboundTran.GetImportAsPositive())?locSKS_CCR_InboundTran.GetMarkupSum():(locSKS_CCR_InboundTran.GetMarkupSum() * -1);
+                    bankTran.TransactionMarkupAmt = CurrencyExchange::round(bankTran.TransactionMarkupAmt, locSKS_CCR_InboundTran.GetCurrency());
+                    //FDD_15121<---
+
+                    if(locSKS_BR_TranTypeProcessing.getIgnoreTranType())
+                    {
+                        locSKS_CCR_InboundTran = locSKS_CCR_InboundStmt.GetTran();
+                        continue; // Skip this transaction if it should not be imported
+                    }
+                    if(locSKS_BR_TranTypeProcessing.getErrorText() != '')
+                    {
+                        ttsAbort;
+                        this.handleError(bankHeaderRecId, (strfmt("@SKS528", bankTran.FileTranType)), 0);
+                        ImportCount = 0;
+                        return;
+                    }//end if(locSKS_BR_TranTypeProcessing.getErrorText() != "")
+                    bankTran.FileTranType = locSKS_CCR_InboundTran.GetTranType();
+                    bankTran.BankTranType = locSKS_BR_TranTypeProcessing.getBankTranType();
+                    
+                    if (strLen(bankTran.BankTranType) > 0)
+                    {
+                        bankTran.GLMappingRuleGroupId = locSKS_BR_TranTypeProcessing.getGLMappingRuleGroupId();
+                        bankTran.MatchingRuleGroupId = locSKS_BR_TranTypeProcessing.getMatchingRuleGroupId();
+                    }
+                    else // Bug 7219
+                    {
+                        bankTran.GLMappingRuleGroupId = '';
+                        bankTran.MatchingRuleGroupId = '';
+                        bankTran.GLMatchOrCreate = SKS_CCR_GLMatchOrCreate::GLMatch;
+                    }
+                    bankTran.DefaultDimension = locSKS_BR_TranTypeProcessing.getDimension();
+                    bankTran.ImportedStatementNum = importedAcctStatementNum;
+                    bankTran.ImportedStatementDate = importedAcctStatementDate;
+                    SKS_CCR_ReadFile::setDefaultMatchGroup(bankTran);
+                    if(!this.parseValue())
+                    {
+                        return;
+                    }//END if(!this.parseValue())
+                    //--- BEGIN DATABASE OPERATIONS ---
+                    // Create the Record in the database
+                    if(BankAccountStatement.AccountId != locPrevAccountId
+                        || curext() !=  locPrevCompanyContext
+                        || BankAccountStatement.AccountStatementNum != locPrevStatementNum)
+                    {
+                        
+
+                        //will only create Statements if the account is setup for automatic statement creation
+                        // vvv11980vvv
+                        if(gSKS_CCR_ReadFileClassesCustomActionsBase)
+                        {
+                            gSKS_CCR_ReadFileClassesCustomActionsBase.modifyStatment(BankAccountStatement);
+                        }
+                        //^^^11980^^^
+                        BankAccountStatement = locSKS_CCR_BankAcctStmt.createCCRStatement(BankAccountStatement, bankHeaderRecId);
+                        locPrevStatementNum = BankAccountStatement.AccountStatementNum;
+                        locPrevAccountId = BankAccountStatement.AccountId;
+                        locPrevCompanyContext = curext();
+                    }//end (locBankAccountStatement.AccountId != locPrevAccountId
+
+                    if(BankAccountStatement && BankAccountStatement.SKS_CCR_BankHeaderRecID > 0 && BankAccountStatement.SKS_CCR_BankHeaderRecID == bankHeaderRecId)
+                        /*|| (locSKS_PP_Bank.BRCreateBankStatements == NoYes::No && BankAccountStatement.RecId == 0))*///only set the originalstatementrecid if we created the statement // 7526
+                    {
+                        bankTran.OriginalStatementRecId  = BankAccountStatement.RecId;
+                        locSKS_CCR_BankTranRecordInsertList.add(bankTran); //Bug:7273
+                    }//end if(locBankAccountStatement)
+                    ImportCount++;
+                    locSKS_CCR_InboundTran = locSKS_CCR_InboundStmt.GetTran();
+                }//end while(locSKS_CCR_InboundTran)
+                locSKS_CCR_BankTranRecordInsertList.insertDatabase();
+
+
+
+                // TFS 7285 -->
+                if(!transactionFound /*&& locSKS_PP_Bank.BRCreateBankStatementsIfNoTrans == NoYes::Yes*/ )
+                {
+                    if(BankAccountStatement.AccountId != locPrevAccountId
+                        || curext() !=  locPrevCompanyContext
+                        || BankAccountStatement.AccountStatementNum != locPrevStatementNum)
+                    {
+                        //will only create Statements if the account is setup for automatic statement creation
+                        // vvv11980vvv
+                        if(gSKS_CCR_ReadFileClassesCustomActionsBase)
+                            gSKS_CCR_ReadFileClassesCustomActionsBase.modifyStatment(BankAccountStatement);
+                        // ^^^11980^^^
+                        BankAccountStatement = locSKS_CCR_BankAcctStmt.createCCRStatement(BankAccountStatement, bankHeaderRecId);
+                        locPrevStatementNum = BankAccountStatement.AccountStatementNum;
+                        locPrevAccountId = BankAccountStatement.AccountId;
+                        locPrevCompanyContext = curext();
+                    }
+                    //end (locBankAccountStatement.AccountId != locPrevAccountId
+                }
+                // TFS 7285 <--
+            }//END CHANGECOMPANY
+            locSKS_CCR_InboundStmt = locSKS_CCR_InboundFile.GetStmt();
+        }//END while(locSKS_CCR_InboundStmt)
+
+        locErrorMessage = this.createCreditCardReconciliationExtensionLines(bankHeaderRecId);
+        if(locErrorMessage != '')
+        {
+            ttsAbort;
+            this.handleError(bankHeaderRecId, strfmt(locErrorMessage), 0);
+            ImportCount = 0;
+            return;
+        }
+
+        this.setMatchRuleBasedOnMappingRules();
+        if(!this.createGL())
+            return;
+
+        if(!this.completeProcessing())
+            return;
+
+        ttscommit;//END TTS BLOCK 001
+
+        SKS_CCR_ReadFile::postGL(bankHeaderRecId);
+        // Import Hit Rate is updated here
+        SKS_CCR_ReadFile::updateImportHitRate(bankHeaderRecId);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setParseRule</Name>
+				<Source><![CDATA[
+    public void setParseRule(SKS_CCR_ReadparseBase _SKS_CCR_ReadParseX)
+    {
+        gSKS_CCR_ReadParseX = _SKS_CCR_ReadParseX;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>completeProcessing</Name>
+				<Source><![CDATA[
+    protected boolean completeProcessing()
+    {
+        boolean rtnval = true;
+        if(gSKS_CCR_ReadFileClassesCustomActionsBase)
+            rtnval = gSKS_CCR_ReadFileClassesCustomActionsBase.modifyCompleteProcessing();
+        if(rtnval)
+            rtnval = super();
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setFormatId</Name>
+				<Source><![CDATA[
+    void setFormatId(SKS_BR_FormatId _formatId)
+    {
+        super(_formatId);
+        gSKS_CCR_ReadParseX.setFormat(_formatId);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

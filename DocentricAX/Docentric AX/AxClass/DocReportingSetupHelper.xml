@@ -1,0 +1,4370 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocReportingSetupHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.AX.Metadata.MetaModel;
+using System.Collections;
+using System.Collections.Specialized;
+using System.IO;
+using System.IO.Compression;
+using Docentric.AX.Framework.Utilities;
+using Docentric.AX.Reporting.TemplateManagement;
+using Docentric.AX.Storage.Azure.BlobStorage;
+
+/// <summary>
+/// Docentric reporting setup helper class.
+/// </summary>
+public class DocReportingSetupHelper
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getAotResourceFonts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get all AOT found font files.
+    /// </summary>
+    /// <param name = "_fontGroupName">Name used to group fonts from this type of storage.</param>
+    /// <returns>Returns a list <c>System.Collections.ArrayList</c> of <c>Docentric.AX.Fonts.DocMemoryFontSource</c> containing font.</returns>
+    public static System.Collections.ArrayList getAotResourceFonts(str _fontGroupName)
+    {
+        if (System.String::IsNullOrWhiteSpace(_fontGroupName))
+        {
+            _fontGroupName = 'Custom AOT fonts';
+        }
+
+        System.Collections.ArrayList fontList = new System.Collections.ArrayList();
+        StringEnumerator resourceNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ResourceNames();
+
+        try
+        {
+            while (resourceNameStringEnum.moveNext())
+            {
+                str resourceName = resourceNameStringEnum.Current;
+            
+                AxResource resource = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetResource(resourceName);
+
+                // Add only supported font files from AOT resources.
+                if (!DocFileMngHelper::isFileFont(resource.FileName))
+                {
+                    continue;
+                }
+
+                using(System.IO.MemoryStream fontContentMemoryStream = DocGlobalHelper::getAotResourceContent(resourceName))
+                {
+                    // Check if the source file stream is a valid font file.
+                    if (!DocFileMngHelper::isSupportedFontStream(fontContentMemoryStream))
+                    {
+                        continue;
+                    }
+
+                    // Add the font to the array list.
+                    var fontByteArray = fontContentMemoryStream.ToArray();
+                    fontList.Add(new Docentric.AX.Fonts.DocMemoryFontSource(byref fontByteArray, strFmt('%1|%2', _fontGroupName, resource.FileName)));
+                }
+            }
+        }
+        catch
+        {
+            Global::exceptionTextFallThrough();
+        }
+    
+        return fontList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustomBlobStorageFonts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get an array of template custom Azure blob storage fonts
+    /// </summary>
+    /// <param name = "_fontGroupName">Name used to group fonts from this type of storage.</param>
+    /// <returns>Return <c>System.Collections.ArrayList</c> containing <c>Docentric.AX.Fonts.DocMemoryFontSource</c> of custom fonts.</returns>
+    public static System.Collections.ArrayList getCustomBlobStorageFonts(str _fontGroupName)
+    {
+        if (System.String::IsNullOrWhiteSpace(_fontGroupName))
+        {
+            _fontGroupName = 'Custom blob storage fonts';
+        }
+
+        System.Collections.ArrayList fontList = new System.Collections.ArrayList();
+        
+        DocParameters docParameters = DocParameters::find();
+
+        // If usage of custom fonts is not enabled then skip
+        if (docParameters.UseCustomBlobStorageFonts == NoYes::No)
+        {
+            return fontList;
+        }
+
+        str containerName = docParameters.CustomFontsBlobStorageContainer;
+        str blobFileName = DocConstant::CustomBlobStorageFontsZipFilename;
+
+        try
+        {
+            // Check if container name is set
+            if (System.String::IsNullOrWhiteSpace(containerName))
+            {
+                return fontList;
+            }
+
+            // First we need to check if the custom font file exists
+            if (!BlobStorageHelper::BlobExists(containerName, blobFileName))
+            {
+                // If not we do not need to load anything
+                return fontList;
+            }
+
+            using(System.IO.Stream customFontZipPackage = BlobStorageHelper::DownloadBlobContent(containerName, blobFileName))
+            {
+                using (System.IO.Compression.ZipArchive archive = new System.IO.Compression.ZipArchive(customFontZipPackage, ZipArchiveMode::Read, true))
+                {
+                    System.Collections.IList fileInArchiveList = archive.Entries;
+                    int fileInArchiveListCount = ListHelper::Count(fileInArchiveList);
+                    // Create a list of processed filenames to be albe to remote duplicates
+                    Set processedFileNames = new Set(Types::String);
+                    // Let's read all the files in the ZIP
+                    for (int i = 0; i < fileInArchiveListCount; i++)
+                    {
+                        ZipArchiveEntry fileInArchive = ListHelper::GetItem(fileInArchiveList, i);
+                        str templateFontFilename = fileInArchive.Name;
+
+                        // If this is a folder, we should skip it
+                        if (System.String::IsNullOrEmpty(templateFontFilename))
+                        {
+                            continue;
+                        }
+
+                        // If not a known file type we should skip it
+                        if (!DocFileMngHelper::isFileFont(templateFontFilename))
+                        {
+                            continue;
+                        }
+
+                        // If there are duplicate font filenames we should skip the next same filename.
+                        if (processedFileNames.in(templateFontFilename))
+                        {
+                            continue;
+                        }
+
+                        processedFileNames.add(templateFontFilename);
+
+                        using (System.IO.Stream unzippedTemplateFontFileContent = fileInArchive.Open())
+                        {
+                            // We need to copy the unzipped file stream to memory as we need to do some checks on the file
+                            using(System.IO.MemoryStream templateFontFileContent = new System.IO.MemoryStream())
+                            {
+                                unzippedTemplateFontFileContent.CopyTo(templateFontFileContent);
+
+                                // Check if the source file and stream is a valid font file.
+                                if (!(DocFileMngHelper::isFileFont(templateFontFilename) && DocFileMngHelper::isSupportedFontStream(templateFontFileContent)))
+                                {
+                                    continue;
+                                }
+
+                                // Now we create FontSource
+                                templateFontFileContent.Position = 0;
+                                var fontByteArray = templateFontFileContent.ToArray();
+                                fontList.Add(new Docentric.AX.Fonts.DocMemoryFontSource(byref fontByteArray, strFmt('%1|%2', _fontGroupName, templateFontFilename)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            Global::exceptionTextFallThrough();
+        }
+
+        // Return the result
+        return fontList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFontManagerVersionId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get font manager version ID. Version ID is used to synchronize fonts across all AOT instances.
+    /// </summary>
+    /// <returns>Version ID as guid.</returns>
+    public static guid getFontManagerVersionId()
+    {
+        DocFontManager fontManager = DocFontManager::find();
+        return fontManager.VersionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAotResourceNameIdRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all resources containing the Word templates from AOT.
+    /// </summary>
+    /// <returns>The DocTmpIdRef table buffer with all resources containing the Word templates from AOT</returns>
+    public static DocTmpIdRef buildAotResourceNameIdRef()
+    {
+        DocTmpIdRef        resourceNameIdRef;
+        StringEnumerator   resourceNameStringEnum;
+
+        resourceNameIdRef.clear();
+
+        resourceNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ResourceNames();
+
+        while (resourceNameStringEnum.moveNext())
+        {
+            str resourceName = resourceNameStringEnum.Current;
+            
+            AxResource resource = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetResource(resourceName);
+
+            if (!DocFileMngHelper::isFileWordDocument(resource.FileName))
+            {
+                continue;
+            }
+
+            using (System.IO.MemoryStream resourceContent = DocGlobalHelper::getAotResourceContent(resourceName))
+            {
+                if (!TemplateHelper::IsTemplateDocument(resourceContent))
+                {
+                    continue;
+                }
+            }
+
+            resourceNameIdRef.Name = resource.Name;
+            resourceNameIdRef.HelpTxt = resource.FileName;
+            resourceNameIdRef.insert();
+        }
+    
+        return resourceNameIdRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAotResourceNameIdRefForReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all resources containing Word templates from AOT for the specified report Id.
+    /// </summary>
+    /// <param name = "_reportId">Report Id</param>
+    /// <returns>The DocTmpIdRef table buffer with resources containing Word templates from AOT</returns>
+    public static DocTmpIdRef buildAotResourceNameIdRefForReport(str _reportId)
+    {
+        DocTmpIdRef        resourceNameIdRef;
+        StringEnumerator   resourceNameStringEnum;
+
+        resourceNameIdRef.clear();
+
+        resourceNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ResourceNames();
+
+        while (resourceNameStringEnum.moveNext())
+        {
+            str resourceName = resourceNameStringEnum.Current;
+            
+            AxResource resource = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetResource(resourceName);
+
+            if (!DocFileMngHelper::isFileWordDocument(resource.FileName))
+            {
+                continue;
+            }
+
+            using (System.IO.MemoryStream resourceContent = DocGlobalHelper::getAotResourceContent(resourceName))
+            {
+                str reportId;
+                if (!TemplateHelper::IsTemplateDocument(resourceContent, byref reportId))
+                {
+                    continue;
+                }
+
+                // Check if this is an invalid legacy template.
+                if (reportId == '')
+                {
+                    DocAotResourceInfo resourceInfo = DocAotResourceInfo::construct(resource, resourceContent);
+                    reportId = resourceInfo.reportId();
+                    if (reportId == '')
+                    {
+                        str warningMsg = strFmt("@DocentricAX:InvalidResource", resourceName, resource.FileName) + ' ' +
+                                         "@DocentricAX:Reason" + ': ' + "@DocentricAX:LegacyTemplateError";
+                        DocGlobalHelper::handleWarning(warningMsg);
+                        continue;
+                    }
+                }
+
+                if (reportId != _reportId)
+                {
+                    continue;
+                }
+            }
+
+            resourceNameIdRef.Name = resource.Name;
+            resourceNameIdRef.HelpTxt = resource.FileName;
+            resourceNameIdRef.insert();
+        }
+    
+        return resourceNameIdRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAotSrsReportDesignNameIdRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all SSRS report designs from AOT for the specified SSRS report name.
+    /// </summary>
+    /// <param name = "_srsReportName">SSRS report name</param>
+    /// <returns>The DocTmpIdRef table buffer with SSRS report designs from AOT</returns>
+    public static DocTmpIdRef buildAotSrsReportDesignNameIdRef(str _srsReportName)
+    {
+        DocTmpIdRef srsReportDesignNameIdRef;
+    
+        srsReportDesignNameIdRef.clear();
+
+        AxReport axReport = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetReport(_srsReportName);
+        if (axReport != null)
+        {
+            IEnumerable ssrsReportDesigns = axReport.Designs;
+            IEnumerator enumerator = ssrsReportDesigns.GetEnumerator();
+            while (enumerator.moveNext())
+            {
+                AxReportDesign srsReportDesign = enumerator.Current;
+                srsReportDesignNameIdRef.Name = srsReportDesign.Name;
+                srsReportDesignNameIdRef.insert();
+            }
+        }
+    
+        return srsReportDesignNameIdRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAotSrsReportNameAndDesignIdRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all SSRS report designs from AOT.
+    /// </summary>
+    /// <returns>The DocTmpIdRef table buffer with all SSRS report designs from AOT</returns>
+    public static DocTmpIdRef buildAotSrsReportNameAndDesignIdRef()
+    {
+        StringEnumerator     reportNameStringEnum;
+        DocTmpIdRef          srsReportIdRef;
+    
+    
+        srsReportIdRef.clear();
+        reportNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ReportNames();
+        while (reportNameStringEnum.moveNext())
+        {
+            str srsReportName = reportNameStringEnum.Current;
+            
+            AxReport axReport = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetReport(srsReportName);
+            IEnumerable ssrsReportDesigns = axReport.Designs;
+            IEnumerator enumerator = ssrsReportDesigns.GetEnumerator();
+            while (enumerator.moveNext())
+            {
+                AxReportDesign srsReportDesign = enumerator.Current;
+                srsReportIdRef.Name = srsReportName + '.' + srsReportDesign.Name;
+                srsReportIdRef.insert();
+            }
+        }
+    
+        return srsReportIdRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAotSrsReportNameIdRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all SSRS reports from AOT.
+    /// </summary>
+    /// <returns>The DocTmpIdRef table buffer with all SSRS reports from AOT</returns>
+    public static DocTmpIdRef buildAotSrsReportNameIdRef()
+    {
+        StringEnumerator     reportNameStringEnum;
+        DocTmpIdRef          srsReportNameIdRef;
+    
+        srsReportNameIdRef.clear();
+        reportNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ReportNames();
+        while (reportNameStringEnum.moveNext())
+        {
+            str srsReportName = reportNameStringEnum.Current;
+            srsReportNameIdRef.Name = srsReportName;
+            srsReportNameIdRef.HelpTxt = DocReportingSetupHelper::getSrsReportUIName(srsReportName);
+            srsReportNameIdRef.insert();
+        }
+    
+        return srsReportNameIdRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSrsDataSourceProviderClassIdRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all SSRS datasource provider classes from AOT.
+    /// </summary>
+    /// <returns>The DocTmpIdRef table buffer with all SSRS datasource provider classes from AOT</returns>
+    public static DocTmpIdRef buildSrsDataSourceProviderClassIdRef()
+    {
+        DictClass                             dictBaseClass, dictClass;
+        ListEnumerator                        listEnumerator;
+        DocDataSourceProviderSrsReporting     curDsProviderClass;
+        DocTmpIdRef                           dsProviderClassIdRef;
+    
+    
+        dsProviderClassIdRef.clear();
+    
+        dictBaseClass = new DictClass(classNum(DocDataSourceProviderSrsReporting));
+    
+        curDsProviderClass = dictBaseClass.makeObject();
+        dsProviderClassIdRef.Name       = dictBaseClass.name();
+        dsProviderClassIdRef.HelpTxt    = curDsProviderClass.description();
+        dsProviderClassIdRef.insert();
+    
+        listEnumerator = dictBaseClass.extendedBy().getEnumerator();
+        while (listEnumerator.moveNext())
+        {
+            dictClass = new DictClass(listEnumerator.current());
+            if (dictClass != null && !dictClass.isAbstract())
+            {
+                curDsProviderClass = dictClass.makeObject();
+    
+                dsProviderClassIdRef.Name       = dictClass.name();
+                dsProviderClassIdRef.HelpTxt    = curDsProviderClass.description();
+                dsProviderClassIdRef.insert();
+            }
+        }
+    
+        return dsProviderClassIdRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>existsSrsReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if exists an SSRS report in AOT with the given name.
+    /// </summary>
+    /// <param name="_reportName">SSRS report name.</param>
+    /// <returns>True if exists an SSRS report with the given name.</returns>
+    public static boolean existsSrsReport(str _reportName)
+    {
+        str errMsg = strFmt('Error while retrieving the report (%1) metadata', _reportName);
+        try
+        {
+            if (!_reportName)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _reportName is not set');
+            }
+            AxReport axReport = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetReport(_reportName);
+            if (axReport != null)
+            {
+                return true;
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), errMsg);
+        }
+        catch (Exception::Internal)
+        {
+            DocGlobalHelper::handleClrException(funcName(), errMsg);
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), errMsg);
+        }
+    
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReportName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the report name from the specified report and design name
+    /// </summary>
+    /// <param name = "_srsReportNameAndDesign">SSRS report and design name</param>
+    /// <returns>The report name</returns>
+    public static ReportName getReportName(SRSCatalogItemName _srsReportNameAndDesign)
+    {
+        int             pointPosition;
+        ReportName      reportName;
+    
+        if (!_srsReportNameAndDesign)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _srsReportNameAndDesign is not set');
+        }
+    
+        pointPosition = strScan(_srsReportNameAndDesign, '.', 1, strLen(_srsReportNameAndDesign));
+        if (pointPosition > 0)
+        {
+            reportName = subStr(_srsReportNameAndDesign, 1, pointPosition - 1);
+        }
+        else
+        {
+            reportName = '';
+        }
+    
+        return reportName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSrsReportUIName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the SSRS report UI name.
+    /// </summary>
+    /// <param name = "_srsReportName">SSRS report name</param>
+    /// <returns>The SSRS report UI name</returns>
+    public static str getSrsReportUIName(str _srsReportName)
+    {
+        str                     srsReportUIName;
+        String255               srsReportNameLike;
+        PrintMgmtReportFormat   printMgmtReports;
+    
+        srsReportUIName = '';
+        if (_srsReportName == 'AgreementConfirmation')
+        {
+            srsReportUIName =
+                enum2Str(PrintMgmtDocumentType::SalesAgreementConfirmation)
+                + ' / ' +
+                enum2Str(PrintMgmtDocumentType::PurchAgreementConfirmation);
+            return srsReportUIName;
+        }
+    
+        srsReportNameLike = _srsReportName + '.*';
+        select firstOnly RecId, DocumentType from printMgmtReports
+        where printMgmtReports.Name like srsReportNameLike;
+    
+        if (printMgmtReports.RecId)
+        {
+            srsReportUIName = enum2Str(printMgmtReports.DocumentType);
+        }
+    
+        return srsReportUIName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAotResourceFilename</Name>
+				<Source><![CDATA[
+    /*--------------------- Methods related to handling templates and their storage -------------------*/
+
+    /// <summary>
+    /// Gets the AOT resource filename for specified resource name.
+    /// </summary>
+    /// <param name = "_resourceName">A reosurce name</param>
+    /// <returns>the AOT resource filename</returns>
+    public static str getAotResourceFilename(str _resourceName)
+    {
+        str resourceFilename;
+
+        if (_resourceName == '')
+        {
+            return '';
+        }
+
+        AxResource resource = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetResource(_resourceName);
+        
+        if (resource != null)
+        {
+            resourceFilename = resource.FileName;
+        }
+
+        return resourceFilename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>downloadTemplate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Downloads the template file for the given template.
+    /// </summary>
+    /// <param name = "_templateRecId">The template RecId</param>
+    public static void downloadTemplate(RecId _templateRecId)
+    {
+        boolean templateFileExists;
+        str templateFileNotExistsErrMsg;
+
+        try
+        {
+            // Validate parameters.
+            if (_templateRecId == 0)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _templateRecId is not set');
+            }
+            DocReportTemplate template = DocReportTemplate::find(_templateRecId);
+            if (template.RecId == 0)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('Template with the RecId (%1) does not exist', _templateRecId));
+            }
+            if (!template.isFileAttached())
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:TemplateFileNotAttached", template.TemplateId));
+            }
+            [templateFileExists, templateFileNotExistsErrMsg] = template.templateFileExists(true);
+            if (!templateFileExists)
+            {
+                DocGlobalHelper::handleException(funcName(), templateFileNotExistsErrMsg);
+            }
+
+            // Send the template file to user.
+            using (System.IO.MemoryStream templateMemoryStream =
+                   DocReportTemplate::getTemplateContent(template.TemplateId, template.CompanyId, template.LanguageID, true))
+            {
+                DocFileMngHelper::sendFileToUser(templateMemoryStream, template.filename());
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX:TemplateFileDownloadFailed");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkTemplateForConditions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given template fulfill the given filter.
+    /// </summary>
+    /// <param name = "_template">Template to be evaluated against the given filter</param>
+    /// <param name = "_customizationLevelFilter">Customization level filter's value</param>
+    /// <param name = "_storageTypeFilter">Current storage type filter's value</param>
+    /// <param name = "_companyIdFilter">Company filter's value</param>
+    /// <returns>True if the filter's conditions are met, false otherwise</returns>
+    public static boolean checkTemplateForConditions(DocReportTemplate _template, DocTemplateCustomizationLevelFilter _customizationLevelFilter,
+                                                     DocTemplateStorageTypeFilter _storageTypeFilter, CompanyId _companyIdFilter)
+    {
+        if ((_customizationLevelFilter == DocTemplateCustomizationLevelFilter::All
+            || (_customizationLevelFilter == DocTemplateCustomizationLevelFilter::CustomTemplates && _template.customizationLevel() == DocReportTemplateCustomizationLevel::Custom)
+            || (_customizationLevelFilter == DocTemplateCustomizationLevelFilter::CustomSysTemplates && _template.customizationLevel() == DocReportTemplateCustomizationLevel::CustomizedSystem)
+            || (_customizationLevelFilter == DocTemplateCustomizationLevelFilter::CustomOrCustomizedSysTemplates
+                    && (_template.customizationLevel() == DocReportTemplateCustomizationLevel::Custom || _template.customizationLevel() == DocReportTemplateCustomizationLevel::CustomizedSystem))
+            || (_customizationLevelFilter == DocTemplateCustomizationLevelFilter::SysTemplates && _template.customizationLevel() == DocReportTemplateCustomizationLevel::System)
+           ) &&
+           (_storageTypeFilter == DocTemplateStorageTypeFilter::Any
+            || (_storageTypeFilter == DocTemplateStorageTypeFilter::BlobStorage && _template.CurrentStorageType == DocTemplateStorageType::AzureBlobStorage)
+            || (_storageTypeFilter == DocTemplateStorageTypeFilter::FileSystem && _template.CurrentStorageType == DocTemplateStorageType::FileSystem)
+            || (_storageTypeFilter == DocTemplateStorageTypeFilter::SharePoint && _template.CurrentStorageType == DocTemplateStorageType::SharePoint)
+           ) &&
+           (_companyIdFilter == '' || (_companyIdFilter == _template.CompanyId))
+          )
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>downloadTemplatesForReports</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Downloads the templates files for the given reports in the form of ZIP file.
+    /// </summary>
+    /// <param name = "_reportRecIds">Report RecIds in a set, i.e. [ReportRecId1, ReportRecId2, ...]</param>
+    /// <param name = "_zipFilename">Zip filename</param>
+    /// <param name = "_customizationLevelFilter">Customization level filter's value</param>
+    /// <param name = "_storageTypeFilter">Current storage type filter's value</param>
+    /// <param name = "_companyIdFilter">Company filter's value</param>
+    /// <returns>Number of the downloaded templates</returns>
+    public static int downloadTemplatesForReports(Set _reportRecIds, str _zipFilename,
+                                                  DocTemplateCustomizationLevelFilter _customizationLevelFilter = DocTemplateCustomizationLevelFilter::All,
+                                                  DocTemplateStorageTypeFilter _storageTypeFilter = DocTemplateStorageTypeFilter::Any,
+                                                  CompanyId _companyIdFilter = curExt())
+    {
+        DocReportTemplate       template;
+        boolean                 templateFileExists;
+        str                     templateFileNotExistsErrMsg, downloadTemplateErrorMsg;
+        int                     downloadTemplateCount = 0;
+
+
+        void addTemplatesToZipFileForReport(RecId _reportRecId, ZipArchive _archive)
+        {
+            while select template where template.Report == _reportRecId
+            {
+                downloadTemplateErrorMsg = strFmt("@DocentricAX:TemplateFailedToBeIncludedIntoZip", template.TemplateId);
+
+                // Validate the template.
+                if (!template.isFileAttached())
+                {
+                    downloadTemplateErrorMsg = downloadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                           strFmt("@DocentricAX:TemplateFileNotAttached", template.TemplateId);
+                    DocGlobalHelper::handleWarning(downloadTemplateErrorMsg);
+                    continue;
+                }
+                [templateFileExists, templateFileNotExistsErrMsg] = template.templateFileExists(true);
+                if (!templateFileExists)
+                {
+                    downloadTemplateErrorMsg = downloadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' + templateFileNotExistsErrMsg;
+                    DocGlobalHelper::handleWarning(downloadTemplateErrorMsg);
+                    continue;
+                }
+
+                if (!DocReportingSetupHelper::checkTemplateForConditions(template, _customizationLevelFilter, _storageTypeFilter, _companyIdFilter))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    // Include the template file in the archive.
+                    using (System.IO.MemoryStream templateMemoryStream =
+                               DocReportTemplate::getTemplateContent(template.TemplateId, template.CompanyId, template.LanguageID, true))
+                    {
+                        ZipArchiveEntry fileInArchive = _archive.CreateEntry(template.fileName(), CompressionLevel::Optimal);
+                        using (System.IO.Stream fileInArchiveMemoryStream = fileInArchive.Open())
+                        {
+                            templateMemoryStream.CopyTo(fileInArchiveMemoryStream);
+                            fileInArchiveMemoryStream.Flush();
+                        }
+                    }
+
+                    // Increment the counter.
+                    downloadTemplateCount++;
+                }
+                catch (Exception::CLRError)
+                {
+                    DocGlobalHelper::handleClrError();
+                    DocGlobalHelper::handleWarning(downloadTemplateErrorMsg);
+                }
+                catch (Exception::Internal)
+                {
+                    DocGlobalHelper::handleClrError();
+                    DocGlobalHelper::handleWarning(downloadTemplateErrorMsg);
+                }
+                catch
+                {
+                    DocGlobalHelper::handleWarning(downloadTemplateErrorMsg);
+                }
+            }
+        }
+
+
+        if (_reportRecIds == null || _reportRecIds.elements() == 0)
+        {
+            DocGlobalHelper::handleError("@DocentricAX:NoReportSelected", true, '', true);
+        }
+
+        try
+        {
+            if (_zipFilename == '')
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _reportRecIds is not set');
+            }
+            
+            using (System.IO.MemoryStream archiveStream = new System.IO.MemoryStream())
+            {
+                using (ZipArchive archive = new ZipArchive(archiveStream, ZipArchiveMode::Create, true))
+                {
+                    // For each of the given reports, zip all its templates.
+                    SetEnumerator setEnum = _reportRecIds.getEnumerator();
+                    while (setEnum.moveNext())
+                    {
+                        RecId reportRecId = setEnum.current();
+                        addTemplatesToZipFileForReport(reportRecId, archive);
+                    }
+                }
+                
+                // Send the ZIP file to user.
+                if (downloadTemplateCount > 0)
+                {
+                    archiveStream.Position = 0;
+                    DocFileMngHelper::sendFileToUser(archiveStream, _zipFilename, '', '', '', '', true, true);
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrError();
+            DocGlobalHelper::handleError("@DocentricAX:TemplateFilesDownloadFailed", true, '', true);
+        }
+        catch (Exception::Internal)
+        {
+            DocGlobalHelper::handleClrError();
+            DocGlobalHelper::handleError("@DocentricAX:TemplateFilesDownloadFailed", true, '', true);
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX:TemplateFilesDownloadFailed", true, '', true);
+        }
+
+        return downloadTemplateCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>uploadTemplatesToAzureContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uploads the given template files to the given azure container.
+    /// </summary>
+    /// <param name = "_archiveMemoryStream">ZIP file containing the uploading template files</param>
+    /// <param name = "_azureContainer">Azure blob container name.</param>
+    /// <param name = "_overrideIfExists">If any of uploading templates already exists in the target container, it will be overriden.</param>
+    /// <param name = "_suppressMsg">Supress info messages</param>
+    /// <returns>[Number of the successfully uploaded templates, number of files in the provided archive]</returns>
+    public static container uploadTemplatesToAzureContainer(System.IO.MemoryStream _archiveMemoryStream, str _azureContainer,
+                                                            boolean _overrideIfExists = true, boolean _suppressMsg = false)
+    {
+        str uploadTemplateErrorMsg;
+        int uploadedTemplateCount = 0;
+        int fileInArchiveListCount = 0;
+
+        // Validate parameters.
+        if (_azureContainer == '' || _archiveMemoryStream == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _azureContainer and/or _archiveMemoryStream are not set');
+        }
+        if (!DocAzureBlobHelper::isContainerNameValid(_azureContainer))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:InvalidContainerName", _azureContainer));
+        }
+
+        try
+        {
+            _archiveMemoryStream.Position = 0;
+            using (ZipArchive archive = new ZipArchive(_archiveMemoryStream, ZipArchiveMode::Read, true))
+            {
+                System.Collections.IList fileInArchiveList = archive.Entries;
+                fileInArchiveListCount = ListHelper::Count(fileInArchiveList);
+                for (int i = 0; i < fileInArchiveListCount; i++)
+                {
+                    ZipArchiveEntry fileInArchive = ListHelper::GetItem(fileInArchiveList, i);
+                    str templateFilename = fileInArchive.Name;
+
+                    uploadTemplateErrorMsg = strFmt("@DocentricAX:FileFailedToBeUploadedToAzure", templateFilename, _azureContainer);
+
+                    if (!DocFileMngHelper::isFileWordDocument(templateFilename))
+                    {
+                        uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                 strFmt("@DocentricAX:TemplateIsNotWordDoc", templateFilename);
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                        continue;
+                    }
+
+                    try
+                    {
+                        using (System.IO.Stream templateFileContent = fileInArchive.Open())
+                        {
+                            using (System.IO.MemoryStream templateFileMemoryStream = new System.IO.MemoryStream())
+                            {
+                                str reportId;
+
+                                templateFileContent.CopyTo(templateFileMemoryStream);
+                                templateFileMemoryStream.Position = 0;
+
+                                if (!TemplateHelper::IsTemplateDocument(templateFileMemoryStream, byref reportId))
+                                {
+                                    uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                             strFmt("@DocentricAX:FileIsNotDocentricAXTemplate", templateFilename);
+                                    DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                    continue;
+                                }
+
+                                // To ensure case-sensitivity, reload the report ID from the database.
+                                reportId = DocReportTable::findReportId(reportId).ReportId;
+
+                                // Set again the stream position to 0, since the TemplateHelper::IsTemplateDocument() has changed this property.
+                                templateFileMemoryStream.Position = 0;
+
+                                if (reportId == '')
+                                {
+                                    uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' + "@DocentricAX:UploadToAzureLegacyError";
+                                    DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                    continue;
+                                }
+                            
+                                // Upload file to the given Azure container.
+                                str blobName = reportId + DocConstantFile::AzureBlobStorageVirtualDirectoryDelimiter + templateFilename;
+                                try
+                                {
+                                    if (!_overrideIfExists)
+                                    {
+                                        // Check if the blob already exists.
+                                        if (BlobStorageHelper::BlobExists(_azureContainer, blobName))
+                                        {
+                                            uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                                     strFmt("@DocentricAX:BlobAlreadyExists", blobName, _azureContainer);
+                                            DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                            continue;
+                                        }
+                                    }
+
+                                    // Upload blob.
+                                    DocAzureBlobHelper::uploadBlob(_azureContainer, blobName, templateFileMemoryStream);
+                                }
+                                catch
+                                {
+                                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ErrorUploadingFileToBlobStorage", templateFilename, _azureContainer, blobName));
+                                    continue;
+                                }
+                            }
+                            // Increment the counter.
+                            uploadedTemplateCount++;
+                        }
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        DocGlobalHelper::handleClrError();
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                    catch (Exception::Internal)
+                    {
+                        DocGlobalHelper::handleClrError();
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                }
+
+                // Inform about success.
+                if (!_suppressMsg)
+                {
+                    if (fileInArchiveListCount == 0)
+                    {
+                        DocGlobalHelper::handleWarning("@DocentricAX3:NoTemplateFontsInZipArchive");
+                    }
+                    else // if (fileInArchiveListCount > 0)
+                    {
+                        if (uploadedTemplateCount == 0)
+                        {
+                            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:UploadedTemplateFontCountZeroAzure", fileInArchiveListCount, _azureContainer));
+                        }
+                        else // if (uploadedTemplateCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX3:UploadedTemplateFontCountAzure", uploadedTemplateCount, fileInArchiveListCount, _azureContainer));
+                        }
+                        int failedToUpload = fileInArchiveListCount - uploadedTemplateCount;
+                        if (failedToUpload > 0  && uploadedTemplateCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX3:TemplateFontFilesCountFailedUpload", failedToUpload, fileInArchiveListCount));
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX3:TemplateFontFilesUploadFailed");
+        }
+
+        return [uploadedTemplateCount, fileInArchiveListCount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>uploadTemplateFontsToAzureContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uploads the given template font files to the given azure container in ZIP format. ZIP file is being repacked to a new ZIP containing only supported fonts files.
+    /// NOTE: Existing ZIP file will be overriden and all the new fonts have to be contained in the new ZIP file.
+    /// </summary>
+    /// <param name = "_archiveMemoryStream">ZIP file containing the uploading template font files</param>
+    /// <param name = "_azureContainer">Azure blob container name.</param>
+    /// <param name = "_overrideIfExists">If any of uploading template font files already exists in the target container, it will be overriden.</param>
+    /// <param name = "_suppressMsg">Supress info messages</param>
+    /// <returns>[Number of the successfully uploaded template font files, number of files in the provided archive, number of invalid font files in ZIP package]</returns>
+    public static container uploadTemplateFontsToAzureContainer(System.IO.MemoryStream _archiveMemoryStream, str _azureContainer, 
+                                                                boolean _overrideIfExists = true, boolean _suppressMsg = false)
+    {
+        str uploadTemplateErrorMsg;
+        int uploadedTemplateFontCount = 0;
+        int fileInArchiveListCount = 0;
+        int invalidFilesInArchiveListCount = 0;
+
+        // Validate parameters.
+        if (_azureContainer == '' || _archiveMemoryStream == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _azureContainer and/or _archiveMemoryStream are not set');
+        }
+        if (!DocAzureBlobHelper::isContainerNameValid(_azureContainer))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:InvalidContainerName", _azureContainer));
+        }
+
+        try
+        {
+            // start unzipping files 
+            _archiveMemoryStream.Position = 0;
+            using (System.IO.Compression.ZipArchive archive = new System.IO.Compression.ZipArchive(_archiveMemoryStream, ZipArchiveMode::Read, true))
+            {
+                // prepare new ZIP file to repack only the supported custom fonts
+                using(System.IO.MemoryStream destinationArchiveMemoryStream = new MemoryStream())
+                {
+                    using (System.IO.Compression.ZipArchive destinationArchive = new System.IO.Compression.ZipArchive(destinationArchiveMemoryStream, ZipArchiveMode::Create, true))
+                    {
+                        System.Collections.IList fileInArchiveList = archive.Entries;
+                        int allArchiveEntriesCount = ListHelper::Count(fileInArchiveList);
+                        
+                        // Create a list of processed filenames to be albe to remote duplicates
+                        Set processedFileNames = new Set(Types::String);
+
+                        // Let's read all the files in the ZIP
+                        for (int i = 0; i < allArchiveEntriesCount; i++)
+                        {
+                            ZipArchiveEntry fileInArchive = ListHelper::GetItem(fileInArchiveList, i);
+                            str templateFontFilename = fileInArchive.Name;
+
+                            // If current ZIP entry is folder we need to skip it
+                            if (System.String::IsNullOrEmpty(templateFontFilename))
+                            {
+                                continue;
+                            }
+
+                            fileInArchiveListCount++;
+
+                            uploadTemplateErrorMsg = strFmt("@DocentricAX:FileFailedToBeUploadedToAzure", templateFontFilename, _azureContainer);
+
+                            // If we have duplicate files we need to skip loading them
+                            if (processedFileNames.in(templateFontFilename))
+                            {
+                                uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                 strFmt("@DocentricAX3:DuplicateFontFilesFoundInSourceZipPackage", templateFontFilename);
+                                DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                continue;
+                            }
+
+                            processedFileNames.add(templateFontFilename);
+
+                            try
+                            {
+                                using (System.IO.Stream unzippedTemplateFontFileContent = fileInArchive.Open())
+                                {
+                                    // We need to copy the unzipped file stream to memory as we need to do some checks before packing this stream to destination zip
+                                    using(System.IO.MemoryStream templateFontFileContent = new System.IO.MemoryStream())
+                                    {
+                                        unzippedTemplateFontFileContent.CopyTo(templateFontFileContent);
+
+                                        // Check if the source file and stream is a valid font file.
+                                        if (!(DocFileMngHelper::isFileFont(templateFontFilename) && DocFileMngHelper::isSupportedFontStream(templateFontFileContent)))
+                                        {
+                                            // Increment invalid font counter.
+                                            invalidFilesInArchiveListCount++;
+
+                                            uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                 strFmt("@DocentricAX3:SourceFileIsNotAValidFontFile", templateFontFilename);
+                                            DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                            continue;
+                                        }
+
+                                        // Add font to new ZIP file as it has passed supported font control
+                                        ZipArchiveEntry destinationFileInArchive = destinationArchive.CreateEntry(templateFontFilename, CompressionLevel::Optimal);
+                                        using (System.IO.Stream destinationFileInArchiveMemoryStream = destinationFileInArchive.Open())
+                                        {
+                                            templateFontFileContent.Position = 0;
+                                            templateFontFileContent.CopyTo(destinationFileInArchiveMemoryStream);
+                                            destinationFileInArchiveMemoryStream.Flush();
+                                        }
+
+                                        // Increment valid font counters
+                                        uploadedTemplateFontCount++;
+                                    }
+                                }
+                            }
+                            catch (Exception::CLRError)
+                            {
+                                DocGlobalHelper::handleClrError();
+                                DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                            }
+                            catch (Exception::Internal)
+                            {
+                                DocGlobalHelper::handleClrError();
+                                DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                            }
+                            catch
+                            {
+                                DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                            }
+                        }
+                    }
+
+
+                    // Upload newly create ZIP file to the given Azure container only if there are any new files to be upload
+                    if (uploadedTemplateFontCount > 0)
+                    {
+                        str blobName = DocConstant::CustomBlobStorageFontsZipFilename;
+                        uploadTemplateErrorMsg = strFmt("@DocentricAX:FileFailedToBeUploadedToAzure", blobName, _azureContainer);
+                        try
+                        {
+                            // Check if the blob already exists.
+                            boolean blobExists = BlobStorageHelper::BlobExists(_azureContainer, blobName);
+                                
+                            // File will not be overriden if override is not forced
+                            if ((!_overrideIfExists) && (blobExists))
+                            {
+                                uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                                    strFmt("@DocentricAX:BlobAlreadyExists", blobName, _azureContainer);
+                                DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                            }
+                            else
+                            {
+                                // Upload blob.
+                                destinationArchiveMemoryStream.Position = 0;
+                                DocAzureBlobHelper::uploadBlob(_azureContainer, blobName, destinationArchiveMemoryStream);
+                            }
+                        }
+                        catch
+                        {
+                            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ErrorUploadingFileToBlobStorage", blobName, _azureContainer, blobName));
+                        }
+                    }
+                }
+
+                // Inform about success.
+                if (!_suppressMsg)
+                {
+                    if (fileInArchiveListCount == 0)
+                    {
+                        DocGlobalHelper::handleWarning("@DocentricAX3:NoTemplateFontsInZipArchive");
+                    }
+                    else // if (fileInArchiveListCount > 0)
+                    {
+                        if (uploadedTemplateFontCount == 0)
+                        {
+                            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:UploadedTemplateFontCountZeroAzure", fileInArchiveListCount, _azureContainer));
+                        }
+                        else // if (uploadedTemplateFontCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX3:UploadedTemplateFontCountAzure", uploadedTemplateFontCount, fileInArchiveListCount, _azureContainer));
+                        }
+                        int failedToUpload = fileInArchiveListCount - uploadedTemplateFontCount;
+                        if (failedToUpload > 0  && uploadedTemplateFontCount > 0)
+                        {
+                            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:TemplateFontFilesCountFailedUpload", failedToUpload, fileInArchiveListCount));
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX3:TemplateFontFilesUploadFailed");
+        }
+
+        return [uploadedTemplateFontCount, fileInArchiveListCount, invalidFilesInArchiveListCount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>uploadTemplatesToFileSystemFolder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uploads the given template files to the given folder on File system.
+    /// </summary>
+    /// <param name = "_archiveMemoryStream">ZIP file containing the uploading template files</param>
+    /// <param name = "_fsFolder">Destination File system folder path.</param>
+    /// <param name = "_overrideIfExists">If any of uploading templates already exists in the target folder, it will be overriden.</param>
+    /// <param name = "_suppressMsg">Supress info messages</param>
+    /// <returns>[Number of the successfully uploaded templates, number of files in the provided archive]</returns>
+    public static container uploadTemplatesToFileSystemFolder(System.IO.MemoryStream _archiveMemoryStream, str _fsFolder,
+                                                              boolean _overrideIfExists = true, boolean _suppressMsg = false)
+    {
+        str getFullFilename(str _templateFilename)
+        {
+            str filePath = _fsFolder;
+            if (!strEndsWith(filePath, DocConstantFile::FilePathDelimiter))
+            {
+                filePath = filePath + DocConstantFile::FilePathDelimiter;
+            }
+            str fullFilename = filePath + _templateFilename;
+            return fullFilename;
+        }
+
+        str uploadTemplateErrorMsg;
+        int uploadedTemplateCount = 0;
+        int fileInArchiveListCount = 0;
+
+        // Validate parameters.
+        if (_fsFolder == '' || _archiveMemoryStream == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _fsFolder and/or _archiveMemoryStream are not set');
+        }
+        // Check if file path is a UNC path.
+        if (!DocFileMngHelper::isUncFilePath(_fsFolder))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:DefaultFolderIsNotUncPath", _fsFolder));
+        }
+        // Validate file path characters.
+        if (!DocFileMngHelper::isValidFilePath(_fsFolder))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:DefaultFolderInvalidChars", _fsFolder));
+        }
+
+
+        try
+        {
+            _archiveMemoryStream.Position = 0;
+            using (ZipArchive archive = new ZipArchive(_archiveMemoryStream, ZipArchiveMode::Read, true))
+            {
+                System.Collections.IList fileInArchiveList = archive.Entries;
+                fileInArchiveListCount = ListHelper::Count(fileInArchiveList);
+                for (int i = 0; i < fileInArchiveListCount; i++)
+                {
+                    ZipArchiveEntry fileInArchive = ListHelper::GetItem(fileInArchiveList, i);
+                    str templateFilename = fileInArchive.Name;
+
+                    uploadTemplateErrorMsg = strFmt("@DocentricAX:FileFailedToUploadToFs", templateFilename, _fsFolder);
+
+                    if (!DocFileMngHelper::isFileWordDocument(templateFilename))
+                    {
+                        uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                 strFmt("@DocentricAX:TemplateIsNotWordDoc", templateFilename);
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                        continue;
+                    }
+
+                    try
+                    {
+                        using (System.IO.Stream templateFileContent = fileInArchive.Open())
+                        {
+                            using (System.IO.MemoryStream templateFileMemoryStream = new System.IO.MemoryStream())
+                            {
+                                str reportId;
+
+                                templateFileContent.CopyTo(templateFileMemoryStream);
+                                templateFileMemoryStream.Position = 0;
+
+                                if (!TemplateHelper::IsTemplateDocument(templateFileMemoryStream, byref reportId))
+                                {
+                                    uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                             strFmt("@DocentricAX:FileIsNotDocentricAXTemplate", templateFilename);
+                                    DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                    continue;
+                                }
+
+                                // Set again the stream position to 0, since the TemplateHelper::IsTemplateDocument() has changed this property.
+                                templateFileMemoryStream.Position = 0;
+                            
+                                // Upload file to the given File system folder.
+                                str fullFilename = getFullFilename(templateFilename);
+                                try
+                                {
+                                    if (!_overrideIfExists)
+                                    {
+                                        // Check if the file already exists.
+                                        if (DocFileSystemMngHelper::fileExistsOnFileSystem(fullFilename))
+                                        {
+                                            uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                                     strFmt("@DocentricAX:TemplateFileAlreadyExistsOnFileSystem", templateFilename, _fsFolder);
+                                            DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                            continue;
+                                        }
+                                    }
+
+                                    // Upload file.
+                                    DocFileSystemMngHelper::createFolderAndSaveToFileSystem(templateFileMemoryStream,_fsFolder, fullFilename);
+                                }
+                                catch
+                                {
+                                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ErrorUploadingFileToFileSystem", templateFilename, _fsFolder));
+                                    continue;
+                                }
+                            }
+                            // Increment the counter.
+                            uploadedTemplateCount++;
+                        }
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        DocGlobalHelper::handleClrError();
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                    catch (Exception::Internal)
+                    {
+                        DocGlobalHelper::handleClrError();
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                }
+
+                // Inform about success.
+                if (!_suppressMsg)
+                {
+                    if (fileInArchiveListCount == 0)
+                    {
+                        DocGlobalHelper::handleWarning("@DocentricAX:NoTemplateInZipArchive");
+                    }
+                    else // if (fileInArchiveListCount > 0)
+                    {
+                        if (uploadedTemplateCount == 0)
+                        {
+                            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:UploadedTemplateCountZeroFileSystem", fileInArchiveListCount, _fsFolder));
+                        }
+                        else // if (uploadedTemplateCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX:UploadedTemplateCountFileSystem", uploadedTemplateCount, fileInArchiveListCount, _fsFolder));
+                        }
+                        int failedToUpload = fileInArchiveListCount - uploadedTemplateCount;
+                        if (failedToUpload > 0  && uploadedTemplateCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX:TemplateFilesCountFailedUpload", failedToUpload, fileInArchiveListCount));
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX:TemplateFilesUploadFailed");
+        }
+
+        return [uploadedTemplateCount, fileInArchiveListCount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>uploadTemplatesToSharePoint</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uploads the given template files to the given SharePoint location.
+    /// </summary>
+    /// <param name = "_archiveMemoryStream">ZIP file containing the uploading template files</param>
+    /// <param name = "_spSiteUrl">SharePoint site URL</param>
+    /// <param name = "_spFolderPath">SharePoint folder path</param>
+    /// <param name = "_overrideIfExists">If any of uploading templates already exists in the target container, it will be overriden.</param>
+    /// <param name = "_suppressMsg">Supress info messages</param>
+    /// <returns>[Number of the successfully uploaded templates, number of files in the provided archive]</returns>
+    public static container uploadTemplatesToSharePoint(System.IO.MemoryStream _archiveMemoryStream, str _spSiteUrl, str _spFolderPath,
+                                                        boolean _overrideIfExists = true, boolean _suppressMsg = false)
+    {
+        str uploadTemplateErrorMsg;
+        int uploadedTemplateCount = 0;
+        int fileInArchiveListCount = 0;
+
+        // Validate parameters.
+        if (_spSiteUrl == '' || _spFolderPath == '' || _archiveMemoryStream == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _spSiteUrl, _spFolderPath and/or _archiveMemoryStream are not set');
+        }
+
+        // Validate site URL.
+        if (!DocGlobalHelper::validateURL(_spSiteUrl))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:SharePointSiteUrlInvalid", _spSiteUrl));
+        }
+
+        // Validate folder path.
+        // Folder path should not start with '/'.
+        if (strStartsWith(_spFolderPath, DocConstantFile::SharePointFolderPathDelimiter))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:SharePointFolderPathInvalidStart", _spFolderPath));
+        }
+        if (!DocSharePointHelperV3::isValidSharePointFolderPath(_spFolderPath))
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:SharePointFolderPathInvalid", _spFolderPath));
+        }
+
+        try
+        {
+            using (ZipArchive archive = new ZipArchive(_archiveMemoryStream, ZipArchiveMode::Read, true))
+            {
+                System.Collections.IList fileInArchiveList = archive.Entries;
+                fileInArchiveListCount = ListHelper::Count(fileInArchiveList);
+                for (int i = 0; i < fileInArchiveListCount; i++)
+                {
+                    ZipArchiveEntry fileInArchive = ListHelper::GetItem(fileInArchiveList, i);
+                    str templateFilename = fileInArchive.Name;
+
+                    uploadTemplateErrorMsg = strFmt("@DocentricAX:FileFailedToBeUploadedToSharePoint", templateFilename, _spSiteUrl, _spFolderPath);
+
+                    if (!DocFileMngHelper::isFileWordDocument(templateFilename))
+                    {
+                        uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                 strFmt("@DocentricAX:TemplateIsNotWordDoc", templateFilename);
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                        continue;
+                    }
+
+                    try
+                    {
+                        // Check if the file is a Docentric template.
+                        using (System.IO.Stream templateFileContent = fileInArchive.Open())
+                        {
+                            using (System.IO.MemoryStream templateFileMemoryStream = new System.IO.MemoryStream())
+                            {
+                                templateFileContent.CopyTo(templateFileMemoryStream);
+                                templateFileMemoryStream.Position = 0;
+
+                                if (!TemplateHelper::IsTemplateDocument(templateFileMemoryStream))
+                                {
+                                    uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                             strFmt("@DocentricAX:FileIsNotDocentricAXTemplate", templateFilename);
+                                    DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                    continue;
+                                }
+
+                                // Set again the stream position to 0, since the TemplateHelper::IsTemplateDocument() has changed this property.
+                                templateFileMemoryStream.Position = 0;
+
+                                // Upload file to the given SharePoint location.
+                                str sharePointFileUrl;
+                                try
+                                {
+                                    DocSharePointCredentials spCredentials = DocSharePointCredentials::constructFromSetup(_spSiteUrl, _spFolderPath, DocSharePointRole::TemplateWriter);
+
+                                    if (!_overrideIfExists)
+                                    {
+                                        // Check if the file already exists on the given SharePoint location.
+                                        if (DocSharePointHelperV3::fileExistsByName(
+                                                                        _spSiteUrl,
+                                                                        _spFolderPath,
+                                                                        templateFilename,
+                                                                        spCredentials,
+                                                                        true,
+                                                                        true))
+                                        {
+                                            uploadTemplateErrorMsg = uploadTemplateErrorMsg + '. ' + "@DocentricAX:Reason" + ': ' +
+                                                                     strFmt("@DocentricAX:FileAlreadyExistsOnSharePointLocation", templateFilename);
+                                            DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                                            continue;
+                                        }
+                                    }
+
+                                    sharePointFileUrl = DocSharePointHelperV3::uploadToSharePoint(
+                                                                                    templateFileMemoryStream, 
+                                                                                    templateFilename, 
+                                                                                    _spSiteUrl, 
+                                                                                    _spFolderPath, 
+                                                                                    spCredentials,
+                                                                                    true, 
+                                                                                    true);
+                                }
+                                catch
+                                {
+                                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ErrorUploadingFileToSharePoint", templateFilename, _spSiteUrl, _spFolderPath));
+                                    continue;
+                                }
+                            }
+
+                            // Increment the counter.
+                            uploadedTemplateCount++;
+                        }
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        DocGlobalHelper::handleClrError();
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                    catch (Exception::Internal)
+                    {
+                        DocGlobalHelper::handleClrError();
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleWarning(uploadTemplateErrorMsg);
+                    }
+                }
+
+                // Inform about success.
+                if (!_suppressMsg)
+                {
+                    if (fileInArchiveListCount == 0)
+                    {
+                        DocGlobalHelper::handleWarning("@DocentricAX:NoTemplateInZipArchive");
+                    }
+                    else // if (fileInArchiveListCount > 0)
+                    {
+                        if (uploadedTemplateCount == 0)
+                        {
+                            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:UploadedTemplateCountZero", fileInArchiveListCount, _spSiteUrl, _spFolderPath));
+                        }
+                        else // if (uploadedTemplateCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX:UploadedTemplateCount", uploadedTemplateCount, fileInArchiveListCount, _spSiteUrl, _spFolderPath));
+                        }
+                        int failedToUpload = fileInArchiveListCount - uploadedTemplateCount;
+                        if (failedToUpload > 0  && uploadedTemplateCount > 0)
+                        {
+                            DocGlobalHelper::handleInfo(strFmt("@DocentricAX:TemplateFilesCountFailedUpload", failedToUpload, fileInArchiveListCount));
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX:TemplateFilesUploadFailed");
+        }
+
+        return [uploadedTemplateCount, fileInArchiveListCount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildReportAotResourceList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a list of report templates from AOT resources for the specified report Id.
+    /// </summary>
+    /// <param name = "_reportId">Report Id</param>
+    /// <returns>A list of report templates from AOT resources</returns>
+    public static List buildReportAotResourceList(str _reportId)
+    {
+        if (_reportId == '')
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _reportId is not set');
+        }
+
+
+        List reportResources = new List(Types::Class);  // List(DocAotResourceInfo)
+
+        StringEnumerator resourceNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ResourceNames();
+        while (resourceNameStringEnum.moveNext())
+        {
+            str resourceName = resourceNameStringEnum.Current;
+            AxResource resource = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetResource(resourceName);
+
+            if (!DocFileMngHelper::isFileWordDocument(resource.FileName))
+            {
+                continue;
+            }
+            
+            using (System.IO.MemoryStream resourceContent = DocGlobalHelper::getAotResourceContent(resourceName))
+            {
+                if (!TemplateHelper::IsTemplateDocument(resourceContent))
+                {
+                    continue;
+                }
+            
+                DocAotResourceInfo resourceInfo = DocAotResourceInfo::construct(resource, resourceContent);
+                
+                // Check if this is an invalid legacy template.
+                if (resourceInfo.reportId() == '')
+                {
+                    str warningMsg = strFmt("@DocentricAX:InvalidResource", resourceName, resource.FileName) + ' ' +
+                                     "@DocentricAX:Reason" + ': ' + "@DocentricAX:LegacyTemplateError";
+                    DocGlobalHelper::handleWarning(warningMsg);
+                    continue;
+                }
+
+                if (resourceInfo.reportId() != _reportId)
+                {
+                    continue;
+                }
+
+                // Add to the list.
+                reportResources.addEnd(resourceInfo);
+            }
+        }
+
+        return reportResources;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildReportAotResourceMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a map of report templates from AOT resources.
+    /// </summary>
+    /// <param name = "_reportIdSet">Set of report Ids</param>
+    /// <param name = "_includeReportsFromSet">Specifies whether to include reports from the set</param>
+    /// <returns>A map of report templates from AOT resources</returns>
+    public static Map buildReportAotResourceMap(Set _reportIdSet, boolean _includeReportsFromSet = true)
+    {
+        Map resourcesByReport = new Map(Types::String, Types::Class);  // Map(ReportId, List(DocAotResourceInfo))
+
+        StringEnumerator resourceNameStringEnum = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::ResourceNames();
+        while (resourceNameStringEnum.moveNext())
+        {
+            str resourceName = resourceNameStringEnum.Current;
+            AxResource resource = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetResource(resourceName);
+
+            if (!DocFileMngHelper::isFileWordDocument(resource.FileName))
+            {
+                continue;
+            }
+            
+            using (System.IO.MemoryStream resourceContent = DocGlobalHelper::getAotResourceContent(resourceName))
+            {
+                if (!TemplateHelper::IsTemplateDocument(resourceContent))
+                {
+                    continue;
+                }
+
+                DocAotResourceInfo resourceInfo = DocAotResourceInfo::construct(resource, resourceContent);
+                
+                // Check if this is an invalid legacy template.
+                if (resourceInfo.reportId() == '')
+                {
+                    str warningMsg = strFmt("@DocentricAX:InvalidResource", resourceName, resource.FileName) + ' ' +
+                                     "@DocentricAX:Reason" + ': ' + "@DocentricAX:LegacyTemplateError";
+                    DocGlobalHelper::handleWarning(warningMsg);
+                }
+                
+                if (_includeReportsFromSet)
+                {
+                    // Check if the reportID is in the given set.
+                    if (!_reportIdSet.in(resourceInfo.reportId()))
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Check if the reportID is NOT in the given set.
+                    if (_reportIdSet.in(resourceInfo.reportId()))
+                    {
+                        continue;
+                    }
+                }
+            
+                // Add to the map.
+                if (resourcesByReport.exists(resourceInfo.reportId()))
+                {
+                    List reportResourceList = resourcesByReport.lookup(resourceInfo.reportId());
+                    reportResourceList.addEnd(resourceInfo);
+                }
+                else
+                {
+                    List reportResourceList = new List(Types::Class); // List(DocAotResourceInfo)
+                    reportResourceList.addEnd(resourceInfo);
+                    resourcesByReport.insert(resourceInfo.reportId(), reportResourceList);
+                }
+            }
+        }
+
+        return resourcesByReport;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reloadSystemTemplate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reload the system template from the corresponding AOT resource for the given template if such exists.
+    /// </summary>
+    /// <param name = "_templateRecId">The template RecId</param>
+    /// <returns>True if the corresponding system template is found and reloaded.</returns>
+    public static boolean reloadSystemTemplate(RecId _templateRecId)
+    {
+        DocReportTemplate   template;
+        DocReportTable      report;
+        List                reportResources;
+        ListEnumerator      listEnum;
+        DocAotResourceInfo  templateResourceInfo;
+  
+
+        if (_templateRecId != 0)
+        {
+            template = DocReportTemplate::find(_templateRecId);
+        }
+        if (template.RecId == 0)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt('Template with RecId (%1) not found', _templateRecId));
+        }
+        if (template.isCustomTemplate())
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt('Only system or customized system templates can be reloaded. Template (%1) is not a (customized) system template', template.TemplateId));
+        }
+        report = DocReportTable::find(template.Report);
+        if (report.RecId == 0)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt('Parent report of the template (%1) not found', template.TemplateId));
+        }
+
+        reportResources = DocReportingSetupHelper::buildReportAotResourceList(report.ReportId);  // List(DocAotResourceInfo)
+        listEnum = reportResources.getEnumerator();
+
+        // Find system template candidate.
+        boolean templateFound = false;
+
+        // First search by Template ID.
+        while (listEnum.moveNext())
+        {
+            templateResourceInfo = listEnum.current();
+
+            // Skip the current resource template if marked with the tag: "SkipLoadSystem=true"
+            if (templateResourceInfo.skipLoadAsSystemTemplate())
+            {
+                continue;
+            }
+
+            if (templateResourceInfo.templateId() == template.TemplateId)
+            {
+                templateFound = true;
+                break;
+            }
+        }
+
+        if (!templateFound)
+        {
+            // Then search by OriginalStorageResourceName, if it is set.
+            listEnum.reset();
+            if (template.OriginalStorageResourceName != '')
+            {
+                while (listEnum.moveNext())
+                {
+                    templateResourceInfo = listEnum.current();
+                    if (templateResourceInfo.resourceName() == template.OriginalStorageResourceName)
+                    {
+                        if ((templateResourceInfo.templateId() == '' || (templateResourceInfo.templateId() != '' && templateResourceInfo.templateId() == template.TemplateId))
+                            &&
+                            (templateResourceInfo.companyId() == '' || (templateResourceInfo.companyId() != '' && templateResourceInfo.companyId() == template.CompanyId))
+                            &&
+                            (templateResourceInfo.languageId() == '' || (templateResourceInfo.languageId() != '' && templateResourceInfo.languageId() == template.LanguageId)))
+                        {
+                            templateFound = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!templateFound)
+        {
+            return false;
+        }
+
+        ttsBegin;
+
+        template.selectForUpdate(true);
+
+        // Reset the storage fields for the existing template.
+        template.updateStorageFields_ResetAll();
+        template.FileNameAot = templateResourceInfo.fileName();
+        template.StorageResourceName = templateResourceInfo.resourceName();
+        template.CurrentStorageType = DocTemplateStorageType::AOT;
+        template.OriginalStorageType = DocTemplateStorageType::AOT;
+        template.OriginalStorageResourceName = template.StorageResourceName;
+
+        // Set the DataSourceType field (SSRS, ER Data model).
+        template.DataSourceType = templateResourceInfo.dataSourceType();
+
+        // Update.
+        template.doUpdate();
+    
+        ttsCommit;
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reloadSystemTemplatesForReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reload the system template from the corresponding AOT resource for the specified report list.
+    /// </summary>
+    /// <param name = "_report">The DocReportTable table buffer</param>
+    /// <param name = "_reportResources">Thereport list</param>
+    /// <param name = "_loadOnlyNewTemplates">Specifies whether to load only new templates</param>
+    /// <returns>A container with result information</returns>
+    private static container reloadSystemTemplatesForReport(DocReportTable _report, List _reportResources, boolean _loadOnlyNewTemplates = false)
+    {
+        ListEnumerator      listEnum;
+        DocReportTemplate   importingReportTemplate, existingReportTemplate;
+        int                 countOfInserted, countOfUpdated;
+
+        void validateParameters()
+        {
+            if (_report.RecId == 0)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _report is not set');
+            }
+            if (_reportResources == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _reportResources is not set');
+            }
+        }
+
+        validateParameters();
+
+        listEnum = _reportResources.getEnumerator();
+        while (listEnum.moveNext())
+        {
+            DocAotResourceInfo templateResourceInfo = listEnum.current();
+
+            // Skip the current resource template if marked with the tag: "SkipLoadSystem=true"
+            if (templateResourceInfo.skipLoadAsSystemTemplate())
+            {
+                continue;
+            }
+
+            if (templateResourceInfo.templateId() != '')
+            {
+                // Try to find the template by the template ID.
+                existingReportTemplate = DocReportTemplate::findTemplateId(
+                    templateResourceInfo.templateId(), templateResourceInfo.companyId(), templateResourceInfo.languageId(), true);
+
+                // Check if the parent reports are matched.
+                if (existingReportTemplate.RecId != 0 && existingReportTemplate.Report != _report.RecId)  // _report.ReportId is always equal to the templateResourceInfo.reportId()
+                {
+                    DocGlobalHelper::handleException(funcName(),
+                        strFmt('Template (%1) found for the resource (%2) that has assigned TemplateID = %3, CompanyID = %4 and LanguageID = %5. But it has different parent report (%6) than provided (%7)',
+                        existingReportTemplate.TemplateId, templateResourceInfo.resourceName(), templateResourceInfo.templateId(), templateResourceInfo.companyId(), templateResourceInfo.languageId(),
+                        DocReportTable::find(existingReportTemplate.Report).ReportId, _report.ReportId));
+                }
+
+                if (existingReportTemplate.isCustomTemplate())
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ReloadSystemTemplateCustomTemplateWithSameIdAlreadyExists",
+                            templateResourceInfo.resourceName(), templateResourceInfo.fileName(), existingReportTemplate.TemplateId));
+                    continue;
+                }
+            }
+            else
+            {
+                // Try to find the template by the OriginalStorageResourceName field.
+                RecId templateFoundRecId = 0;
+
+                while select existingReportTemplate
+                      where existingReportTemplate.Report == _report.RecId &&
+                            existingReportTemplate.OriginalStorageType == DocTemplateStorageType::AOT &&
+                            existingReportTemplate.OriginalStorageResourceName != '' &&
+                            existingReportTemplate.OriginalStorageResourceName == templateResourceInfo.resourceName()
+                {
+                    if ((templateResourceInfo.templateId() == '' || (templateResourceInfo.templateId() != '' && templateResourceInfo.templateId() == existingReportTemplate.TemplateId))
+                        &&
+                        (templateResourceInfo.companyId() == '' || (templateResourceInfo.companyId() != '' && templateResourceInfo.companyId() == existingReportTemplate.CompanyId))
+                        &&
+                        (templateResourceInfo.languageId() == '' || (templateResourceInfo.languageId() != '' && templateResourceInfo.languageId() == existingReportTemplate.LanguageId)))
+                    {
+                        templateFoundRecId = existingReportTemplate.RecId;
+                        break;
+                    }
+                }
+                existingReportTemplate = DocReportTemplate::find(templateFoundRecId, true);
+            }
+
+            if (existingReportTemplate && !_loadOnlyNewTemplates)
+            {
+                // Store old values before updating.
+                boolean templateHadFileAttached = existingReportTemplate.isFileAttached();
+                DocReportTemplateCustomizationLevel templateOldCustomizationLevel = existingReportTemplate.customizationLevel();
+                str templateOldLocationUrl = existingReportTemplate.azureBlobStoragePath();
+                str templateOldStorageType = "@DocentricAX:AzureBlobStorage";
+                if (templateOldLocationUrl == '')
+                {
+                    templateOldLocationUrl = existingReportTemplate.sharePointFileUrl();
+                    templateOldStorageType = "@DocentricAX:SharePointStorage";
+                }
+                if (templateOldLocationUrl == '')
+                {
+                    templateOldLocationUrl = existingReportTemplate.fileSystemFullFilename();
+                    templateOldStorageType = "@DocentricAX:FileSystem";
+                }
+
+
+                ttsBegin;
+
+                // Reset the storage fields for the existing template.
+                existingReportTemplate.updateStorageFields_ResetAll();
+                existingReportTemplate.FileNameAot = templateResourceInfo.fileName();
+                existingReportTemplate.StorageResourceName = templateResourceInfo.resourceName();
+                existingReportTemplate.CurrentStorageType = DocTemplateStorageType::AOT;
+                existingReportTemplate.OriginalStorageType = DocTemplateStorageType::AOT;
+                existingReportTemplate.OriginalStorageResourceName = existingReportTemplate.StorageResourceName;
+                
+                // Set the DataSourceType field (SSRS, ER Data model).
+                existingReportTemplate.DataSourceType = templateResourceInfo.dataSourceType();
+
+                // Update.
+                existingReportTemplate.doUpdate();
+                ttscommit;
+
+                countOfUpdated++;
+
+                if (templateHadFileAttached)
+                {
+                    if (templateOldCustomizationLevel == DocReportTemplateCustomizationLevel::System)
+                    {
+                        DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ReloadSystemTemplatesTemplateAlreadyExists", existingReportTemplate.TemplateId));
+                    }
+                    else // if (templateCustomizationLevel == DocReportTemplateCustomizationLevel::CustomizedSystem)
+                    {
+                        DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ReloadCustSystemTemplatesTemplateAlreadyExists",
+                            existingReportTemplate.TemplateId, templateOldStorageType, templateOldLocationUrl));
+                    }
+                }
+                else
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ReloadSystemTemplatesTemplateWithoutAttachedFileAlreadyExists", existingReportTemplate.TemplateId));
+                }
+            }
+            else if (!existingReportTemplate)
+            {
+                // Insert the new report template.
+                importingReportTemplate.clear();
+                importingReportTemplate.Report = _report.RecId;
+                
+                importingReportTemplate.CompanyId = templateResourceInfo.companyId();
+                importingReportTemplate.LanguageID = templateResourceInfo.languageId();
+
+                importingReportTemplate.TemplateId = templateResourceInfo.templateId();
+
+                if (importingReportTemplate.TemplateId == '')
+                {
+                    // Set Template ID to the filename of the resource.
+                    importingReportTemplate.TemplateId = DocFileMngHelper::getFileNameWithoutExtension(templateResourceInfo.fileName());
+
+                    // Check if such template already exists - this is possible if the template was added using the New button
+                    // and afterwards no template file is attached. In this case, only issue a warning.
+                    DocReportTemplate testTemplate = DocReportTemplate::findTemplateId(
+                        importingReportTemplate.TemplateId, importingReportTemplate.CompanyId, importingReportTemplate.LanguageID);
+                    if (testTemplate.RecId != 0)
+                    {
+                        DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ReloadSystemTemplateTemplateIdAlreadyExistsWarning",
+                            templateResourceInfo.resourceName(), templateResourceInfo.fileName(), importingReportTemplate.TemplateId));
+                        continue;
+                    }
+                }
+                
+                // Set the storage fields.
+                importingReportTemplate.FileNameAot = templateResourceInfo.fileName();
+                importingReportTemplate.StorageResourceName = templateResourceInfo.resourceName();
+                importingReportTemplate.CurrentStorageType = DocTemplateStorageType::AOT;
+                importingReportTemplate.OriginalStorageType = DocTemplateStorageType::AOT;
+                importingReportTemplate.OriginalStorageResourceName = importingReportTemplate.StorageResourceName;
+
+                // Marked the template as ER based if needed.
+                importingReportTemplate.DataSourceType = templateResourceInfo.dataSourceType();
+                
+
+                ttsbegin;
+                // Insert and set the default flag is needed.
+                importingReportTemplate.insert();
+                ttscommit;
+
+                countOfInserted++;
+            }
+        }
+
+        return [countOfInserted, countOfUpdated];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFirstSystemTemplateForReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the first system template from the specified report list.
+    /// </summary>
+    /// <param name = "_reportResourceInfoList">A report list</param>
+    /// <returns>The first system template resource info</returns>
+    private static DocAotResourceInfo getFirstSystemTemplateForReport(List _reportResourceInfoList)
+    {
+        ListEnumerator listEnum = _reportResourceInfoList.getEnumerator();
+        DocAotResourceInfo currentReportTemplateResourceInfo;
+        boolean firstTemplateFound = false;
+        while (listEnum.moveNext())
+        {
+            currentReportTemplateResourceInfo = listEnum.current();
+                
+            // If the current resource (template) is not marked with the tag: "SkipLoadSystem=true",
+            // we can use it for the reloading report.
+            if (!currentReportTemplateResourceInfo.skipLoadAsSystemTemplate())
+            {
+                firstTemplateFound = true;
+                break;
+            }
+        }
+
+        if (firstTemplateFound)
+        {
+            return currentReportTemplateResourceInfo;
+        }
+
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFirstSystemERTemplateForReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the first system ER based report template from the specified report template list
+    /// for the specified  first report template resource info object.
+    /// </summary>
+    /// <param name = "_firstReportTemplateResourceInfo">The first report template resource info object</param>
+    /// <param name = "_reportResourceInfoList">A report template list</param>
+    /// <returns>The first system ER based report template resource info object</returns>
+    private static DocAotResourceInfo getFirstSystemERTemplateForReport(DocAotResourceInfo _firstReportTemplateResourceInfo, List _reportResourceInfoList)
+    {
+        ListEnumerator listEnum = _reportResourceInfoList.getEnumerator();
+        DocAotResourceInfo currentReportTemplateResourceInfo;
+        boolean firstERTemplateFound = false;
+
+        if (!_firstReportTemplateResourceInfo)
+        {
+            return null;
+        }
+
+        while (listEnum.moveNext())
+        {
+            currentReportTemplateResourceInfo = listEnum.current();
+
+            // Check if the report Id matches
+            if (currentReportTemplateResourceInfo.reportId() != _firstReportTemplateResourceInfo.reportId())
+            {
+                continue;
+            }
+
+            // Check if the report template should be skipped
+            if (currentReportTemplateResourceInfo.skipLoadAsSystemTemplate())
+            {
+                continue;
+            }
+
+            // Check if the report template is ER based
+            if (currentReportTemplateResourceInfo.dataSourceType() == DocTemplateDataSourceType::ERDataModel)
+            {
+                firstERTemplateFound = true;
+                break;
+            }
+        }
+
+        if (firstERTemplateFound)
+        {
+            return currentReportTemplateResourceInfo;
+        }
+
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reloadSystemTemplatesForReportsV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reload system templates from the corresponding AOT Resources for the given reports.
+    /// </summary>
+    /// <param name = "_reportIds">Report Ids in a set, i.e. [ReportId1, ReportId2, ...]</param>
+    /// <param name = "_loadOnlyNewTemplates">Should only new templates be loaded</param>
+    /// <param name = "_countOnlyReports">When true, only affected reports are counted; when false inserted and updated system templates are counted</param>
+    /// <returns>[The number of reports having system templates reloaded or the number of system templates (re)loaded,
+    /// the number of invalid reports, the first invalid report record encountered, the total number of validated reports]</returns>
+    public static container reloadSystemTemplatesForReportsV2(Set _reportIds, boolean _loadOnlyNewTemplates = false, boolean _countOnlyReports = true)
+    {
+        DocReportTable updatingReport;
+
+        // Updates the report with the data from the resource info object of the specified report template. If the specified report
+        // template is based on SSRS and the report also contains report templates based on ER, the report is also updated with ER
+        // data from the specified ER based report template resource info object.
+        DocReportTable updateReport(DocAotResourceInfo _reportTemplateResourceInfo, DocAotResourceInfo _erReportTemplateResourceInfo)
+        {
+            if (updatingReport.RecId == 0)
+            {
+                return updatingReport;
+            }
+
+            boolean updated = false;
+            
+            // Check if the report group should be updated.
+            if (_reportTemplateResourceInfo.reportGroupId() != '')
+            {
+                // Update group only if the updating report doesn't have a group assigned.
+                if (updatingReport.ReportGroup == 0)
+                {
+                    DocReportGroup reportGroup = DocReportGroup::findOrInsert(_reportTemplateResourceInfo.reportGroupId(), '');
+                    if (updatingReport.ReportGroup != reportGroup.RecId)
+                    {
+                        updatingReport.ReportGroup = reportGroup.RecId;
+                        updated = true;
+                    }
+                }
+            }
+
+            // Check if the DSP class differs from the default DSP class.
+            if (_reportTemplateResourceInfo.dspClassName() != '' &&
+                _reportTemplateResourceInfo.dspClassName() != updatingReport.DataSourceProviderClassName)
+            {
+                updatingReport.DataSourceProviderClassName = _reportTemplateResourceInfo.dspClassName();
+                updated = true;
+            }
+
+            // Set the ER Model Mapping GUID if this is an ER-based template.
+            if (_erReportTemplateResourceInfo && _erReportTemplateResourceInfo.dataSourceType() == DocTemplateDataSourceType::ERDataModel)
+            {
+                if (!_erReportTemplateResourceInfo.erModelMappingGuid())
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:InvalidTemplateErMetadataWarningMsg", _erReportTemplateResourceInfo.templateId(), _erReportTemplateResourceInfo.reportId()));
+                }
+                else
+                {
+                    ERModelMappingTable erModelMapping = ERModelMappingTable::findByGUID(_erReportTemplateResourceInfo.erModelMappingGuid());
+                    if (erModelMapping)
+                    {
+                        updatingReport.ERModelMapping = erModelMapping.RecId;
+                        updated = true;
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleWarning(DocReportingSetupHelper::validateERConfiguration(_erReportTemplateResourceInfo.reportId(),
+                            _erReportTemplateResourceInfo.erModelMappingGuid(), _erReportTemplateResourceInfo.erModelMappingName(),
+                            _erReportTemplateResourceInfo.erDataModelGuid(), _erReportTemplateResourceInfo.erDataModelName(),
+                            _erReportTemplateResourceInfo.erSolutionGuid(), _erReportTemplateResourceInfo.erSolutionName()));
+                    }
+                }
+            }
+
+            if (updated)
+            {
+                ttsbegin;
+                updatingReport.selectForUpdate(true);
+                updatingReport.doUpdate();
+                ttscommit;
+            }
+
+            return updatingReport;
+        }
+        
+
+        if (_reportIds.elements() == 0)
+        {
+            DocGlobalHelper::handleError("@DocentricAX:NoReportSelected");
+            return [0, 0, null, 0];
+        }
+
+        // Build the resources by report map but inlcude only those reports provided in the input set.
+        Map resourcesByReport = DocReportingSetupHelper::buildReportAotResourceMap(_reportIds, true);  // Map(ReportId, List(DocAotResourceInfo)), i.e. Map(Types::String, Types::Class)
+        MapEnumerator mapEnum = resourcesByReport.getEnumerator();
+        
+        int counter = 0;
+        int invalidReportCount = 0;
+        int validatedReportCount = 0;
+        DocReportTable firstInvalidReportRecord = null;
+        while (mapEnum.moveNext())
+        {
+            List resourceInfoList = mapEnum.currentValue();
+
+            // Only first report template will be considered regarding report group and DSP class.
+            // Also, this first template will be set as default.
+            DocAotResourceInfo firstReportTemplateResourceInfo = DocReportingSetupHelper::getFirstSystemTemplateForReport(resourceInfoList);
+
+            if (firstReportTemplateResourceInfo)
+            {
+                // Get the first ER based report template for the selected report Id from the firstReportTemplateResourceInfo object.
+                // It will be used to update the ER model mapping GUID field when updating the report.
+                DocAotResourceInfo firstERReportTemplateResourceInfo = DocReportingSetupHelper::getFirstSystemERTemplateForReport(firstReportTemplateResourceInfo, resourceInfoList);
+
+                // Check if the report exists in Docentric report setup.
+                str srsReportNameAndDesign = firstReportTemplateResourceInfo.reportId();
+                updatingReport = DocReportTable::findReportId(srsReportNameAndDesign);
+                if (updatingReport.RecId == 0)
+                {
+                    continue;
+                }
+
+                // Reload system templates for this report.
+                int insSysTempl, updSysTempl;
+                [insSysTempl, updSysTempl] = DocReportingSetupHelper::reloadSystemTemplatesForReport(updatingReport, resourceInfoList, _loadOnlyNewTemplates);
+
+                // Do not update the existing report if "Load only new" is invoked and no new templates was found.
+                if ((_loadOnlyNewTemplates && insSysTempl > 0) || (!_loadOnlyNewTemplates && ((insSysTempl + updSysTempl) > 0)))
+                {
+                    // Update the existing report.
+                    updateReport(firstReportTemplateResourceInfo, firstERReportTemplateResourceInfo);
+
+                    // Validate the updated report and increment number of invalid reports.
+                    invalidReportCount += conPeek(DocReportTable::validateReports([updatingReport.RecId]), 2);
+
+                    // Save first encountered invalid report record.
+                    if (invalidReportCount == 1 && !firstInvalidReportRecord)
+                    {
+                        firstInvalidReportRecord = updatingReport;
+                    }
+                }
+
+                // Increment the counter based on _countOnlyReports flag
+                if (_countOnlyReports)
+                {
+                    // only affected reports are counted
+                    counter++;
+                }
+                else
+                {
+                    // affected system templates are counted
+                    counter += (insSysTempl + updSysTempl);
+                }
+
+                // Increment counter for number of validated reports.
+                validatedReportCount++;
+            }
+        }
+
+        return [counter, invalidReportCount, firstInvalidReportRecord, validatedReportCount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reloadSystemTemplatesForReports</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reload system templates from the corresponding AOT Resources for the given reports.
+    /// </summary>
+    /// <param name = "_reportIds">Report Ids in a set, i.e. [ReportId1, ReportId2, ...]</param>
+    /// <param name = "_loadOnlyNewTemplates">Should only new templates be loaded</param>
+    /// <param name = "_countOnlyReports">When true, only affected reports are counted; when false inserted and updated system templates are counted</param>
+    /// <returns>The number of reports having system templates reloaded or the number of system templates (re)loaded</returns>
+    public static int reloadSystemTemplatesForReports(Set _reportIds, boolean _loadOnlyNewTemplates = false, boolean _countOnlyReports = true)
+    {
+        return conPeek(DocReportingSetupHelper::reloadSystemTemplatesForReportsV2(_reportIds, _loadOnlyNewTemplates, _countOnlyReports), 1);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reloadSystemTemplatesAndReports</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reload all system templates and the related reports from AOT Resources.
+    /// </summary>
+    /// <param name = "_loadOnlyNewReports">True, if only new reports should be loaded</param>
+    /// <returns>[Number of reports having system templates reloaded, Number of inserted reports using metadata from AOT,
+    /// the number of invalid reports, the first invalid report record encountered]</returns>
+    public static container reloadSystemTemplatesAndReports(boolean _loadOnlyNewReports = false)
+    {
+        int                 updatedReportCount, insertedReportCount, invalidReportCount, validatedReportCount;
+        DocReportTable      reportTable, firstInvalidReportRecord;
+
+        // Inserts a new report with the data from the resource info object of the specified report template. If the specified report
+        // template is based on SSRS and the report also contains report templates based on ER, the report is also updated with ER
+        // data from the specified ER based report template resource info object.
+        DocReportTable insertReport(DocAotResourceInfo _reportTemplateResourceInfo, DocAotResourceInfo _erReportTemplateResourceInfo)
+        {
+            DocReportTable insertedReport;
+            str srsReportName, srsReportDesign;
+            str srsReportNameAndDesign = _reportTemplateResourceInfo.reportId();
+
+            int pointPosition = strScan(srsReportNameAndDesign, '.', 1, strLen(srsReportNameAndDesign));
+            if (pointPosition > 0)
+            {
+                srsReportName = subStr(srsReportNameAndDesign, 1, pointPosition - 1);
+                srsReportDesign = subStr(srsReportNameAndDesign, pointPosition + 1, strLen(srsReportNameAndDesign));
+            }
+
+            // Check if such SSRS report design exists.
+            if (srsReportName == '' || srsReportDesign == '')
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('Invalid report ID (%1). It should be in the form <SSRSReportName>.<DesignName>', _reportTemplateResourceInfo.reportId()));
+            }
+
+            AxReport axReport = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetReport(srsReportName);
+            if (axReport == null)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('SSRS report with the name (%1) not found in AOT', srsReportName));
+            }
+
+            IEnumerable ssrsReportDesigns = axReport.Designs;
+            IEnumerator enumerator = ssrsReportDesigns.GetEnumerator();
+            boolean reportFound = false;
+            while (enumerator.moveNext())
+            {
+                AxReportDesign axReportDesign = enumerator.Current;
+                if (axReportDesign.Name == srsReportDesign)
+                {
+                    reportFound = true;
+                    break;
+                }
+            }
+            if (!reportFound)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('SSRS report with the name (%1) and design (%2) not found in AOT', srsReportName, srsReportDesign));
+            }
+
+            if (DocReportTable::findReportId(srsReportNameAndDesign).RecId != 0)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('SSRS report with ID (%1) already exists in the report setup', srsReportNameAndDesign));
+            }
+
+            RecId insertedReportRecId = DocReportTable::insertSrsReport(srsReportNameAndDesign, false);
+            insertedReport = DocReportTable::find(insertedReportRecId);
+
+            boolean updated = false;
+
+            // Check if the report group exists.
+            if (_reportTemplateResourceInfo.reportGroupId() != '')
+            {
+                DocReportGroup reportGroup = DocReportGroup::findOrInsert(_reportTemplateResourceInfo.reportGroupId(), '');
+                insertedReport.ReportGroup = reportGroup.RecId;
+                updated = true;
+            }
+
+            // Check if the DSP class differs from the default DSP class.
+            if (_reportTemplateResourceInfo.dspClassName() != '' &&
+                _reportTemplateResourceInfo.dspClassName() != insertedReport.DataSourceProviderClassName)
+            {
+                // Check if the DSP class read from the template is valid.
+                DocReportTable reportForDspValidation;
+                reportForDspValidation.DataSourceProviderClassName = _reportTemplateResourceInfo.dspClassName();
+                str validationMsgDspClass;
+                boolean isValidDspClass;
+                [isValidDspClass, validationMsgDspClass] = reportForDspValidation.validateDsProviderClassWithMsg();
+                if (!isValidDspClass)
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:InsertReportViaLoadingTemplateValidationErrMsg", validationMsgDspClass, _reportTemplateResourceInfo.reportId()));
+                }
+                else  // DSP class is valid
+                {
+                    insertedReport.DataSourceProviderClassName = _reportTemplateResourceInfo.dspClassName();
+                    updated = true;
+                }
+            }
+
+            // Set the ER Model Mapping Guid if this is an ER-based template.
+            if (_erReportTemplateResourceInfo && _erReportTemplateResourceInfo.dataSourceType() == DocTemplateDataSourceType::ERDataModel)
+            {
+                if (!_erReportTemplateResourceInfo.erModelMappingGuid())
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:InvalidTemplateErMetadataWarningMsg", _erReportTemplateResourceInfo.templateId(), _erReportTemplateResourceInfo.reportId()));
+                }
+                else
+                {
+                    ERModelMappingTable erModelMapping = ERModelMappingTable::findByGUID(_erReportTemplateResourceInfo.erModelMappingGuid());
+                    if (erModelMapping)
+                    {
+                        insertedReport.ERModelMapping = erModelMapping.RecId;
+                        updated = true;
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleWarning(DocReportingSetupHelper::validateERConfiguration(_erReportTemplateResourceInfo.reportId(),
+                            _erReportTemplateResourceInfo.erModelMappingGuid(), _erReportTemplateResourceInfo.erModelMappingName(),
+                            _erReportTemplateResourceInfo.erDataModelGuid(), _erReportTemplateResourceInfo.erDataModelName(),
+                            _erReportTemplateResourceInfo.erSolutionGuid(), _erReportTemplateResourceInfo.erSolutionName()));
+                    }
+                }
+            }
+
+            if (updated)
+            {
+                ttsbegin;
+                insertedReport.selectForUpdate(true);
+                insertedReport.doUpdate();
+                ttscommit;
+            }
+
+            return insertedReport;
+        }
+
+
+        Set reportSet = new Set(Types::String);
+
+        // Create set of Report IDs of all registered reports.
+        while select reportTable
+        {
+            reportSet.add(reportTable.ReportId);
+        }
+
+        // 1) Update existing reports.
+        updatedReportCount = 0;
+        invalidReportCount = 0;
+        if (!_loadOnlyNewReports && reportSet.elements() > 0)
+        {
+            [updatedReportCount, invalidReportCount, firstInvalidReportRecord, validatedReportCount]
+                = DocReportingSetupHelper::reloadSystemTemplatesForReportsV2(reportSet);
+        }
+
+        // 2) Insert new reports.
+        // Build the resources by report map but inlcude only those reports
+        // which are not registered in the report setup.
+        Map resourcesByReport = DocReportingSetupHelper::buildReportAotResourceMap(reportSet, false);  // Map(ReportId, List(DocAotResourceInfo)), i.e. Map(Types::String, Types::Class)
+        MapEnumerator mapEnum = resourcesByReport.getEnumerator();
+        
+        insertedReportCount = 0;
+        while (mapEnum.moveNext())
+        {
+            List resourceInfoList = mapEnum.currentValue();
+
+            // Only first report template will be considered regarding report group and DSP class.
+            // Also, this first template will be set as default.
+            DocAotResourceInfo firstReportTemplateResourceInfo = DocReportingSetupHelper::getFirstSystemTemplateForReport(resourceInfoList);
+            
+            if (firstReportTemplateResourceInfo)
+            {
+                // Get the first ER based report template for the selected report Id from the firstReportTemplateResourceInfo object.
+                // It will be used to update the ER model mapping GUID field when updating the report.
+                DocAotResourceInfo firstERReportTemplateResourceInfo = DocReportingSetupHelper::getFirstSystemERTemplateForReport(firstReportTemplateResourceInfo, resourceInfoList);
+
+                // Insert new report.
+                reportTable = insertReport(firstReportTemplateResourceInfo, firstERReportTemplateResourceInfo);
+
+                // Reload all system templates for the new inserting report.
+                DocReportingSetupHelper::reloadSystemTemplatesForReport(reportTable, resourceInfoList);
+
+                // Validate the inserted report and increment number of invalid reports.
+                invalidReportCount += conPeek(DocReportTable::validateReports([reportTable.RecId]), 2);
+
+                // Save first encountered invalid report record.
+                if (invalidReportCount == 1 && !firstInvalidReportRecord)
+                {
+                    firstInvalidReportRecord = reportTable;
+                }
+
+                // Increment counter.
+                insertedReportCount++;
+            }
+        }
+
+        return [updatedReportCount, insertedReportCount, invalidReportCount, firstInvalidReportRecord];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateERConfiguration</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the ER configuration for the specified report Id.
+    /// </summary>
+    /// <param name = "_reportId">Report Id</param>
+    /// <param name = "_erModelMappingGuid">ER model mapping guid</param>
+    /// <param name = "_erModelMappingName">ER model mapping name</param>
+    /// <param name = "_erDataModelGuid">ER model guid</param>
+    /// <param name = "_erDataModelName">ER model name</param>
+    /// <param name = "_erSolutionGuid">ER solution guid</param>
+    /// <param name = "_erSolutionName">ER solution name</param>
+    /// <returns>Empty string if the validation was successful; otherwise error message</returns>
+    public static str validateERConfiguration(str _reportId, guid _erModelMappingGuid, str _erModelMappingName,
+                                              guid _erDataModelGuid, str _erDataModelName, guid _erSolutionGuid, str _erSolutionName)
+    {
+        str errMsgMappingNotFoundModelFound = strFmt("@DocentricAX3:ErrMsgMappingNotFoundModelFound", _reportId, _erModelMappingName, _erModelMappingGuid, _erDataModelName, _erDataModelGuid);
+        str errMsgMappingNotFoundModelNotFound = strFmt("@DocentricAX3:ErrMsgMappingNotFoundModelNotFound", _reportId, _erModelMappingName, _erModelMappingGuid, _erDataModelName, _erDataModelGuid);
+        str errMsgConfigurationFound = strFmt("@DocentricAX3:ErrMsgConfigurationFound", _erSolutionName, _erSolutionGuid);
+        str errMsgERConfigurationFinal = "@DocentricAX3:ErrMsgERConfigurationFinal";
+        str errMsg = '';
+
+        ERModelMappingTable erModelMapping = ERModelMappingTable::findByGUID(_erModelMappingGuid);
+        if (!erModelMapping)
+        {
+            // Check if the related ER Data model exists.
+            ERDataModelTable erDataModel = ERDataModelTable::findByGUID(_erDataModelGuid);
+            if (erDataModel)
+            {
+                errMsg = errMsgMappingNotFoundModelFound;
+            }
+            else
+            {
+                errMsg = errMsgMappingNotFoundModelNotFound;
+                ERSolutionTable erSolution = ERSolutionTable::findByGUID(_erSolutionGuid);
+                if (erSolution)
+                {
+                    errMsg = strFmt('%1\n%2', errMsg, errMsgConfigurationFound);
+                }
+            }
+
+            errMsg = strFmt('%1\n%2', errMsg, errMsgERConfigurationFinal);
+        }
+
+        return errMsg;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addReportsForPrintMgmtDocumentType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add new SSRS report designs for the same print management document type (in active company).
+    /// </summary>
+    /// <param name = "_reportTable">The DocReportTable table buffer</param>
+    /// <param name = "_showInfo">Specifies whether to show info</param>
+    /// <returns>Number of report (designs) added.</returns>
+    public static int addReportsForPrintMgmtDocumentType(DocReportTable _reportTable, boolean _showInfo = true)
+    {
+        int countOfInsertedReports = 0;
+
+        void insertReportsForDocumentType(PrintMgmtDocumentType _documentType)
+        {
+            PrintMgmtReportFormat   printMgmtReportFormat;
+            DocReportTable          reportTable2;
+
+            ttsBegin;
+
+            while select printMgmtReportFormat group by Name where
+                printMgmtReportFormat.DocumentType == _documentType
+            notExists join reportTable2 where
+                reportTable2.SRSReportName == printMgmtReportFormat.Name
+            {
+                DocReportTableRecId reportRecId = DocReportTable::insertSrsReport(printMgmtReportFormat.Name, false);
+            
+                DocReportTable reportTable = DocReportTable::find(reportRecId, true);
+                reportTable.ReportGroup = _reportTable.ReportGroup;
+                reportTable.DataSourceProviderClassName = _reportTable.DataSourceProviderClassName;
+                reportTable.ERModelMapping = _reportTable.ERModelMapping;
+                reportTable.UseOnlyWithPrintDestinations = _reportTable.UseOnlyWithPrintDestinations;
+                reportTable.ReportDefaultCaption = _reportTable.ReportDefaultCaption;
+                reportTable.update();
+
+                if (_showInfo)
+                {
+                    // Inform about successfully added report.
+                    DocGlobalHelper::handleInfo(strFmt("@DocentricAX2:NewReportAddedInfo", reportTable.ReportId, printMgmtReportFormat.DocumentType, reportTable.DataSourceProviderClassName));
+                }
+
+                // Validate report.
+                DocReportTable::validateReports([reportRecId]);
+                countOfInsertedReports++;
+            }
+
+            ttsCommit;
+        }
+
+        // First populate the PrintMgmtReportFormat table for the current company.
+        DocPrintMgmtHelper::populatePrintMgmtReportFormat();
+
+        // Insert reports for all document types.
+        List documentTypeList = DocPrintMgmtHelper::getPrintMgmtDocumentTypes(_reportTable.ReportId);
+        ListEnumerator docTypeListEnum = documentTypeList.getEnumerator();
+
+        while(docTypeListEnum.moveNext())
+        {
+            PrintMgmtDocumentType documentType = docTypeListEnum.current();
+            insertReportsForDocumentType(documentType);
+        }
+        
+        return countOfInsertedReports;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportsFromXml</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports Docentric AX from the provided XML file.
+    /// </summary>
+    /// <param name = "_importXmlFileStream">Memory stream containing XML report setup data</param>
+    /// <returns>Number of imported reports</returns>
+    public static int importReportsFromXml(System.IO.MemoryStream _importXmlFileStream)
+    {
+        XmlElement          xmlElem;
+        XMLNodeList         xmlNodeList;
+        SysDictTable        sysDictTable;
+        XmlDocument         fromXmlDocument;
+        int                 importedReportCount;
+        str                 xpathStr;
+        RecId               importedReportRecId;
+        str                 reportSchemaVersion;
+    
+    
+        if (_importXmlFileStream == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _importXmlFileStream is not provided');
+        }
+    
+        try
+        {
+            fromXmlDocument = XmlDocument::newFromStream(_importXmlFileStream);
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), "@DocentricAX:ErrorWhileReadingXmlFile");
+        }
+    
+        try
+        {
+            xpathStr = DocConstant::ReportsRootElement;
+            xmlElem = fromXmlDocument.selectSingleNode(xpathStr);  // DocentricReports
+            if (xmlElem == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Invalid importing XML');
+            }
+            xpathStr = DocConstant::ReportsRootElement + @'/@' + DocConstant::ReportsVersionAttr;  // DocentricReports/@ReportSchemaVersion
+            XmlAttribute xmlAttr = fromXmlDocument.selectSingleNode(xpathStr);
+            if (xmlAttr == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Invalid importing XML - the @ReportSchemaVersion attribute does not exist');
+            }
+            reportSchemaVersion = xmlAttr.value();
+            if (reportSchemaVersion == '')
+            {
+                DocGlobalHelper::handleException(funcName(), 'Invalid importing XML - the @ReportSchemaVersion attribute is not set');
+            }
+
+            sysDictTable = new SysDictTable(tableNum(DocReportTable));
+            importedReportCount = 0;
+            xpathStr = @'//' + DocConstant::ReportsRootElement + @'/' + sysDictTable.name();
+            xmlNodeList = fromXmlDocument.selectNodes(xpathStr);
+            xmlElem = xmlNodeList.nextNode();
+            while (xmlElem != null)
+            {
+                // Import the report.
+                importedReportRecId = DocReportingSetupHelper::importReportFromXmlElement(xmlElem, reportSchemaVersion);
+                importedReportCount++;
+    
+                // Validate the report.
+                DocReportTable::validateReports([importedReportRecId]);
+    
+                xmlElem = xmlNodeList.nextNode();
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), "@DocentricAX:ErrorWhileImportingReports");
+        }
+    
+        // Inform about success.
+        DocGlobalHelper::handleInfo(strFmt("@DocentricAX:ReportsSuccessfullyImported", importedReportCount));
+
+        return importedReportCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports the report from the provided XML element.
+    /// </summary>
+    /// <param name = "_fromXmlElement">Xml element to import from</param>
+    /// <param name = "_reportSchemaVersion">Report schema version</param>
+    /// <returns>The record Id of imported report</returns>
+    private static RecId importReportFromXmlElement(XmlElement _fromXmlElement, str _reportSchemaVersion)
+    {
+        DocReportTable       importingReport, existingReport, existingReportBkp;
+        XmlNamedNodeMap      attributes;
+        XmlNodeList          xmlNodes;
+        XmlNode              xmlNode;
+        boolean              reportExists;
+        RecId                importingReportRecId;
+        guid                 erModelMappingGuid, erDataModelGuid, erSolutionGuid;
+        boolean              erModelMappingNotFound;
+        str                  erModelMappingName, erDataModelName, erSolutionName;
+    
+    
+        void setReportValidityFields(DocReportTable _reportTable)
+        {
+            _reportTable.IsValid = DocIsReportValid::Unchecked;
+            _reportTable.LastValidationDatetime = DateTimeUtil::getSystemDateTime();
+            _reportTable.ValidationErrorList = '';
+        }
+    
+    
+        void backupExistingReport()
+        {
+            existingReportBkp.clear();
+            buf2Buf(existingReport, existingReportBkp);
+        }
+    
+    
+        void restoreExistingReport_GenerateDSFlags()
+        {
+            existingReport.GenerateXmlDsWithReportRun = existingReportBkp.GenerateXmlDsWithReportRun;
+            existingReport.GenerateXmlDsWithReportRunSettings = existingReportBkp.GenerateXmlDsWithReportRunSettings;
+            existingReport.GenerateXmlDsWithReportRunMode = existingReportBkp.GenerateXmlDsWithReportRunMode;
+        }
+    
+
+        // Set report field from provided XML attribute.
+        void setReportField(XmlAttribute _xmlAttr)
+        {
+            str reportFieldName = _xmlAttr.name();
+            switch (_xmlAttr.name())
+            {
+                // String fields.
+                case fieldStr(DocReportTable, DataSourceProviderClassName):
+                case fieldStr(DocReportTable, ReportId):
+                case fieldStr(DocReportTable, SRSReportName):
+                case fieldStr(DocReportTable, SRSOnlyReportName):
+                case fieldStr(DocReportTable, SRSReportDesignName):
+                case fieldStr(DocReportTable, ReportDefaultCaption):
+                case fieldStr(DocReportTable, ReportDescription):
+                case fieldStr(DocReportTable, EmailAccountDisplayName):
+                case fieldStr(DocReportTable, EmailBounceToAddress):
+                case fieldStr(DocReportTable, EmailReplyToAddress):
+                case fieldStr(DocReportTable, EmailReadReceiptAddress):
+                case fieldStr(DocReportTable, PdfDocumentTitle):
+                case fieldStr(DocReportTable, PdfDocumentAuthor):
+                case fieldStr(DocReportTable, PdfDocumentSubject):
+                case fieldStr(DocReportTable, PdfDocumentKeywords):
+                    reportFieldName = _xmlAttr.name();
+                    importingReport.setFieldValue(reportFieldName, _xmlAttr.value());
+                    break;
+    
+                // ER Model Mapping Guid.
+                case DocConstant::ERModelMappingGuidExportAttr:
+                    erModelMappingGuid = str2Guid(_xmlAttr.value());
+                    if (erModelMappingGuid)
+                    {
+                        ERModelMappingTable erModelMapping = ERModelMappingTable::findByGUID(erModelMappingGuid);
+                        if (erModelMapping)
+                        {
+                            importingReport.ERModelMapping = erModelMapping.RecId;
+                        }
+                        else
+                        {
+                            erModelMappingNotFound = true;
+                        }
+                    }
+                    break;
+
+                // ER related fields.
+                case DocConstant::ERModelMappingNameExportAttr:
+                    erModelMappingName = _xmlAttr.value();
+                    break;
+
+                case DocConstant::ERDataModelGuidExportAttr:
+                    erDataModelGuid = str2Guid(_xmlAttr.value());
+                    break;
+
+                case DocConstant::ERDataModelNameExportAttr:
+                    erDataModelName = _xmlAttr.value();
+                    break;
+
+                case DocConstant::ERSolutionGuidExportAttr:
+                    erSolutionGuid = str2Guid(_xmlAttr.value());
+                    break;
+
+                case DocConstant::ERSolutionNameExportAttr:
+                    erSolutionName = _xmlAttr.value();
+                    break;
+
+                // Boolean fields.
+                case fieldStr(DocReportTable, IncludeCompanyLogoInDS):
+                case fieldStr(DocReportTable, IncludeHiddenParamsInDS):
+                case fieldStr(DocReportTable, IncludeSystemFieldsInDSSRS):
+                case fieldStr(DocReportTable, IsActiveSRS):
+                case fieldStr(DocReportTable, SuppressRDPExecution):
+                case fieldStr(DocReportTable, UseDocentricPreviewForSrs):
+                case fieldStr(DocReportTable, UseDocentricPreviewerForSrs):
+                case fieldStr(DocReportTable, IncludeDocuBrandingInDSSRS):
+                case fieldStr(DocReportTable, UseOnlyWithPrintDestinations):
+                case fieldStr(DocReportTable, IncludeAllDisplayMethodsInDS):
+                case fieldStr(DocReportTable, IncludeReportDefinedDispMethodsInDS):
+                case fieldStr(DocReportTable, IncludeReportDefinedFieldsInDS):
+                case fieldStr(DocReportTable, RestrictForNewPrinters):
+                    reportFieldName = _xmlAttr.name();
+                    if (strUpr(_xmlAttr.value()) == 'TRUE')
+                    {
+                        importingReport.setFieldValue(reportFieldName, true);
+                    }
+                    else if (strUpr(_xmlAttr.value()) == 'FALSE')
+                    {
+                        importingReport.setFieldValue(reportFieldName, false);
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleException(
+                            funcName(), strFmt('Unexpected value (%1) for the attribute (%2)', _xmlAttr.value(), _xmlAttr.name()));
+                    }
+                    break;
+    
+                default:
+                    if (_reportSchemaVersion != DocConstant::ImportExportVersion)
+                    {
+                        DocGlobalHelper::handleWarning(strFmt('Legacy attribute (%1 = %2) ignored', _xmlAttr.name(), _xmlAttr.value()));
+                    }
+                    else
+                    {
+                        // Enable a subscriber to set additional fields in the DocReportTable table from the provided XML element.
+                        EventHandlerResult result = DocReportingSetupHelper::importReportFromXmlElementSetReportField(_xmlAttr, importingReport);
+                        if (!(result.hasResult() && result.booleanResult()))
+                        {
+                            DocGlobalHelper::handleException(funcName(), strFmt('Unexpected attribute (%1 = %2)', _xmlAttr.name(), _xmlAttr.value()));
+                        }
+                    }
+            }
+        }
+    
+
+        // Get the list of report enum fields which needs to be set.
+        Set getReportEnumFields()
+        {
+            Set reportEnumFieldSet = new Set(Types::String);
+
+            reportEnumFieldSet.add(fieldStr(DocReportTable, ReportUsageType));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, EmailEmailingMode));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, EmailMsgPriority));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, EmailDeliveryReceiptCondition));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, ArchivingEmailAttachmentsOption));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, ArchivingReportParamsOption));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, ArchivingReportsOption));
+            reportEnumFieldSet.add(fieldStr(DocReportTable, ERModelDataToIncludeInDS));
+
+            // Enable a subscriber to add additional enum fields to the list to be set in the DocReportTable from the provided XML element.
+            DocReportingSetupHelper::importReportFromXmlElementAddReportEnumField(reportEnumFieldSet);
+
+            return reportEnumFieldSet;
+        }
+    
+
+        // Set report group from provided XML element.
+        void setReportGroup(XmlElement _xmlElemGroup)
+        {
+            str xmlAttrValueGroupId = _xmlElemGroup.getAttribute(fieldStr(DocReportGroup, GroupId));
+            str xmlAttrValueGroupDesc = _xmlElemGroup.getAttribute(fieldStr(DocReportGroup, Description));
+    
+            str reportFieldName = fieldStr(DocReportTable, ReportGroup);
+            DocReportGroup reportGroup = DocReportGroup::findOrInsert(xmlAttrValueGroupId, xmlAttrValueGroupDesc);
+    
+            importingReport.setFieldValue(reportFieldName, reportGroup.RecId);
+        }
+    
+
+        // Set report enum field from provided XML element
+        void setReportEnumField(XmlElement _xmlElemEnum)
+        {
+            str xmlAttrValue = _xmlElemEnum.getAttribute(DocConstantDSP::XmlAttrEnumValue);
+            str reportFieldName = _xmlElemEnum.name();
+            importingReport.setFieldValue(reportFieldName, str2int(xmlAttrValue));
+        }
+    
+    
+        erModelMappingNotFound = false;
+        importingReport.clear();
+    
+        attributes = _fromXmlElement.attributes();
+        xmlNode = attributes.nextNode();
+        while (xmlNode != null)
+        {
+            // Set all report's fields.
+            setReportField(xmlNode);
+            xmlNode = attributes.nextNode();
+        }
+
+        // Check if the importing Docentric SSRS report is valid.
+        if (importingReport.SRSReportName == ''|| importingReport.ReportId == '')
+        {
+            DocGlobalHelper::handleException(funcName(), 'Importing report does not have the ReportId and SRSReportName fields are not set');
+        }
+
+        // If the related ER Model Mapping is not found, throw a warning.
+        if (erModelMappingNotFound)
+        {
+            DocGlobalHelper::handleWarning(DocReportingSetupHelper::validateERConfiguration(
+                importingReport.ReportId, erModelMappingGuid, erModelMappingName, erDataModelGuid, erDataModelName, erSolutionGuid, erSolutionName));
+        }
+
+        // If this is a legacy report, fix the fields: SRSOnlyReportName and SRSReportDesignName.
+        if (importingReport.SRSOnlyReportName == '' || importingReport.SRSReportDesignName == '')
+        {
+            importingReport.SRSOnlyReportName = subStr(importingReport.ReportId, 1, strScan(importingReport.ReportId, '.', 1, strLen(importingReport.ReportId)) - 1);
+            importingReport.SRSReportDesignName = subStr(importingReport.ReportId, strScan(importingReport.ReportId, '.', 1, strLen(importingReport.ReportId)) + 1, strLen(importingReport.ReportId));
+        }
+    
+        // Report group.
+        xmlNode = _fromXmlElement.selectSingleNode(tableStr(DocReportGroup));
+        if (xmlNode != null)
+        {
+            setReportGroup(xmlNode);
+        }
+    
+        // Set report's enum fields.
+        SetEnumerator reportEnumFieldSetEnum = getReportEnumFields().getEnumerator();
+        while (reportEnumFieldSetEnum.moveNext())
+        {
+            xmlNode = _fromXmlElement.selectSingleNode(reportEnumFieldSetEnum.current());
+            if (xmlNode != null)
+            {
+                setReportEnumField(xmlNode);
+            }
+        }
+        
+        // Insert or update report.
+        ttsBegin;
+        existingReport = DocReportTable::findReportId(importingReport.ReportId, true);
+        if (existingReport)
+        {
+            backupExistingReport();
+    
+            buf2Buf(importingReport, existingReport);
+    
+            restoreExistingReport_GenerateDSFlags();
+            setReportValidityFields(existingReport);
+    
+            existingReport.update();
+    
+            importingReportRecId = existingReport.RecId;
+            reportExists = true;
+        }
+        else
+        {
+            setReportValidityFields(importingReport);
+            importingReport.insert();
+            importingReportRecId = importingReport.RecId;
+            reportExists = false;
+        }
+        ttsCommit;
+    
+    
+        setPrefix(DocConstant::Docentric);
+        setPrefix(importingReport.ReportId);
+    
+        // Import report labels.
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportLabel));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportLabelFromXmlElement(importingReportRecId, xmlNode, _reportSchemaVersion);
+            xmlNode = xmlNodes.nextNode();
+        }
+
+        // Import report settings per company.
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportCompanySetting));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportCompanySettingFromXmlElement(importingReportRecId, xmlNode);
+            xmlNode = xmlNodes.nextNode();
+        }
+
+        // Import email tokens print destination redirection settings per company.
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocEmailTokensPDRedirection));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportEmailTokensPDRedirectionSettingFromXmlElement(importingReportRecId, xmlNode);
+            xmlNode = xmlNodes.nextNode();
+        }
+
+        // Import user-defined placeholders
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportUserDefinedPlaceholder));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportUserDefinedPlaceholderFromXmlElement(importingReportRecId, xmlNode);
+            xmlNode = xmlNodes.nextNode();
+        }
+
+        // Import report email templates.
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportEmailTemplate));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportEmailTemplateFromXmlElement(importingReportRecId, xmlNode);
+            xmlNode = xmlNodes.nextNode();
+        }
+    
+        // Import report templates.
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportTemplate));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportTemplateFromXmlElement(importingReportRecId, xmlNode, _reportSchemaVersion);
+            xmlNode = xmlNodes.nextNode();
+        }
+
+        // Import PDF signature settings.
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportPdfSignatureSettings));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportPdfSignatureSettingsFromXmlElement(importingReportRecId, xmlNode);
+            xmlNode = xmlNodes.nextNode();
+        }
+    
+        // Import SharePoint settings
+        xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportSharePointSettings));
+        xmlNode = xmlNodes.nextNode();
+        while (xmlNode != null)
+        {
+            DocReportingSetupHelper::importReportSharePointSettingsFromXmlElement(importingReportRecId, xmlNode);
+            xmlNode = xmlNodes.nextNode();
+        }
+
+        // Inform about success.
+        if (reportExists)
+        {
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ImportingReportAlreadyExists", existingReport.ReportId));
+            DocReportTemplate::defaultDefaultTemplateForReport(existingReport.RecId);
+        }
+        else
+        {
+            DocGlobalHelper::handleInfo(strFmt("@DocentricAX:ReportImportedSuccess", importingReport.ReportId));
+        }
+    
+        return importingReportRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportFromXmlElementSetReportFieldDelegate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delegate for setting additional fields in the DocReportTable table from the provided XML element.
+    /// Enum fields are excluded. To set additional enum field, subscribe to the delegate
+    /// importReportFromXmlElementAddReportEnumFieldsDelegate.
+    /// </summary>
+    /// <param name = "_xmlAttr">XML attribute with the field name and value to be imported</param>
+    /// <param name = "_importingReport">The DocReportTable record</param>
+    /// <param name = "_result">An EventHandlerResult instance. Set the _result.booleanResult(true) if the additional field has been set.</param>
+    static delegate void importReportFromXmlElementSetReportFieldDelegate(XmlAttribute _xmlAttr, DocReportTable _importingReport, EventHandlerResult _result)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportFromXmlElementSetReportField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Publisher for setting additional fields in the DocReportTable table from the provided XML element.
+    /// </summary>
+    /// <param name = "_xmlAttr">XML attribute with the field name and value to be imported</param>
+    /// <param name = "_importingReport">The DocReportTable record</param>
+    /// <returns>An EventHandlerResult instance where subscribers can provide the information whether the additional field has been set.</returns>
+    private static EventHandlerResult importReportFromXmlElementSetReportField(XmlAttribute _xmlAttr, DocReportTable _importingReport)
+    {
+        EventHandlerResult result = new EventHandlerResult();
+        result.booleanResult(false);
+
+        try
+        {
+            DocReportingSetupHelper::importReportFromXmlElementSetReportFieldDelegate(_xmlAttr, _importingReport, result);
+            if (!(result.hasResult() && result.booleanResult()))
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:DocDelegateMethodResultError", staticDelegateStr(DocReportingSetupHelper, importReportFromXmlElementSetReportFieldDelegate)), true, funcName());
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), strFmt("@DocentricAX4:DocDelegateMethodError", staticDelegateStr(DocReportingSetupHelper, importReportFromXmlElementSetReportFieldDelegate)));
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:DocDelegateMethodError", staticDelegateStr(DocReportingSetupHelper, importReportFromXmlElementSetReportFieldDelegate)));
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportFromXmlElementAddReportEnumFieldDelegate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delegate for adding additional enum fields to the list to be set in the DocReportTable table
+    /// from the provided XML element.
+    /// </summary>
+    /// <param name = "_reportEnumFieldSet">List of enum fields to be set: Set[fieldname]</param>
+    static delegate void importReportFromXmlElementAddReportEnumFieldDelegate(Set _reportEnumFieldSet)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportFromXmlElementAddReportEnumField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Publisher for adding additional enum fields to the list to be set in the DocReportTable table
+    /// from the provided XML element.
+    /// </summary>
+    /// <param name = "_reportEnumFieldSet">List of enum fields to be set: Set[fieldname]</param>
+    private static void importReportFromXmlElementAddReportEnumField(Set _reportEnumFieldSet)
+    {
+        try
+        {
+            DocReportingSetupHelper::importReportFromXmlElementAddReportEnumFieldDelegate(_reportEnumFieldSet);
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), strFmt("@DocentricAX4:DocDelegateMethodError", staticDelegateStr(DocReportingSetupHelper, importReportFromXmlElementAddReportEnumFieldDelegate)));
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:DocDelegateMethodError", staticDelegateStr(DocReportingSetupHelper, importReportFromXmlElementAddReportEnumFieldDelegate)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportLabelFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports report labels for selected report id from provided xml..
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    /// <param name = "_reportSchemaVersion">Report schema version</param>
+    private static void importReportLabelFromXmlElement(RecId _reportRecId, XmlElement _fromXmlElement, str _reportSchemaVersion)
+    {
+        DocReportLabel      importingReportLabel, existingReportLabel;
+        XmlNode             xmlNode;
+        XmlNamedNodeMap     attributes;
+
+    
+        void setReportField(XmlAttribute _xmlAttr)
+        {
+            str reportLabelFieldName = _xmlAttr.name();
+            switch (_xmlAttr.name())
+            {
+                // String fields.
+                case fieldStr(DocReportLabel, LabelId):
+                case fieldStr(DocReportLabel, LabelName):
+                    reportLabelFieldName = _xmlAttr.name();
+                    importingReportLabel.setFieldValue(reportLabelFieldName, _xmlAttr.value());
+                    break;
+    
+                default:
+                    if (_reportSchemaVersion != DocConstant::ImportExportVersion)
+                    {
+                        DocGlobalHelper::handleWarning(strFmt('Legacy attribute (%1 = %2) ignored', _xmlAttr.name(), _xmlAttr.value()));
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleException(funcName(), strFmt('Unexpected attribute (%1 = %2)', _xmlAttr.name(), _xmlAttr.value()));
+                    }
+            }
+        }
+    
+    
+        importingReportLabel.clear();
+    
+        attributes = _fromXmlElement.attributes();
+        xmlNode = attributes.nextNode();
+        while (xmlNode != null)
+        {
+            setReportField(xmlNode);
+            xmlNode = attributes.nextNode();
+        }
+    
+    
+        ttsBegin;
+    
+        existingReportLabel = DocReportLabel::findReportLabel(_reportRecId, importingReportLabel.LabelId, true);
+        if (existingReportLabel)
+        {
+            // Update label name if it differs from the new one.
+            if (existingReportLabel.LabelName != importingReportLabel.LabelName)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX:LabelWithIdAlreadyExists", existingReportLabel.LabelId, existingReportLabel.LabelName, importingReportLabel.LabelName));
+                existingReportLabel.LabelName = importingReportLabel.LabelName;
+                existingReportLabel.update();
+            }
+        }
+        else
+        {
+            // Insert new report label.
+            importingReportLabel.Report = _reportRecId;
+            importingReportLabel.insert();
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportTemplateFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports report templates for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    /// <param name = "_reportSchemaVersion">Report schema version</param>
+    private static void importReportTemplateFromXmlElement(RecId _reportRecId, XmlElement _fromXmlElement, str _reportSchemaVersion)
+    {
+        DocReportTemplate importingReportTemplate, existingReportTemplate;
+        XmlNamedNodeMap attributes;
+        XmlNode xmlNode;
+        boolean isLegacyReport = false;
+
+        // Sets the report template fields.
+        void setReportField(XmlAttribute _xmlAttr)
+        {
+            str reportTemplateFieldName = _xmlAttr.name();
+            switch (_xmlAttr.name())
+            {
+                // String fields.
+                case fieldStr(DocReportTemplate, Comment):
+                case fieldStr(DocReportTemplate, Title):
+                case fieldStr(DocReportTemplate, Tags):
+                case fieldStr(DocReportTemplate, FileNameAot):
+                case fieldStr(DocReportTemplate, FileNameAzure):
+                case fieldStr(DocReportTemplate, FileNameSp):
+                case fieldStr(DocReportTemplate, FileNameFs):
+                case fieldStr(DocReportTemplate, LanguageId):
+                case fieldStr(DocReportTemplate, CompanyId):
+                case fieldStr(DocReportTemplate, TemplateId):
+                case fieldStr(DocReportTemplate, StorageAzureContainer):
+                case fieldStr(DocReportTemplate, StorageResourceName):
+                case fieldStr(DocReportTemplate, StorageSharePointSiteUrl):
+                case fieldStr(DocReportTemplate, StorageSharePointFolderPath):
+                case fieldStr(DocReportTemplate, StorageFileSystemFolderPath):
+                case fieldStr(DocReportTemplate, OriginalStorageResourceName):
+                    reportTemplateFieldName = _xmlAttr.name();
+                    importingReportTemplate.setFieldValue(reportTemplateFieldName, _xmlAttr.value());
+                    break;
+    
+                // Boolean fields.
+                case fieldStr(DocReportTemplate, IsDefaultTemplate):
+                case fieldStr(DocReportTemplate, IsEnabled):
+                case fieldStr(DocReportTemplate, SignatureAppearanceOverride):
+                    reportTemplateFieldName = _xmlAttr.name();
+                    if (strUpr(_xmlAttr.value()) == 'TRUE')
+                    {
+                        importingReportTemplate.setFieldValue(reportTemplateFieldName, true);
+                    }
+                    else if (strUpr(_xmlAttr.value()) == 'FALSE')
+                    {
+                        importingReportTemplate.setFieldValue(reportTemplateFieldName, false);
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleException(
+                            funcName(), strFmt('Unexpected value (%1) for the attribute (%2)', _xmlAttr.value(), _xmlAttr.name()));
+                    }
+                    break;
+
+                // Int64 (RecId) fields.
+                case identifierStr(SignatureAppearanceId):
+                    break;
+    
+                default:
+                    if (_reportSchemaVersion != DocConstant::ImportExportVersion)
+                    {
+                        // Keep the old template FileName as FileNameAzure.
+                        if (_xmlAttr.name() == 'FileName')
+                        {
+                            isLegacyReport = true;
+                            importingReportTemplate.setFieldValue(fieldStr(DocReportTemplate, FileNameAzure), _xmlAttr.value());
+                            importingReportTemplate.setFieldValue(fieldStr(DocReportTemplate, StorageAzureContainer), DocParameters::find().ReportTemplateStorageAzureContainer);
+                            importingReportTemplate.setFieldValue(fieldStr(DocReportTemplate, OriginalStorageType), DocTemplateStorageType::AzureBlobStorage);
+                            importingReportTemplate.setFieldValue(fieldStr(DocReportTemplate, CurrentStorageType), DocTemplateStorageType::AzureBlobStorage);
+                        }
+                        else
+                        {
+                            DocGlobalHelper::handleWarning(strFmt('Legacy attribute (%1 = %2) ignored', _xmlAttr.name(), _xmlAttr.value()));
+                        }
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleException(funcName(), strFmt('Unexpected attribute (%1 = %2)', _xmlAttr.name(), _xmlAttr.value()));
+                    }
+            }
+        }
+
+        // Sets the report template enum fields.
+        void setReportEnumField(XmlElement _xmlElemEnum)
+        {
+            str    reportTemplateFieldName;
+            str    xmlAttrValue;
+    
+            xmlAttrValue = _xmlElemEnum.getAttribute(DocConstantDSP::XmlAttrEnumValue);
+            reportTemplateFieldName = _xmlElemEnum.name();
+            importingReportTemplate.setFieldValue(reportTemplateFieldName, str2int(xmlAttrValue));
+        }
+
+        // Sets the SigantureAppearance field.
+        void setSignatureAppearanceField(XmlNode _xmlNode)
+        {
+            if (xmlNode.value())
+            {
+                DocElectronicSignatureAppearance signatureAppearance = DocElectronicSignatureAppearance::find(xmlNode.value(), true);
+                if (!signatureAppearance)
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:ImportingTemplateSignatureAppearanceNotFound", xmlNode.value()));
+                }
+                importingReportTemplate.SignatureAppearanceId = signatureAppearance.SignatureAppearanceId;
+            }
+        }
+
+        importingReportTemplate.clear();
+    
+        attributes = _fromXmlElement.attributes();
+        xmlNode = attributes.nextNode();
+        while (xmlNode != null)
+        {
+            setReportField(xmlNode);
+            xmlNode = attributes.nextNode();
+        }
+    
+        // Set enums OriginalStorageType and CurrentStorageType.
+        if (!isLegacyReport)
+        {
+            xmlNode = _fromXmlElement.selectSingleNode(fieldStr(DocReportTemplate, OriginalStorageType));
+            if (xmlNode != null)
+            {
+                setReportEnumField(xmlNode);
+            }
+            xmlNode = _fromXmlElement.selectSingleNode(fieldStr(DocReportTemplate, CurrentStorageType));
+            if (xmlNode != null)
+            {
+                setReportEnumField(xmlNode);
+            }
+        }
+
+        // Set enum DataSourceType
+        xmlNode = _fromXmlElement.selectSingleNode(fieldStr(DocReportTemplate, DataSourceType));
+        if (xmlNode != null)
+        {
+            setReportEnumField(xmlNode);
+        }
+
+        // Set field SignatureAppearance
+        xmlNode = attributes.getNamedItem(identifierStr(SignatureAppearanceId));
+        if (xmlNode != null)
+        {
+            setSignatureAppearanceField(xmlNode);
+        }
+    
+        ttsBegin;
+    
+        existingReportTemplate = DocReportTemplate::findTemplateId(
+            importingReportTemplate.TemplateId, importingReportTemplate.CompanyId, importingReportTemplate.LanguageID, true);
+        if (existingReportTemplate)
+        {
+            if (existingReportTemplate.Report != _reportRecId)
+            {
+                DocGlobalHelper::handleError(
+                    strFmt("@DocentricAX:ImportingTemplateAlreadyExists", existingReportTemplate.TemplateId, DocReportTable::find(existingReportTemplate.Report).ReportId),
+                    true, '', true);
+            }
+    
+            importingReportTemplate.Report = _reportRecId;
+            buf2Buf(importingReportTemplate, existingReportTemplate);
+    
+            // Reset all default templates.
+            existingReportTemplate.IsDefaultTemplate = false;
+    
+            existingReportTemplate.doUpdate();
+    
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ImportingTemplateWithIdAlreadyExists", existingReportTemplate.TemplateId));
+        }
+        else
+        {
+            // Insert new report template.
+            importingReportTemplate.Report = _reportRecId;
+            importingReportTemplate.doInsert();
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportCompanySettingFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports report settings per company for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportCompanySettingFromXmlElement(RecId _reportRecId, XmlElement _fromXmlElement)
+    {
+        DocReportCompanySetting     importingReportCompanySetting, existingReportCompanySetting;
+        XmlNode                     xmlNode;
+        XmlNamedNodeMap             attributes;
+        str                         skippedCompanyId;
+
+    
+        void setReportField(XmlAttribute _xmlAttr)
+        {
+            str reportCompanySettingFieldName = _xmlAttr.name();
+            switch (_xmlAttr.name())
+            {
+                case fieldStr(DocReportCompanySetting, CompanyId):
+                    str companyId = _xmlAttr.value();
+                    CompanyInfo company = CompanyInfo::findDataArea(companyId);
+                    if (company == null)
+                    {
+                        skippedCompanyId = companyId;
+                        return;
+                    }
+                    importingReportCompanySetting.setFieldValue(fieldStr(DocReportCompanySetting, CompanyId), _xmlAttr.value());
+                    break;
+
+                // String fields.
+                case fieldStr(DocReportCompanySetting, SettingName):
+                case fieldStr(DocReportCompanySetting, SettingValue):
+                    reportCompanySettingFieldName = _xmlAttr.name();
+                    importingReportCompanySetting.setFieldValue(reportCompanySettingFieldName, _xmlAttr.value());
+                    break;
+    
+                default:
+                    DocGlobalHelper::handleException(funcName(), strFmt('Unexpected attribute (%1 = %2)', _xmlAttr.name(), _xmlAttr.value()));
+            }
+        }
+    
+        skippedCompanyId = '';
+        importingReportCompanySetting.clear();
+    
+        attributes = _fromXmlElement.attributes();
+        xmlNode = attributes.nextNode();
+        while (xmlNode != null)
+        {
+            setReportField(xmlNode);
+            xmlNode = attributes.nextNode();
+        }
+    
+        if (skippedCompanyId != '')
+        {
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ImportReportCompanySettingCompanyNotExist", skippedCompanyId, importingReportCompanySetting.SettingName,
+                                                  importingReportCompanySetting.SettingValue, skippedCompanyId));
+        }
+    
+        ttsBegin;
+    
+        existingReportCompanySetting = DocReportCompanySetting::findSettingName(_reportRecId, importingReportCompanySetting.CompanyId, importingReportCompanySetting.SettingName, true);
+        if (existingReportCompanySetting)
+        {
+            // Update the setting value if it differs from the new one.
+            if (existingReportCompanySetting.SettingValue != importingReportCompanySetting.SettingValue)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX:SettingAlreadyExists", existingReportCompanySetting.SettingName, existingReportCompanySetting.SettingValue,
+                                                      importingReportCompanySetting.CompanyId, importingReportCompanySetting.SettingValue));
+                existingReportCompanySetting.SettingValue = importingReportCompanySetting.SettingValue;
+                existingReportCompanySetting.update();
+            }
+        }
+        else
+        {
+            // Insert the new report per company setting.
+            importingReportCompanySetting.Report = _reportRecId;
+            importingReportCompanySetting.insert();
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportEmailTokensPDRedirectionSettingFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports email tokens print destination redirection settings per company for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportEmailTokensPDRedirectionSettingFromXmlElement(RecId _reportRecId, XmlElement _fromXmlElement)
+    {
+        DocEmailTokensPDRedirection importingReportCompanySetting, existingReportCompanySetting;
+        XmlNode                     xmlNode;
+        XmlNamedNodeMap             attributes;
+        str                         skippedCompanyId, containerAsString;
+
+        void setReportEnumField(XmlElement _xmlElemEnum)
+        {
+            str    reportTemplateFieldName;
+            str    xmlAttrValue;
+
+            xmlAttrValue = _xmlElemEnum.getAttribute(DocConstantDSP::XmlAttrEnumValue);
+            reportTemplateFieldName = _xmlElemEnum.name();
+            importingReportCompanySetting.setFieldValue(reportTemplateFieldName, str2int(xmlAttrValue));
+        }
+
+        void setReportField(XmlAttribute _xmlAttr)
+        {
+            str settingFieldName = _xmlAttr.name();
+            switch (_xmlAttr.name())
+            {
+                case fieldStr(DocEmailTokensPDRedirection, CompanyId):
+                    str companyId = _xmlAttr.value();
+                    CompanyInfo company = CompanyInfo::findDataArea(companyId);
+                    if (company == null)
+                    {
+                        skippedCompanyId = companyId;
+                        return;
+                    }
+                    importingReportCompanySetting.setFieldValue(fieldStr(DocEmailTokensPDRedirection, CompanyId), _xmlAttr.value());
+                    break;
+
+                // String fields
+                case fieldStr(DocEmailTokensPDRedirection, PrintDestinationDescription):
+                    settingFieldName = _xmlAttr.name();
+                    importingReportCompanySetting.setFieldValue(settingFieldName, _xmlAttr.value());
+                    break;
+
+                // Boolean fields
+                case fieldStr(DocEmailTokensPDRedirection, ShowInfoMessage):
+                    settingFieldName = _xmlAttr.name();
+                    if (strUpr(_xmlAttr.value()) == 'TRUE')
+                    {
+                        importingReportCompanySetting.setFieldValue(settingFieldName, true);
+                    }
+                    else if (strUpr(_xmlAttr.value()) == 'FALSE')
+                    {
+                        importingReportCompanySetting.setFieldValue(settingFieldName, false);
+                    }
+                    else
+                    {
+                        DocGlobalHelper::handleException(
+                            funcName(), strFmt('Unexpected value (%1) for the attribute (%2)', _xmlAttr.value(), _xmlAttr.name()));
+                    }
+                    break;
+
+                // Container fileds
+                case 'PrintJobSettingsStr':
+                    containerAsString = _xmlAttr.value();
+                    container con = base64str2con(containerAsString);
+                    importingReportCompanySetting.setFieldValue(fieldStr(DocEmailTokensPDRedirection, PrintJobSettings), con);
+                    break;
+    
+                default:
+                    DocGlobalHelper::handleException(funcName(), strFmt('Unexpected attribute (%1 = %2)', _xmlAttr.name(), _xmlAttr.value()));
+            }
+        }
+    
+        skippedCompanyId = '';
+        importingReportCompanySetting.clear();
+    
+        attributes = _fromXmlElement.attributes();
+        xmlNode = attributes.nextNode();
+        while (xmlNode != null)
+        {
+            setReportField(xmlNode);
+            xmlNode = attributes.nextNode();
+        }
+
+        // Enum fields
+        xmlNode = _fromXmlElement.selectSingleNode(fieldStr(DocEmailTokensPDRedirection, RedirectIf));
+        if (xmlNode != null)
+        {
+            setReportEnumField(xmlNode);
+        }
+        xmlNode = _fromXmlElement.selectSingleNode(fieldStr(DocEmailTokensPDRedirection, ShowErrorMessageIf));
+        if (xmlNode != null)
+        {
+            setReportEnumField(xmlNode);
+        }
+    
+        if (skippedCompanyId != '')
+        {
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:ImportReportCompanySettingCompanyNotExist",
+                            skippedCompanyId,
+                            fieldId2PName(tableNum(DocEmailTokensPDRedirection), fieldNum(DocEmailTokensPDRedirection, PrintDestinationDescription)),
+                            importingReportCompanySetting.PrintDestinationDescription,
+                            skippedCompanyId));
+        }
+    
+        ttsBegin;
+    
+        existingReportCompanySetting = DocEmailTokensPDRedirection::findByReportAndCompany(_reportRecId, importingReportCompanySetting.CompanyId, true);
+        if (existingReportCompanySetting)
+        {
+            // Update the setting value if it differs from the new one.
+            if (con2base64str(existingReportCompanySetting.PrintJobSettings) != containerAsString)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX:SettingAlreadyExists",
+                                fieldId2PName(tableNum(DocEmailTokensPDRedirection), fieldNum(DocEmailTokensPDRedirection, PrintDestinationDescription)),
+                                existingReportCompanySetting.PrintDestinationDescription,
+                                importingReportCompanySetting.CompanyId,
+                                importingReportCompanySetting.PrintDestinationDescription));
+                existingReportCompanySetting.PrintJobSettings = importingReportCompanySetting.PrintJobSettings;
+                existingReportCompanySetting.RedirectIf = importingReportCompanySetting.RedirectIf;
+                existingReportCompanySetting.ShowInfoMessage = importingReportCompanySetting.ShowInfoMessage;
+                existingReportCompanySetting.ShowErrorMessageIf = importingReportCompanySetting.ShowErrorMessageIf;
+                existingReportCompanySetting.PrintDestinationDescription = importingReportCompanySetting.PrintDestinationDescription;
+                existingReportCompanySetting.update();
+            }
+        }
+        else
+        {
+            // Insert the new report per company setting.
+            importingReportCompanySetting.ReportTable = _reportRecId;
+            importingReportCompanySetting.insert();
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportUserDefinedPlaceholderFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports user-defined placeholders for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportUserDefinedPlaceholderFromXmlElement(DocReportTableRecId _reportRecId, XmlElement _fromXmlElement)
+    {
+        DocReportUserDefinedPlaceholder importing, existing;
+    
+        importing.clear();
+        importing.Report = _reportRecId;
+
+        // Import report placeholder group
+        XmlNode xmlNode = _fromXmlElement.selectSingleNode(tableStr(DocReportPlaceholderGroup));
+        if (xmlNode != null)
+        {
+            importing.PlaceholderGroup = DocReportingSetupHelper::importReporPlaceholderGroupFromXmlElement(xmlNode);
+        }
+
+        DocReportingSetupHelper::fillRecordFromXmlElement(importing, _fromXmlElement, true);
+    
+        ttsBegin;
+        
+        existing = DocReportUserDefinedPlaceholder::find(_reportRecId, importing.PlaceholderName, true);
+        if (existing)
+        {
+            buf2Buf(importing, existing);
+            // Update record if it differs from the new one.
+            if (!bufCmp(existing, existing.orig()))
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:UserDefinedPlaceholderAlreadyExists", existing.PlaceholderName));
+                existing.update();
+            }
+        }
+        else
+        {
+            importing.insert();
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReporPlaceholderGroupFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports report placeholder group from provided xml.
+    /// </summary>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    /// <returns>Report placeholder group record Id</returns>
+    private static DocReportPlaceholderGroupRecId importReporPlaceholderGroupFromXmlElement(XmlElement _fromXmlElement)
+    {
+        DocReportPlaceholderGroup importingReportPlaceholderGroup, existingReportPlaceholderGroup;
+        DocReportPlaceholderGroupRecId reportPlaceholderGroupRecId;
+
+        importingReportPlaceholderGroup.clear();
+        DocReportingSetupHelper::fillRecordFromXmlElement(importingReportPlaceholderGroup, _fromXmlElement);
+
+        ttsBegin;
+        
+        existingReportPlaceholderGroup = DocReportPlaceholderGroup::findByGroup(importingReportPlaceholderGroup.GroupId, true);
+        if (existingReportPlaceholderGroup)
+        {
+            buf2Buf(importingReportPlaceholderGroup, existingReportPlaceholderGroup);
+            existingReportPlaceholderGroup.doUpdate();
+            reportPlaceholderGroupRecId = existingReportPlaceholderGroup.RecId;
+    
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:ImportingReportPlaceholderGroupAlreadyExists", existingReportPlaceholderGroup.GroupId));
+        }
+        else
+        {
+            // Insert new report placeholder group
+            importingReportPlaceholderGroup.doInsert();
+            reportPlaceholderGroupRecId = importingReportPlaceholderGroup.RecId;
+        }
+
+        ttsCommit;
+
+        return reportPlaceholderGroupRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportEmailTemplateFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports report email templates for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportEmailTemplateFromXmlElement(DocReportTableRecId _reportRecId, XmlElement _fromXmlElement)
+    {
+        DocReportEmailTemplate importingReportEmailTemplate, existingReportEmailTemplate;
+       
+        importingReportEmailTemplate.clear();
+        importingReportEmailTemplate.Report = _reportRecId;
+        DocReportingSetupHelper::fillRecordFromXmlElement(importingReportEmailTemplate, _fromXmlElement);
+
+        ttsBegin;
+        
+        existingReportEmailTemplate = DocReportEmailTemplate::findEmailTemplateId(
+            importingReportEmailTemplate.EmailTemplateId, importingReportEmailTemplate.CompanyId, importingReportEmailTemplate.LanguageID, true);
+        if (existingReportEmailTemplate)
+        {
+            if (existingReportEmailTemplate.Report != _reportRecId)
+            {
+                DocGlobalHelper::handleError(
+                    strFmt("@DocentricAX3:ImportingEmailTemplateAlreadyExists", existingReportEmailTemplate.EmailTemplateId, 
+                    DocReportTable::find(existingReportEmailTemplate.Report).ReportId), true, '', true);
+            }
+    
+            importingReportEmailTemplate.Report = _reportRecId;
+            buf2Buf(importingReportEmailTemplate, existingReportEmailTemplate);    
+            existingReportEmailTemplate.doUpdate();
+    
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:ImportingEmailTemplateWithIdAlreadyExists", existingReportEmailTemplate.EmailTemplateId));
+        }
+        else
+        {
+            // Insert new report email template.
+            importingReportEmailTemplate.Report = _reportRecId;
+            importingReportEmailTemplate.doInsert();
+        }
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportPdfSignatureSettingsFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports PDF signature settings for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportPdfSignatureSettingsFromXmlElement(DocReportTableRecId _reportRecId, XmlElement _fromXmlElement)
+    {
+        DocReportPdfSignatureSettings importingReportPdfSignatureSettings, existingReportPdfSignatureSettings;
+        DocReportId reportId = DocReportTable::find(_reportRecId).ReportId;
+
+        importingReportPdfSignatureSettings.clear();
+        importingReportPdfSignatureSettings.Report = _reportRecId;
+        DocReportingSetupHelper::fillRecordFromXmlElement(importingReportPdfSignatureSettings, _fromXmlElement);
+
+        boolean signatureCertificateEmpty = !importingReportPdfSignatureSettings.CertificateId;
+        boolean signatureAppearanceEmpty = !importingReportPdfSignatureSettings.SignatureAppearanceId;
+        boolean signatureCertificateExists = false;
+        boolean signatureAppearanceExists = false;
+
+        changecompany(importingReportPdfSignatureSettings.CompanyId)
+        {
+            signatureCertificateExists = DocElectronicSignatureCertificate::exist(importingReportPdfSignatureSettings.CertificateId);
+            signatureAppearanceExists = DocElectronicSignatureAppearance::exist(importingReportPdfSignatureSettings.SignatureAppearanceId);
+        }
+
+        if ((!signatureCertificateEmpty && !signatureCertificateExists) && (!signatureAppearanceEmpty && !signatureAppearanceExists))
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX3:ImportingReportPdfSecuritySettingsCertificateAndAppearanceNotFound", importingReportPdfSignatureSettings.CertificateId, importingReportPdfSignatureSettings.SignatureAppearanceId, reportId, importingReportPdfSignatureSettings.CompanyId), true, '', false);
+            return;
+        }
+        if ((!signatureCertificateEmpty && !signatureCertificateExists) && (signatureAppearanceEmpty || signatureAppearanceExists))
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX3:ImportingReportPdfSecuritySettingsCertificateNotFound", importingReportPdfSignatureSettings.CertificateId, reportId, importingReportPdfSignatureSettings.CompanyId), true, '', false);
+            return;
+        }
+        if ((signatureCertificateEmpty || signatureCertificateExists) && (!signatureAppearanceEmpty && !signatureAppearanceExists))
+        {
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:ImportingReportPdfSecuritySettingsAppearanceNotFound", importingReportPdfSignatureSettings.SignatureAppearanceId, reportId, importingReportPdfSignatureSettings.CompanyId, importingReportPdfSignatureSettings.CertificateId));
+        }
+
+        ttsBegin;
+        
+        existingReportPdfSignatureSettings = DocReportPdfSignatureSettings::findByReportAndCompany(
+            importingReportPdfSignatureSettings.Report, importingReportPdfSignatureSettings.CompanyId, true, false);
+        if (existingReportPdfSignatureSettings)
+        {    
+            importingReportPdfSignatureSettings.Report = _reportRecId;
+            buf2Buf(importingReportPdfSignatureSettings, existingReportPdfSignatureSettings);
+            existingReportPdfSignatureSettings.doUpdate();
+    
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:ImportingReportPdfSecuritySettingsAlreadyExists", reportId, existingReportPdfSignatureSettings.CompanyId));
+        }
+        else
+        {
+            // Insert new report PDF signature setting.
+            importingReportPdfSignatureSettings.Report = _reportRecId;
+            importingReportPdfSignatureSettings.doInsert();
+        }
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportSharePointSettingsFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports SharePoint settings for selected report id from provided xml.
+    /// </summary>
+    /// <param name = "_reportRecId">Report Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportSharePointSettingsFromXmlElement(DocReportTableRecId _reportRecId, XmlElement _fromXmlElement)
+    {
+        DocReportSharePointSettings importingReportSharePointSettings, existingReportSharePointSettings;
+        DocReportSharePointSettingsRecId importingReportSharePointSettingsRecId;
+        DocReportId reportId = DocReportTable::find(_reportRecId).ReportId;
+
+        importingReportSharePointSettings.clear();
+        importingReportSharePointSettings.Report = _reportRecId;
+        DocReportingSetupHelper::fillRecordFromXmlElement(importingReportSharePointSettings, _fromXmlElement, true);
+
+        ttsBegin;
+        
+        existingReportSharePointSettings = DocReportSharePOintSettings::findByReportSiteUrlAndLibraryUrl(
+                                                                            importingReportSharePointSettings.Report,
+                                                                            importingReportSharePointSettings.SharePointSiteUrl,
+                                                                            importingReportSharePointSettings.SharePointDocumentLibraryUrl,
+                                                                            true);
+        if (existingReportSharePointSettings)
+        {
+            importingReportSharePointSettings.Report = _reportRecId;
+            buf2Buf(importingReportSharePointSettings, existingReportSharePointSettings);
+            existingReportSharePointSettings.doUpdate();
+            importingReportSharePointSettingsRecId = existingReportSharePointSettings.RecId;
+
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:ImportingReportSharePointSettingsAlreadyExists", reportId));
+        }
+        else
+        {
+            // Insert new SharePoint signature setting.
+            importingReportSharePointSettings.Report = _reportRecId;
+            importingReportSharePointSettings.doInsert();
+            importingReportSharePointSettingsRecId = importingReportSharePointSettings.RecId;
+        }
+
+        // Import SharePoint metadata for current SharePoint settings record
+        if (importingReportSharePointSettingsRecId > 0)
+        {
+            XmlNodeList xmlNodes = _fromXmlElement.selectNodes(tableStr(DocReportSharePointMetadata));
+            XmlNode xmlNode = xmlNodes.nextNode();
+            while (xmlNode != null)
+            {
+                DocReportingSetupHelper::importReportSharePointMetadataFromXmlElement(importingReportSharePointSettingsRecId, xmlNode);
+                xmlNode = xmlNodes.nextNode();
+            }
+        }
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importReportSharePointMetadataFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports SharePoint metadata for selected SharePoint settings record Id from provided xml.
+    /// </summary>
+    /// <param name = "_reportSharePointSettingsRecId">SharePOint settings record Id</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    private static void importReportSharePointMetadataFromXmlElement(DocReportSharePointSettingsRecId _reportSharePointSettingsRecId, XmlElement _fromXmlElement)
+    {
+        DocReportSharePointMetadata importingReportSharePointMetadata, existingReportSharePointMetadata;
+        DocReportSharePointSettings spSettings = DocReportSharePointSettings::find(_reportSharePointSettingsRecId);
+        DocReportId reportId = DocReportTable::find(spSettings.Report).ReportId;
+
+        importingReportSharePointMetadata.clear();
+        importingReportSharePointMetadata.SharePointSettingsRecId = _reportSharePointSettingsRecId;
+        DocReportingSetupHelper::fillRecordFromXmlElement(importingReportSharePointMetadata, _fromXmlElement);
+
+        ttsBegin;
+        
+        existingReportSharePointMetadata = DocReportSharePointMetadata::findBySharePointSettingsRecIdAndFieldInternalName(
+                                                                            importingReportSharePointMetadata.SharePointSettingsRecId, 
+                                                                            importingReportSharePointMetadata.FieldInternalName, 
+                                                                            true);
+        if (existingReportSharePointMetadata)
+        {
+            importingReportSharePointMetadata.SharePointSettingsRecId = _reportSharePointSettingsRecId;
+            buf2Buf(importingReportSharePointMetadata, existingReportSharePointMetadata);
+            existingReportSharePointMetadata.doUpdate();
+    
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:ImportingReportSharePointMetadataAlreadyExists", reportId, spSettings.SharePointSiteUrl, spSettings.SharePointDocumentLibraryUrl));
+        }
+        else
+        {
+            // Insert new SharePoint metadata setting.
+            importingReportSharePointMetadata.SharePointSettingsRecId = _reportSharePointSettingsRecId;
+            importingReportSharePointMetadata.doInsert();
+        }
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillRecordFromXmlElement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fills the record from provided xml element.
+    /// Ignores child nodes that are not enums if _ignoreNonEnumChildNodes is set.
+    /// </summary>
+    /// <param name = "_rec">Common record</param>
+    /// <param name = "_fromXmlElement">Xml element</param>
+    /// <param name = "_ignoreNonEnumChildNodes">Should ignore non enum child nodes</param>
+    private static void fillRecordFromXmlElement(Common _rec, XmlElement _fromXmlElement, boolean _ignoreNonEnumChildNodes = false)
+    {
+        DictTable       dictTable = new DictTable(_rec.TableId);
+
+        // Set field value from xml node
+        boolean setField(XmlNode _xmlNode)
+        {
+            FieldName   fieldName = _xmlNode.name();
+            FieldId     fieldId = dictTable.fieldName2Id(fieldName);
+            str         value = _xmlNode.value();
+
+            if (!fieldId)
+            {
+                return false;
+            }
+                
+            DictField dictField = dictTable.fieldObject(fieldId);
+            // boolean fields
+            if (dictField.enumId() == enumNum(NoYes))
+            {
+                if (value == 'true')
+                {
+                    _rec.(fieldId) = true;
+                }
+                else if (value == 'false')
+                {
+                    _rec.(fieldId) = false;
+                }
+                else
+                {
+                    DocGlobalHelper::handleException(funcName(), strFmt('Unexpected value (%1) for the attribute (%2)', value, fieldName));
+                }
+            }
+            // string fields
+            else if (dictField.baseType() == Types::String || dictField.baseType() == Types::VarString)
+            {
+                _rec.(fieldId) = value;
+            }
+            else
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        // Set enum field value from xml node
+        boolean setEnumField(XmlElement _xmlElemEnum)
+        {
+            FieldName   fieldName = _xmlElemEnum.name();
+            FieldId     fieldId = dictTable.fieldName2Id(fieldName);
+            str         value = _xmlElemEnum.getAttribute(DocConstantDSP::XmlAttrEnumName);
+
+            if (!fieldId)
+            {
+                return false;
+            }
+                
+            DictField dictField = dictTable.fieldObject(fieldId);
+            if (dictField.baseType() != Types::Enum)
+            {
+                return false;
+            }
+
+            DictEnum dictEnum = new DictEnum(dictField.enumId());
+            int enumValue = dictEnum.symbol2Value(value);
+            
+            if (enumValue == 255)   // not found
+            {
+                return false;
+            }
+
+            _rec.(fieldId) = enumValue;
+
+            return true;
+        }
+
+        // Atributes
+        XmlNamedNodeMap attributes = _fromXmlElement.attributes();
+
+        XmlNode xmlNode = attributes.nextNode();        
+        while (xmlNode)
+        {
+            if (!setField(xmlNode))
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('Unexpected attribute (%1 = %2)', xmlNode.name(), xmlNode.value()));
+            }
+
+            xmlNode = attributes.nextNode();
+        }
+
+        // Enums are subelements
+        XmlNodeList childNodes = _fromXmlElement.childNodes();
+        
+        xmlNode = childNodes.nextNode();
+        while (xmlNode)
+        {
+            DocGlobalHelper::assert(xmlNode is XmlElement);
+            
+            if (!setEnumField(xmlNode) && !_ignoreNonEnumChildNodes)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('Unexpected enum (%1 = %2)', xmlNode.name(), xmlNode.value()));
+            }
+
+            xmlNode = childNodes.nextNode();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>detachTemplateFiles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Detaches the template files from report for provided report list.
+    /// </summary>
+    /// <param name = "_reportIds">List of report ids</param>
+    /// <returns>Number of updated reports</returns>
+    public static int detachTemplateFiles(container _reportIds)
+    {
+        DocReportTable      report;
+        int                 i;
+        str                 currentReportId;
+        boolean             isReportUpdated;
+        int                 reportUpdatedCount;
+        
+        
+        boolean detachTemplateFilesForReport(RecId _reportRecId)
+        {
+            DocReportTemplate reportTemplate;
+            boolean reportUpdated = false;
+
+            while select RecId from reportTemplate where reportTemplate.Report == _reportRecId
+            {
+                DocReportTemplate::detachTemplateFile(reportTemplate.RecId);
+                reportUpdated = true;
+            }
+
+            return reportUpdated;
+        }
+   
+      
+        // Validate parameters.
+        if (_reportIds == conNull())
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _reportIds is not set');
+        }
+
+        reportUpdatedCount = 0;
+        for (i = 1; i <= conLen(_reportIds); i++)
+        {
+            currentReportId = conPeek(_reportIds, i);
+
+            report = DocReportTable::findReportId(currentReportId, true);
+            if (!report)
+            {
+                DocGlobalHelper::handleError(strFmt('Report with ID (%1) does not exist', currentReportId), true, funcName(), true);
+            }
+
+            isReportUpdated = detachTemplateFilesForReport(report.RecId);
+
+            if (isReportUpdated)
+            {
+                reportUpdatedCount++;
+            }
+        }
+
+        return reportUpdatedCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteTemplateFilesOnAzureBlobStorage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the template files on Azure storage for provided report list.
+    /// </summary>
+    /// <param name = "_reportIds">List of report ids</param>
+    /// <returns>Number of updated reports</returns>
+    public static int deleteTemplateFilesOnAzureBlobStorage(container _reportIds)
+    {
+        DocReportTable      report;
+        int                 i;
+        str                 currentReportId;
+        boolean             isReportUpdated;
+        int                 reportUpdatedCount;
+        
+        
+        boolean deleteTemplatesForReport(RecId _reportRecId)
+        {
+            DocReportTemplate reportTemplate;
+            boolean reportUpdated = false;
+
+            while select reportTemplate where reportTemplate.Report == _reportRecId
+            {
+                if (reportTemplate.CurrentStorageType == DocTemplateStorageType::AzureBlobStorage &&
+                    reportTemplate.isFileAttached())
+                {
+                    DocReportTemplate::deleteTemplateFile_AzureBlobStorage(reportTemplate.RecId, false, false);
+                    reportUpdated = true;
+                }
+            }
+
+            return reportUpdated;
+        }
+   
+      
+        // Validate parameters.
+        if (_reportIds == conNull())
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _reportIds is not set');
+        }
+
+        reportUpdatedCount = 0;
+        for (i = 1; i <= conLen(_reportIds); i++)
+        {
+            currentReportId = conPeek(_reportIds, i);
+
+            report = DocReportTable::findReportId(currentReportId, true);
+            if (!report)
+            {
+                DocGlobalHelper::handleError(strFmt('Report with ID (%1) does not exist', currentReportId), true, funcName(), true);
+            }
+
+            isReportUpdated = deleteTemplatesForReport(report.RecId);
+
+            if (isReportUpdated)
+            {
+                reportUpdatedCount++;
+            }
+        }
+    
+        return reportUpdatedCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteTemplateFilesOnFileSystem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the template files on File system for provided report list.
+    /// </summary>
+    /// <param name = "_reportIds">List of report ids</param>
+    /// <returns>Number of updated reports</returns>
+    public static int deleteTemplateFilesOnFileSystem(container _reportIds)
+    {
+        DocReportTable      report;
+        int                 i;
+        str                 currentReportId;
+        boolean             isReportUpdated;
+        int                 reportUpdatedCount;
+        
+        
+        boolean deleteTemplatesForReport(RecId _reportRecId)
+        {
+            DocReportTemplate reportTemplate;
+            boolean reportUpdated = false;
+
+            while select reportTemplate where reportTemplate.Report == _reportRecId
+            {
+                if (reportTemplate.CurrentStorageType == DocTemplateStorageType::FileSystem &&
+                    reportTemplate.isFileAttached())
+                {
+                    DocReportTemplate::deleteTemplateFile_FileSystem(reportTemplate.RecId, false, false);
+                    reportUpdated = true;
+                }
+            }
+
+            return reportUpdated;
+        }
+   
+      
+        // Validate parameters.
+        if (_reportIds == conNull())
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _reportIds is not set');
+        }
+
+        reportUpdatedCount = 0;
+        for (i = 1; i <= conLen(_reportIds); i++)
+        {
+            currentReportId = conPeek(_reportIds, i);
+
+            report = DocReportTable::findReportId(currentReportId, true);
+            if (!report)
+            {
+                DocGlobalHelper::handleError(strFmt('Report with ID (%1) does not exist', currentReportId), true, funcName(), true);
+            }
+
+            isReportUpdated = deleteTemplatesForReport(report.RecId);
+
+            if (isReportUpdated)
+            {
+                reportUpdatedCount++;
+            }
+        }
+    
+        return reportUpdatedCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTemplateDsTypeApplicable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag indicating whether the provided report is of the ClassicSSRS ReportUsageType 
+    /// and the CBD feature is enabled.
+    /// </summary>
+    /// <param name = "_reportRecId">Report recod Id</param>
+    /// <returns>True if the report is of the ClassicSSRS ReportUsageType and the CBD feature is enabled.</returns>
+    public static boolean isTemplateDsTypeApplicable(RecId _reportRecId)
+    {
+        // If the provided report is of the ClassicSSRS ReportUsageType and the CBD feature is enabled, return true.
+        DocReportTable report = DocReportTable::find(_reportRecId);
+        if (report.RecId != 0 && report.ReportUsageType == DocReportUsageType::ClassicSSRS)
+        {
+            if (!DocParameters::find().EnableCbdDs)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recheckTemplateDataSourceType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the DataSourceType field for the specified template.
+    /// </summary>
+    /// <param name = "_templateRecId">Template record Id</param>
+    /// <param name = "_showError">Specifies whether to show the error</param>
+    /// <returns>True if the template was updated; otherwise false</returns>
+    public static boolean recheckTemplateDataSourceType(RecId _templateRecId, boolean _showError = true)
+    {
+        boolean templateDsTypeUpdated = false;
+
+        if (_templateRecId)
+        {
+            DocReportTemplate template = DocReportTemplate::find(_templateRecId);
+            if (template)
+            {
+                // Update the DataSourceType field, if this field is applicable.
+                templateDsTypeUpdated = template.updateTemplateDataSourceType(_showError);
+                if (templateDsTypeUpdated)
+                {
+                    // Update.
+                    ttsbegin;
+                    template.selectForUpdate(true);
+                    template.doUpdate();
+                    ttscommit;
+                }
+            }
+        }
+
+        return templateDsTypeUpdated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recheckTemplateDataSourceType_forTemplates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the DataSourceType field for the specified list of templates.
+    /// </summary>
+    /// <param name = "_templateRecIDs">List of template record Ids</param>
+    /// <param name = "_showError">Specifies whether to show the error</param>
+    /// <returns>Number of updated templates</returns>
+    public static int recheckTemplateDataSourceType_forTemplates(container _templateRecIDs, boolean _showError = true)
+    {
+        if (_templateRecIDs == conNull())
+        {
+            return 0;
+        }
+
+        int updatedTemplateCount = 0;
+        for (int i = 1; i <= conLen(_templateRecIDs); i++)
+        {
+            RecId templateRecId = conPeek(_templateRecIDs, i);
+            if (DocReportingSetupHelper::recheckTemplateDataSourceType(templateRecId, _showError))
+            {
+                updatedTemplateCount++;
+            }
+        }
+
+        return updatedTemplateCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recheckTemplateDataSourceType_forReports</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the DataSourceType field for the specified list of reports.
+    /// </summary>
+    /// <param name = "_reportRecIDs">List of report record Ids</param>
+    /// <param name = "_showError">Specifies whether to show the error</param>
+    public static void recheckTemplateDataSourceType_forReports(container _reportRecIDs, boolean _showError = true)
+    {
+        container templateRecIDs;
+
+        void fillTemplateRecIDs(RecId _reportRecId)
+        {
+            DocReportTemplate template;
+            while select RecId from template where template.Report == _reportRecId
+            {
+                templateRecIDs = templateRecIDs + [template.RecId];
+            }
+        }
+
+        if (_reportRecIDs == conNull())
+        {
+            return;
+        }
+
+        if (!DocParameters::find().EnableCbdDs)
+        {
+            return;
+        }
+
+        for (int i = 1; i <= conLen(_reportRecIDs); i++)
+        {
+            RecId reportRecId = conPeek(_reportRecIDs, i);
+
+            if (!DocReportingSetupHelper::isTemplateDsTypeApplicable(reportRecId))
+            {
+                continue;
+            }
+
+            fillTemplateRecIDs(reportRecId);
+        }
+
+        DocReportingSetupHelper::recheckTemplateDataSourceType_forTemplates(templateRecIDs, _showError);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

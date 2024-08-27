@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SysOutgoingEmailTable_DCE_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The class SysOutgoingEmailTable_DCE_Extension is an extension of the table SysOutgoingEmailTable.
+/// </summary>
+[ExtensionOf(tableStr(SysOutgoingEmailTable))]
+final class SysOutgoingEmailTable_DCE_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>insert</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the current table buffer to the table.
+    /// 
+    /// (1) Adds embedded images for image placeholders used in the email body.
+    /// (2) Handle document attachments for WF emails.
+    /// (3) Enables mail message post-processing.
+    /// </summary>
+    public void insert()
+    {
+        // Check if the Docentric's improvement of Email templates is turned on
+        if (DocEmailTemplateHelper::isDocentricImprovedEmailTemplatesTurnedOn(this.TemplateId, this.IsSystemEmail))
+        {
+            // If there is no ETH class, then image placeholders are not used in the email body nor additional actions are an option
+            // (email attachments, post-processing the inserting outgoing email message).
+            // Also, we will skip this logic for Alert emails, where other and simpler approaches should be used.
+            DocEmailTemplateHandlerBase ethClassInstance = DocEmailTemplateHandlerBase::constructFromEmailId(this.TemplateId, this.IsSystemEmail);
+            if (ethClassInstance.getEventNotificationSource() != DocEmailTemplateEventNotificationSource::Alert)
+            {
+                // (1) Parse the email message body to enable embedding images to the email during its sending.
+                try
+                {
+                    const str cid = 'cid:';
+                    int lenCid = strLen(cid);
+
+                    int lenMessage = strLen(this.Message);
+                    int i = strScan(this.Message, cid, 1, lenMessage);
+
+                    while (i)
+                    {
+                        i += lenCid;
+                        int j = strFind(this.Message, ' "', i, lenMessage - i + 1);
+
+                        if (j)
+                        {
+                            str imageId = subStr(this.Message, i, j - i);
+                            str imageBase64String = DocEmailTemplateHelper::getImageFromSessionCache(imageId, true);
+                
+                            Bitmap image = conNull();
+                            if (imageBase64String != '')
+                            {
+                                image = DocGlobalHelper::convertBytesToContainer(DocGlobalHelper::convertFromBase64String(imageBase64String));
+                            }
+
+                            if (image != conNull())
+                            {
+                                SysOutgoingEmailData outgoingEmailData;
+
+                                // Get next free cid (DataId).
+                                select maxOf(DataId) from outgoingEmailData group by outgoingEmailData.DataId where outgoingEmailData.EmailItemId == this.EmailItemId;
+                                SysEmailDataId newDataId = outgoingEmailData.DataId + 1;
+
+                                // Skip used cids with missing parts.
+                                while (strScan(this.Message, strFmt('src="%1%2"', cid, newDataId), 1, lenMessage))
+                                {
+                                    newDataId++;
+                                }
+
+                                outgoingEmailData.clear();
+                                outgoingEmailData.EmailItemId = this.EmailItemId;
+                                outgoingEmailData.DataId = newDataId;
+                                outgoingEmailData.EmailDataType = SysEmailDataType::Embedded;
+                                outgoingEmailData.Data = image;
+                                outgoingEmailData.FileName = 'image';       // Empty filename will cause an error on SysOutgoingEmailMessage form, so we just set one.
+                    
+                                str contentType = DocGlobalHelper::getImageMIMEContentType(DocGlobalHelper::convertContainerToMemoryStream(image));
+                                outgoingEmailData.FileExtension = (strStartsWith(contentType, 'image/') ? strReplace(contentType, 'image/', '.') : '.png');
+
+                                outgoingEmailData.insert();
+
+                                this.Message = subStr(this.Message, 1, i - 1) + int2Str(newDataId) + subStr(this.Message, j, lenMessage - j + 1);
+                                lenMessage = strLen(this.Message);
+                            }
+                        }
+            
+                        i = strScan(this.Message, cid, i + lenCid, lenMessage - i - lenCid + 1);
+                    }
+                }
+                catch (Exception::CLRError)
+                {
+                    DocGlobalHelper::handleClrException(funcName(), strFmt('Inserting images for the email template (%1) failed', this.TemplateId));
+                }
+                catch
+                {
+                    DocGlobalHelper::handleException(funcName(), strFmt('Inserting images for the email template (%1) failed', this.TemplateId));
+                }
+        
+
+                // Check if the corresponding ETH class implements the DocEmailTemplateEmailProcessingActions interface that affects further processing regarding (2) and (3).
+                DocEmailTemplateEmailProcessingActions ethEPA = ethClassInstance as DocEmailTemplateEmailProcessingActions;
+                if (ethEPA != null)
+                {
+                    // (2) Handle document attachments (it's meant only for WF emails).
+                    try
+                    {
+                        boolean addEmailAttachments;
+                        str emailAttachmentTags;
+                        if (this.IsSystemEmail)
+                        {
+                            SysEmailSystemTable emailSystemTable = SysEmailSystemTable::find(this.TemplateId);
+                            addEmailAttachments = emailSystemTable.AddEmailAttachments_DC;
+                            emailAttachmentTags = emailSystemTable.EmailAttachmentTags_DC;
+                        }
+                        else
+                        {
+                            SysEmailTable emailTable = SysEmailTable::find(this.TemplateId);
+                            addEmailAttachments = emailTable.AddEmailAttachments_DC;
+                            emailAttachmentTags = emailTable.EmailAttachmentTags_DC;
+                        }
+
+                        if (addEmailAttachments)
+                        {
+                            // Handle attachments as implemented in the ETH class and check if the standard handling should be skipped.
+                            boolean skipAttachmentHandlingFromSetup = ethEPA.handleAttachments(this) == false;
+                            if (!skipAttachmentHandlingFromSetup)
+                            {
+                                // Handle attachments as configured in the Email templates form -> add all attachments tagged with the configured Attachment tags.
+                                this.insertTaggedAttachmentsFromCommon_DC(ethEPA.getAttachmentsContextRecord(), emailAttachmentTags, ethClassInstance.parmLanguageId());
+                            }
+                        }
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        ethEPA.finalize();
+                        DocGlobalHelper::handleClrException(funcName(), strFmt("@DocentricAX4:HandlingWFEmailAttachmentsError",
+                            this.IsSystemEmail ? "@DocentricAX4:System" : "@DocentricAX4:Organization",  this.TemplateId));
+                    }
+                    catch
+                    {
+                        ethEPA.finalize();
+                        DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:HandlingWFEmailAttachmentsError",
+                            this.IsSystemEmail ? "@DocentricAX4:System" : "@DocentricAX4:Organization",  this.TemplateId));
+                    }
+
+
+                    // (3) Post-process the inserting mail message.
+                    try
+                    {
+                        ethEPA.postProcessMailMessage(this);
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        DocGlobalHelper::handleClrException(funcName(), strFmt("@DocentricAX4:PostProcessingWFEmailError",
+                            this.IsSystemEmail ? "@DocentricAX4:System" : "@DocentricAX4:Organization",  this.TemplateId));
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:PostProcessingWFEmailError",
+                            this.IsSystemEmail ? "@DocentricAX4:System" : "@DocentricAX4:Organization",  this.TemplateId));
+                    }
+                    finally
+                    {
+                        ethEPA.finalize();
+                    }
+                }
+            }
+        }
+
+        next insert();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

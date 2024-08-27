@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TTBWHSWorkExecute_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// TTB006_GaugeReport - TTB customizations for the <c>WHSWorkExecute</c> class.
+/// </summary>
+[ExtensionOf(classStr(WHSWorkExecute))]
+public final class TTBWHSWorkExecute_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>updateWorkStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// 	Creates TTB records after the mobile work is marked complete
+    /// </summary>
+    /// <param name="_workId">
+    /// 	Work id of the work line.
+    /// </param>
+    /// <param name="_lineNum">
+    /// 	Line number of the work line.
+    /// </param>
+    /// <param name="_userId">
+    /// 	Work user id.
+    /// </param>
+    void updateWorkStatus(WHSWorkId _workId, LineNum _lineNum, WHSUserId _userId)
+    {
+        next updateWorkStatus(_workId, _lineNum, _userId);
+
+        WHSWorkTable workTable = WHSWorkTable::find(_workId);
+        WHSWorkLine workLine;
+        TTBFormluaName ttbFormulaName;
+        RefRecId gaugeRecId;
+
+        TTBRailCarRecord    TTBrailcar;
+        TTBInventGaugeTable inventGaugeTable;
+        TTBInventGaugeId    inventGuageId;    
+
+        if (workTable.WorkStatus == WHSWorkStatus::Closed)
+        {
+            while select workLine
+                order by workLine.LineNum asc
+                where workLine.WorkId     == _workId
+                   && workLine.WorkStatus == WHSWorkStatus::Closed
+                   && workLine.WorkType   == WHSWorkType::Put
+            {
+                ttbFormulaName = TTBFormluaName::find(InventTable::find(workLine.ItemId).TTBFormulaID);
+
+                if ((workTable.WorkTransType == WHSWorkTransType::Purch
+                    || workTable.WorkTransType == WHSWorkTransType::Invent
+                    || workTable.WorkTransType == WHSWorkTransType::TransferReceipt
+                    || (workTable.WorkTransType == WHSWorkTransType::ReturnOrder
+                        && WHSZone::find(WMSLocation::find(workTable.getFinalPutLocation(), workTable.InventSiteId).ZoneId).GGIGaugeControlled))
+                    && ttbFormulaName.AlcoholType != TTBAlcoholType::none
+                    && InventSite::find(workTable.InventSiteId).GGIInventSiteEnabled)
+                {
+                    gaugeRecId = TTBInventGaugeTableCreate::createFromWorkCompleted(workTable, workLine);
+
+                    select firstonly inventGaugeTable
+                        where inventGaugeTable.RecId == gaugeRecId;
+
+                    inventGuageId = inventGaugeTable.InventGaugeId;
+
+                    if (!TTBUtilHelper::isUnitFinshedGood(workLine.UnitId) && InventTable::find(workLine.ItemId).TTBAlcoholType() != TTBAlcoholType::none)
+                    {
+                        //TTB008 railcar record
+                        switch (workTable.WorkTransType)
+                        {
+                            case WHSWorkTransType::Purch:
+                                TTBrailcar =TTBRailCarRecord::newFromParameter(TTBRailcarRecordSubclass::PoRegistration, workTable.RecId, inventGuageId);
+                                break;
+                            case WHSWorkTransType::Invent:
+                            if(this.isRCRWorkClassID(workTable) )
+                                {
+                                    TTBrailcar = TTBRailCarRecord::newFromParameter(TTBRailcarRecordSubclass::InventoryMovement, workTable.RecId, inventGuageId);
+                                }
+                                break;
+                            case WHSWorkTransType::TransferReceipt:
+                                TTBrailcar = TTBRailCarRecord::newFromParameter(TTBRailcarRecordSubclass::TransferOrder,workTable.RecId, inventGuageId);
+                                break;
+                            default:
+                        }
+                        if (TTBrailcar)
+                        {
+                            TTBrailcar.run();
+                        }
+                    }
+
+                    try
+                    {
+                        this.ggiCreateDBR(_workId, gaugeRecId);
+                    }
+                    catch (Exception::Error)
+                    {
+                        info("DBR creation failed.");
+                    }
+
+					// Only one gauge record is created for a return order/item
+                    if (workTable.WorkTransType == WHSWorkTransType::ReturnOrder)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRCRWorkClassID</Name>
+				<Source><![CDATA[
+    public boolean isRCRWorkClassID(WHSWorkTable _workTable)
+    {
+        str workclassID = 'TTBRCRINV';
+        WHSWorkTemplateLine line;
+        WHSWorkTemplateTable header;
+
+        select firstonly header
+            where header.WorkTemplateCode == _workTable.WorkTemplateCode
+            && header.WorkTransType == _workTable.WorkTransType;
+
+        select firstonly line
+             where line.WorkTemplateCode == header.WorkTemplateCode
+            && line.WorkTransType == header.WorkTransType
+            && line.WorkClassId == workclassID;
+
+        return line.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ggiCreateDBR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a DBR line from the PICK or PUT work line.
+    /// </summary>
+    /// <param name = "_workId">
+    /// The work Id for which the transactions need to be tracked for DBR.
+    /// </param>
+    /// <param name = "_gaugeRecord">
+    /// The gauge record surrogate key to update the link between DBR and Gauge record.
+    /// </param>
+    public void ggiCreateDBR(WHSWorkId _workId, RefRecId _gaugeRecord = 0)
+    {
+        GGIInventTrans      ggiInventTrans;
+        WHSWorkLine         workLine;
+        WHSWorkInventTrans  whsWorkInventTrans;
+        WMSLocation         wmsLocation;
+        InventTrans         inventTrans;
+
+        while select workLine
+            where workLine.WorkId           == _workId
+                && (workLine.WorkType       == WHSWorkType::Pick
+                    || workLine.WorkType    == WHSWorkType::Put)
+        {
+            wmsLocation = WMSLocation::find(workLine.WMSLocationId, workLine.inventDim().InventLocationId);
+
+            if (workLine.WorkType    == WHSWorkType::Put)
+            {
+                select firstonly ggiInventTrans
+                    where ggiInventTrans.ReferenceId        == _workId
+                    join whsWorkInventTrans
+                    where whsWorkInventTrans.LineNum        == workLine.LineNum
+                        && whsWorkInventTrans.WorkId        == ggiInventTrans.ReferenceId
+                        && ggiInventTrans.InventTransId     == whsWorkInventTrans.InventTransIdTo;
+            }
+            else
+            {
+                select firstonly ggiInventTrans
+                    where ggiInventTrans.ReferenceId        == _workId
+                    join whsWorkInventTrans
+                    where whsWorkInventTrans.LineNum        == workLine.LineNum
+                        && whsWorkInventTrans.WorkId        == ggiInventTrans.ReferenceId
+                        && ggiInventTrans.InventTransId     == whsWorkInventTrans.InventTransIdFrom;
+            }
+
+            if (ggiInventTrans && wmsLocation.GGIDBRControlled)
+            {
+                inventTrans = InventTrans::findRecId(ggiInventTrans.InventTrans);
+
+                if (inventTrans.inventTable().TTBAlcoholType() == TTBAlcoholType::PURE && !GGIDumpAndBottlingLine::findByInventTrans(inventTrans.RecId).RecId)
+                {
+                    GGIDumpAndBottlingRecordManager dbrManager = GGIDumpAndBottlingRecordManager::constructFromInventTrans(InventTrans::findRecId(ggiInventTrans.InventTrans));
+                    dbrManager.parmWMSLocation(wmsLocation);
+                    if (_gaugeRecord)
+                    {
+                        dbrManager.parmGaugeRecord(_gaugeRecord);
+                    }
+                    dbrManager.createDBR();
+                }
+            }
+        }
+      
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

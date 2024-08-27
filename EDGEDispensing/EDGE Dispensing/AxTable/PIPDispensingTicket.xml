@@ -1,0 +1,360 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPDispensingTicket</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class PIPDispensingTicket extends common
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>anyIncluded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets a value indicating if any lines for this dispensing ticket are to be included in the dispensed quantity validation.
+    /// </summary>
+    /// <param name="_lineToIgnore">
+    ///    The record ID for the dispensing ticket line to ignore; optional. This is useful for forms to allow
+    ///    separate determination of the current line.
+    /// </param>
+    /// <returns>
+    ///    true if at least one lines for this dispensing ticket is marked for inclusion; otherwise, false.
+    /// </returns>
+    public boolean anyIncluded(RecId _lineToIgnore = 0)
+    {
+        return (select PIPDispensingTicketLine
+            where PIPDispensingTicketLine.PIPDispensingTicket  == this.RecId
+                && PIPDispensingTicketLine.RecId               != _lineToIgnore
+                && PIPDispensingTicketLine.IncludeInValidation == NoYes::Yes).RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkTolerances</Name>
+				<Source><![CDATA[
+    private boolean checkTolerances(PIPDispensedQty _dispensedQty, PIPDispensedCWQty _dispensedCWQty)
+    {
+        ProdJournalBOM      prodJournalBOM  = this.prodJournalBOM();
+        boolean             ret             = true;
+        BOM                 bom;
+    
+        if (!prodJournalBOM.prodTable().pipIsDispensingEnabled())
+        {
+            return true;
+        }
+    
+        bom = prodJournalBOM.prodBOM().pipBOM();
+    
+        if (PdsGlobal::pdsIsCWItem(prodJournalBOM.ItemId))
+        {
+            ret = bom.pipCheckDispensingTolerances(prodJournalBOM.PdsCWInventProposal, _dispensedCWQty, prodJournalBOM.InventDimId);
+        }
+        else
+        {
+            ret = bom.pipCheckDispensingTolerances(prodJournalBOM.BOMProposal, _dispensedQty, prodJournalBOM.InventDimId);
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProdJournalBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes fields in this table from a given record in the <c>ProdJournalBOM</c> table.
+    /// </summary>
+    /// <param name="_prodJournalBOM">
+    ///    The record in the <c>ProdJournalBOM</c> table.
+    /// </param>
+    public void initProdJournalBOM(ProdJournalBOM _prodJournalBOM)
+    {
+        this.ProdJournalBOMRefRecId = _prodJournalBOM.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prodJournalBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets the related record in the <c>ProdJournalBOM</c> table.
+    /// </summary>
+    /// <param name="_forUpdate">
+    ///    Determines if the record should be locked for updating; optional.
+    /// </param>
+    /// <returns>
+    ///    The related record in the <c>ProdJournalBOM</c> table.
+    /// </returns>
+    public ProdJournalBOM prodJournalBOM(boolean _forUpdate = false)
+    {
+        return ProdJournalBOM::findRecId(this.ProdJournalBOMRefRecId, _forUpdate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDispenseQtyFromLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the dispensed quantity for the BOM line dispensing ticket from the included dispensing ticket lines.
+    /// </summary>
+    /// <returns>
+    ///    true if all validations pass and this dispensing ticket buffer was updated; otherwise, false.
+    /// </returns>
+    public boolean updateDispenseQtyFromLines()
+    {
+        PIPDispensingTicketLine ticketLine;
+        ProdJournalBOM          prodJournalBOM  = this.prodJournalBOM();
+        boolean                 isCWItem        = PdsGlobal::pdsIsCWItem(prodJournalBOM.ItemId);
+        boolean                 ret             = true;
+    
+        setPrefix(prodJournalBOM.ItemId);
+    
+        select avg(DispensedQty), avg(DispensedCWQty) from ticketLine
+            where ticketLine.PIPDispensingTicket    == this.RecId
+                && ticketLine.IncludeInValidation   == NoYes::Yes;
+    
+        if (isCWItem)
+        {
+            // Catch weight quantity must be whole units
+            ticketLine.DispensedCWQty = roundDown(ticketLine.DispensedCWQty, 1);
+        }
+
+        ticketLine.DispensedQty = decRound(ticketLine.DispensedQty, UnitOfMeasure::unitOfMeasureDecimalPrecision(UnitOfMeasure::unitOfMeasureIdBySymbol(prodJournalBOM.BOMUnitId)));
+    
+        // Block to indent prefix
+        {
+            setPrefix(strFmt((isCWItem ? "@PIP972" : "@PIP973"), ticketLine.DispensedQty, ticketLine.DispensedCWQty));
+    
+            if (isCWItem && !PdsCatchWeight::validateQty(prodJournalBOM.ItemId, ticketLine.DispensedQty, UnitOfMeasure::unitOfMeasureIdBySymbol(prodJournalBOM.BOMUnitId), ticketLine.DispensedCWQty))
+            {
+                ret = false;
+            }
+    
+            ret = ret && this.checkTolerances(ticketLine.DispensedQty, ticketLine.DispensedCWQty);
+    
+            // Update the buffer with the computed quantities after all validations pass
+            if (ret)
+            {
+                this.DispensedQty   = ticketLine.DispensedQty;
+                this.DispensedCWQty = ticketLine.DispensedCWQty;
+            }
+            else
+            {
+                error("@SYS18447");
+            }
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets a value indicating if a matching record exists in the <c>PIPDispensingTicket</c> table.
+    /// </summary>
+    /// <param name="_recId">
+    ///    The surrogate key to check.
+    /// </param>
+    /// <returns>
+    ///    true if a matching record exists in the <c>PIPDispensingTicket</c> table; otherwise, false.
+    /// </returns>
+    public static boolean exist(RefRecId _recId)
+    {
+        return _recId
+            && (select PIPDispensingTicket
+                where PIPDispensingTicket.RecId == _recId).RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>find</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds a matching record in the <c>PIPDispensingTicket</c> table.
+    /// </summary>
+    /// <param name="_recId">
+    ///    The surrogate key to find.
+    /// </param>
+    /// <param name="_forUpdate">
+    ///    Determines if the record should be locked for updating; optional.
+    /// </param>
+    /// <returns>
+    ///    The matching record in the <c>PIPDispensingTicket</c> table or an empty buffer if no such record exists.
+    /// </returns>
+    public static PIPDispensingTicket find(RefRecId _recId, boolean _forUpdate = false)
+    {
+        PIPDispensingTicket dispensingTicket;
+    
+        if (_recId)
+        {
+            dispensingTicket.selectForUpdate(_forUpdate);
+    
+            select firstOnly dispensingTicket
+                where dispensingTicket.RecId == _recId;
+        }
+    
+        return dispensingTicket;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDispensingTicket</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the records in the <c>PIPDispensingTicket</c> table for all lines on the given production journal
+    ///    that are dispensing controlled.
+    /// </summary>
+    /// <param name="_journalTable">
+    ///    The record in the <c>ProdJournalTable</c> for the production order picking list journal to do the initialization for.
+    /// </param>
+    /// <remarks>
+    ///    This checks for existing records so may be called multiple times safely.
+    /// </remarks>
+    public static void initDispensingTicket(ProdJournalTable _journalTable)
+    {
+        PIPDispensingTicket     ticket;
+        QueryRun                queryRun;
+        Query                   query       = _journalTable.pipCreateDispensingQuery();
+        QueryBuildDataSource    dsProdJournalBOM;
+        QueryBuildDataSource    dsDispensingTicket;
+    
+        dsProdJournalBOM = query.dataSourceTable(tableNum(ProdJournalBOM));
+        dsDispensingTicket = dsProdJournalBOM.addDataSource(tableNum(PIPDispensingTicket));
+        dsDispensingTicket.joinMode(JoinMode::NoExistsJoin);
+        dsDispensingTicket.relations(true);
+    
+        ttsBegin;
+    
+        RecordInsertList ticketInserter = new RecordInsertList(tableNum(PIPDispensingTicket));
+        queryRun = new QueryRun(query);
+        while (queryRun.next())
+        {
+            ticket.initProdJournalBOM(queryRun.get(tableNum(ProdJournalBOM)));
+            ticketInserter.add(ticket);
+        }
+        ticketInserter.insertDatabase();
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+	<DeveloperDocumentation>@PIP894</DeveloperDocumentation>
+	<Label>@PIP862</Label>
+	<TableGroup>WorksheetHeader</TableGroup>
+	<TitleField1>ProdJournalBOMRefRecId</TitleField1>
+	<TitleField2>DispensedQty</TitleField2>
+	<DeleteActions />
+	<FieldGroups>
+		<AxTableFieldGroup>
+			<Name>AutoReport</Name>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>DispensedQty</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>DispensedCWQty</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoLookup</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoIdentification</Name>
+			<AutoPopulate>Yes</AutoPopulate>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoSummary</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoBrowse</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>Identification</Name>
+			<Label>@SYS53631</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>ProdJournalBOMRefRecId</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>Quantities</Name>
+			<Label>@PIP901</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>DispensedQty</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>DispensedCWQty</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+	</FieldGroups>
+	<Fields>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldReal">
+			<Name>DispensedCWQty</Name>
+			<ExtendedDataType>PIPDispensedCWQty</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldReal">
+			<Name>DispensedQty</Name>
+			<ExtendedDataType>PIPDispensedQty</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldInt64">
+			<Name>ProdJournalBOMRefRecId</Name>
+			<ExtendedDataType>RefRecId</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+	</Fields>
+	<FullTextIndexes />
+	<Indexes>
+		<AxTableIndex>
+			<Name>ProdJournalBOMRefIdx</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>ProdJournalBOMRefRecId</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+	</Indexes>
+	<Mappings />
+	<Relations>
+		<AxTableRelation>
+			<Name>ProdJournalBOM</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<RelatedTable>ProdJournalBOM</RelatedTable>
+			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>ProdJournalBOMRefRecId</Name>
+					<Field>ProdJournalBOMRefRecId</Field>
+					<RelatedField>RecId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+		</AxTableRelation>
+	</Relations>
+	<StateMachines />
+</AxTable>

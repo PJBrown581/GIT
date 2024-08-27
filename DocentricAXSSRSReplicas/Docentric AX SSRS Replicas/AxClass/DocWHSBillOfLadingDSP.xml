@@ -1,0 +1,275 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocWHSBillOfLadingDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class DocWHSBillOfLadingDSP extends DocDataSourceProviderSrsReporting
+{
+    WHSBillOfLadingTmp      header;     // used for placeholders
+    
+    #define.BillOfLadingHeader          ('BillOfLading')
+    #define.CarrierInformation          ('CarrierInformation')
+    #define.CustomerOrderInformation    ('CustomerOrderInformation')
+
+    // WHSBillOfLadingTmp is a single temporary table (filled by class WhsBillOfLadingDP) that contains header and lines
+
+    // fields used for Carrier information lines
+    container carrierFieldList = [
+                    fieldStr(WHSBillOfLadingTmp, LineQty),
+                    fieldStr(WHSBillOfLadingTmp, DefaultHandlingType),
+                    fieldStr(WHSBillOfLadingTmp, Qty),
+                    fieldStr(WHSBillOfLadingTmp, PackingType),
+                    fieldStr(WHSBillOfLadingTmp, grossWeight),
+                    fieldStr(WHSBillOfLadingTmp, HazardousMaterial),
+                    fieldStr(WHSBillOfLadingTmp, NmfcName),
+                    fieldStr(WHSBillOfLadingTmp, LTLClassCode),
+                    fieldStr(WHSBillOfLadingTmp, nmfcCode)];
+
+    // fields used for Customer order information lines
+    container orderFieldList = [
+                    fieldStr(WHSBillOfLadingTmp, PurchOrderFormNum),
+                    fieldStr(WHSBillOfLadingTmp, CustOrderPackQty),
+                    fieldStr(WHSBillOfLadingTmp, CustOrderWeight),
+                    fieldStr(WHSBillOfLadingTmp, CircleY),
+                    fieldStr(WHSBillOfLadingTmp, CircleN),
+                    fieldStr(WHSBillOfLadingTmp, AdditionalInfo)];
+
+    // fields not used for DDSP
+    container uselessFieldList = [
+                    fieldStr(WHSBillOfLadingTmp, DummyCustomer),
+                    fieldStr(WHSBillOfLadingTmp, CustLine),
+                    fieldStr(WHSBillOfLadingTmp, CountLine)];
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return 'WHS Bill of lading DSP';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>singleLineStreet</Name>
+				<Source><![CDATA[
+    LogisticsAddressStreet singleLineStreet(LogisticsAddressStreet _street)
+    {
+        _street = strReplace(_street, '\n', ', ');
+        _street = strReplace(_street, '\r', '');
+        _street = strReplace(_street, '\t', ' ');
+
+        return _street;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>subBOLIds</Name>
+				<Source><![CDATA[
+    String255 subBOLIds(WHSBillOfLading _whsBillOfLading, boolean _requireMaster = true)
+    {
+        String255           res = '';
+        String255           resTemp = '';
+        WHSBillOfLading     subWHSBillOfLading;
+
+        if (_requireMaster && !_whsBillOfLading.MasterBOLFlag)
+        {
+            return res;
+        }
+        while select BillOfLadingId from subWHSBillOfLading where subWHSBillOfLading.MasterBillOfLadingId == _whsBillOfLading.BillOfLadingId
+        {
+            if (res)
+            {
+                res += ', ';
+            }
+            res += subWHSBillOfLading.BillOfLadingId;
+            resTemp = this.subBOLIds(subWHSBillOfLading, false);
+            if (resTemp)
+            {
+                res += ', ' + resTemp;
+            }
+        }
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        // Standard mechanism is replaced by custom DDSP generation
+        //super(_recordBuilder);
+
+        WHSBillOfLadingTmp whsBillOfLadingTmp = this.getReportDataTableContext(tableStr(WHSBillOfLadingTmp));
+
+        // Header
+        select firstOnly whsBillOfLadingTmp;
+        whsBillOfLadingTmp.FromStreet = this.singleLineStreet(whsBillOfLadingTmp.FromStreet);
+        whsBillOfLadingTmp.ToStreet   = this.singleLineStreet(whsBillOfLadingTmp.ToStreet);
+        
+        WHSBillOfLading     billOfLading = WHSBillOfLading::find(whsBillOfLadingTmp.BillOfLadingId);
+        whsBillOfLadingTmp.MasterBillOfLadingId = billOfLading.MasterBillOfLadingId;
+
+        DocXmlRecord headerDataRecord = _recordBuilder.addRecord(whsBillOfLadingTmp.data()).setSingleRecord(true);     // each line contains header data
+        headerDataRecord.setRecordName(#BillOfLadingHeader);
+        headerDataRecord.setRecordLabel('Bill Of Lading');
+        headerDataRecord.addAllFieldsExcept(carrierFieldList + orderFieldList + uselessFieldList);
+
+        // Master Bill of Lading
+        headerDataRecord.addCalculatedFieldFromEnum('MasterBOL', enumStr(boolean), billOfLading.MasterBOLFlag);
+        headerDataRecord.addCalculatedField('SubBOLIds', this.subBOLIds(billOfLading), 'Undelaying Bill of Lading Numbers');
+
+        // TODO: Add additional header fields if required
+
+        // Split addresses in multiple fields and convert multiline street into single line
+        LogisticsPostalAddress fromAddress = LogisticsPostalAddress::findRecId(billOfLading.ShippingPostalAddress);
+        LogisticsPostalAddress toAddress = LogisticsPostalAddress::findRecId(billOfLading.DeliveryPostalAddress);
+        LogisticsPostalAddress thirdPartyAddress = LogisticsPostalAddress::findRecId(billOfLading.ThirdPartyPostalAddress);
+        headerDataRecord.addCalculatedFieldFromEdt('FromCountry', extendedTypeStr(LogisticsAddressCountryRegionId), fromAddress.CountryRegionId);
+        headerDataRecord.addCalculatedFieldFromEdt('ToCountry', extendedTypeStr(LogisticsAddressCountryRegionId), toAddress.CountryRegionId);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyCity', extendedTypeStr(LogisticsAddressCityName), thirdPartyAddress.City);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyStreet', extendedTypeStr(LogisticsAddressStreet), this.singleLineStreet(thirdPartyAddress.Street));
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyState', extendedTypeStr(LogisticsAddressStateId), thirdPartyAddress.State);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyZipCode', extendedTypeStr(LogisticsAddressZipCodeId), thirdPartyAddress.ZipCode);
+        headerDataRecord.addCalculatedFieldFromEdt('ThirdPartyCountry', extendedTypeStr(LogisticsAddressCountryRegionId), thirdPartyAddress.CountryRegionId);
+                
+        // Carrier items
+        while select whsBillOfLadingTmp where
+            whsBillOfLadingTmp.LineQty ||
+            whsBillOfLadingTmp.DefaultHandlingType ||
+            whsBillOfLadingTmp.Qty ||
+            whsBillOfLadingTmp.PackingType ||
+            whsBillOfLadingTmp.grossWeight ||
+            whsBillOfLadingTmp.HazardousMaterial ||
+            whsBillOfLadingTmp.NmfcName ||
+            whsBillOfLadingTmp.LTLClassCode ||
+            whsBillOfLadingTmp.nmfcCode
+        {
+            _recordBuilder.goToParentRecord();
+            DocXmlRecord carrierDataRecord = _recordBuilder.addRecord(whsBillOfLadingTmp);
+            carrierDataRecord.setRecordName(#CarrierInformation);
+            carrierDataRecord.setRecordLabel('Carrier information');
+            carrierDataRecord.addFields(carrierFieldList);
+        }
+
+        // Customer orders
+        while select whsBillOfLadingTmp where
+            whsBillOfLadingTmp.PurchOrderFormNum ||
+            whsBillOfLadingTmp.CustOrderPackQty ||
+            whsBillOfLadingTmp.CustOrderWeight ||
+            whsBillOfLadingTmp.CircleY ||
+            whsBillOfLadingTmp.CircleN ||
+            whsBillOfLadingTmp.AdditionalInfo
+        {
+            _recordBuilder.goToParentRecord();
+            DocXmlRecord orderDataRecord = _recordBuilder.addRecord(whsBillOfLadingTmp);
+            orderDataRecord.setRecordName(#CustomerOrderInformation);
+            orderDataRecord.setRecordLabel('Customer order information');
+            orderDataRecord.addFields(orderFieldList);
+        }
+
+        // Store the header to use it in overrideReportRunSettings()
+        header = headerDataRecord.getCommon();
+
+        // Export generated XML to a string or a file to check the resulting report DS.
+        //_recordBuilder.exportToXmlFile('WHSBillOfLadingDs.xml');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // Custom placeholders
+    #define.BillOfLadingId('BillOfLadingId')
+    #define.ShipFromName('ShipFromName')
+    #define.ShipmentId('ShipmentId')
+    #define.ShipToName('ShipToName')
+    #define.CustAccount('CustAccount')
+    #define.CustName('CustName')
+    #define.CustContactName('CustContactName')
+    #define.CompanyName('CompanyName')
+    #define.CarrierCode('CarrierCode')
+    #define.CarrierName('CarrierName')
+    #define.TrailerNumber('TrailerNumber')
+    #define.SealNum('SealNum')
+    #define.SCAC('SCAC')
+    #define.ProNum('ProNum')
+    #define.MasterBOL('MasterBOL')
+    #define.MasterBillOfLadingId('MasterBillOfLadingId')
+    #define.Notes('Notes')
+    #define.TotalHandlingQty('TotalHandlingQty')
+    #define.TotalPackageQty('TotalPackageQty')
+    #define.TotalWeight('TotalWeight')
+    // for SessionDate use standard CurrentDate placeholder
+    
+    [DocPlaceholderAttribute(#BillOfLadingId, 'BOL - Bill of Lading ID'),
+     DocPlaceholderAttribute(#ShipFromName, 'BOL - Ship From Name'),
+     DocPlaceholderAttribute(#ShipmentId, 'BOL - Shipment ID'),
+     DocPlaceholderAttribute(#ShipToName, 'BOL - Ship To Name'),
+     DocPlaceholderAttribute(#CustAccount, 'BOL - Customer Account'),
+     DocPlaceholderAttribute(#CustName, 'BOL - Customer Name'),
+     DocPlaceholderAttribute(#CustContactName, 'BOL - Customer Contact Name'),
+     DocPlaceholderAttribute(#CompanyName, 'BOL - Company Name'),
+     DocPlaceholderAttribute(#CarrierCode, 'BOL - Shipping Carrier'),
+     DocPlaceholderAttribute(#CarrierName, 'BOL - Carrier Name'),
+     DocPlaceholderAttribute(#TrailerNumber, 'BOL - Trailer Number'),
+     DocPlaceholderAttribute(#SealNum, 'BOL - Seal Number'),
+     DocPlaceholderAttribute(#SCAC, 'BOL - SCAC'),
+     DocPlaceholderAttribute(#ProNum, 'BOL - Pro Number'),
+     DocPlaceholderAttribute(#MasterBOL, 'BOL - Master Bill of Lading'),
+     DocPlaceholderAttribute(#MasterBillOfLadingId, 'BOL - Master Bill of Lading ID'),
+     DocPlaceholderAttribute(#Notes, 'BOL - Notes'),
+     DocPlaceholderAttribute(#TotalHandlingQty, 'BOL - Total Handlig Qty'),
+     DocPlaceholderAttribute(#TotalPackageQty, 'BOL - Total Package Qty'),
+     DocPlaceholderAttribute(#TotalWeight, 'BOL - Total Weight')]
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        // Replace standard placeholders.
+        DocPlaceholderManager placeholderMng = super(_reportRunContext, _replaceStandardPlaceholders);
+
+        // Replace custom placeholders.
+        CustTable custTable = CustTable::find(header.CustAccount);
+        WHSBillOfLading billOfLading = WHSBillOfLading::find(header.BillOfLadingId);
+
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#BillOfLadingId, header.BillOfLadingId);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipFromName, header.ShipFromName);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipmentId, header.ShipmentId);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipToName, header.ShipToName);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustAccount, header.CustAccount);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustName, custTable.name());
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustContactName, DocDspHelper::contactPersonName(custTable.ContactPersonId));
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CompanyName, header.CompanyName);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CarrierCode, header.CarrierCode);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CarrierName, header.Name);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TrailerNumber, header.TrailerNumber);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#SealNum, header.SealNum);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#SCAC, header.SCAC);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ProNum, header.ProNumShipment);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#MasterBOL, billOfLading.MasterBOLFlag);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#MasterBillOfLadingId, billOfLading.MasterBillOfLadingId);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#Notes, header.Notes);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TotalHandlingQty, header.TotalHandlingQty);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TotalPackageQty, header.TotalPackingQty);
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#TotalWeight, header.TotalWeight);
+
+        // Fill the Print archive contract.
+        _reportRunContext.archiveContract().setCustAccount(header.CustAccount);
+        _reportRunContext.archiveContract().setWHSShipmentId(header.ShipmentId);
+        _reportRunContext.archiveContract().setDocument(header.BillOfLadingId);
+        
+        return placeholderMng;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

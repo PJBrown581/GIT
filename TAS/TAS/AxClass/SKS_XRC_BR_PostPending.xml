@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_XRC_BR_PostPending</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_XRC_BR_PostPending
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the class with the specified arguments.
+    /// </summary>
+    /// <param name = "_args">The specified arguments.</param>
+    /// 
+    public static void main(Args _args)
+    {
+        if (Box::okCancel("@SKS:SKGXRCWarning", DialogButton::Cancel, '') == DialogButton::Cancel)
+        {
+            return;
+        }
+
+        Dialog locDialog = new Dialog('Post pending Bank Trans');
+        locDialog.addText('This dialog is post all pending transactions on a given statement:');
+        DialogField locDialogFieldDataAreaID = locDialog.addField(extendedTypeStr(SelectableDataArea), 'Enter Company');
+        DialogField locDialogFieldAccountID = locDialog.addField(extendedTypeStr(BankAccountID), 'Enter Account ID');
+        DialogField locDialogFieldStatementDate = locDialog.addField(extendedTypeStr(TransDate), 'Enter Statement Date');
+        DialogField locDialogFieldStatemenum = locDialog.addField(extendedTypeStr(BankAccountStatementNum), 'Enter Statement Number');
+
+        if(locDialog.run() == 0)
+            return;
+
+        SelectableDataArea locCompany   = locDialogFieldDataAreaID.value();
+        BankAccountID locAccountID = locDialogFieldAccountID.value();
+        date locStatementDate = locDialogFieldStatementDate.value();
+        str locStatementNum = locDialogFieldStatemenum.value();
+
+        if(!locCompany)
+            error('Company is empty');
+        else if (!locAccountID)
+            error('Acount ID is empty');
+        else if(locStatementDate == dateNull())
+            error('Statement date is empty');
+        else if (!locStatementNum)
+            error('Account statement num is empty');
+
+        if(!locCompany || !locAccountID || locStatementDate == dateNull() || !locStatementNum)
+            return;
+
+        SysOperationSandbox::callStaticMethod(classNum(SKS_XRC_BR_PostPending),
+            staticMethodStr(SKS_XRC_BR_PostPending, processTransactions),
+            [locCompany, locAccountID, locStatementDate, locStatementNum],
+            'Posting transactions',
+            'Posting complete');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTransactions</Name>
+				<Source><![CDATA[
+    public static void processTransactions(container _params)
+    {
+        SelectableDataArea locCompany = conPeek(_params,1);
+        BankAccountID locAccountID = conPeek(_params,2);
+        date locStatementDate = conPeek(_params,3);
+        str locStatementNum = conPeek(_params,4);
+
+        changecompany(locCompany)
+        {
+            SKS_PP_Bank ppBank = SKS_PP_Bank::find(locAccountID, locCompany);
+
+            if(!ppBank)
+            {
+                error(strFmt('%1 bank was not found in TAS setup', locAccountID));
+                return;
+            }
+
+            BankAccountStatement locBankAccountStatement;
+
+            Select DataAreaId, RecId, ReconcileDate from locBankAccountStatement
+                where locBankAccountStatement.AccountId == locAccountID
+                    && locBankAccountStatement.AccountStatementDate == locStatementDate
+                    && locBankAccountStatement.AccountStatementNum == locStatementNum;
+
+            if(!locBankAccountStatement)
+            {
+                error(strFmt('Statement not found. Cpny: %1 AccountID: %2 StatementDate: %3 StatementNum: %4', locCompany, locAccountID, SKS_PP_StringFormats::strDateMMDDYYYY(locStatementDate, DateSeparator::Slash), locStatementNum));
+                return;
+            }
+            else if(locBankAccountStatement.ReconcileDate != dateNull())
+            {
+                error(strFmt('Statement is reconciled.Cpny: %1 AccountID: %2 StatementDate: %3 StatementNum: %4', locCompany, locAccountID, SKS_PP_StringFormats::strDateMMDDYYYY(locStatementDate, DateSeparator::Slash), locStatementNum));
+                return;
+            }
+
+            SKS_BR_BankTran sksBankTran;
+            System.Threading.Tasks.Task postingTask;
+            List tasks = new List(Types::Class);
+
+            while select * from sksBankTran where sksBankTran.Matched == NoYes::No
+                && sksBankTran.MatchIndicator == SKS_BR_MatchIndicator::Yellow
+                && sksBankTran.ImportedStatementDate == locStatementDate
+                && sksBankTran.ImportedStatementNum == locStatementNum
+                && sksBankTran.AccountId == locAccountID
+            {
+                BankAccountTrans accountTrans;
+                SKS_LB_JournalARApplic journalARApplic;
+
+                select crosscompany sum(AmountCur) from accountTrans
+                where accountTrans.SKS_BR_ManualReconciliationID == sksBankTran.ManualReconciliationID
+                    && accountTrans.SKS_BR_ManualReconciliationID != emptyGuid();
+
+                select sum(TransactionAmount) from journalARApplic
+                where journalARApplic.SKS_BR_BankTran == sksBankTran.RecId;
+
+                if(sksBankTran.TranAmount - (accountTrans.AmountCur + journalARApplic.TransactionAmount) != 0)
+                {
+                    continue;
+                }
+
+                SKS_LB_JournalARApplic partialApplic;
+
+                select firstonly partialApplic
+                    where partialApplic.SKS_BR_BankTran == sksBankTran.RecId
+                    && partialApplic.Status == SKS_BR_Status::Partial;
+
+                if(partialApplic)
+                {
+                    continue;
+                }
+
+                postingTask = Global::runAsync(
+                        classNum(SKS_XRC_BR_PostPending),
+                        staticMethodStr(SKS_XRC_BR_PostPending, postTran),
+                        [sksBankTran.Recid, locStatementDate, locStatementNum, locAccountID, locCompany, locBankAccountStatement.CurrencyCode],
+                        System.Threading.CancellationToken::None);
+
+                tasks.addEnd(postingTask);
+
+            }
+
+            SKS_XRC_BR_PostPending::runAfterAllPosted(tasks.pack());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postTran</Name>
+				<Source><![CDATA[
+    public static container postTran(container _params)
+    {
+        changecompany(conPeek(_params, 5))
+        {
+            int64 sksBankTranRecId = conPeek(_params, 1);
+            SKS_BR_BankTran sksBankTran;
+            select forupdate * from sksBankTran where sksBankTran.RecId == sksBankTranRecId;
+
+            if(sksBankTran.ManualReconciliationID == emptyGuid())
+            {
+                sksBankTran.ManualReconciliationID = newGuid();
+            }
+
+            SKS_BR_BankReconciliationTrans SKS_BR_BankReconciliationTrans = new SKS_BR_BankReconciliationTrans();
+
+            SKS_BR_BankReconciliationTrans.parmBankAccountId(conPeek(_params, 4));
+            SKS_BR_BankReconciliationTrans.parmTransDate(conPeek(_params, 2));
+            SKS_BR_BankReconciliationTrans.parmBankAccountStatementNum(conPeek(_params, 3));
+            SKS_BR_BankReconciliationTrans.parmcurrency(conPeek(_params, 6));
+
+            SKS_BR_BankReconciliationTrans.parmTransGuid(sksBankTran.ManualReconciliationID);
+            SKS_BR_BankReconciliationTrans.parmBankTransactionType(sksBankTran.BankTranType);
+            SKS_BR_BankReconciliationTrans.parmCompanyBankAccountId(sksBankTran.AccountId);
+            SKS_BR_BankReconciliationTrans.parmCustAccount(sksBankTran.CustAccount);
+            SKS_BR_BankReconciliationTrans.parmDataAreaId(sksBankTran.dataAreaId);
+            SKS_BR_BankReconciliationTrans.parmSelectableDataArea(sksBankTran.CustCompany);
+            SKS_BR_BankReconciliationTrans.parmSKS_BR_BankCustomerNum(sksBankTran.BankCustomerNum);
+            SKS_BR_BankReconciliationTrans.parmSKS_BR_BankNum(sksBankTran.BankNum);
+            SKS_BR_BankReconciliationTrans.parmImportTranType(sksBankTran.FileTranType);
+            SKS_BR_BankReconciliationTrans.parmRecId(sksBankTran.RecId);
+            SKS_BR_BankReconciliationTrans.parmMatched(sksBankTran.Matched);
+
+            boolean isPosted;
+            boolean isMapped;
+
+            SKS_BR_GLProcessing_transactionform locSKS_BR_GLProcessing = new SKS_BR_GLProcessing_transactionform();
+
+            ttsbegin;
+            isMapped = locSKS_BR_GLProcessing.MatchExistingBankTransactions(SKS_BR_BankReconciliationTrans);
+            isPosted = locSKS_BR_GLProcessing.PostGL(SKS_BR_BankReconciliationTrans.parmRecId(), SKS_BR_BankReconciliationTrans);
+
+            if(isMapped && isPosted)
+            {
+                sksBankTran.reread();
+                sksBankTran.unMarkUserPrivate();
+                sksBankTran.update();
+                ttsCommit;
+            }
+            else
+            {
+                ttsabort;
+            }
+        }
+        return conNull();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runAfterAllPosted</Name>
+				<Source><![CDATA[
+    public static void runAfterAllPosted(container _params)
+    {
+        List tasks = new List(Types::Class);
+        for(int i = 3; i < conLen(_params); i++)
+        {
+            tasks.addEnd(conPeek(_params, i+1));
+        }
+
+        boolean threadsRunning = true;
+        while (threadsRunning)
+        {
+            ListEnumerator enumerator = tasks.getEnumerator();
+
+            System.Threading.Tasks.Task currentTask;
+            boolean allCompleted = true;
+
+            while(enumerator.moveNext())
+            {
+                currentTask = enumerator.current();
+
+                if(currentTask.Status == System.Threading.Tasks.TaskStatus::RanToCompletion)
+                {
+                    allCompleted = true && allCompleted;
+                }
+                else
+                {
+                    allCompleted = false;
+                    break;
+                }
+            }
+            threadsRunning = !allCompleted;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

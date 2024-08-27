@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_BTBJournalValidate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class SKS_EFT_BTBJournalValidate
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>validateSet</Name>
+				<Source><![CDATA[
+    static boolean validateSet(LedgerJournalTable _ledgerJournalTable, boolean _enableLog = false,  boolean _displaystatus = true, boolean _isCallFromPaymReq = false /*SKS_FDD_9536*/)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        SKS_BTB_PaymModeTable sKS_BTB_PaymModeTable;
+        boolean valid = true;
+        SKS_EFT_BanktoBankPaym sks_eft_BanktoBankPaym;
+        SKS_EFTBTB_Bank sks_EFTBTB_Bank;
+        SKS_EFT_FileFormat sks_eft_FileFormat;
+        SKS_EFT_FileFormatPaymSpec  sks_eft_fileformatpaymspec;
+        BankAccountTable bankAccountTable;
+        BankAccountTable ledgerbankAccountTable;
+       // Spectrans spectrans;
+        #define.PaymSpec_CCDP('CCD+')
+        boolean CheckAllowDr;
+        //SKS_VSTS_12517 --->
+        SKS_EFT_FileFormatPaymSpecFields lSKS_EFT_FileFormatPaymSpecFields;
+        SKS_EFT_BankPaymLookup lSKS_EFT_BankPaymLookup;
+        //SKS_VSTS_12517< ---
+        System.Threading.Tasks.Task validationTask;
+        //SKS_FDD_16447/16448 --->
+        SKS_EFT_FileFormatFields            lSKS_EFT_FileFormatFields;
+        SKS_EFT_BTBBankAccountPaymLookup    lSKS_EFT_BTBBankAccountPaymLookup;
+        SKS_EFT_FileFormat                  lsks_eft_FileFormat;
+        //SKS_FDD_16447/16448< ---
+        List tasks = new List(Types::Class);
+        boolean recordsFound = false;
+        ;
+
+        //SKS-VP1-APPaymentJournalValidation
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList_del;
+        LedgerJournalTrans ledgerJournalTransUpt;
+        SKS_DD_CustVendMandPaymValidate custVendMandPaymValidate = new SKS_DD_CustVendMandPaymValidate();
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList;
+
+        SKS_PP_500PPBas dd500PP = new SKS_PP_500PPBas();
+
+        EventHandlerResult result = new EventHandlerResult();           //SKS_VSTS_12680
+
+        if(dd500PP.IsRegistered('APEFT') != 1)
+        {
+            throw error("@SKS326");
+        }
+
+        ttsBegin;
+        custVendPaymExceptionList_del.skipDeleteActions(true);      //TAS_CAR
+        delete_from custVendPaymExceptionList_del where custVendPaymExceptionList_del.JournalId == _ledgerJournalTable.JournalNum;
+        // reset the exception status on the line level
+        ledgerJournalTransUpt.skipDataMethods(true);        //TAS_CAR
+        update_recordSet ledgerJournalTransUpt setting
+        SKS_DD_ExceptionStatus = SKS_DD_ExceptionStatus::Blank
+        where ledgerJournalTransUpt.JournalNum == _ledgerJournalTable.JournalNum &&
+              ledgerJournalTransUpt.SKS_DD_ExceptionStatus != SKS_DD_ExceptionStatus::Blank;
+        ttsCommit;
+        //SKS-VP1-APPaymentJournalValidation
+
+        //select APAcctApproval, APReqPreNote from sks_eft_Setup;
+
+        while select ledgerJournalTrans where
+          ledgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum &&
+          ledgerJournalTrans.PaymentStatus != CustVendPaymStatus::Rejected && // Don't check rejected lines
+          ledgerJournalTrans.SKS_EFT_BTBPmtSelectionRecId == 0 // Only get non-transferred lines
+          join FormatId, TransferType from sKS_BTB_PaymModeTable where
+            sKS_BTB_PaymModeTable.PaymMode == ledgerJournalTrans.PaymMode 
+        {
+            CheckAllowDr = false;
+            if(ledgerJournalTrans.OffsetAccountType != LedgerJournalACType::Bank)
+            {
+                // Offset account type must be Bank.
+                SKS_EFT_JournalValidate::errorLog("@SYS119875", ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                valid = false;
+            }
+            if(ledgerJournalTrans.OffsetLedgerDimension == 0)
+            {
+                // Offset account must be set.
+                SKS_EFT_JournalValidate::errorLog("@SYS35030", ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                valid = false;
+            }
+            else
+            {
+                bankAccountTable = BankAccountTable::findByLedgerDimension(ledgerJournalTrans.OffsetLedgerDimension);
+                sks_EFTBTB_Bank = SKS_EFTBTB_Bank::find(bankAccountTable.AccountID, ledgerJournalTrans.PaymMode);
+                if(!sks_EFTBTB_Bank)
+                {
+                    // Bank account: %1 not setup for EFT+.
+                    SKS_EFT_JournalValidate::errorLog(strFmt("@SKS987", bankAccountTable.AccountID, strFmt("@SKS:SKGBTBEFT")), ledgerJournalTrans, _enableLog);
+                    valid = false;
+                }
+                else
+                {
+                    SKS_EB_CommProcess SKS_EB_CommProcess;
+                    select * from SKS_EB_CommProcess where SKS_EB_CommProcess.CommID == sks_EFTBTB_Bank.BTBCommID;
+                   
+                     if(Global::clientKind() == ClientType::Server && _ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes && SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::Prompt)
+                    {
+                        SKS_EFT_JournalValidate::errorLog(strFmt("@SKS:SKGFileCompletePromptError", sks_EFTBTB_Bank.BTBCommID), ledgerJournalTrans, _enableLog);
+                        valid = false;
+                    }
+
+                    //SKS_FDD_16447/16448---->
+                    select firstonly lsks_eft_FileFormat where lsks_eft_FileFormat.FormatId == sKS_BTB_PaymModeTable.FormatId;
+
+                    while select FileFormatRecId, RecId, Description, FixedValue, Required from
+                        lSKS_EFT_FileFormatFields where
+                        lSKS_EFT_FileFormatFields.FileFormatRecId == lsks_eft_FileFormat.RecId &&
+                        lSKS_EFT_FileFormatFields.Required == NoYes::Yes
+                        join CodeLookupValuesRecId, FixedValue, FileFormatFieldsRecId from
+                            lSKS_EFT_BTBBankAccountPaymLookup where
+                            lSKS_EFT_BTBBankAccountPaymLookup.FileFormatFieldsRecId == lSKS_EFT_FileFormatFields.RecId &&
+                            lSKS_EFT_BTBBankAccountPaymLookup.BankPaymRecId == sks_EFTBTB_Bank.RecId
+                    {
+                        if(lSKS_EFT_BTBBankAccountPaymLookup.fixedvalue == '' && lSKS_EFT_BTBBankAccountPaymLookup.CodeLookupValuesRecId == 0)
+                        {
+                            SKS_EFT_JournalValidate::errorLog(strFmt("@SKS:SKGBTBBankCodeLookupValidation", lSKS_EFT_FileFormatFields.Description), ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                            valid = false;
+                        }
+                    }
+                    //SKS_FDD_16447/16448<----
+                }
+
+                /*if(sks_eft_setup.APBankAcctApproval == NoYes::Yes && bankAccountTable.SKS_EFT_AcctStatus == SKS_EFT_AcctApprovalStatus::Pending)
+                {
+                    SKS_EFT_JournalValidate::errorLog(strFmt("@SKS2705"), ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                    valid = false;
+                }*/
+
+                if (!bankAccountTable.BankMultiCurrency && ledgerJournalTrans.CurrencyCode != bankAccountTable.CurrencyCode)
+                {
+                    SKS_EFT_JournalValidate::errorLog(strFmt("@SKS6745", bankAccountTable.AccountID, bankAccountTable.CurrencyCode), ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                    valid = false;
+                }
+            }
+
+            //do not allow a zero balance
+            if(ledgerJournalTrans.AmountCurCredit == 0 && ledgerJournalTrans.AmountCurDebit == 0)
+            {
+
+                SKS_EFT_JournalValidate::errorLog("@SKS2030", ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                valid = false;
+            }
+
+            if(!ledgerJournalTrans.SKS_EFT_IsPaymentUpload) //SKS_FDD_9785
+            {
+                changeCompany(ledgerJournalTrans.Company)
+                {
+                    ledgerbankAccountTable = BankAccountTable::findByLedgerDimension(ledgerJournalTrans.LedgerDimension);
+                }
+
+                sks_eft_BanktoBankPaym = SKS_EFT_BanktoBankPaym::find(
+                                ledgerJournalTrans.Company,
+                                ledgerbankAccountTable.AccountID,
+                                ledgerJournalTrans.PaymMode,
+                                ledgerJournalTrans.PaymSpec);
+
+                //vendBankAccount = VendBankAccount::findByCompany(ledgerJournalTrans.Company, vendTable.AccountNum, ledgerJournalTrans.CustVendBankAccountId);       ////SKS_VSTS_12680
+
+                if(!sks_eft_BanktoBankPaym)
+                {
+                    // Company, Vendor, Method of payment, Payment specification, Vendot bank account combination not setup for EFT+.
+                    SKS_EFT_JournalValidate::errorLog("@SKS:SKGBTBValidateCombException", ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                    valid = false;
+                }
+                else
+                {
+                    //SKS_VSTS_12680--->
+                    select sks_eft_fileformatpaymspec where sks_eft_fileformatpaymspec.FormatId == sKS_BTB_PaymModeTable.FormatId
+                            && sks_eft_fileformatpaymspec.PaymSpec == ledgerjournaltrans.PaymSpec;
+
+
+                    if(!result.result())
+                    {
+                        //SKS_VSTS_12680<---
+                        //SKS_VSTS_12517----->
+
+                        while select FileFormatPaymSpecRecId, RecId, Description, FixedValue, Required from
+                            lSKS_EFT_FileFormatPaymSpecFields where
+                            lSKS_EFT_FileFormatPaymSpecFields.FileFormatPaymSpecRecId == sks_eft_fileformatpaymspec.RecId &&
+                            lSKS_EFT_FileFormatPaymSpecFields.Required == NoYes::Yes
+                            join CodeLookupValuesRecId, FixedValue, FileFormatPaymSpecFieldsRecId from
+                                lSKS_EFT_BankPaymLookup where
+                                lSKS_EFT_BankPaymLookup.FileFormatPaymSpecFieldsRecId == lSKS_EFT_FileFormatPaymSpecFields.RecId &&
+                                lSKS_EFT_BankPaymLookup.BankPaymRecId == sks_eft_BanktoBankPaym.RecId
+                        {
+                            if(lSKS_EFT_BankPaymLookup.fixedvalue == '' && lSKS_EFT_BankPaymLookup.CodeLookupValuesRecId == 0)
+                            {
+                                SKS_EFT_JournalValidate::errorLog(strFmt("@SKS:SKGBTBCodeLookupValidation", lSKS_EFT_FileFormatPaymSpecFields.Description), ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                                valid = false;
+                            }
+                        }
+                    }
+                    //SKS_VSTS_12517<-------
+                    select SKS_BTB_InboundFileGroupId from sks_eft_fileformat where sks_eft_FileFormat.FormatId == sks_eft_BanktoBankPaym.formatid;
+                }
+
+                sks_eft_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(ledgerJournalTrans.company(), sks_eft_BanktoBankPaym.formatid, ledgerJournalTrans.PaymSpec);
+
+                //// If summary by Invoice and using Inbound files you can only have 1 invoice per payment
+                //if(sks_eft_fileformat.SKS_BTB_InboundFileGroupId
+                //    && (sks_eft_FileFormatPaymSpec.RecordSummary == SKS_EFT_PaymSpecRecordSummary::Invoice
+                //    || (sks_eft_FileFormatPaymSpec.RecordSummary == SKS_EFT_PaymSpecRecordSummary::AllAllowed && sks_eft_BanktoBankPaym.RecordSummary == SKS_EFT_VendorRecordSummary::Invoice)))
+                //{
+                //    select count(RecId) from spectrans where Spectrans.specrecid == LedgerJournalTrans.Recid;
+                //    if(spectrans.RecId > 1)
+                //    {
+                //        SKS_EFT_JournalValidate::errorLog("@SKS3000", ledgerJournalTrans, _enableLog, ledgerJournalTrans.AmountCurCredit ? ledgerJournalTrans.AmountCurCredit : ledgerJournalTrans.AmountCurDebit);
+                //        valid = false;
+                //    }
+                //}
+                
+            } // SKS_FDD_9785
+
+            if(sks_eft_BanktoBankPaym) //Only run validation if a valid vendorpaym combination exists
+            {
+                recordsFound = true;
+                validationTask = Global::runAsync(
+                        classNum(SKS_BTBEFT_JournalBankValidate),
+                        staticMethodStr(SKS_BTBEFT_JournalBankValidate, runValidation),
+                        [sKS_BTB_PaymModeTable, ledgerJournalTrans, false, false],
+                        System.Threading.CancellationToken::None);
+
+                tasks.addEnd(validationTask);
+            }
+            if(!SKS_EFT_JournalValidate::checkSettledAmount(ledgerJournalTrans, SKS_EFT_Module::BTB, _enableLog))
+            {
+                valid = false;
+            }           
+        }
+
+        // Only run this format validation code if records were found in prior while select
+        if(recordsFound && !SKS_EFT_JournalValidate::runAfterAllValidated(tasks.pack(), _ledgerJournalTable.JournalNum))
+        {
+            valid = false;
+        }
+       
+        custVendMandPaymValidate.init(_ledgerJournalTable.JournalNum);
+        valid = custVendMandPaymValidate.validateVendPaymentJournal(_enableLog);
+       
+        if(valid == false)
+        {
+            if (_enableLog == false)
+            {
+                select RecId from custVendPaymExceptionList
+                where custVendPaymExceptionList.JournalId == _ledgerJournalTable.JournalNum
+                && custVendPaymExceptionList.ErrorWarning == SKS_DD_ErrorWarning::Error
+                && custVendPaymExceptionList.IsDirectDebitException == false;
+
+                if(custVendPaymExceptionList.RecId)
+                {
+                    valid = false;
+                }
+                else
+                {
+                    valid = true;
+                }
+            }
+        }
+
+        //SKS-VP1-APPaymentJournalValidation
+        select RecId from custVendPaymExceptionList
+        where custVendPaymExceptionList.JournalId == _ledgerJournalTable.JournalNum;
+
+        if(custVendPaymExceptionList.RecId && !_isCallFromPaymReq) // SKS_FDD_9536
+        {
+            select RecId from custVendPaymExceptionList
+            where custVendPaymExceptionList.JournalId == _ledgerJournalTable.JournalNum
+            && custVendPaymExceptionList.ErrorWarning == SKS_DD_ErrorWarning::Error
+            && custVendPaymExceptionList.IsDirectDebitException == false;
+
+            if(custVendPaymExceptionList.RecId)
+            {
+                valid = false;
+                error('Exception found. Please check exception list.');
+            }
+            else
+            {
+                valid = true;
+                warning('Exception found. Please check exception list.');
+            }
+        }
+        //SKS-VP1-APPaymentJournalValidation
+
+        if(!valid && _displaystatus && _enableLog)
+        {
+            error("@SKS1440");
+        }
+        return valid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateUnSet</Name>
+				<Source><![CDATA[
+    static boolean validateUnSet(LedgerJournalTable _ledgerJournalTable, boolean _log = false, boolean _enableLog = false)
+    {
+        SKS_EFT_FilePmtSelection  sks_eft_FilePmtSelection;
+        SKS_EFTAP_File sks_eftap_File;
+        str errorMsg;
+        LedgerJournalTrans  ledgerJournalTrans;
+
+        select firstonly FileRecId
+            from  sks_eft_FilePmtSelection
+            where sks_eft_FilePmtSelection.PmtJournalNum == _ledgerJournalTable.JournalNum && sks_eft_FilePmtSelection.FileRecId !=0;
+
+        if (sks_eft_FilePmtSelection)
+        {
+            if(_log)
+            {
+                select FileNbr from sks_eftap_File where sks_eftap_File.RecId == sks_eft_FilePmtSelection.FileRecId;
+                select firstOnly ledgerJournalTrans where ledgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum;
+                errorMsg = "@SKS:BankTransferValidationError" +
+                            ' ' +
+                            strFmt("@SKS:SKGBTBRemoveTransaction", sks_eftap_File.FileNbr);
+                SKS_EFT_JournalValidate::errorLog(errorMsg, ledgerJournalTrans, _enableLog,0);
+            }
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

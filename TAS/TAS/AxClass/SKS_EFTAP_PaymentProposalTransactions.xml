@@ -1,0 +1,829 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFTAP_PaymentProposalTransactions</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EFTAP_PaymentProposalTransactions extends CustVendCreatePaymJournal_Vend
+{
+    Name            payGroupCompare;
+    DataAreaId      gPaymentCompanyCompare;
+    Name            requestPayGroupCompare;
+    CustVendCreatePaymProposalType proposalTypeCompare;
+    DataAreaId      lastInvoiceCompany,lastInvoiceCompanyReq;
+    JournalId       lastJournalId;
+    JournalId       requestLastJournalId;
+    boolean         canCreateRecord = true;
+    SKS_EFT_Setup   sks_EFT_Setup;
+    boolean         paymentJournal = false;
+
+
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>runPaymentProposalGenerationProcess</Name>
+				<Source><![CDATA[
+    protected void runPaymentProposalGenerationProcess(Name             _payGroup = '',
+                                                       DataAreaId       _invoiceCompany = '',
+                                                       DataAreaId       _paymentCompany = '',
+                                                       JournalNameId    _journalName = '')
+
+    {
+        #OCCRetryCount
+        const int           WaitTimeAfterDeadlockInMiliseconds = 500;
+        int                 line;
+        LedgerJournalTable  ledgerJournalTableCanCreateNew;
+        MainAccount         mainAccount;
+        MainAccountLegalEntity          mainAccountLegalEntity;
+        LedgerDimensionDefaultAccount   offsetDefaultLedgerDimension;
+        tableId tableIdCustVendTable    = queryCreatePayment.query().dataSourceNo(1).table();
+
+        sks_EFT_Setup = SKS_EFT_Setup::find();
+
+        changecompany(_invoiceCompany) //Bug 10174 //Bug  10210
+        {
+            boolean                         paymentJournalLocal = false;
+            SKS_EFT_Setup sks_EFT_SetupLocal;
+            sks_EFT_SetupLocal = SKS_EFT_Setup::find(); //Bug  10210
+            if(sks_EFT_SetupLocal.EFTAP_PaymRequest == NoYes::No)
+            {
+                paymentJournalLocal = true;
+            }
+            paymentJournal = paymentJournalLocal;
+        }
+
+        if(paymentJournal == true)
+        {
+            if ((payGroupCompare != _payGroup || payGroupCompare == '' ) || (gPaymentCompanyCompare != _paymentCompany || gPaymentCompanyCompare == ''))// BWS Add paymentCompany equilivant to PayGroupCompare.  IF the company changes, we need to reRun this code.
+            {
+                changecompany( paymentJournal ? _paymentCompany : _invoiceCompany) //Bug 10174
+                {
+                    LedgerJournalName   paymentLedgerJournalNameLocal;
+                    LedgerJournalTable  paymentLedgerJournalTableLocal;
+
+                    //SKS_VSTS_12925 --->
+                    LedgerJournalTrans  paymentLedgerJournalTransLocal;
+                    LedgerJournalTrans  ledgerJournalTransLocal;
+
+
+                    ledgerJournalTransLocal = null;
+                    ledgerJournalTableCanCreateNew = null;
+                    paymentLedgerJournalTransLocal = null;
+                    //SKS_VSTS_12925 <---
+
+                    ttsbegin;
+                    select firstonly paymentLedgerJournalNameLocal
+                        where paymentLedgerJournalNameLocal.JournalType == LedgerJournalType::Payment
+                        && paymentLedgerJournalNameLocal.JournalName == _journalName;
+
+
+                    if(!paymentLedgerJournalNameLocal)
+                    {
+                        throw error(strFmt("@SKS:SKGInvalidJournalForCompany", _journalName, curExt()));
+                    }
+
+                    //SKS_VSTS_12925 --->
+                    while select ledgerJournalTableCanCreateNew
+                        where ledgerJournalTableCanCreateNew.SKS_EFTAP_ISPaymentCalendarJournal == NoYes::Yes
+                        && ledgerJournalTableCanCreateNew.SKS_EFTAP_PayGroup == _payGroup
+                        && ledgerJournalTableCanCreateNew.Posted == NoYes::No
+                        && ledgerJournalTableCanCreateNew.WorkflowApprovalStatus < LedgerJournalWFApprovalStatus::Submitted //Bug 10760
+                        && ledgerJournalTableCanCreateNew.SKS_EFTAP_AcceptPaymReq == NoYes::Yes
+                    {
+                        select firstonly RecId from ledgerJournalTransLocal
+                            where ledgerJournalTransLocal.JournalNum == ledgerJournalTableCanCreateNew.JournalNum
+                            && ledgerJournalTransLocal.DataAreaId == ledgerJournalTableCanCreateNew.DataAreaId
+                            && ledgerJournalTransLocal.PaymentStatus != CustVendPaymStatus::None;
+
+                        if(!ledgerJournalTransLocal.RecId)
+                        {
+                            break;
+                        }
+                    }
+                    //SKS_VSTS_12925 <---
+
+                    if (!ledgerJournalTableCanCreateNew.RecId)
+                    {
+                        paymentLedgerJournalTableLocal.initFromLedgerJournalName(paymentLedgerJournalNameLocal.JournalName);
+                        paymentLedgerJournalTableLocal.SKS_EFTAP_ISPaymentCalendarJournal = NoYes::Yes;
+                        paymentLedgerJournalTableLocal.SKS_EFTAP_PayGroup                 = _payGroup;
+                        paymentLedgerJournalTableLocal.SKS_EFTAP_AcceptPaymReq            = NoYes::Yes;
+                        paymentLedgerJournalTableLocal.SKS_EFTAP_PaymentCompany           = _paymentCompany;
+                        paymentLedgerJournalTableLocal.SKS_EFTAP_PaymJourName             = _journalName;
+                        paymentLedgerJournalTableLocal.insert();
+                        ledgerJournalId = paymentLedgerJournalTableLocal.JournalNum;
+                        payGroupCompare = _payGroup;
+                        gPaymentCompanyCompare = _paymentCompany;
+                        lastJournalId   = ledgerJournalId;
+                    }
+                    else
+                    {
+                        //SKS_VSTS_12925 --->
+                        select firstonly RecId from paymentLedgerJournalTransLocal
+                            where paymentLedgerJournalTransLocal.JournalNum == ledgerJournalTableCanCreateNew.JournalNum &&
+                            paymentLedgerJournalTransLocal.DataAreaId == ledgerJournalTableCanCreateNew.DataAreaId &&
+                            paymentLedgerJournalTransLocal.PaymentStatus != CustVendPaymStatus::None;
+
+                        if(paymentLedgerJournalTransLocal.RecId)
+                        {
+                            paymentLedgerJournalTableLocal.initFromLedgerJournalName    (paymentLedgerJournalNameLocal.JournalName);
+                            paymentLedgerJournalTableLocal.SKS_EFTAP_ISPaymentCalendarJournal = NoYes::Yes;
+                            paymentLedgerJournalTableLocal.SKS_EFTAP_PayGroup                 = _payGroup;
+                            paymentLedgerJournalTableLocal.SKS_EFTAP_AcceptPaymReq            = NoYes::Yes;
+                            paymentLedgerJournalTableLocal.SKS_EFTAP_PaymentCompany           = _paymentCompany;
+                            paymentLedgerJournalTableLocal.SKS_EFTAP_PaymJourName             = _journalName;
+                            paymentLedgerJournalTableLocal.insert();
+                            ledgerJournalId = paymentLedgerJournalTableLocal.JournalNum;
+                            payGroupCompare = _payGroup;
+                            gPaymentCompanyCompare = _paymentCompany;
+                            lastJournalId   = ledgerJournalId;
+                        }
+                        else     //SKS_VSTS_12925 <---
+                        {
+                            ledgerJournalId = ledgerJournalTableCanCreateNew.JournalNum;
+                            lastJournalId   = ledgerJournalId;
+                        }
+                    }
+
+                    ttscommit;
+                }
+            }
+            else
+            {
+                ledgerJournalId = lastJournalId;
+            }
+        }
+        else
+        {
+            if(_invoiceCompany != lastInvoiceCompanyReq)
+            {
+                requestPayGroupCompare = '';
+            }
+            ttsbegin;
+            if (requestPayGroupCompare != _payGroup || requestPayGroupCompare == '' )
+            {
+
+                changecompany( paymentJournal ? _paymentCompany : _invoiceCompany) //Bug 10174
+                {
+                    LedgerJournalName   ledgerJournalNameLocal;
+                    LedgerJournalTable  ledgerJournalTableLocal;
+                    SKS_EFT_Setup sks_EFT_SetupLocal = SKS_EFT_Setup::find();
+
+                    select firstonly ledgerJournalNameLocal
+                        where ledgerJournalNameLocal.JournalName == sks_EFT_SetupLocal.EFTAP_PaymRequestJournalName &&
+                        ledgerJournalNameLocal.JournalType == LedgerJournalType::Payment;
+
+
+                    if(!ledgerJournalNameLocal)
+                    {
+                        throw error(strFmt("@SKS:SKGInvalidJournalForCompany", _journalName, curExt()));
+                    }
+
+                    select firstonly ledgerJournalTableCanCreateNew
+                        where ledgerJournalTableCanCreateNew.SKS_EFTAP_IsPaymReqJournal == NoYes::Yes
+                        && ledgerJournalTableCanCreateNew.SKS_EFTAP_PayGroup == _payGroup
+                        && ledgerJournalTableCanCreateNew.Posted == NoYes::No
+                        && ledgerJournalTableCanCreateNew.WorkflowApprovalStatus < LedgerJournalWFApprovalStatus::Submitted //Bug 10760
+                        && ledgerJournalTableCanCreateNew.SKS_EFTAP_AcceptPaymReq == NoYes::Yes;
+
+                    if (!ledgerJournalTableCanCreateNew.RecId)
+                    {
+                        ledgerJournalTableLocal.initFromLedgerJournalName(ledgerJournalNameLocal.JournalName);
+                        ledgerJournalTableLocal.SKS_EFTAP_IsPaymReqJournal = NoYes::Yes;
+                        ledgerJournalTableLocal.SKS_EFTAP_PayGroup         = _payGroup;
+                        ledgerJournalTableLocal.SKS_EFTAP_AcceptPaymReq    = NoYes::Yes;
+                        ledgerJournalTableLocal.SKS_EFTAP_IsCreatedByReqJournal = NoYes::Yes; //Bug10210
+                        ledgerJournalTableLocal.SKS_EFTAP_PaymentCompany   = sks_EFT_SetupLocal.EFTAP_DefaultPaymentCompany;
+                        ledgerJournalTableLocal.SKS_EFTAP_PaymJourName     = sks_EFT_SetupLocal.EFTAP_PaymCompanyJournalName;
+                        changecompany( paymentJournal ? _paymentCompany : _invoiceCompany) //Bug 10174
+                        {
+                            ledgerJournalTableLocal.insert();
+                        }
+                        ledgerJournalId = ledgerJournalTableLocal.JournalNum;
+                        requestPayGroupCompare = _payGroup;
+                        requestLastJournalId   = ledgerJournalId;
+                        lastInvoiceCompanyReq = _invoiceCompany;
+                    }
+                    else
+                    {
+                        ledgerJournalId = ledgerJournalTableCanCreateNew.JournalNum;
+                        requestLastJournalId   = ledgerJournalId;
+                        lastInvoiceCompanyReq = _invoiceCompany;
+                    }
+                }
+            }
+            else
+            {
+                ledgerJournalId = requestLastJournalId;
+                lastInvoiceCompanyReq = _invoiceCompany;
+            }
+            ttscommit;
+        }
+        changecompany( paymentJournal ? _paymentCompany : _invoiceCompany)
+        {
+            CustVendPaymProposalCalcPaym paymProposalCalcPaym = CustVendPaymProposalCalcPaym::construct(LedgerJournalTable::find(ledgerJournalId).JournalType);
+            paymProposalCalcPaym.parmPaymDatePrinciple(paymProposalType);
+            paymProposalCalcPaym.parmPaymWeekDayFixed(paymWeekDayFixed);
+            paymProposalCalcPaym.parmPaymDateFixed(paymDateFixed);
+            paymProposalCalcPaym.parmMinimumPaymDate(earlyPaymDate);
+            paymProposalCalcPaym.parmFromDate(fromDate);
+            paymProposalCalcPaym.parmToDate(toDate);
+            paymProposalCalcPaym.parmPaymCurrency(paymCurrency);
+
+            paymProposal = CustVendPaymProposal::newLedgerJournal(ledgerJournalId);
+            paymProposal.parmPaymProposalCalcPaym(paymProposalCalcPaym);
+            paymProposal.parmIncludeInvoicesFromOtherCompanies(includeInvoicesFromOtherCompanies == NoYes::Yes ? true : false);
+            paymProposal.parmCreatePaymPerInvoiceCompany(proposeSeparatePaymentPerCompany == NoYes::Yes ? true : false);
+            paymProposal.parmLimitPaymCreationToLedgerCompanyOnly(limitPaymCreationToLedgerCompanyOnly);
+
+            paymProposal.parmDefaultOffsetAccountType(this.convertToLedgerJournalACType(defaultOffsetAccountType));
+            paymProposal.parmUserInteraction(this.userInteraction());
+
+            if (paymProposal.parmDefaultOffsetAccountType() == LedgerJournalACType::Ledger)
+            {
+                // Cache default dimensions
+                journalHeaderCompany = paymProposal.getLedgerJournalTable().company();
+                journalHeaderDefaultDimension = paymProposal.getLedgerJournalTable().DefaultDimension;
+
+                offsetDefaultLedgerDimension = this.parmDefaultOffsetLedgerDimension();
+                if (offsetDefaultLedgerDimension)
+                {
+                    mainAccount = LedgerDimensionFacade::getMainAccountFromLedgerDimension(offsetDefaultLedgerDimension);
+                    mainAccountLegalEntity = MainAccountLegalEntity::findByMainAccountLegalEntity(mainAccount.RecId, CompanyInfo::current());
+                    this.parmMainAccountDefaultDimension(mainAccountLegalEntity.DefaultDimension);
+                }
+            }
+            else
+            {
+                // NOTE:For non-ledger, the default dimension is not defaulted for either the primary or offset.
+                // These default dimensions are calcuated during the transfer.
+                paymProposal.parmDefaultOffsetAccount(this.parmDefaultOffsetAccount());
+            }
+        }
+        // Update the company range and continue only if the company range is valid for the process
+        changecompany(_invoiceCompany)
+        {
+            this.checkBlocked();
+            this.initBalances();
+
+            try
+            {
+                line = Global::infologLine();
+                ttsbegin;
+
+                if (this.canUseCustVendPaymProposalLineSetBasedInsert())
+                {
+                    Debug::assert(this.canUseSpecTransSetBasedInsert());
+
+                    paymProposal.parmCanUseCustVendPaymProposalLineSetBasedInsert(true);
+                }
+
+                if (this.canUseSpecTransSetBasedInsert())
+                {
+                    paymProposal.parmCanUseSpecTransSetBasedInsert(true);
+                }
+
+                paymProposal.deleteLines();
+
+                this.updateQuery();
+
+                this.searchTransactions(_invoiceCompany, _paymentCompany);
+
+                if (this.canUseCustVendPaymProposalLineSetBasedInsert())
+                {
+                    paymProposal.invokeCustVendPaymProposalLineSetBasedInsert();
+                    paymProposal.parmCanUseCustVendPaymProposalLineSetBasedInsert(false);
+                }
+
+                if (this.canUseSpecTransSetBasedInsert())
+                {
+                    if (this.canUseCustVendPaymProposalLineSetBasedInsert())
+                    {
+                        paymProposal.invokeSpecTransSetBasedInsert(ledgerJournalId);
+                    }
+                    else
+                    {
+                        paymProposal.invokeSpecTransSetBasedInsert();
+                    }
+                    paymProposal.parmCanUseSpecTransSetBasedInsert(false);
+                }
+
+                if (tableIdCustVendTable == tableNum(VendTable))
+                {
+                    CustVendPaymProposalLine::vendSearchForOmittedPaymentGroupInvoice(tableIdCustVendTable);
+                }
+
+                if (deleteCredit)
+                {
+                    paymProposal.removeNegativePayments();
+                }
+
+                paymProposal.removeAlreadySettledTransactions();
+                paymProposal.adjustToMaxTotals(amountMax);
+
+                // Need to clear payment proposal line cache of temporary RecIds.
+                if (this.canUseCustVendPaymProposalLineSetBasedInsert())
+                {
+                    paymProposal.clearPaymentProposalLineCache();
+                }
+                ttscommit;
+                changecompany( paymentJournal ? _paymentCompany : _invoiceCompany)
+                {
+                    this.checkIfCanTransferToJournal(ledgerJournalId);
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    sleep(WaitTimeAfterDeadlockInMiliseconds);
+                    infolog.clear(line);
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    infolog.clear(line);
+                    retry;
+                }
+            }
+            catch (Exception::Error)
+            {
+                throw error("@SYS21628");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateQueryCompanyRanges</Name>
+				<Source><![CDATA[
+    protected boolean updateQueryCompanyRanges()
+    {
+        Query query;
+        container sharedServiceBoundaryCompanies;
+        container queryRangeCompanies;
+        container queryRangeCompany;
+        boolean isQueryValidForProcess = false;
+        int i;
+
+        queryRangeCompany = conNull();
+        if (queryCreatePayment.allowCrossCompany())
+        {
+            query = queryCreatePayment.query();
+
+            sharedServiceBoundaryCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+            queryRangeCompanies = query.getCompanyRange();
+
+            // Disable companies that are not part of the shared service boundary
+            // The company range is a collection of containers. The container structure is (CompanyId,boolean)
+            // where the boolean is a flag specifying whether data for the associated CompanyId is included in
+            // the query processing.
+
+            query.clearCompanyRange();
+            for (i = 1; i <= conLen(queryRangeCompanies); i++)
+            {
+                queryRangeCompany = conPeek(queryRangeCompanies, i);
+
+                // if the company was enabled and is part of the shared service boundary then add it back to the company range
+                if (conPeek(queryRangeCompany, 2) && conFind(sharedServiceBoundaryCompanies, conPeek(queryRangeCompany, 1)) != 0)
+                {
+                    query.addCompanyRange(conPeek(queryRangeCompany, 1));
+
+                    // If we enable at least one company that is part of the shared service boundary
+                    // the query is useful to the process.
+                    isQueryValidForProcess = true;
+                }
+            }
+        }
+        else
+        {
+            // query is not cross company so company range is ignored and thus valid
+            isQueryValidForProcess = true;
+        }
+
+        return isQueryValidForProcess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    server static SKS_EFTAP_PaymentProposalTransactions construct()
+    {
+        return new SKS_EFTAP_PaymentProposalTransactions();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates proposal line to journals
+    /// </summary>
+    public void runProcess(CustVendCreatePaymProposalType _proposalType,
+                           Name                           _paymentWeekday,
+                           Transdate                      _totalPaymentDate,
+                           Transdate                      _minimumPaymentDate,
+                           Transdate                      _fromDate,
+                           Transdate                      _toDate,
+                           CurrencyCode                   _paymentCurrency,
+                           NOYES                          _seperateByLE,
+                           AmountCur                      _amountLimit,
+                           NOYES                          _checkBalance,
+                           NOYES                          _deleteNegative,
+                           SKS_BR_NoteMemo                _invoiceMethodOfPayment, /*10118*/
+                           str                            _invoiceCurrency,         //Bug 11920
+                           Name                           _payGroup,
+                           Str1260                        _invoiceCompany,
+                           DataareaId                     _paymentCompany,
+                           JournalNameId                  _journalName,
+                           container                      _paymentCalendarQuery = conNull())//SKS_Bug_12658
+    {
+        WeekDays weekDaysLoc;
+        Args args = new Args();
+        LedgerJournalTable  ledgerJournalTableLoc;
+
+
+        paymProposalType = _proposalType;
+        paymWeekDayFixed = str2Enum(weekDaysLoc,_paymentWeekday);
+        paymDateFixed    = _totalPaymentDate;
+        earlyPaymDate    = _minimumPaymentDate;
+        fromDate         = _fromDate;
+        toDate           = _toDate;
+        paymCurrency     = _paymentCurrency;
+        proposeSeparatePaymentPerCompany = _seperateByLE;
+        balanceCheck     = _checkBalance;
+        amountMax        = _amountLimit;
+        deleteCredit     = _deleteNegative;
+        includeInvoicesFromOtherCompanies = _invoiceCompany ? NoYes::Yes : NoYes::No;
+        canCreateRecord = true; // Bug10193
+
+        this.queryRangeUpdate(_invoiceMethodOfPayment, _invoiceCurrency,_invoiceCompany, _paymentCalendarQuery);//SKS_Bug_12658
+        this.runPaymentProposalGenerationProcess(_payGroup, _invoiceCompany, _paymentCompany, _journalName);
+        if(this.parmCanCreateRecord())
+        {
+            changecompany (_invoiceCompany )
+            {
+                changecompany( paymentJournal ? _paymentCompany : _invoiceCompany)
+                {
+                    this.transferProposalLinesToJournal();
+                }
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRangeUpdate</Name>
+				<Source><![CDATA[
+    public void queryRangeUpdate(SKS_BR_NoteMemo _invoiceMethodOfPayment/*10118*/, str _invoiceCurrency, DataAreaId _invoiceCompany, container _paymentCalendarFilterCon = conNull()) //Bug 11920 //SKS_Bug_12658
+    {
+        Query query;
+        //SKS_Bug_12658 -->
+        query = new Query(_paymentCalendarFilterCon);
+        query.clearCompanyRange();
+        if(_invoiceCompany)
+        {
+            query.addCompanyRange(_invoiceCompany);
+        }
+        //SKS_Bug_12658 <--
+        query.recordLevelSecurity(true);
+
+        queryCreatePayment = new QueryRun(query);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transferProposalLinesToJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// transfers proposal lines to journals.
+    /// </summary>
+    public void transferProposalLinesToJournal()
+    {
+        CustVendPaymProposalTransferToJournal   custVendPaymProposalTransferToJournal;
+        custVendPaymProposalTransferToJournal = CustVendPaymProposalTransferToJournal::constructForPaymProposal(paymProposal);
+        custVendPaymProposalTransferToJournal.getLast();
+        custVendPaymProposalTransferToJournal.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmpayGroupCompare</Name>
+				<Source><![CDATA[
+    public Name parmpayGroupCompare(Name _payGroupCompare = payGroupCompare)
+    {
+        payGroupCompare = _payGroupCompare;
+        return payGroupCompare;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPaymentCompanyCompare</Name>
+				<Source><![CDATA[
+    public DataAreaId parmPaymentCompanyCompare(DataAreaId _PaymentCompanyCompare = gPaymentCompanyCompare)
+    {
+        gPaymentCompanyCompare = _PaymentCompanyCompare;
+        return gPaymentCompanyCompare;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRequestPayGroupCompare</Name>
+				<Source><![CDATA[
+    public Name parmRequestPayGroupCompare(Name _requestPayGroupCompare = requestPayGroupCompare)
+    {
+        requestPayGroupCompare = _requestPayGroupCompare;
+        return requestPayGroupCompare;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLastJournalId</Name>
+				<Source><![CDATA[
+    public JournalId parmLastJournalId(JournalId _lastJournalId = lastJournalId)
+    {
+        lastJournalId = _lastJournalId;
+        return lastJournalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCanCreateRecord</Name>
+				<Source><![CDATA[
+    public boolean parmCanCreateRecord(boolean _canCreateRecord = canCreateRecord)
+    {
+        canCreateRecord = _canCreateRecord;
+        return canCreateRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfCanTransferToJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// checks if it can create journal
+    /// </summary>
+    private boolean checkIfCanTransferToJournal(LedgerJournalId _ledgerJournalId)
+    {
+        CustVendPaymProposalLine proposalLine;
+
+        select firstonly proposalLine
+            where proposalLine.JournalId == _ledgerJournalId;
+        if(!proposalLine)
+        {
+            canCreateRecord = false;
+        }
+        return this.parmCanCreateRecord(canCreateRecord);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateJournalId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// validates journal id if lines are not created deletes the journal.
+    /// </summary>
+    private void validateJournalId()
+    {
+        LedgerJournalTable      ledgerJournalTable;
+        LedgerJournalTrans      ledgerJournalTrans;
+
+        while select  ledgerJournalTrans
+            join ledgerJournalTable
+            where  ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+            && ledgerJournalTable.SKS_EFTAP_ISPaymentCalendarJournal == NoYes::Yes
+            && ledgerJournalTrans.RecId == 0
+        {
+            ttsbegin;
+            ledgerJournalTable.delete();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>searchTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// gets the transaction from given range.
+    /// </summary>
+    protected void searchTransactions(DataAreaId _invoiceCompany = '', DataAreaId _paymentCompany = '')
+    {
+        VendTable vendTable;
+        VendTrans vendTrans;
+        VendTransOpen vendTransOpen;
+        AmountCur paymentAmount;
+        AmountMST mstBalance;
+        CustVendPaymProposalCalcPaym paymProposalCalcPaym = paymProposal.parmPaymProposalCalcPaym();
+        boolean includeTransaction;
+        CompanyId lastVendTableCompany = '';
+        VendAccount lastVendNumber;
+        LedgerDimensionDefaultAccount defaultOffsetLedgerAccount;
+        RecId ledgerDimension;
+        CompanyId lastProposalCompany = '';
+        boolean contextChanged;
+        boolean isSetupDimensions;
+        DimensionDefault headerDefaultDimension;
+
+        // Init isSetupDimensions
+        defaultOffsetLedgerAccount = this.parmDefaultOffsetLedgerDimension();
+        isSetupDimensions = (defaultOffsetLedgerAccount != 0) && (paymProposal.parmDefaultOffsetAccountType() == LedgerJournalACType::Ledger);
+
+        queryCreatePayment.reset();
+
+        while (queryCreatePayment.next())
+        {
+            if (balanceCheck)
+            {
+                // Determine if the VendTable record from the query is referencing a different logical vendor
+                // than the previous transaction. This is needed because Query.changed(VendTable) will not
+                // return true if the vendor differs only by company in the shared table scenario. See also kernel bug 47368.
+                vendTable = queryCreatePayment.get(tableNum(VendTable));
+                if (queryCreatePayment.changed(tableNum(VendTable)) ||
+                vendTable.company() != lastVendTableCompany)
+                {
+                    lastVendTableCompany = vendTable.company();
+                    mstBalance = this.getCachedMstBalance(vendTable);
+                }
+                if (mstBalance > 0)
+                {
+                    continue;
+                }
+            }
+
+            if (queryCreatePayment.changed(tableNum(VendTransOpen)))
+            {
+                vendTransOpen = queryCreatePayment.get(tableNum(VendTransOpen));
+
+                // The invocation of calc() determines the appropriate payment date which is stored on the paymProposalCalcPaym object.
+                includeTransaction = this.calc(vendTransOpen);
+
+                if (includeTransaction)
+                {
+                    // Setup dimensions for current customer
+                    if (isSetupDimensions)
+                    {
+                        // Check if vendor changed
+                        if (lastVendNumber != vendTransOpen.AccountNum)
+                        {
+                            lastVendNumber = vendTransOpen.AccountNum;
+                            contextChanged = true;
+                        }
+
+                        // Check if company changed
+                        if (lastProposalCompany != vendTransOpen.DataAreaId)
+                        {
+                            lastProposalCompany = vendTransOpen.DataAreaId;
+                            contextChanged = true;
+                        }
+
+                        if (contextChanged)
+                        {
+                            contextChanged = false;
+
+                            headerDefaultDimension = this.getJournalHeaderDefaultDimension(vendTransOpen.DataAreaId);
+                            vendTable = queryCreatePayment.get(tableNum(VendTable));
+                            ledgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(defaultOffsetLedgerAccount, headerDefaultDimension, vendTable.DefaultDimension, this.parmMainAccountDefaultDimension());
+
+                            paymProposal.parmDefaultOffsetLedgerDimension(ledgerDimension);
+                        }
+                    }
+
+                    vendTrans = queryCreatePayment.get(tableNum(VendTrans));
+
+                    // <GBR>
+                    if (BrazilParameters::isEnabled())
+                    {
+                        CustVendPaymProposalEditForm::calculateAndUpdateFineAmount_BR(vendTransOpen.company(),
+                                                                                    paymProposal.parmLedgerJournalTableCompany(),
+                                                                                    vendTransOpen,
+                                                                                    paymProposalCalcPaym.paymDate(),
+                                                                                    this.paymCurrency(vendTrans.CurrencyCode));
+
+                        CustVendPaymProposalEditForm::calculateAndUpdateInterestAmount_BR(vendTransOpen.company(),
+                                                                                    paymProposal.parmLedgerJournalTableCompany(),
+                                                                                    vendTransOpen,
+                                                                                    paymProposalCalcPaym.paymDate(),
+                                                                                    this.paymCurrency(vendTrans.CurrencyCode));
+                    }
+                    // </GBR>
+
+                    if (PublicSectorUtils::isFrenchRegulatoryEnabled() &&
+                    VendInvoiceHoldHistory::isPlaceInHold(vendTrans.RecId, tableNum(VendTrans)))
+                    {
+                        continue;
+                    }
+                    changecompany (_invoiceCompany)
+                    {
+                        paymentAmount = paymProposalCalcPaym.paymAmountInvoiceCur();
+                    }
+
+                    if (paymentAmount == 0.0)
+                    {
+                        continue;
+                    }
+                    changecompany( paymentJournal ? _paymentCompany : _invoiceCompany)
+                    {
+                        if (this.shouldAddCustVendTransOpens(vendTrans))
+                        {
+                            paymProposal.parmCanUseCustVendPaymProposalLineSetBasedInsert(false);
+                            paymProposal.addCustVendTransOpen(vendTransOpen,
+                                                            paymProposalCalcPaym.paymDate(),
+                                                            this.paymCurrency(vendTrans.CurrencyCode),
+                                                            paymentAmount);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldAddCustVendTransOpens</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the proj invoice transaction if paid
+    /// </summary>
+    private boolean shouldAddCustVendTransOpens(VendTrans _vendTrans)
+    {
+        boolean shouldAddCustVendTransOpen = true;
+
+        if (this.isProjectInvoiceWithPayWhenPaids(_vendTrans))
+        {
+            shouldAddCustVendTransOpen = false;
+        }
+
+        return shouldAddCustVendTransOpen;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isProjectInvoiceWithPayWhenPaids</Name>
+				<Source><![CDATA[
+    private boolean isProjectInvoiceWithPayWhenPaids(VendTrans _vendTrans)
+    {
+        boolean isProjectInvoiceWithPayWhenPaid = false;
+        LedgerJournalTrans ledgerJournalTrans;
+        LedgerJournalTrans_Project ledgerJournalTrans_Project;
+
+        select firstonly RecId, IsPwp, ReadyForPayment from ledgerJournalTrans_Project
+            exists join RecId from ledgerJournalTrans
+                where ledgerJournalTrans.RecId == ledgerJournalTrans_Project.RefRecId &&
+                    ledgerJournalTrans.VendTransId == _vendTrans.RecId;
+
+        if (ledgerJournalTrans_Project.RecId && ledgerJournalTrans_Project.ReadyForPayment == NoYesCombo::Yes &&
+                ledgerJournalTrans_Project.IsPwp == NoYes::Yes)
+        {
+            isProjectInvoiceWithPayWhenPaid = true;
+        }
+
+        return isProjectInvoiceWithPayWhenPaid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCreateJournalType</Name>
+				<Source><![CDATA[
+    public boolean parmCreateJournalType(boolean _paymentJournal = paymentJournal)
+    {
+        paymentJournal = _paymentJournal;
+        return paymentJournal;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

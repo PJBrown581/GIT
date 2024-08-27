@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LogisticsPostalAddressForm_EH</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Event handlers for the LogisticsPostalAddressForm
+/// </summary>
+class SKS_LogisticsPostalAddressForm_EH
+{
+    static LogisticsAddressing origAddress;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>IsPrimary_OnModified</Name>
+				<Source><![CDATA[
+    //static boolean primaryFlag;
+
+    /// <summary>
+    ///  save previous primary address
+    /// </summary>
+    /// <param name="sender">Invoking control</param>
+    /// <param name="e">paramaters passed by the invoking control</param>   
+    [FormControlEventHandler(formControlStr(LogisticsPostalAddress, IsPrimary), FormControlEventType::Modified),
+    SuppressBPWarning('BPParameterNotUsed', "Parameter required by the event interface")]
+    public static void IsPrimary_OnModified(FormControl sender, FormControlEventArgs e)
+    {
+        FormRun form = sender.formRun();
+        var isPirmary = form.design().controlName(formControlStr(LogisticsPostalAddress, IsPrimary)) as FormCheckBoxControl;
+        
+        boolean primaryFlag = isPirmary.checked();
+
+        FormDataSource logisticsPostalAddress_ds = form.dataSource(formDataSourceStr(LogisticsPostalAddress,LogisticsPostalAddress)) as FormDataSource;
+        LogisticsPostalAddress logisticsPostalAddress = logisticsPostalAddress_ds.cursor();
+
+        // get old primary address
+        if(primaryFlag)
+        {                
+            VendTable vendTable = SKS_LogisticsPostalAddressForm_EH::getVendor(logisticsPostalAddress);
+            
+            if(vendTable)                
+            {
+                // get primary address of vendor                                              
+                LogisticsPostalAddress  logisticsPostalAddressLoc;
+                LogisticsLocation   logisticsLocation;
+                DirPartyLocation    dirPartyLocation;
+              
+                select firstonly logisticsPostalAddressLoc
+                    join logisticsLocation
+                    join dirPartyLocation
+                    where dirPartyLocation.Party == vendTable.Party
+                        && dirPartyLocation.IsPrimary == NoYes::Yes                        
+                        && logisticsLocation.RecId == dirPartyLocation.Location
+                        && logisticsPostalAddressLoc.Location == logisticsLocation.RecId; 
+
+                if(logisticsPostalAddressLoc)
+                {
+                    SKS_LogisticsPostalAddressForm_EH::origAddress = logisticsPostalAddressLoc.Address;
+                }       
+            }            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getVendor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get vendor from address
+    /// </summary>
+    /// <param name = "_logisticsPostalAddress">A logisticsPostalAddress to be used in the lookup of the related vendor record</param>
+    /// <returns>Returns the vendor record from the VendTable</returns>
+    private static VendTable getVendor(LogisticsPostalAddress _logisticsPostalAddress)
+    {
+        // get vendor
+        LogisticsLocation   logisticsLocation;
+        DirPartyLocation    dirPartyLocation;        
+        VendTable           vendTable;
+
+        select firstonly logisticsLocation
+                    where logisticsLocation.RecId == _logisticsPostalAddress.Location
+                join dirPartyLocation
+                    where dirPartyLocation.Location == logisticsLocation.RecId
+                join vendTable
+                    where vendTable.Party == dirPartyLocation.Party;
+
+        return vendTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>OKButton_OnClicked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// OK button clicked
+    /// </summary>
+    /// <param name="sender">Invoking control</param>
+    /// <param name="e">parameters passed by invoking control</param>
+    [SuppressBPWarning('BPCheckNestedLoopinCode', 'Invalid warning'),
+    SuppressBPWarning('BPParameterNotUsed', 'Parameter required by the event interface'),
+    FormControlEventHandler(formControlStr(LogisticsPostalAddress, OKButton), FormControlEventType::Clicked)]
+    public static void OKButton_OnClicked(FormControl sender, FormControlEventArgs e)
+    {
+        if (SKS_EFT_Setup::find().ModAPEFT)
+        {
+            FormRun form = sender.formRun();
+            var isPrimary = form.design().controlName(formControlStr(LogisticsPostalAddress, IsPrimary)) as FormCheckBoxControl;
+        
+            boolean primaryFlag = isPrimary.checked();
+
+            FormDataSource logisticsPostalAddress_ds = form.dataSource(formDataSourceStr(LogisticsPostalAddress,LogisticsPostalAddress)) as FormDataSource;
+            LogisticsPostalAddress logisticsPostalAddress = logisticsPostalAddress_ds.cursor();
+
+            // check if address is  newly added primary address for vendor
+            VendTable vendTableLoc = SKS_LogisticsPostalAddressForm_EH::getVendor(logisticsPostalAddress);
+       
+            if(vendTableLoc && primaryFlag)
+            {
+                // checks if this is a AP EFT+ related vendor
+                if (SKS_EB_Vendor::find(vendTableLoc.DataAreaId, vendTableLoc.AccountNum).Active)
+                {
+                    // display dialog to ask if the user wants to update primary address of vendor
+                    DialogButton diagBut;
+                    str strMessage = "@SKS:UpdatePrimaryAddr";
+                    str strTitle = "@SKS:UpdateAddr";
+       
+                    diagBut = Box::yesNo(strMessage,DialogButton::Yes, strTitle);
+
+                    // if yes button is clicked - user wants to update the address
+                    if (diagBut == DialogButton::Yes)
+                    {
+                        // update Vendor eBanking Detail beneficiary address
+                        SKS_EFT_VendorPaym      sks_eft_vendorPaym;
+
+                        VendTable vendTable = SKS_LogisticsPostalAddressForm_EH::getVendor(logisticsPostalAddress);
+
+                        if(vendTable)
+                        {
+                            // get shared vendors
+                            SKS_EB_VendBankTmp  sks_EB_VendBankTmp;
+                            sks_EB_VendBankTmp = SKS_VendBankAccounts_EH::getMatchingVendors(vendTable.AccountNum);
+                
+                            // split street address
+                            Array vendAddrArray = new Array(Types::String);
+                            SKS_EB_Address tempAddr1;
+                            SKS_EB_Address tempAddr2;
+
+                            vendAddrArray = SKS_PP_50000Bas::StreetToAddressLineArray(logisticsPostalAddress.Street,2);
+                            if (vendAddrArray.exists(1))
+                            {
+                                tempAddr1 = vendAddrArray.value(1);
+
+                                if (vendAddrArray.exists(2))
+                                {
+                                    tempAddr2 = vendAddrArray.value(2);
+                                }
+                            }
+
+                            // update vendor ebanking details address
+                            while select sks_EB_VendBankTmp
+                            {
+                                while select crosscompany sks_eft_vendorPaym
+                                join sks_EB_VendBankTmp
+                                where sks_eft_vendorPaym.VendAccount == sks_EB_VendBankTmp.VendAccount
+                                    && sks_eft_vendorPaym.VendCompany == sks_EB_VendBankTmp.VendCompany
+                                    && sks_eft_vendorPaym.WBeneUseVendAddr == NoYes::Yes
+                                    && sks_eft_vendorPaym.DataAreaId == sks_EB_VendBankTmp.LegalCompany
+                                {
+                                    changecompany(sks_eft_vendorPaym.DataAreaId)
+                                    {
+                                        ttsbegin;
+                                        sks_eft_vendorPaym.selectforupdate(true);
+
+                                        sks_eft_vendorPaym.WBeneName            =   LogisticsLocation::find(logisticsPostalAddress.Location).Description;
+                                        sks_eft_vendorPaym.WBeneRemittanceLocation =  logisticsPostalAddress.Location;
+                                        sks_eft_vendorPaym.WBeneAddr            =   tempAddr1;
+                                        sks_eft_vendorPaym.WBeneAddr2           =   tempAddr2;
+                                        sks_eft_vendorPaym.WBeneCity            =   logisticsPostalAddress.City;
+                                        sks_eft_vendorPaym.WBeneState           =   logisticsPostalAddress.State;
+                                        sks_eft_vendorPaym.WBeneZipPostal       =   logisticsPostalAddress.ZipCode;
+                                        sks_eft_vendorPaym.WBeneCountryRegionId =   logisticsPostalAddress.CountryRegionId;
+                    
+                                        sks_eft_vendorPaym.update();
+                                        ttscommit;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

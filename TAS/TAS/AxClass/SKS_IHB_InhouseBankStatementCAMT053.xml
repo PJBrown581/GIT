@@ -1,0 +1,904 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_InhouseBankStatementCAMT053</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_IHB_InhouseBankStatementCAMT053
+{    
+    FormRun formRun;
+    XmlDocument                                 xmlDoc;
+    XmlElement                                  nodeRoot;
+    XmlElement                                  GrpHdr;
+    XmlElement                                  nodePmtInf;
+    CompanyBankAccountId                        bankAccountId;
+    AmountMST                                   openingBal,
+                                                closingBal;
+    TransDate                                   statementDate;
+    BankStatementName                           statementNum;
+    BankAccountTrans                            bankAccountTrans;
+    AmountMST                                   transAmount;
+    CurrencyCode                                transCurrency;
+    int                                         trxRef;
+    TransDate                                   trxDate, trxValDate;
+    Voucher                                     voucherNum;
+    SKS_IHB_InhouseBankTransactionTypeDetails   transTypeDetails;
+    RefRecId                                    transTypeMapping;
+    SKS_PP_Bank                                 transTypeSetup; 
+    SKS_EB_FileHub                              mFileHub;
+    str                                         mErrorText;
+    System.Xml.XmlDocument                      gXmlDocument;
+
+   
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>closingBal</Name>
+				<Source><![CDATA[
+    public AmountMST closingBal(
+    SKS_IHB_InhouseBankAccountsStatementDetails _currentBuffer,
+    SKS_IHB_InhouseBankAccountsStatementDetails _previousBuffer)
+    {
+        BankAccountTrans    bankAccountTransLoc;
+        
+        select sum(AmountCur) from bankAccountTransLoc
+        where bankAccountTransLoc.TransDate > _previousBuffer.statementdate
+            &&  bankAccountTransLoc.TransDate <= _currentBuffer.statementdate
+            &&  bankAccountTransLoc.AccountId == _currentBuffer.AccountId; // SKS_Bug_10400
+
+        return bankAccountTransLoc.AmountCur;// SKS_Bug_10400
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSettleInv</Name>
+				<Source><![CDATA[
+    public Description getSettleInv(BankAccountTrans    _bankAccountTrans)
+    {
+        VendTrans   vendTrans;
+        CustTrans   custTrans;
+        Description invList;
+
+        if (VendTrans::findVoucherDate(_bankAccountTrans.Voucher, _bankAccountTrans.TransDate))
+        {
+            while select invoice from vendTrans
+                where vendTrans.LastSettleVoucher == _bankAccountTrans.Voucher
+            {
+                if(invList == '')
+                {
+                    invList = vendTrans.Invoice;
+                }
+                else
+                {
+                    invList = invList+','+vendTrans.Invoice;
+                }
+            }
+
+        }
+        else if(CustTrans::findByVoucher(_bankAccountTrans.Voucher))
+        {
+            while select invoice from custTrans
+                where custTrans.LastSettleVoucher == _bankAccountTrans.Voucher
+            {
+                if(invList == '')
+                {
+                    invList = custTrans.Invoice;
+                }
+                else
+                {
+                    invList = invList+','+custTrans.Invoice;
+                }
+            }
+        }
+        return invList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatStructure</Name>
+				<Source><![CDATA[
+    Public void formatStructure(
+        SKS_IHB_InhouseBankAccountsStatementDetails _bufferCur,
+        SKS_IHB_InhouseBankAccountsStatementDetails _bufferPrev
+        )
+    {
+        bankAccountId       = _bufferCur.AccountId;
+        statementNum        = _bufferCur.StatementNumber;
+        statementDate       = _bufferCur.StatementDate;
+        openingBal          = _bufferPrev.EndingBalance;
+        closingBal          = openingBal + this.closingBal(_bufferCur, _bufferPrev);
+
+        SKS_EB_FileStorage locSKS_EB_FileStorage;
+        SKS_BF_BankIntType locSKS_BF_BankIntType;
+
+        select firstonly StorageOption_IHB from locSKS_EB_FileStorage;
+
+        locSKS_BF_BankIntType = locSKS_EB_FileStorage.StorageOption_IHB == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue ? SKS_BF_BankIntType::BankFabric : SKS_BF_BankIntType::FileHubLocal;
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(locSKS_BF_BankIntType);
+        
+        //SKS_EB_FilePath filepath = mSKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric ? SKS_PP_Bank::find(bankAccountId).IHBBankFabricLocation :  SKS_PP_Bank::find(bankAccountId).IHB_FilePath;
+        SKS_EB_FilePath filepath;
+
+        if(locSKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric)
+        {
+            filepath = SKS_PP_Bank::find(bankAccountId).IHBBankFabricLocation;
+        }
+        else
+        {
+            filepath = SKS_PP_Bank::find(bankAccountId).IHB_FilePath;
+        }
+
+        if (filepath)
+        {
+            SKS_EB_FileName filename;
+            xmlDoc = XmlDocument::newBlank();
+    
+            this.node_MessageRoot();
+    
+            this.node_GrpHdr();
+
+            this.node_Stmt(_bufferCur, _bufferPrev);
+
+            filename = this.getFileName(_bufferCur);
+            if (locSKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal)
+            {
+                fileHub.runFileInquire(@filepath+'/'+filename);
+            }
+            else
+            {
+                fileHub.runFileInquire(filepath + '\\' + filename);
+            }
+
+            if(!fileHub.attrFileExists())
+            {
+                try
+                {
+                    if (locSKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal)
+                    {
+                        fileHub.runFileDelete(@filepath+'/'+filename);
+                    }
+                }
+                catch (Exception::Error)
+                {
+                    info('An error occured.Please try again.');
+                    return;
+                }
+            }
+
+            if (locSKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal)
+            {
+                fileHub.runFileCreate(filepath+'/'+filename,xmlDoc.innerXml());
+            }
+            else
+            {
+                fileHub.runAppendLine(xmlDoc.innerXml());
+                fileHub.runFileCreate(filepath + '\\' + filename,xmlDoc.innerXml());
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileName</Name>
+				<Source><![CDATA[
+    public SKS_EB_FileName getFileName(SKS_IHB_InhouseBankAccountsStatementDetails _bufferCurLoc)
+    {
+        SKS_EB_FileName filename = curExt()+'-'+bankAccountId+'-'+ BankAccountTable::find(bankAccountId).Name+'-'+
+                                    BankAccountTable::find(bankAccountId).AccountNum+'-'+ _bufferCurLoc.StatementNumber +'-'+ date2Str(_bufferCurLoc.StatementDate,213,DateDay::Digits2,DateSeparator::None,
+                                    DateMonth::Digits2,DateSeparator::None,DateYear::Digits4)+ '.xml';
+
+        return filename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry(XmlElement _nodeStmt, int _trxRef)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //  1.0: Stmt
+        //      1.7: Ntry
+        //              NtryRef
+        //              Amt Ccy
+        //              CdtDbtInd
+        //              Sts
+        //              BookgDt
+        //              ValDt
+        //              AcctSvcrRef
+        //              BkTxCd
+        //              NtryDtls
+        //                  TxDtls
+        //                      Refs
+        //                          EndToEndId
+        //                      RmtInf
+        //                          Ustrd
+        //          AddtlNtryInf
+        //------------------------------------------------------------------------------------------------------
+        XmlElement  nodeStmtNtry;
+        XmlElement  currentElement;
+        str         stmtDate, trxValDateStr;
+        // SKS_Bug_10598 -->
+        XmlElement  nodeStmtNtryBookgDt;
+        XmlElement  nodeStmtNtryValDt;
+        // SKS_Bug_10598 <--
+
+        nodeStmtNtry = _nodeStmt.appendChild(xmlDoc.createElement('Ntry'));        
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeStmtNtry, 'NtryRef', int2Str(_trxRef)); // SKS_Bug_10598 
+
+        currentElement = SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeStmtNtry, 'Amt',
+        num2str(abs(transAmount),0,2,1,0));
+        SKS_EFT_Format::xmlsetAttributeText(currentElement, 'Ccy', transCurrency);
+        if (transAmount >= 0)
+        {
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc,nodeStmtNtry, 'CdtDbtInd', 'DBIT');
+        }
+        else
+        {
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc,nodeStmtNtry, 'CdtDbtInd', 'CRDT');
+        }        
+        nodeStmtNtry.appendChild(xmlDoc.createElement('Sts')).appendChild(xmlDoc.createTextNode('Book'));
+        
+        stmtdate =date2Str(trxDate,321,DateDay::Digits2,DateSeparator::Hyphen,DateMonth::Digits2,DateSeparator::Hyphen,DateYear::Digits4);
+        // SKS_Bug_10598 -->
+        nodeStmtNtryBookgDt = nodeStmtNtry.appendChild(xmlDoc.createElement('BookgDt'));
+        nodeStmtNtryBookgDt.appendChild(xmlDoc.createElement('Dt')).appendChild(xmlDoc.createTextNode(stmtDate));
+        // SKS_Bug_10598 <--
+        
+        trxValDateStr =date2Str(trxValDate,321,DateDay::Digits2,DateSeparator::Hyphen,DateMonth::Digits2,DateSeparator::Hyphen,DateYear::Digits4);
+        // SKS_Bug_10598 -->
+        nodeStmtNtryValDt = nodeStmtNtry.appendChild(xmlDoc.createElement('ValDt'));
+        nodeStmtNtryValDt.appendChild(xmlDoc.createElement('Dt')).appendChild(xmlDoc.createTextNode(trxValDateStr));
+        // SKS_Bug_10598 <--
+        
+        nodeStmtNtry.appendChild(xmlDoc.createElement('AcctSvcrRef')).appendChild(xmlDoc.createTextNode( voucherNum));
+        
+        this.node_Stmt_Ntry_BkTxCd(nodeStmtNtry);
+        this.node_Stmt_Ntry_NtryDtls(nodeStmtNtry);
+        
+        nodeStmtNtry.appendChild(xmlDoc.createElement('AddtlNtryInf')).appendChild(xmlDoc.createTextNode( bankAccountTrans.Txt));
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_NtryDtls</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_NtryDtls(XmlElement _nodeStmtNtry)
+    {
+        XmlElement  nodeStmtNtryNtryDtls;
+
+        nodeStmtNtryNtryDtls = _nodeStmtNtry.appendChild(xmlDoc.createElement('NtryDtls'));
+
+        this.node_Stmt_Ntry_NtryDtls_TxDtls(nodeStmtNtryNtryDtls);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_NtryDtls_TxDtls</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_NtryDtls_TxDtls(XmlElement _nodeStmtNtryNtryDtls)
+    {
+        XmlElement  nodeStmtNtryNtryDtlsTxDtls;
+
+        nodeStmtNtryNtryDtlsTxDtls = _nodeStmtNtryNtryDtls.appendChild(xmlDoc.createElement('TxDtls'));
+
+        this.node_Stmt_Ntry_NtryDtls_TxDtls_Refs(nodeStmtNtryNtryDtlsTxDtls);
+        this.node_Stmt_Ntry_NtryDtls_TxDtls_RmtInf(nodeStmtNtryNtryDtlsTxDtls);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_NtryDtls_TxDtls_RmtInf</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_NtryDtls_TxDtls_RmtInf(XmlElement _nodeStmtNtryNtryDtlsTxDtls)
+    {
+        XmlElement  nodeStmtNtryNtryDtlsTxDtlsRmtInf;
+        Description settleInvList;        
+
+        nodeStmtNtryNtryDtlsTxDtlsRmtInf = _nodeStmtNtryNtryDtlsTxDtls.appendChild(xmlDoc.createElement('RmtInf'));
+
+        //nodeStmtNtryNtryDtlsTxDtlsRmtInf.appendChild(xmlDoc.createElement('Ustrd'));
+        settleInvList = this.getSettleInv(bankAccountTrans);
+        //nodeStmtNtryNtryDtlsTxDtlsRmtInf.appendChild(xmlDoc.createTextNode(settleInvList));
+        nodeStmtNtryNtryDtlsTxDtlsRmtInf.appendChild(xmlDoc.createElement('Ustrd')).appendChild(xmlDoc.createTextNode(settleInvList));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_NtryDtls_TxDtls_Refs</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_NtryDtls_TxDtls_Refs(XmlElement _nodeStmtNtryNtryDtlsTxDtls)
+    {
+        XmlElement  nodeStmtNtryNtryDtlsTxDtlsRefs;
+
+        nodeStmtNtryNtryDtlsTxDtlsRefs = _nodeStmtNtryNtryDtlsTxDtls.appendChild(xmlDoc.createElement('Refs'));
+
+        nodeStmtNtryNtryDtlsTxDtlsRefs.appendChild(xmlDoc.createElement('EndToEndId')).appendChild(xmlDoc.createTextNode( bankAccountTrans.PaymReference));
+        /*nodeStmtNtryNtryDtlsTxDtlsRefs.appendChild(xmlDoc.createElement('EndToEndId'));
+        nodeStmtNtryNtryDtlsTxDtlsRefs.appendChild(xmlDoc.createTextNode(bankAccountTrans.PaymReference));*/
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_BkTxCd</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_BkTxCd(XmlElement _nodeStmtNtry)
+    {
+        XmlElement  nodeStmtNtryBkTxCd;
+
+        nodeStmtNtryBkTxCd = _nodeStmtNtry.appendChild(xmlDoc.createElement('BkTxCd'));
+
+        this.node_Stmt_Ntry_BkTxCd_Domn(nodeStmtNtryBkTxCd);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_BkTxCd_Domn</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_BkTxCd_Domn(XmlElement _nodeStmtNtryBkTxCd)
+    {
+        XmlElement  nodeStmtNtryBkTxCdDomain;        
+        
+        nodeStmtNtryBkTxCdDomain = _nodeStmtNtryBkTxCd.appendChild(xmlDoc.createElement('Domn'));
+
+        this.node_Stmt_Ntry_BkTxCd_Domn_Cd(nodeStmtNtryBkTxCdDomain);
+        this.node_Stmt_Ntry_BkTxCd_Domn_Family(nodeStmtNtryBkTxCdDomain);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_BkTxCd_Domn_Family</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_BkTxCd_Domn_Family(XmlElement _nodeStmtNtryBkTxCdDomain)
+    {
+        XmlElement  nodeStmtNtryBkTxCdDomnFmly;
+        
+        nodeStmtNtryBkTxCdDomnFmly = _nodeStmtNtryBkTxCdDomain.appendChild(xmlDoc.createElement('Fmly'));
+
+        this.node_Stmt_Ntry_BkTxCd_Domn_Family_Cd(nodeStmtNtryBkTxCdDomnFmly);
+        
+        nodeStmtNtryBkTxCdDomnFmly.appendChild(xmlDoc.createElement('SubFmlyCd')).appendChild(xmlDoc.createTextNode(transTypeDetails.Subfamily));
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_BkTxCd_Domn_Family_cd</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_BkTxCd_Domn_Family_cd(XmlElement _nodeStmtNtryBkTxCdDomnFmly)
+    {   
+        _nodeStmtNtryBkTxCdDomnFmly.appendChild(xmlDoc.createElement('Cd')).appendChild(xmlDoc.createTextNode(transTypeDetails.Family));     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_BkTxCd_Domn_Cd</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_BkTxCd_Domn_Cd(XmlElement _nodeStmtNtryBkTxCdDomain)
+    {        
+        _nodeStmtNtryBkTxCdDomain.appendChild(xmlDoc.createElement('Cd')).appendChild(xmlDoc.createTextNode(transTypeDetails.Domain));     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Ntry_NtryRef</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Ntry_NtryRef(XmlElement _nodeStmtNtry)
+    {
+        XmlElement  nodeStmtNtryNref;
+        XmlElement  currentElement;
+
+        nodeStmtNtryNref = nodeRoot.appendChild(xmlDoc.createElement('NtryRef')); // SKS_Bug_10598
+
+        currentElement = SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeStmtNtryNref, 'Amt',
+        num2str(transAmount,0,2,1,0));        
+        currentElement.setAttribute('Ccy', transCurrency);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt</Name>
+				<Source><![CDATA[
+    protected void node_Stmt(
+    SKS_IHB_InhouseBankAccountsStatementDetails _bufferCur,
+    SKS_IHB_InhouseBankAccountsStatementDetails _bufferPrev)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //  1.0: Stmt
+        //      1.1: Id
+        //      1.2: ElctrncSeqNb
+        //      1.3: CreDtTm
+        //      1.4: Acct
+        //              Id
+        //     .            Othr
+        //      .               Id
+        //              Ccy
+        //      1.5: Bal
+        //              TP
+        //     .           CdOrPrtry
+        //      .               Cd
+        //              Amt
+        //              CdtDbtInd
+        //              dt
+        //      1.6: Bal
+        //              TP
+        //     .           CdOrPrtry
+        //      .               Cd
+        //              Amt
+        //              CdtDbtInd
+        //              dt
+        //------------------------------------------------------------------------------------------------------
+        XmlElement  nodeStmt;
+        str         stmtdate;
+       
+
+        //  1.0: GrpHdr
+        nodeStmt = nodeRoot.appendChild(xmlDoc.createElement('Stmt'));
+
+        //      1.1: Id
+        stmtdate =date2Str(statementDate,321,DateDay::Digits2,DateSeparator::None,DateMonth::Digits2,DateSeparator::None,DateYear::Digits4);
+        
+        nodeStmt.appendChild(xmlDoc.createElement('Id')).appendChild(xmlDoc.createTextNode(stmtdate));
+           
+        //      1.2: ElctrncSeqNb
+        
+        nodeStmt.appendChild(xmlDoc.createElement('ElctrncSeqNb')).appendChild(xmlDoc.createTextNode(statementNum));
+        
+        //      1.3: CreDtTm        
+        nodeStmt.appendChild(xmlDoc.createElement('CreDtTm')).appendChild(xmlDoc.createTextNode(DateTimeUtil::toStr(DateTimeUtil::utcNow())));
+               
+        //      1.4: Acct
+        this.node_Stmt_Act(nodeStmt);
+        this.node_Stmt_BalOPening(nodeStmt);
+        this.node_Stmt_BalClosing(nodeStmt);
+        // loop for each transaction
+        while select bankAccountTrans
+            where bankAccountTrans.AccountId == _bufferCur.AccountId
+                && bankAccountTrans.TransDate <= _bufferCur.StatementDate
+                && bankAccountTrans.TransDate >_bufferPrev.StatementDate
+        {
+            if (bankAccountTrans)
+            {
+                transTypeSetup      = SKS_PP_Bank::find(bankAccountId);
+                transTypeMapping    = SKS_IHB_InhouseBankTransactionTypeMapping::find(transTypeSetup.IHB_InhouseBankTransactionTypeMappingId).RecId;
+                transTypeDetails    = SKS_IHB_InhouseBankTransactionTypeDetails::find(transTypeMapping, bankAccountTrans.BankTransType);
+
+                transAmount = bankAccountTrans.AmountCur; // SKS_Bug_10400
+                transCurrency = bankAccountTrans.CurrencyCode;
+                trxDate = bankAccountTrans.TransDate;
+                trxValDate= bankAccountTrans.SKS_IHB_ValueDate;
+                voucherNum = bankAccountTrans.Voucher;
+                trxRef = trxRef + 1;
+                this.node_Stmt_Ntry(nodeStmt, trxRef);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_BalOPening</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_BalOPening(XmlElement _nodeStmt)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.5: Bal
+        //              TP
+        //     .           CdOrPrtry
+        //      .               Cd
+        //              Amt
+        //              CdtDbtInd
+        //              dt
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtBal;
+        XmlElement currentElement;
+        
+        nodeStmtBal = _nodeStmt.appendChild(xmlDoc.createElement('Bal'));
+        this.node_Stmt_Bal_Tp(nodeStmtBal, 1); // 1 - opening balance
+
+        currentElement = SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeStmtBal, 'Amt',
+        num2str(openingBal,0,2,1,0));
+        
+        currentElement.setAttribute('Ccy', BankAccountTable::find(bankAccountId).CurrencyCode);
+        
+        nodeStmtBal.appendChild(xmlDoc.createElement('CdtDbtInd')).appendChild(xmlDoc.createTextNode('DEBIT'));
+        
+        this.node_Stmt_Bal_Dt(nodeStmtBal);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_BalClosing</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_BalClosing(XmlElement _nodeStmt)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.5: Bal
+        //              TP
+        //     .           CdOrPrtry
+        //      .               Cd
+        //              Amt
+        //              CdtDbtInd
+        //              dt
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtBal;
+        XmlElement currentElement;
+        
+        nodeStmtBal = _nodeStmt.appendChild(xmlDoc.createElement('Bal'));
+        this.node_Stmt_Bal_Tp(nodeStmtBal, 0); // 0 - closing bal
+        currentElement = SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeStmtBal, 'Amt',
+        num2str(closingBal,0,2,1,0));
+        
+        currentElement.setAttribute('Ccy', BankAccountTable::find(bankAccountId).CurrencyCode);
+               
+        nodeStmtBal.appendChild(xmlDoc.createElement('CdtDbtInd')).appendChild(xmlDoc.createTextNode('DEBIT'));
+        
+        this.node_Stmt_Bal_Dt(nodeStmtBal);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Bal_Dt</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Bal_Dt(XmlElement _nodeStmtBal)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      Amt
+        //      Ccy
+        //------------------------------------------------------------------------------------------------------
+        XmlElement  nodeStmtBalDt;
+        str         stmtdate;
+
+        nodeStmtBalDt = _nodeStmtBal.appendChild(xmlDoc.createElement('Dt'));
+
+        stmtdate =date2Str(statementDate,321,DateDay::Digits2,DateSeparator::Hyphen,DateMonth::Digits2,DateSeparator::Hyphen,DateYear::Digits4);        
+        
+        nodeStmtBalDt.appendChild(xmlDoc.createElement('Dt')).appendChild(xmlDoc.createTextNode(stmtdate));
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatDayMonth</Name>
+				<Source><![CDATA[
+    public str formatDayMonth(str _dayMonth)
+    {
+        str     dayMonth = _dayMonth;
+        if (strLen(dayMonth) > 2 )
+        {
+            dayMonth = '0'+ dayMonth;
+        }
+        return dayMonth;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Bal_Tp</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Bal_Tp(XmlElement _nodeStmtBal,
+                                int        _Open_Close)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtBalTp;
+        
+        nodeStmtBalTp = _nodeStmtBal.appendChild(xmlDoc.createElement('Tp'));
+        this.node_Stmt_Bal_Tp_CdOrPrtry(nodeStmtBalTp, _Open_Close);
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Bal_Tp_CdOrPrtry</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Bal_Tp_CdOrPrtry(XmlElement _nodeStmtBalTp,
+                                            int       _Open_Close)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtBalTpCdOrPrtry;
+        
+        nodeStmtBalTpCdOrPrtry = _nodeStmtBalTp.appendChild(xmlDoc.createElement('CdOrPrtry'));
+        if (_Open_Close == 1)
+        {            
+            nodeStmtBalTpCdOrPrtry.appendChild(xmlDoc.createElement('Cd')).appendChild(xmlDoc.createTextNode('OPBD'));         
+        }
+        else if(_Open_Close == 0)
+        {            
+            nodeStmtBalTpCdOrPrtry.appendChild(xmlDoc.createElement('Cd')).appendChild(xmlDoc.createTextNode('CLBD'));         
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Act</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Act(XmlElement _nodeStmt)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtAct;
+        
+        nodeStmtAct = _nodeStmt.appendChild(xmlDoc.createElement('Acct')); // SKS_Bug_10557
+        this.node_Stmt_Act_Id(nodeStmtAct);
+        this.node_Stmt_Act_Ccy(nodeStmtAct);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Act_Ccy</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Act_Ccy(XmlElement nodeStmtAct)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeStmtAct, 'Ccy', BankAccountTable::find(bankAccountId).CurrencyCode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Act_Id</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Act_Id(XmlElement _nodeStmtAct)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtActId;
+        
+        nodeStmtActId = _nodeStmtAct.appendChild(xmlDoc.createElement('Id'));
+        this.node_Stmt_Act_Id_other(nodeStmtActId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Act_Id_other</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Act_Id_other(XmlElement _nodeStmtActId)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeStmtActIdOther;
+        
+        nodeStmtActIdOther = _nodeStmtActId.appendChild(xmlDoc.createElement('Othr')); // SKS_Bug_10557
+
+        this.node_Stmt_Act_Id_other_Id(nodeStmtActIdOther);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_Stmt_Act_Id_other_Id</Name>
+				<Source><![CDATA[
+    protected void node_Stmt_Act_Id_other_Id(XmlElement _nodeStmtActIdOther)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.4: Acct
+        //              Id
+        //------------------------------------------------------------------------------------------------------
+        
+        _nodeStmtActIdOther.appendChild(xmlDoc.createElement('Id')).appendChild(xmlDoc.createTextNode(BankAccountTable::find(bankAccountId).AccountNum));        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_MessageRoot</Name>
+				<Source><![CDATA[
+    protected void node_MessageRoot()
+    {
+        nodeRoot = xmlDoc.appendChild(xmlDoc.createNode(XmlNodeType::Element,'Document', 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.02'));        
+        nodeRoot = nodeRoot.appendChild(xmlDoc.createElement('BkToCstmrStmt'));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //  1.0: GrpHdr
+        //      1.1: MsgId
+        //      1.2: CreDtTm
+        //      1.3: MsgRcpt
+        //           Id
+        //              OrgId
+        //     .             Othr
+        //      .               Id
+        //                      SchmeNm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeGrpHdr;
+        str        stmtdate;
+       
+
+        //  1.0: GrpHdr
+        nodeGrpHdr = nodeRoot.appendChild(xmlDoc.createElement('GrpHdr'));
+
+        //      1.1: MsgId
+        stmtdate =date2Str(statementDate,321,DateDay::Digits2,DateSeparator::None,DateMonth::Digits2,DateSeparator::None,DateYear::Digits4);
+
+        nodeGrpHdr.appendChild(xmlDoc.createElement('MsgId')).appendChild(xmlDoc.createTextNode(curExt() +'-'+ stmtdate));
+           
+        //      1.2: CreDtTm
+        
+        nodeGrpHdr.appendChild(xmlDoc.createElement('CreDtTm')).appendChild(xmlDoc.createTextNode(DateTimeUtil::toStr(DateTimeUtil::utcNow())));
+        
+        //      1.3: MsgRcpt
+        this.node_GrpHdr_MsgRcpt(nodeGrpHdr);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_MsgRcpt</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_MsgRcpt(XmlElement _nodeGrpHdr)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.3: MsgRcpt
+        //          Id
+        //              OrgId
+        //                  Other
+        //                  Id
+        //                  SchmeNm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeMsgRcpt;
+        //      1.8: InitgPty
+        nodeMsgRcpt = _nodeGrpHdr.appendChild(xmlDoc.createElement('MsgRcpt'));
+        this.node_GrpHdr_MsgRcpt_Id(nodeMsgRcpt);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_MsgRcpt_Id</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_MsgRcpt_Id(XmlElement _nodeMsgRcpt)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.3: MsgRcpt
+        //          Id
+        //              OrgId
+        //                  Other
+        //                  Id
+        //                  SchmeNm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeMsgRcptId;
+        //      1.8: InitgPty
+        nodeMsgRcptId = _nodeMsgRcpt.appendChild(xmlDoc.createElement('Id'));
+        this.node_GrpHdr_MsgRcpt_Id_OrigId(nodeMsgRcptId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_MsgRcpt_Id_OrigId</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_MsgRcpt_Id_OrigId(XmlElement _nodeMsgRcptId)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.3: MsgRcpt
+        //          Id
+        //              OrgId
+        //                  Other
+        //                  Id
+        //                  SchmeNm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeMsgRcptIdOrigId;
+        //      1.8: InitgPty
+        nodeMsgRcptIdOrigId = _nodeMsgRcptId.appendChild(xmlDoc.createElement('OrigId'));
+        this.node_GrpHdr_MsgRcpt_Id_OrigId_Other(nodeMsgRcptIdOrigId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_MsgRcpt_Id_OrigId_Other</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_MsgRcpt_Id_OrigId_Other(XmlElement _nodeMsgRcptIdOrigId)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.3: MsgRcpt
+        //          Id
+        //              OrgId
+        //                  Other
+        //                  Id
+        //                  SchmeNm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeMsgRcptIdOrigIdOther;
+        //      1.8: InitgPty
+        nodeMsgRcptIdOrigIdOther = _nodeMsgRcptIdOrigId.appendChild(xmlDoc.createElement('Other'));
+        this.node_GrpHdr_MsgRcpt_Id_OrigId_Other_Id(nodeMsgRcptIdOrigIdOther);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_MsgRcpt_Id_OrigId_Other_Id</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_MsgRcpt_Id_OrigId_Other_Id(XmlElement _nodeMsgRcptIdOrigIdOther)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.8: Other
+        //          Id
+        //------------------------------------------------------------------------------------------------------
+       
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, _nodeMsgRcptIdOrigIdOther, 'Id', bankAccountId);
+        
+        this.node_GrpHdr_MsgRcpt_Id_OrigId_Other_SchmeNm(_nodeMsgRcptIdOrigIdOther);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_MsgRcpt_Id_OrigId_Other_SchmeNm</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_MsgRcpt_Id_OrigId_Other_SchmeNm(XmlElement _nodeMsgRcptIdOrigIdOther)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.3: MsgRcpt
+        //          Id
+        //              OrgId
+        //                  Other
+        //                  Id
+        //                  SchmeNm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeMsgRcptIdOrigIdOtherSchmeNm;
+        //      1.8: InitgPty
+        nodeMsgRcptIdOrigIdOtherSchmeNm = _nodeMsgRcptIdOrigIdOther.appendChild(xmlDoc.createElement('SchmeNm'));
+                
+        nodeMsgRcptIdOrigIdOtherSchmeNm.appendChild(xmlDoc.createElement('Cd')).appendChild(xmlDoc.createTextNode('BANK'));        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

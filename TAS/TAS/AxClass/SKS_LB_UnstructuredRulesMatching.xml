@@ -1,0 +1,1546 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_UnstructuredRulesMatching</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class SKS_LB_UnstructuredRulesMatching
+{
+    TmpSKS_LB_RecordCreation  TmpMatchTemp;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ARCreation</Name>
+				<Source><![CDATA[
+    private RefRecId ARCreation(TmpSKS_LB_Importing _TmpImporting, SKS_LB_ClsJARRecord _ClsJARRecord, Container ConGoodInv, container ConAmountCur, container ConDiscount, Container ConMatchType, SKS_LB_Journal  lJournal, Boolean ApplyDiscount, real tolerance)
+    {
+        SKS_LB_SecondaryMatch   lSecondaryMatch = new SKS_LB_SecondaryMatch();
+        SKS_LB_54000Bas         sks_lb_54000Bas = new SKS_LB_54000Bas();
+        CustTable           lCustTable;
+        CustTransOpen       lCustTransOpen;
+        CustTrans           lCustTrans;
+        DirPartyTable       lDirpartyTable;
+        SKS_LB_JournalAR    lJournalAR, TmpSKS_LB_Journalar;
+        SKS_LB_Bank         lbBank;
+        SKS_PP_Setup        lSetup;
+        container           virtualCompanyCompanies;
+        AmountCur           lSettleApplyAmount, lPaymAmtAvail, lDiscAmt, lBankAcctCurrCTOAmount;
+        int                 Counter;
+        RefRecId            TmpRecid;
+        SKS_LB_FileFormat   SKS_LB_FileFormat;
+        ;
+
+        lbBank = SKS_LB_Bank::find(_ClsJARRecord.getsetbankAccount(), lJournal.FormatID);//Used to find if separate payment by invoice is turned on
+        virtualCompanyCompanies = SKS_LB_54000Bas::LBFindSharedServiceCompanies(lbBank);
+        lSetup = SKS_PP_Setup::find();
+        select FileType from SKS_LB_FileFormat where SKS_LB_FileFormat.FormatID == lJournal.FormatID;
+
+        lPaymAmtAvail = _TmpImporting.CheckAmount;//Initialize the full payment amount
+
+        For(Counter = 1; Counter <= conLen(ConGoodInv); Counter++)
+        {
+            lDiscAmt = 0;
+            TmpRecid = conPeek(ConGoodInv,Counter);
+            select firstonly crossCompany lCustTransOpen where lCustTransOpen.recid == TmpRecid;
+            select firstonly crossCompany lCustTrans where lCustTrans.recid == lCustTransOpen.RefRecId;
+            Select crosscompany * from lCustTable where lCustTable.AccountNum == lCustTrans.AccountNum;
+
+            if (counter == 1)
+            {
+                //Initialize a Journal AR record for us to start with
+                lJournalAR = lSecondaryMatch.InitARRecord(_ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetLBJournalID(),
+                                _ClsJARRecord.getsetformattedBatNum(), _ClsJARRecord.getsetpathFile(), _ClsJARRecord.getsetfileDate(),
+                                _ClsJARRecord.getsetformatID(), lCustTrans.AccountNum, _ClsJARRecord.getsetvirtualCompanyCompanies(),
+                                _TmpImporting, _TmpImporting.InvAmount != 0 ? _TmpImporting.InvAmount : _TmpImporting.CheckAmount, '');
+                lJournalAR.CustomerCompany = lSetup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? lCustTrans.company() : lJournalAR.CustomerCompany;
+                lJournalAR.PmtAmountCur = 0;
+                lJournalAR.ActualSettleAmountCur = 0;
+                lJournalAR.update();
+            }
+
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            //lBankAcctCurrCTOAmount = conPeek(ConAmountcur, Counter);
+            lBankAcctCurrCTOAmount = lCustTransOpen.sksGetRemainingAmount();
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+            if(ApplyDiscount)
+            {
+                lDiscAmt = conPeek(ConDiscount, Counter);
+            }
+
+            //if the available payment amount is less that what is to be settled (and not within tolerance) then we will only settle the available payment amount. This would be for shortpay settle oldest due date.
+            if((lPaymAmtAvail - (lBankAcctCurrCTOAmount - lDiscAmt) < 0) && (abs(lPaymAmtAvail - (lBankAcctCurrCTOAmount - lDiscAmt)) > abs(tolerance)))//lDiscAmt will be zero if Apply discount is turned off
+            {
+                lSettleApplyAmount = lPaymAmtAvail + lDiscAmt;
+            }
+            else
+            {
+                lSettleApplyAmount = lBankAcctCurrCTOAmount;//Set settlement apply amount to full settlement amount. Discount amount will be subtracted when the Applic recorde is inserted
+            }
+
+            lPaymAmtAvail = lPaymAmtAvail - (lSettleApplyAmount - lDiscAmt);//Adjust the available payment amount
+
+            if(lbBank.SepPaymByInv && Counter != 1)//When counter equals one we have already created a payment line
+            {
+                //Update old AR record
+                lJournalAR.PmtWasSplit = NoYes::Yes;
+                lJournalAR.update();
+
+                //Create and update new AR record.
+                lJournalAR = lSecondaryMatch.InitARRecord(_ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetLBJournalID(),
+                    _ClsJARRecord.getsetformattedBatNum(), _ClsJARRecord.getsetpathFile(), _ClsJARRecord.getsetfileDate(),
+                    _ClsJARRecord.getsetformatID(), lCustTrans.AccountNum, _ClsJARRecord.getsetvirtualCompanyCompanies(),
+                    _TmpImporting,  _TmpImporting.InvAmount != 0 ? _TmpImporting.InvAmount : _TmpImporting.CheckAmount, lCustTrans.Invoice);
+                lJournalAR.PmtWasSplit = NoYes::Yes;
+                lJournalAR.DefaultDimension = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(lSetup, lCustTrans.DefaultDimension, lCustTable.DefaultDimension, lbBank.LBJournalName, lCustTrans.company());
+                lJournalAR.CustomerCompany = lSetup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? lCustTrans.company() : lJournalAR.CustomerCompany;
+                lJournalAR.ActualSettleAmountCur = lSettleApplyAmount - lDiscAmt;
+                lJournalAR.PmtAmountCur = lJournalAR.ActualSettleAmountCur ;//Assign each record a payment amount of only what it is settling. The final record created will get any overpayment amount
+                lJournalAR.update();
+            }
+            else
+            {
+                //Determine if this payment needs to be split
+                if(Counter != 1
+                    && (lJournalAR.CustAccount != lCustTrans.AccountNum || lJournalAR.DefaultDimension != SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(lSetup, lCustTrans.DefaultDimension, lCustTable.DefaultDimension, lbBank.LBJournalName, lCustTrans.company()))
+                    || (lSetup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany && lJournalAR.CustomerCompany != lCustTrans.company()))
+                {
+                    //Update old AR record
+                    lJournalAR.PmtWasSplit = NoYes::Yes;
+                    lJournalAR.update();
+
+                    //Attempts to find a pre-existing Payment record to combine the newly found invoice with
+                    if(SKS_LB_Process_IMPORTTEMP_Records::Parentrecidfiletype(SKS_LB_FileFormat.FileType))
+                    {
+                        Select firstOnly forupdate TmpSKS_LB_Journalar
+                            where TmpSKS_LB_Journalar.ParentRecId == _TmpImporting.ParentRecId
+                            && TmpSKS_LB_Journalar.CustAccount == lCustTrans.AccountNum
+                            && TmpSKS_LB_Journalar.DefaultDimension == SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(lSetup, lCustTrans.DefaultDimension, lCustTable.DefaultDimension, lbBank.LBJournalName, lCustTrans.company())
+                            && TmpSKS_LB_Journalar.JournalId == lJournal.JournalID
+                            && TmpSKS_LB_Journalar.Batchnum == lJournal.BatchNum
+                            && TmpSKS_LB_Journalar.CustomerCompany == lCustTrans.company()
+                            && TmpSKS_LB_Journalar.isDED == NoYes::No
+                            && TmpSKS_LB_Journalar.AresDed == NoYes::No;
+                    }
+                    else
+                    {
+                        //Determine if a payment record already exists that match this critera
+                        select firstOnly forupdate TmpSKS_LB_Journalar where TmpSKS_LB_Journalar.CustAccount == lCustTrans.AccountNum 
+                            && TmpSKS_LB_Journalar.DefaultDimension == SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(lSetup, lCustTrans.DefaultDimension, lCustTable.DefaultDimension, lbBank.LBJournalName, lCustTrans.company())//CAR TOOL Change
+                            && TmpSKS_LB_Journalar.BatchNum == lJournal.BatchNum 
+                            && TmpSKS_LB_Journalar.JournalId == lJournal.JournalID  
+                            && TmpSKS_LB_Journalar.CustomerCompany == lCustTrans.company()
+                            && TmpSKS_LB_Journalar.isDED == NoYes::No
+                            && TmpSKS_LB_Journalar.AresDed == NoYes::No;
+                    }
+
+                    //No existing payment found
+                    if(!TmpSKS_LB_Journalar)
+                    {
+                        lJournalAR = lSecondaryMatch.InitARRecord(_ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetLBJournalID(),
+                            _ClsJARRecord.getsetformattedBatNum(), _ClsJARRecord.getsetpathFile(), _ClsJARRecord.getsetfileDate(),
+                            _ClsJARRecord.getsetformatID(), lCustTrans.AccountNum, _ClsJARRecord.getsetvirtualCompanyCompanies(),
+                            _TmpImporting, _TmpImporting.InvAmount != 0 ? _TmpImporting.InvAmount : _TmpImporting.CheckAmount, lCustTrans.Invoice);
+                        lJournalAR.PmtWasSplit = NoYes::Yes;
+                        lJournalAR.DefaultDimension = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(lSetup, lCustTrans.DefaultDimension, lCustTable.DefaultDimension, lbBank.LBJournalName, lCustTrans.company());
+                        lJournalAR.CustAccount = lCustTrans.AccountNum;
+                        lJournalAR.CustomerCompany = lSetup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? lCustTrans.company() : lJournalAR.CustomerCompany;
+                        lJournalAR.ActualSettleAmountCur = lSettleApplyAmount - lDiscAmt;
+                        lJournalAR.PmtAmountCur = lJournalAR.ActualSettleAmountCur;
+                        lJournalAR.update();
+                    }
+                    else
+                    {
+                        lJournalAR = TmpSKS_LB_Journalar;//lJournalar is passed to the setapplics method in all cases
+                        lJournalAR.CustomerCompany = lSetup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? lCustTrans.company() : lJournalAR.CustomerCompany;
+                        lJournalAR.ActualSettleAmountCur += lSettleApplyAmount - lDiscAmt;
+                        lJournalAR.PmtAmountCur += lSettleApplyAmount - lDiscAmt;
+                        lJournalAR.Invoice = '*';
+                        lJournalAR.PmtWasSplit = NoYes::Yes;
+                        lJournalAR.update();
+                    }
+                }
+                else
+                {
+                    if(lJournalAR.Invoice != '')
+                    {
+                        lJournalAR.Invoice = '*';
+                    }
+                    else if(lJournalAR.Invoice == '')
+                    {
+                        lJournalAR.Invoice = lCustTrans.Invoice;
+                    }
+
+                    //If no customer was found we found the customer with the invoice. Assign it now as it was not initialized.
+                    //This will only be able to happen on the first record//If no customer was found we found the customer with the invoice.
+                    //Assign it now as it was not initialized. This will only be able to happen on the first record
+                    if ((lJournalAR.CustAccount == '') || (Counter == 1 && lJournalAR.CustAccount != lCustTrans.AccountNum))
+                    {
+                        lJournalAR.CustAccount = lCustTrans.AccountNum;
+
+                        select crossCompany:virtualCompanyCompanies Name from lDirPartyTable
+                            where lCustTable.Party == lDirPartyTable.RecId;
+
+                        lJournalAR.CustName = lDirPartyTable.Name;
+                    }
+                    lJournalAR.DefaultDimension = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(lSetup, lCustTrans.DefaultDimension, lCustTable.DefaultDimension, lbBank.LBJournalName, lCustTrans.company());
+                    lJournalAR.CustomerCompany = lSetup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? lCustTrans.company() : lJournalAR.CustomerCompany;
+                    lJournalAR.ActualSettleAmountCur += lSettleApplyAmount - lDiscAmt;
+                    lJournalAR.PmtAmountCur += lSettleApplyAmount - lDiscAmt;
+                    lJournalAR.update();
+                }
+            }
+
+            lSecondaryMatch.setApplics(lCustTransOpen.company(), lCustTransOpen.RecId, lCustTransOpen.RefRecId,
+                lSettleApplyAmount, lDiscAmt, lCustTransOpen.dataareaid, lCustTrans.Invoice, _TmpImporting, lJournal.CurrencyCode,
+                lCustTrans.AccountNum, _ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetformatID(), lJournalAR, SKS_LB_MatchType::UnstrData);
+        }
+
+        if(lPaymAmtAvail > 0)//Overpayment. Leave the rest on account
+        {
+            lJournalAR.PmtAmountCur += lPaymAmtAvail;
+            lJournalAR.update();
+        }
+        else if(lPaymAmtAvail < 0)//Ran out of available payment. Tolerance was used. Take it out of the payment amount
+        {
+            lJournalAR.PmtAmountCur -= tolerance;
+            lJournalAR.update();
+        }
+
+        return lJournalAR.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CalcPartialDiscount</Name>
+				<Source><![CDATA[
+    private amountcur CalcPartialDiscount(TmpSKS_LB_Importing _TmpImporting, sks_lb_Journal lJournal, refrecid   CTORecId, amountcur CTOAmt)
+    {
+        date            pmtDate;
+        CustPaymSettlementManager   settlementManager;
+        CustTransOpen   lCustTransOpen;
+
+        lCustTransOpen = CustTransOpen::find(CTORecId);
+        changeCompany(lCustTransOpen.company())
+        {
+            if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(_TmpImporting.DateDay, _TmpImporting.DateMonth, _TmpImporting.DateYear))//Returns TRUE if the date is NULL
+            {
+                if(lJournal.HeadPaymDate != dateNull())
+                {
+                    pmtdate = lJournal.HeadPaymDate;
+                }
+                else
+                {
+                    pmtdate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                }
+            }
+            else
+            {
+                pmtdate = mkDate( _TmpImporting.DateDay, _TmpImporting.DateMonth, _TmpImporting.DateYear );
+            }
+
+            settlementManager = SKS_LB_Process_ImportTemp_Records::constructSettlementManager(pmtdate, lJournal.CurrencyCode, lJournal.ExchRate, lCustTransOpen.dataAreaId, lCustTransOpen.AccountNum);
+            return settlementManager.calculatePartialApplicableCashDiscount(lCustTransOpen, CTOAmt);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateNote</Name>
+				<Source><![CDATA[
+    private void CreateNote(str error, SKS_LB_JournalAR tmpSKS_LB_JournalAR)
+    {
+        DocuRef newDocuRef;
+        ;
+
+        newDocuRef.TypeId = 'Note';
+        newDocuRef.Notes = error;
+        newDocuRef.RefCompanyId = tmpSKS_LB_JournalAR.DataAreaId;
+        newDocuRef.RefTableId = tmpSKS_LB_JournalAR.TableId;
+        newDocuRef.RefRecId = tmpSKS_LB_JournalAR.RecId;
+        newDocuRef.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateOnAccount</Name>
+				<Source><![CDATA[
+    public RefRecId CreateOnAccount(container ConGoodInv, container ConMatchType, SKS_LB_ClsJARRecord _ClsJARRecord, TmpSKS_LB_Importing _TmpImporting, SKS_LB_Journal lJournal)
+    {
+        SKS_LB_JournalAR        lJournalAR;
+        SKS_PP_Setup            tmpSetup;
+        SKS_LB_Bank             tmpBank;
+        CustTable               l_CustTable;
+        DirPartyTable           dirPartyTable;
+        SKS_LB_JournalAR        TmpSKS_LB_Journalar;
+        CustTransOpen           lCustTransOpen;
+        CustTrans               lCustTrans;
+        int                     Counter;
+        RefRecId                InitialARRec;
+        container               virtualCompanies;
+        DimensionDefault        DefaultDim;
+        SKS_LB_SecondaryMatch   lSecondaryMatch = new SKS_LB_SecondaryMatch();
+
+        select * from tmpSetup;
+        select LBjournalname, LBformatID, bankAccountID from tmpBank where tmpBank.bankaccountID == _ClsJARRecord.getsetbankAccount() && tmpBank.LBformatid == _ClsJARRecord.getsetformatID();
+        virtualCompanies = _ClsJARRecord.getsetvirtualCompanyCompanies();
+
+        For(Counter = 1; Counter <= conLen(ConGoodInv); Counter++)
+        {
+            lCustTransOpen = CustTransOpen::find(conPeek(ConGoodInv,Counter));
+            lCustTrans = CustTrans::find(lCustTransOpen.RefRecId);
+            DefaultDim = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(Tmpsetup,  lCustTrans.DefaultDimension, l_CustTable.DefaultDimension, tmpBank.LBJournalName, lCustTrans.company());
+            if(counter == 1)
+            {
+                lJournalAR = lSecondaryMatch.InitARRecord(_ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetLBJournalID(),
+                    _ClsJARRecord.getsetformattedBatNum(), _ClsJARRecord.getsetpathFile(), _ClsJARRecord.getsetfileDate(),
+                    _ClsJARRecord.getsetformatID(), _ClsJARRecord.getsetCustAccount(), _ClsJARRecord.getsetvirtualCompanyCompanies(),
+                    _TmpImporting,  _TmpImporting.InvAmount != 0 ? _TmpImporting.InvAmount : _TmpImporting.CheckAmount, '', DefaultDim);
+                lJournalAR.ActualSettleAmountCur = 0;
+                lJournalAR.Invoice = '';
+                lJournalAR.update();
+                InitialARRec = lJournalAR.recid;
+            }
+            Select crossCompany:virtualCompanies AccountNum, Party, DefaultDimension
+            from l_CustTable
+            join Name
+                from dirPartyTable
+                WHERE l_CustTable.Party == dirPartyTable.RecId
+                    && l_CustTable.AccountNum == lCustTrans.AccountNum;
+
+            if(Counter != 1
+                && (lJournalAR.CustAccount != lCustTrans.AccountNum || lJournalAR.DefaultDimension != DefaultDim))
+            {
+                select firstOnly TmpSKS_LB_Journalar where TmpSKS_LB_Journalar.CustAccount == lCustTrans.AccountNum && TmpSKS_LB_Journalar.DefaultDimension == DefaultDim
+                    && TmpSKS_LB_Journalar.BatchNum == lJournal.BatchNum && TmpSKS_LB_Journalar.JournalId == lJournal.JournalID;
+
+                if(!TmpSKS_LB_Journalar)
+                {
+                    lJournalAR = lSecondaryMatch.InitARRecord(_ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetLBJournalID(),
+                        _ClsJARRecord.getsetformattedBatNum(), _ClsJARRecord.getsetpathFile(), _ClsJARRecord.getsetfileDate(),
+                        _ClsJARRecord.getsetformatID(), lCustTrans.AccountNum, _ClsJARRecord.getsetvirtualCompanyCompanies(),
+                        _TmpImporting,  _TmpImporting.InvAmount != 0 ? _TmpImporting.InvAmount : _TmpImporting.CheckAmount, lCustTrans.Invoice, DefaultDim);
+                    lJournalAR.PmtAmountCur = 0;
+                    lJournalAR.ActualSettleAmountCur = 0;
+                    lJournalAR.Invoice = '';
+                    lJournalAR.update();
+                    lSecondaryMatch.setApplics(lCustTransOpen.company(), lCustTransOpen.RecId, lCustTransOpen.RefRecId,
+                        0, 0, lCustTransOpen.dataareaid, lCustTrans.Invoice, _TmpImporting, lJournal.CurrencyCode,
+                        lCustTrans.AccountNum, _ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetformatID(), lJournalAR, SKS_LB_MatchType::UnstrData);
+                }
+                else
+                {
+                    lJournalAR = TmpSKS_LB_Journalar;
+                    if(lJournalAR.RecId != InitialARRec)
+                    {
+                        lJournalAR.PmtAmountCur = 0;
+                        lJournalAR.ActualSettleAmountCur = 0;
+                        lJournalAR.Invoice = '';
+                        lJournalAR.update();
+                    }
+                    lSecondaryMatch.setApplics(lCustTransOpen.company(), lCustTransOpen.RecId, lCustTransOpen.RefRecId,
+                        0, 0, lCustTransOpen.dataareaid, lCustTrans.Invoice, _TmpImporting, lJournal.CurrencyCode,
+                        lCustTrans.AccountNum, _ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetformatID(), lJournalAR, SKS_LB_MatchType::UnstrData);
+                }
+            }
+            else
+            {
+                lSecondaryMatch.setApplics(lCustTransOpen.company(), lCustTransOpen.RecId, lCustTransOpen.RefRecId,
+                    0, 0, lCustTransOpen.dataareaid, lCustTrans.Invoice, _TmpImporting, lJournal.CurrencyCode,
+                    lCustTrans.AccountNum, _ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetformatID(), lJournalAR, SKS_LB_MatchType::UnstrData);
+
+                if(lJournalAR.CustAccount == '')
+                {
+                    lJournalAR.CustAccount = lCustTrans.AccountNum;
+                    lJournalAR.update();
+                }
+            }
+        }
+        return InitialARRec;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CycleValues</Name>
+				<Source><![CDATA[
+    public SKS_LB_UnstructuredMatchContainers CycleValues(list _TextDataList, CustAccount _CustAccount, boolean _IncludeDuplicateInvs, boolean _CrossCompanySearch = true, boolean _displayErrors = false)
+    {
+        ListIterator                        ListIter = new ListIterator(_TextDataList);
+        container                           ConGoodInv, ConMatchType, ConInvDueDate, ConAmountCur, AllCons;
+        SKS_LB_UnstructuredMatchContainers  UnstrMatchContainers = new SKS_LB_UnstructuredMatchContainers();
+        SKS_LB_UnstructuredMatchContainers  lUMC = new SKS_LB_UnstructuredMatchContainers();
+        str                                 errorText;
+        boolean errorFound = false;
+        int i;
+        ;
+
+
+        while(ListIter.more())//ListIter contains each "parsed valued" from the file record
+        {
+            if(_IncludeDuplicateInvs)
+            {
+                lUMC = this.FindOpenInvoicesIncludeDuplicates(ListIter.value(), _CustAccount, _CrossCompanySearch);
+                ConGoodInv += lUMC.GoodInv();
+                ConInvDueDate += lUMC.InvDueDate();
+                ConAmountCur += lUMC.ConAmountCur();
+
+                ListIter.next();
+            }
+            else
+            {
+                errorText = this.FindOpenInvoices(ListIter.value(), _CustAccount, _CrossCompanySearch);
+
+                if(ListIter.value().CTORecId() != 0)
+                {
+                    if(!_IncludeDuplicateInvs)
+                    {
+                        if(conFind(ConGoodInv, ListIter.value().CTORecId()) == 0)
+                        {
+                            ConGoodInv += ListIter.value().CTORecId();
+                            ConMatchType += ListIter.value().NumberType();
+                            ConInvDueDate += ListIter.value().CTODueDate();
+                            ConAmountCur += ListIter.value().CTOAmountCur();
+                        }
+                    }
+                    ListIter.next();
+                }
+                else
+                {
+                    ListIter.delete();
+                }
+            }
+
+            if(errorText != '' && _displayErrors)
+            {
+                error(errorText);
+                errorFound = true;
+            }
+        }
+
+        UnstrMatchContainers.InvDueDate(ConInvDueDate);
+        UnstrMatchContainers.GoodInv(ConGoodInv);
+        UnstrMatchContainers.MatchType(ConMatchType);
+        UnstrMatchContainers.ConAmountCur(ConAmountCur);
+
+        if(errorFound == false && ConGoodInv == conNull() && _displayErrors)
+        {
+            info("@SKS6227");
+        }
+
+        return UnstrMatchContainers;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DetermineSettleAmount</Name>
+				<Source><![CDATA[
+    public SKS_LB_MatchParms DetermineSettleAmount(SKS_LB_UnstructuredMatchContainers _AllContainers, SKS_LB_UnstrRuleId _RuleID, Date _PaymDate, ExchRate _ExchangeRate, CurrencyCode _CurrCode, AmountCur _paymentAmount)
+    {
+        SKS_LB_MatchParms                   lMatchParms = new SKS_LB_MatchParms();
+        SKS_LB_54000Bas                     sks_lb_54000Bas = new SKS_LB_54000Bas();
+        CustTransOpen                       lCustTransOpen;
+        CustTrans                           lCustTrans;
+        SKS_LB_RemitTxtSettlementRules      RemitTxtSettlementRules;
+        container                           ConGoodInv, ConMatchType, ConInvDueDate, ConAmountCur, ConDiscount;
+        int                                 Counter;
+        DataAreaId                          TmpCompany;
+        AmountCur                           SettleTotal, DiscAmount, tolerance;
+        boolean                             SettlementSuccess = false;
+
+        ConInvDueDate = _AllContainers.InvDueDate();
+        ConGoodInv = _AllContainers.GoodInv();
+        ConMatchType = _AllContainers.MatchType();
+        ConAmountcur = _AllContainers.ConAmountCur();
+
+        if(ConGoodInv != conNull())
+        {
+            tolerance = CustParameters::Find().maxMSTOVerUnder;
+
+            While select Discount, SKS_LB_RemitTxtAnalysis, step, tolerance, settlementAction from RemitTxtSettlementRules order by step asc where RemitTxtSettlementRules.SKS_LB_RemitTxtAnalysis == _RuleID
+            {
+                ConDiscount = conNull();
+                SettleTotal = 0;
+                For(Counter = 1; Counter <= conLen(ConGoodInv); Counter++)
+                {
+                    RefRecId lCTORecID = conPeek(ConGoodInv,Counter);
+                    select firstonly crosscompany lCustTransOpen where lCustTransOpen.RecId == lCTORecID;
+                    select firstonly crosscompany lCustTrans where lCustTrans.RecId == lCustTransOpen.RefRecId;
+
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    //ConAmountCur = conPoke(ConAmountCur, Counter, sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, _CurrCode, lCustTrans.CurrencyCode, _ExchangeRate, SKS_LB_ConvertType::TrantoPaym, lCustTransOpen.AmountCur, _PaymDate));
+                    ConAmountCur = conPoke(ConAmountCur, Counter, sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, _CurrCode, lCustTrans.CurrencyCode, _ExchangeRate, SKS_LB_ConvertType::TrantoPaym, lCustTransOpen.sksGetRemainingAmount(), _PaymDate));
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                    if(RemitTxtSettlementRules.Discount)
+                    {
+                        DiscAmount = this.FindDiscountAmount(TmpCompany, lCustTransOpen, lCustTrans, _PaymDate, _CurrCode, _ExchangeRate);
+                    }
+                    else
+                    {
+                        DiscAmount = 0;
+                    }
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    //SettleTotal += conPeek(ConAmountCur, Counter) - DiscAmount;//DiscAmount will be zero if discount isn't turned on
+                    ConDiscount += DiscAmount;
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    Amount remainingAmount = lCustTransOpen.sksGetRemainingAmount();
+                    Amount locSettleAmount = remainingAmount - DiscAmount;
+                    SettleTotal += locSettleAmount;
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                }
+
+                if(RemitTxtSettlementRules.Tolerance && (SettleTotal + tolerance == _paymentAmount))
+                {
+                    SettleTotal += tolerance;
+                }
+                else if(RemitTxtSettlementRules.Tolerance && (SettleTotal - tolerance == _paymentAmount))
+                {
+                    SettleTotal -= tolerance;
+                }
+
+                if((SettleTotal == _paymentAmount) || ((SettleTotal < _paymentAmount) && (RemitTxtSettlementRules.SettlementAction == SKS_LB_SettlementAction::OverpaySettleAndOnAccount))
+                    ||
+                    (SettleTotal > _paymentAmount && RemitTxtSettlementRules.SettlementAction == SKS_LB_SettlementAction::ShortpayOldest)
+                    ||
+                    ((SettleTotal > _paymentAmount && RemitTxtSettlementRules.SettlementAction == SKS_LB_SettlementAction::ShortpayOnAccount) || (SettleTotal < _paymentAmount && RemitTxtSettlementRules.SettlementAction == SKS_LB_SettlementAction::OverpayOnAccount))
+                    )
+                {
+                    _AllContainers.ConAmountCur(ConAmountCur);
+                    _AllContainers.ConDiscount(ConDiscount);
+                    lMatchParms.invoiceIDErr(SKS_LB_InvoiceIdErr::OK);
+                    lMatchParms.StopMatch(NoYes::Yes);
+                    lMatchParms.CustomOnAccount(true);
+                    lMatchParms.PaymenCount(1);
+                    lMatchParms.SettlementAction(RemitTxtSettlementRules.SettlementAction);
+                    lMatchParms.UseDiscount(RemitTxtSettlementRules.Discount);
+                    lMatchParms.UseTolerance(RemitTxtSettlementRules.Tolerance);
+                    return lMatchParms;
+                }
+            }
+        }
+        return lMatchParms;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindDiscountAmount</Name>
+				<Source><![CDATA[
+    private amountcur FindDiscountAmount(DataAreaId  TmpCompany, CustTransOpen lCustTransOpen, CustTrans lCustTrans, Date _PaymDate, CurrencyCode _CurrCode, ExchRate _ExchRate)
+    {
+        SKS_LB_54000Bas         sks_lb_54000Bas = new SKS_LB_54000Bas();
+        CustPaymSettlementManager           SettlementManager;
+        if(TmpCompany != lCustTransOpen.dataAreaId)
+        {
+            settlementManager = SKS_LB_Process_ImportTemp_Records::constructSettlementManager(_PaymDate,
+                   _CurrCode, _ExchRate, lcusttransopen.dataAreaId, lCustTransOpen.AccountNum);
+        }
+        
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+        /*
+        if(_CurrCode != lCustTrans.CurrencyCode)
+        {
+            return sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, _CurrCode, lCustTrans.CurrencyCode, _ExchRate, SKS_LB_ConvertType::TrantoPaym, settlementManager.calcCashDiscAmountToTake(lcustTransOpen), _PaymDate);
+        }
+        else
+        {
+            return settlementManager.calcCashDiscAmountToTake(lcustTransOpen);
+        }
+        */
+
+        if (lCustTransOpen.AmountCur == lCustTransOpen.sksGetRemainingAmount())
+        {
+            if(_CurrCode != lCustTrans.CurrencyCode)
+            {
+                return sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, _CurrCode, lCustTrans.CurrencyCode, _ExchRate, SKS_LB_ConvertType::TrantoPaym, settlementManager.calcCashDiscAmountToTake(lcustTransOpen), _PaymDate);
+            }
+            else
+            {
+                return settlementManager.calcCashDiscAmountToTake(lcustTransOpen);
+            }
+        }
+        else
+        {
+            Amount partialCashDiscount = settlementManager.calculatePartialApplicableCashDiscount(lCustTransOpen, lCustTransOpen.sksGetRemainingAmount());
+            if(_CurrCode != lCustTrans.CurrencyCode)
+            {
+                return sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, _CurrCode, lCustTrans.CurrencyCode, _ExchRate, SKS_LB_ConvertType::TrantoPaym, partialCashDiscount, _PaymDate);
+            }
+            else
+            {
+                return partialCashDiscount;
+            }
+        }
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindOpenInvoices</Name>
+				<Source><![CDATA[
+    private str FindOpenInvoices(SKS_LB_RemitTxtData  _RemitTxtData, CustAccount _CustAccount, boolean _SearchCrossCompany = true)
+    {
+        SKS_LB_InvoiceMatch     TmpInvoiceMatch;
+        SpecTrans               lSpecTrans;
+        SKS_LB_JournalARApplic  lJournalarapplic;
+        RefRecId                Rec;
+        container               virtualCompanyCompanies;
+
+        if(_SearchCrossCompany)
+        {
+            virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext()); 
+        }
+        else
+        {
+            virtualCompanyCompanies += curext();
+        }
+
+        if(_RemitTxtData.SearchType() == SKS_LB_SearchType::Exact)
+        {
+            Select firstOnly crosscompany:virtualCompanyCompanies
+            TmpInvoiceMatch
+                where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+            TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum();
+
+            rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+            If (TmpInvoiceMatch)
+            {
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                /*
+                select firstOnly TmpInvoiceMatch join lSpectrans
+                where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatch.CustTransOpenRecId == lSpecTrans.refrecid
+                    && TmpInvoiceMatch.CustTransOpenRecId == rec;
+
+                if(TmpInvoiceMatch)
+                {
+                    return(strFmt("@SKS4121", _RemitTxtData.InvoiceNum()));
+                }
+                */
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                Select firstOnly crosscompany:virtualCompanyCompanies
+                TmpInvoiceMatch
+                    where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                    TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                    TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum() &&
+                    TmpInvoiceMatch.CustTransOpenRecId != Rec;
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    /*
+                    notExists join lSpectrans
+                where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatch.custtransopenrecid == lSpecTrans.refrecid;
+                    */
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                if(!TmpInvoiceMatch)
+                {
+                    Select firstOnly crosscompany:virtualCompanyCompanies
+                    TmpInvoiceMatch
+                        where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                        TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                        TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum() &&
+                        TmpInvoiceMatch.CustTransOpenRecId == Rec;
+
+                    Select firstOnly crosscompany:virtualCompanyCompanies
+                    TmpInvoiceMatch
+                        where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                        TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                        TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum() &&
+                        TmpInvoiceMatch.CustTransOpenRecId == Rec;
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    /*
+                        notExists join lSpectrans
+                    where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                        && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                        && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid;
+                    */
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                    lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecid);
+
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton >>
+                    CustTransOpen   custTransOpen = custTransOpen::find(TmpInvoiceMatch.CustTransOpenRecid);
+                    Amount amount = custTransOpen.sksGetRemainingRefAmount();
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton<<
+
+                    if(!lJournalarapplic)
+                    {
+                        _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                        _RemitTxtData.CTODueDate(TmpInvoiceMatch.DueDate);
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //_RemitTxtData.CTOAmountCur(TmpInvoiceMatch.CTOAmountCur);
+                        //_RemitTxtData.CTOAmountCur(CustTransOpen::find(TmpInvoiceMatch.CustTransOpenRecId).sksGetRemainingAmount());
+                        _RemitTxtData.CTOAmountCur(amount);
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        return '';
+                    }
+                    else
+                    {
+                        _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                        _RemitTxtData.CTODueDate(dateNull());
+                        _RemitTxtData.CTOAmountCur(amount);
+                        return '';
+                    }
+                }
+                else
+                {
+                    if(_CustAccount != '')
+                    {
+                        Select firstOnly crosscompany:virtualCompanyCompanies CustTransOpenRecId
+                        from TmpInvoiceMatch
+                            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                            TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum() &&
+                            TmpInvoiceMatch.CustAccount == _CustAccount;
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            /*
+                        notExists join lSpectrans
+                            where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                            && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                            && TmpInvoiceMatch.CustTransOpenRecId == lSpecTrans.refrecid;
+                            */
+                            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                        if(TmpInvoiceMatch)
+                        {
+                            rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                            Select firstOnly crosscompany:virtualCompanyCompanies
+                            TmpInvoiceMatch
+                            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                            TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum() &&
+                            TmpInvoiceMatch.CustTransOpenRecId != rec &&
+                            TmpInvoiceMatch.CustAccount == _CustAccount;
+
+                            if(TmpInvoiceMatch)
+                            {
+                                return(strFmt("@SKS4052", _RemitTxtData.InvoiceNum(), _CustAccount));
+                            }
+                            else
+                            {
+                                Select firstOnly crosscompany:virtualCompanyCompanies CustTransOpenRecId
+                            from TmpInvoiceMatch
+                                where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                                TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                                TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum() &&
+                                TmpInvoiceMatch.CustTransOpenRecId == rec &&
+                                TmpInvoiceMatch.CustAccount == _CustAccount;
+
+                                lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecid);
+
+                                if(!lJournalarapplic)
+                                {
+                                    _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                                    _RemitTxtData.CTODueDate(TmpInvoiceMatch.DueDate);
+                                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                                    //_RemitTxtData.CTOAmountCur(TmpInvoiceMatch.CTOAmountCur);
+                                    _RemitTxtData.CTOAmountCur(CustTransOpen::find(TmpInvoiceMatch.CustTransOpenRecId).sksGetRemainingAmount());
+                                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                                    return '';
+                                }
+                                else
+                                {
+                                    _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecId);
+                                    _RemitTxtData.CTODueDate(dateNull());
+                                    _RemitTxtData.CTOAmountCur(0);
+                                    return '';
+                                }
+                            }
+                        }
+                    }
+                    return(strFmt("@SKS4052", _RemitTxtData.InvoiceNum(), _CustAccount));
+                }
+            }
+        }
+        else if(_RemitTxtData.SearchType() == SKS_LB_SearchType::StartsWith)
+        {
+            Select firstOnly crosscompany:virtualCompanyCompanies CustTransOpenRecId
+            from TmpInvoiceMatch
+            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+            TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*';
+
+            If (TmpInvoiceMatch)
+            {
+                rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                /*
+                select firstOnly TmpInvoiceMatch join lSpectrans
+                where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid
+                    && TmpInvoiceMatch.CustTransOpenRecId == rec;
+
+                if(TmpInvoiceMatch)
+                {
+                    return(strFmt("@SKS4121", _RemitTxtData.InvoiceNum()));
+                }
+                */
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                Select firstOnly crosscompany:virtualCompanyCompanies
+                TmpInvoiceMatch
+                where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*' &&
+                TmpInvoiceMatch.CustTransOpenRecId != rec;
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                /*
+                notExists join lSpectrans
+                    where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                        && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                        && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid;
+                */
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                if(!TmpInvoiceMatch)
+                {
+                    Select firstOnly crosscompany:virtualCompanyCompanies
+                    TmpInvoiceMatch
+                    where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                    TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                    TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*' &&
+                    TmpInvoiceMatch.CustTransOpenRecId == rec;
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    /*
+                    notExists join lSpectrans
+                        where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                            && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                            && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid;
+                    */
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                    lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecId);
+
+                    if(!lJournalarapplic)
+                    {
+                        _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                        _RemitTxtData.CTODueDate(TmpInvoiceMatch.DueDate);
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        _RemitTxtData.CTOAmountCur(CustTransOpen::find(TmpInvoiceMatch.CustTransOpenRecId).sksGetRemainingAmount());
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        return '';
+                    }
+                    else
+                    {
+                        _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                        _RemitTxtData.CTODueDate(dateNull());
+                        _RemitTxtData.CTOAmountCur(0);
+                        return '';
+                    }
+                }
+                else
+                {
+                    if(_CustAccount != '')
+                    {
+                        Select firstOnly crosscompany:virtualCompanyCompanies
+                        TmpInvoiceMatch
+                        where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                        TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                        TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*' &&
+                        TmpInvoiceMatch.CustAccount == _CustAccount;
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        /*
+                        notExists join lSpectrans
+                            where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                                && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                                && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid;
+                        */
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                        if(TmpInvoiceMatch)
+                        {
+                            rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                            Select firstOnly crosscompany:virtualCompanyCompanies
+                            TmpInvoiceMatch
+                                where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                            TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*' &&
+                            TmpInvoiceMatch.CustTransOpenRecId != rec &&
+                            TmpInvoiceMatch.CustAccount == _CustAccount;
+
+                            if(TmpInvoiceMatch)
+                            {
+                                return(strFmt("@SKS4052", _RemitTxtData.InvoiceNum(), _CustAccount));
+                            }
+                            else
+                            {
+                                Select firstOnly crosscompany:virtualCompanyCompanies CustTransOpenRecId
+                                from TmpInvoiceMatch
+                                where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                                TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                                TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*' &&
+                                TmpInvoiceMatch.CustTransOpenRecId == rec &&
+                                TmpInvoiceMatch.CustAccount == _CustAccount;
+
+                                lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecId);
+
+                                if(!lJournalarapplic)
+                                {
+                                    _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecId);
+                                    _RemitTxtData.CTODueDate(TmpInvoiceMatch.DueDate);
+                                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                                    _RemitTxtData.CTOAmountCur(CustTransOpen::find(TmpInvoiceMatch.CustTransOpenRecId).sksGetRemainingAmount());
+                                    //_RemitTxtData.CTOAmountCur(TmpInvoiceMatch.CToAmountCur);
+                                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                                    return '';
+                                }
+                                else
+                                {
+                                    _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                                    _RemitTxtData.CTODueDate(dateNull());
+                                    _RemitTxtData.CTOAmountCur(0);
+                                    return '';
+                                }
+                            }
+                        }
+                    }
+                    return(strFmt("@SKS4052", _RemitTxtData.InvoiceNum(), _CustAccount));
+                }
+            }
+        }
+        else if(_RemitTxtData.SearchType() == SKS_LB_SearchType::EndsWith)
+        {
+            Select firstOnly crosscompany:virtualCompanyCompanies
+            TmpInvoiceMatch
+            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+            TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*';
+
+            If (TmpInvoiceMatch)
+            {
+                rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                /*
+                select firstOnly TmpInvoiceMatch join lSpectrans
+                where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatch.CustTransOpenRecID == lSpecTrans.refrecid
+                    && TmpInvoiceMatch.CustTransOpenRecID == rec;
+
+                if(TmpInvoiceMatch)
+                {
+                    return(strFmt("@SKS4121", _RemitTxtData.InvoiceNum()));
+                }
+                */
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                Select firstOnly crosscompany:virtualCompanyCompanies
+                TmpInvoiceMatch
+                    where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                    TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+                    TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*' &&
+                    TmpInvoiceMatch.CustTransOpenRecId != rec;
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                /*
+                        notExists join lSpectrans
+                    where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                        && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                        && TmpInvoiceMatch.CustTransOpenRecId == lSpecTrans.refrecid;
+                */
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                if(!TmpInvoiceMatch)
+                {
+                    Select firstOnly crosscompany:virtualCompanyCompanies
+                    TmpInvoiceMatch
+                    where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                    TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+                    TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*' &&
+                    TmpInvoiceMatch.CustTransOpenRecId == rec;
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    /*
+                    notExists join lSpectrans
+                        where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                            && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                            && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid;
+                    */
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                    lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecid);
+
+                    if(!lJournalarapplic)
+                    {
+                        _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                        _RemitTxtData.CTODueDate(TmpInvoiceMatch.DueDate);
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //_RemitTxtData.CTOAmountCur(TmpInvoiceMatch.CTOAmountCur);
+                        _RemitTxtData.CTOAmountCur(CustTransOpen::find(TmpInvoiceMatch.CustTransOpenRecId).sksGetRemainingAmount());
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        return '';
+                    }
+                    else
+                    {
+                        _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                        _RemitTxtData.CTODueDate(dateNull());
+                        _RemitTxtData.CTOAmountCur(0);
+                        return '';
+                    }
+                }
+                else
+                {
+                    if(_CustAccount != '')
+                    {
+                        Select firstOnly crosscompany:virtualCompanyCompanies
+                        TmpInvoiceMatch
+                        where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                        TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+                        TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*' &&
+                        TmpInvoiceMatch.CustAccount == _CustAccount;
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                            /*
+                        notExists join lSpectrans
+                            where TmpInvoiceMatch.dataareaid == lSpecTrans.RefCompany
+                                && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                                && TmpInvoiceMatch.CustTransOpenRecid == lSpecTrans.refrecid;
+                            */
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                        if(TmpInvoiceMatch)
+                        {
+                            rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                            Select firstOnly crosscompany:virtualCompanyCompanies
+                            TmpInvoiceMatch
+                            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+                            TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*' &&
+                            TmpInvoiceMatch.CustTransOpenRecId != rec &&
+                            TmpInvoiceMatch.CustAccount == _CustAccount;
+
+                            if(TmpInvoiceMatch)
+                            {
+                                return(strFmt("@SKS4052", _RemitTxtData.InvoiceNum(), _CustAccount));
+                            }
+                            else
+                            {
+                                Select firstOnly crosscompany:virtualCompanyCompanies
+                                TmpInvoiceMatch
+                                where TmpInvoiceMatch.MatchType ==  _RemitTxtData.NumberType() &&
+                                TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+                                TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*' &&
+                                TmpInvoiceMatch.CustTransOpenRecId == rec &&
+                                TmpInvoiceMatch.CustAccount == _CustAccount;
+
+                                lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecId);
+
+                                if(!lJournalarapplic)
+                                {
+                                    _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecid);
+                                    _RemitTxtData.CTODueDate(TmpInvoiceMatch.DueDate);
+                                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                                    //_RemitTxtData.CTOAmountCur(TmpInvoiceMatch.CTOAmountCur);
+                                    _RemitTxtData.CTOAmountCur(CustTransOpen::find(TmpInvoiceMatch.CustTransOpenRecId).sksGetRemainingAmount());
+                                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                                    return '';
+                                }
+                                else
+                                {
+                                    _RemitTxtData.CTORecId(TmpInvoiceMatch.CustTransOpenRecID);
+                                    _RemitTxtData.CTODueDate(dateNull());
+                                    _RemitTxtData.CTOAmountCur(0);
+                                    return '';
+                                }
+                            }
+                        }
+                    }
+                    return(strFmt("@SKS4052", _RemitTxtData.InvoiceNum(), _CustAccount));
+                }
+            }
+        }
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindOpenInvoicesIncludeDuplicates</Name>
+				<Source><![CDATA[
+    public SKS_LB_UnstructuredMatchContainers FindOpenInvoicesIncludeDuplicates(SKS_LB_RemitTxtData  _RemitTxtData, CustAccount _CustAccount, boolean _SearchCrossCompany = true)
+    {
+        SKS_LB_InvoiceMatch     TmpInvoiceMatch;
+        SKS_LB_InvoiceMatch     TmpInvoiceMatchAMCheck;//Buffer for already marked checking
+        SpecTrans               lSpecTrans;
+        SKS_LB_JournalARApplic  lJournalarapplic;
+        RefRecId                Rec;
+        container               virtualCompanyCompanies;
+        container               ConGoodInv, ConInvDueDate, ConAmountCur;
+        SKS_LB_UnstructuredMatchContainers lUnstructuredMatchContainers = new SKS_LB_UnstructuredMatchContainers();
+
+        if(_SearchCrossCompany)
+        {
+            virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+        }
+        else
+        {
+            virtualCompanyCompanies += curext();
+        }
+
+        if(_RemitTxtData.SearchType() == SKS_LB_SearchType::Exact)
+        {
+            while Select crosscompany:virtualCompanyCompanies
+            TmpInvoiceMatch
+                where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+                TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+                TmpInvoiceMatch.MatchValue == _RemitTxtData.InvoiceNum()
+                    notexists join TmpMatchTemp 
+                    where tmpMatchTemp.ctorecid == TmpInvoiceMatch.CustTransOpenRecID
+            {
+                rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                //CHecks if record is already marked
+                select firstOnly TmpInvoiceMatchAMCheck join lSpectrans
+                where TmpInvoiceMatchAMCheck.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatchAMCheck.CustTransOpenRecId == lSpecTrans.refrecid
+                    && TmpInvoiceMatchAMCheck.CustTransOpenRecId == rec;
+
+                if(!TmpInvoiceMatchAMCheck)
+                {
+                    lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecid);
+                }
+
+                if(!lJournalarapplic && !TmpInvoiceMatchAMCheck)
+                {
+                    ttsbegin;
+                    TmpMatchTemp.CTORecid = TmpInvoiceMatch.CustTransOpenRecId;
+                    TmpMatchTemp.insert();
+                    ttscommit;
+                    ConGoodInv += TmpInvoiceMatch.CustTransOpenRecId;
+                    ConInvDueDate += TmpInvoiceMatch.DueDate;
+                    ConAmountCur += TmpInvoiceMatch.CTOAmountCur;
+                }
+            }
+        }
+        else if(_RemitTxtData.SearchType() == SKS_LB_SearchType::StartsWith)
+        {
+            while Select crosscompany:virtualCompanyCompanies CustTransOpenRecId
+            from TmpInvoiceMatch
+            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::Forward &&
+            TmpInvoiceMatch.MatchValue LIKE _RemitTxtData.InvoiceNum() + '*'
+                notexists join TmpMatchTemp
+                    where tmpMatchTemp.ctorecid == TmpInvoiceMatch.CustTransOpenRecID
+            {
+                rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                select firstOnly TmpInvoiceMatchAMCheck join lSpectrans
+                where TmpInvoiceMatchAMCheck.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatchAMCheck.CustTransOpenRecid == lSpecTrans.refrecid
+                    && TmpInvoiceMatchAMCheck.CustTransOpenRecId == rec;
+
+                if(!TmpInvoiceMatchAMCheck)
+                {
+                    lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecId);
+                }
+
+                if(!lJournalarapplic)
+                {
+                    ttsbegin;
+                    TmpMatchTemp.CTORecid = TmpInvoiceMatch.CustTransOpenRecId;
+                    TmpMatchTemp.insert();
+                    ttscommit;
+                    ConGoodInv += TmpInvoiceMatch.CustTransOpenRecId;
+                    ConInvDueDate += TmpInvoiceMatch.DueDate;
+                    ConAmountCur += TmpInvoiceMatch.CTOAmountCur;
+                }
+            }
+        }
+        else if(_RemitTxtData.SearchType() == SKS_LB_SearchType::EndsWith)
+        {
+            while Select crosscompany:virtualCompanyCompanies
+            TmpInvoiceMatch
+            where TmpInvoiceMatch.MatchType == _RemitTxtData.NumberType() &&
+            TmpInvoiceMatch.Direction == SKS_LB_MatchTypeDirection::reverse &&
+            TmpInvoiceMatch.MatchValue LIKE SKS_PP_StringFormats::reverse_String(_RemitTxtData.InvoiceNum()) + '*'
+                notexists join TmpMatchTemp
+                where tmpMatchTemp.ctorecid == TmpInvoiceMatch.CustTransOpenRecID
+            {
+                rec = TmpInvoiceMatch.CustTransOpenRecId;
+
+                select firstOnly TmpInvoiceMatchAMCheck join lSpectrans
+                where TmpInvoiceMatchAMCheck.dataareaid == lSpecTrans.RefCompany
+                    && tableNum(CustTransOpen) == lSpecTrans.reftableid
+                    && TmpInvoiceMatchAMCheck.CustTransOpenRecID == lSpecTrans.refrecid
+                    && TmpInvoiceMatchAMCheck.CustTransOpenRecID == rec;
+
+                if(!TmpInvoiceMatchAMCheck)
+                {
+                    lJournalarapplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(TmpInvoiceMatch.CustTransOpenRecid);
+                }
+
+                if(!lJournalarapplic)
+                {
+                    ttsbegin;
+                    TmpMatchTemp.CTORecid = TmpInvoiceMatch.CustTransOpenRecId;
+                    TmpMatchTemp.insert();
+                    ttscommit;
+                    ConGoodInv += TmpInvoiceMatch.CustTransOpenRecId;
+                    ConInvDueDate += TmpInvoiceMatch.DueDate;
+                    ConAmountCur += TmpInvoiceMatch.CTOAmountCur;
+                }
+            }
+        }
+
+        lUnstructuredMatchContainers.GoodInv(ConGoodInv);
+        lUnstructuredMatchContainers.InvDueDate(ConInvDueDate);
+        lUnstructuredMatchContainers.ConAmountCur(ConAmountCur);
+        return lUnstructuredMatchContainers;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindPaymentDate</Name>
+				<Source><![CDATA[
+    private PaymDate FindPaymentDate(TmpSKS_LB_Importing    TmpRecord)
+    {
+        if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.DateDay, tmpRecord.DateMonth, tmpRecord.DateYear))
+        {
+            if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear))
+            {
+                return mkDate( tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear );
+            }
+            else
+            {
+                return DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            }
+        }
+        else
+        {
+            return mkDate( tmpRecord.DateDay, tmpRecord.DateMonth, tmpRecord.DateYear );
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ParseInvNumbers</Name>
+				<Source><![CDATA[
+    public List ParseInvNumbers(SKS_BR_NoteMemo _Note, SKS_LB_UnstrRuleId _RuleID) // 7483
+    {
+        SKS_LB_MatchParms               lMatchParms = new SKS_LB_MatchParms();
+        SKS_LB_RemitTxtParse            lRemitTxtParse;
+        container                       lResults;
+        container                       tmpInvTextResults;
+        str                             lExpr;
+        int                             Counter;
+        List                            RemitTxtDataList = new List(Types::Class);
+
+        while select lRemitTxtParse order by lRemitTxtParse.step where lRemitTxtParse.SKS_LB_RemitTxtAnalysis == _RuleID
+        {
+            tmpInvTextResults = conNull();
+            if(lRemitTxtParse.SKS_LB_DataSearchType == SKS_LB_DataSearchType::NumberLength)
+            {
+                lExpr = '[0-9]{' + int642str(lRemitTxtParse.NumberMin) + ',' + int642str(lRemitTxtParse.Numbermax) + '}';
+                tmpInvTextResults += this.searchString(_Note, lExpr);
+
+                for(Counter = 1; counter <= conLen(tmpInvTextResults); Counter++)
+                {
+                    if(lRemitTxtParse.RestrictNumberRange)
+                    {
+                        if(str2int64(conPeek(tmpInvTextResults, counter)) < lRemitTxtParse.MinValue  ||  str2int64(conPeek(tmpInvTextResults, counter)) > lRemitTxtParse.maxValue)
+                        {
+                            tmpInvTextResults = conDel(tmpInvTextResults, Counter, 1);
+                            Counter = Counter - 1;
+                        }
+                        else
+                        {
+                            RemitTxtDataList.addEnd(this.RemoveZeroesAddPrefixSuffix(lRemitTxtParse.RemoveLeadingZeroes, tmpInvTextResults, Counter, lRemitTxtParse));
+                        }
+                    }
+                    else
+                    {
+                        RemitTxtDataList.addEnd(this.RemoveZeroesAddPrefixSuffix(lRemitTxtParse.RemoveLeadingZeroes, tmpInvTextResults, Counter, lRemitTxtParse));
+                    }
+                }
+            }
+            else
+            {
+                tmpInvTextResults += this.searchString(_Note, lRemitTxtParse.RegularExpression);
+                for(Counter = 1; counter <= conLen(tmpInvTextResults); Counter++)
+                {
+                    RemitTxtDataList.addEnd(this.RemoveZeroesAddPrefixSuffix(lRemitTxtParse.RemoveLeadingZeroes, tmpInvTextResults, Counter, lRemitTxtParse));
+                }
+            }
+
+            lResults += tmpInvTextResults;
+        }
+
+        return RemitTxtDataList;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RemoveZeroesAddPrefixSuffix</Name>
+				<Source><![CDATA[
+    private SKS_LB_RemitTxtData RemoveZeroesAddPrefixSuffix(boolean _removeZeroes, container _tmpResults, int _Counter, SKS_LB_RemitTxtParse  _RemitParse)
+    {
+        SKS_LB_RemitTxtData RemitTxtData = new SKS_LB_RemitTxtData();
+        SKS_LB_MatchValue   lInvoiceNum;
+        if(_removeZeroes)
+        {
+            lInvoiceNum =_RemitParse.AXPrefix +  SKS_PP_StringFormats::strLTrimZeroes(conPeek(_tmpResults, _Counter)) + _RemitParse.AXSuffix;
+        }
+        else
+        {
+            lInvoiceNum =_RemitParse.AXPrefix +  conPeek(_tmpResults, _Counter) + _RemitParse.AXSuffix;
+        }
+        RemitTxtData.InvoiceNum(lInvoiceNum);
+        RemitTxtData.NumberType(_RemitParse.NumberType);
+        RemitTxtData.SearchType(_RemitParse.SearchType);
+
+        return RemitTxtData;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ReorderAndShortpayHandling</Name>
+				<Source><![CDATA[
+    public RefRecId ReorderAndShortpayHandling(TmpSKS_LB_Importing _TmpImporting, SKS_LB_ClsJARRecord _ClsJARRecord, SKS_LB_UnstructuredMatchContainers UnstructuredMatchContainers, SKS_LB_Journal  lJournal, boolean ApplyDiscount, boolean _Usetolerance)
+    {
+        SKS_LB_SecondaryMatch   lSecondaryMatch = new SKS_LB_SecondaryMatch();
+        CustTransOpen           lCustTransOpen;
+        CustTrans               lCustTrans;
+        SKS_LB_JournalAR        lJournalAR;
+        CustParameters          CustParameters;
+        container               ConApplicInv, ConApplicMatchType, virtualCompanies, ConDueDate, ConGoodInv, ConMatchType, ConAmountcur, ConDiscount;
+        AmountCur               SettleAmount, tolerance;
+        RefRecId                ARRecid;
+        int                     Counter =1;
+        SKS_PP_Setup            tmpSetup;
+        SKS_LB_Bank             tmpBank;
+        CustTable               l_CustTable;
+        DirPartyTable           dirPartyTable;
+        ;
+
+        UnstructuredMatchContainers = this.SortContainer(UnstructuredMatchContainers.InvDueDate(), UnstructuredMatchContainers.GoodInv(), UnstructuredMatchContainers.MatchType(),
+            UnstructuredMatchContainers.ConAmountCur(), UnstructuredMatchContainers.ConDiscount());
+        ConDueDate = UnstructuredMatchContainers.InvDueDate();
+        ConGoodInv = UnstructuredMatchContainers.GoodInv();
+        ConMatchType = UnstructuredMatchContainers.MatchType();
+        ConAmountcur = UnstructuredMatchContainers.ConAmountCur();
+        ConDiscount = UnstructuredMatchContainers.ConDiscount();
+
+        if(_UseTolerance)
+        {
+            tolerance = CustParameters::Find().maxMSTOVerUnder;
+        }
+
+        select CashDiscForPartialPaym from CustParameters;
+        select * from tmpSetup;
+        select LBjournalname, LBformatID, bankAccountID from tmpBank where tmpBank.bankaccountID == _ClsJARRecord.getsetbankAccount() && tmpBank.LBformatid == _ClsJARRecord.getsetformatID();
+
+        for(Counter = 1; Counter <= conLen(ConGoodInv); counter++)
+        {
+            if(SettleAmount < _TmpImporting.CheckAmount)
+            {
+                if(SettleAmount + conPeek(ConAmountcur, Counter) - conPeek(ConDiscount, Counter) <= _TmpImporting.CheckAmount)//if full settlement amount can be applied add it to the running total
+                {
+                    SettleAmount += conPeek(ConAmountcur, Counter) - conPeek(Condiscount, Counter);
+                }
+                else//Full settlement amount can't be settled. Add as much as we can
+                {
+                    if(ApplyDiscount && CustParameters.CashDiscForPartialPaym == noyes::Yes)
+                    {
+                        ConDiscount = conPoke(ConDiscount, Counter, this.CalcPartialDiscount(_TmpImporting, lJournal, conPeek(ConGoodInv, Counter), _TmpImporting.CheckAmount - SettleAmount));
+                    }
+                    else
+                    {
+                        ConDiscount = conPoke(ConDiscount, Counter, 0);
+                    }
+                    SettleAmount += _TmpImporting.CheckAmount - SettleAmount;
+                }
+            }
+            else//Remove any invoices that won't be able to be settled due to the shortpay
+            {
+                ConApplicInv += conPeek(ConGoodInv, Counter);      //Store off the info so that zero amount applics can be created later
+                ConApplicMatchType += conPeek(ConMatchType, Counter);
+                ConGoodInv = conDel(ConGoodInv, counter, 1);
+                ConMatchType = conDel(ConMatchType, counter, 1);
+                ConAmountcur = conDel(ConAmountcur, counter, 1);
+                ConDueDate = conDel(ConDueDate, counter, 1);
+                Counter--;
+            }
+        }
+
+        ARRecid = this.ARCreation(_TmpImporting, _ClsJARRecord, ConGoodInv, ConAmountcur, ConDiscount, ConMatchType,  lJournal, ApplyDiscount, tolerance);//Create the AR and settlements
+
+        for(Counter = 1; Counter <= conLen(ConApplicInv); counter++)
+        {
+            lCustTransOpen = CustTransOpen::find(conPeek(ConApplicInv, Counter));
+            lCustTrans = CustTrans::find(lCustTransOpen.RefRecId);
+            Select crossCompany:virtualCompanies AccountNum, Party, DefaultDimension
+            from l_CustTable
+            join Name
+                from dirPartyTable
+                WHERE l_CustTable.Party == dirPartyTable.RecId
+                    && l_CustTable.AccountNum == lCustTrans.AccountNum;
+            select firstonly lJournalAR where lJournalAR.JournalId == lJournal.JournalID 
+                &&  lJournalAR.BatchNum == lJournal.BatchNum 
+                && lJournalAR.CustAccount == lCustTrans.AccountNum 
+                && lJournalAR.DefaultDimension == SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(Tmpsetup,  lCustTrans.DefaultDimension, l_CustTable.DefaultDimension, tmpBank.LBJournalName, lCustTrans.company())
+                && lJournalAR.CustomerCompany == lCustTrans.company()
+                && lJournalAR.isDED == NoYes::No
+                && lJournalAR.AresDed == NoYes::No;
+            if(!lJournalAR)
+            {
+                lJournalAR = lSecondaryMatch.InitARRecord(_ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetLBJournalID(),
+                    _ClsJARRecord.getsetformattedBatNum(), _ClsJARRecord.getsetpathFile(), _ClsJARRecord.getsetfileDate(),
+                    _ClsJARRecord.getsetformatID(), lCustTrans.AccountNum, _ClsJARRecord.getsetvirtualCompanyCompanies(),
+                    _TmpImporting,  _TmpImporting.InvAmount != 0 ? _TmpImporting.InvAmount : _TmpImporting.CheckAmount, '', lCustTrans.DefaultDimension);
+                lJournalAR.ActualSettleAmountCur = 0;
+                lJournalAR.PmtAmountCur = 0;
+                lJournalAR.Invoice = '';
+                lJournalAR.update();
+            }
+            lSecondaryMatch.setApplics(lCustTransOpen.company(), lCustTransOpen.RecId, lCustTransOpen.RefRecId,
+                0, 0, lCustTransOpen.dataareaid, lCustTrans.Invoice, _TmpImporting, lJournal.CurrencyCode,
+                lCustTrans.AccountNum, _ClsJARRecord.getsetbankAccount(), _ClsJARRecord.getsetformatID(), lJournalAR, SKS_LB_MatchType::UnstrData);
+        }
+
+        return ARRecid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>searchString</Name>
+				<Source><![CDATA[
+    public container searchString(SKS_BR_NoteMemo _txt, str _Expression) // 7483
+    {
+        System.Text.RegularExpressions.Match myMatch;
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        str value;
+        container results;
+        ;
+
+        myMatch = System.Text.RegularExpressions.Regex::Match(_txt, _Expression);
+        sb.Clear();
+
+        while(myMatch.get_Success())
+        {
+            Value = myMatch.get_Value();
+            results += value;
+            myMatch = myMatch.NextMatch();
+        }
+        return results;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SortContainer</Name>
+				<Source><![CDATA[
+    private SKS_LB_UnstructuredMatchContainers SortContainer(container _ConDate, Container _ConGoodInv, Container _ConMatchType, Container _ConAmountcur, container _ConDiscAmount)
+    {
+        date        tempdate1, tempdate2;
+        RefRecId    invRec1, invRec2;
+        str         Matchtype1, MatchType2;
+        AmountCur   Amount1, Amount2, discAmt1, discAmt2;
+        int         i, j;
+        SKS_LB_UnstructuredMatchContainers  UnstructuredContainers = new SKS_LB_UnstructuredMatchContainers();
+        ;
+
+        //Sort containers by date
+        for (i = 1; i <= conlen(_ConDate); i++)
+        {
+            for (j = i + 1; j <= conlen(_ConDate); j++)
+            {
+                tempdate1 = conpeek(_ConDate, j);
+                tempdate2 = conpeek(_ConDate, i);
+
+                invRec1 = conpeek(_ConGoodInv, j);
+                invRec2 = conpeek(_ConGoodInv, i);
+                Matchtype1 = conpeek(_ConMatchType, j);
+                MatchType2 = conpeek(_ConMatchType, i);
+                Amount1 = conpeek(_ConAmountcur, j);
+                Amount2 = conpeek(_ConAmountcur, i);
+                discAmt1 = conpeek(_ConDiscAmount, j);
+                discAmt2 = conpeek(_ConDiscAmount, i);
+
+                if (tempdate1 < tempdate2)
+                {
+                    _ConDate = condel(_ConDate, j, 1);
+                    _ConDate = conins(_ConDate, j, tempdate2);
+                    _ConDate = condel(_ConDate, i, 1);
+                    _ConDate = conins(_ConDate, i, tempdate1);
+
+                    _ConGoodInv = condel(_ConGoodInv, j, 1);
+                    _ConGoodInv = conins(_ConGoodInv, j, invRec2);
+                    _ConGoodInv = condel(_ConGoodInv, i, 1);
+                    _ConGoodInv = conins(_ConGoodInv, i, invRec1);
+
+                    _ConMatchType = condel(_ConMatchType, j, 1);
+                    _ConMatchType = conins(_ConMatchType, j, MatchType2);
+                    _ConMatchType = condel(_ConMatchType, i, 1);
+                    _ConMatchType = conins(_ConMatchType, i, Matchtype1);
+
+                    _ConAmountcur = condel(_ConAmountcur, j, 1);
+                    _ConAmountcur = conins(_ConAmountcur, j, Amount2);
+                    _ConAmountcur = condel(_ConAmountcur, i, 1);
+                    _ConAmountcur = conins(_ConAmountcur, i, Amount1);
+
+                    _ConDiscAmount = condel(_ConDiscAmount, j, 1);
+                    _ConDiscAmount = conins(_ConDiscAmount, j, discAmt2);
+                    _ConDiscAmount = condel(_ConDiscAmount, i, 1);
+                    _ConDiscAmount = conins(_ConDiscAmount, i, discAmt1);
+                }
+            }
+        }
+
+        //put credit invoice at the front of the containers regardless of date
+        for (i = 1; i <= conlen(_ConAmountcur); i++)
+        {
+            Amount1 = conPeek(_ConAmountcur, i);
+            tempdate1 = conpeek(_ConDate, i);
+            invRec1 = conpeek(_ConGoodInv, i);
+            discAmt1 = conpeek(_ConDiscAmount, i);
+            Matchtype1 = conpeek(_ConMatchType, i);
+
+            if(Amount1 < 0)
+            {
+                _ConAmountcur = condel(_ConAmountcur, i, 1);
+                _ConAmountcur = conins(_ConAmountcur, 1, Amount1);
+                _ConGoodInv = condel(_ConGoodInv, i, 1);
+                _ConGoodInv = conins(_ConGoodInv, 1, invRec1);
+                _ConDate = condel(_ConDate, i, 1);
+                _ConDate = conins(_ConDate, 1, tempdate1);
+                _ConMatchType = condel(_ConMatchType, i, 1);
+                _ConMatchType = conins(_ConMatchType, 1, Matchtype1);
+                _ConDiscAmount = condel(_ConDiscAmount, i, 1);
+                _ConDiscAmount = conins(_ConDiscAmount, 1, discAmt1);
+            }
+        }
+        UnstructuredContainers.InvDueDate(_ConDate);
+        UnstructuredContainers.GoodInv(_ConGoodInv);
+        UnstructuredContainers.MatchType(_ConMatchType);
+        UnstructuredContainers.ConAmountCur(_ConAmountcur);
+        UnstructuredContainers.ConDiscount(_ConDiscAmount);
+        return UnstructuredContainers;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

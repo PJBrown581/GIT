@@ -1,0 +1,758 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_RF</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Importing ihb external vendor netting files
+/// </summary>
+class SKS_IHB_RF
+{
+
+    #define.Archive('Archive')
+    SKS_PP_Setup setup;
+    boolean  mbankFabricInt;                     //bankfabric
+    str locControlSum;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>SettlmtProcessAllDirectories</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process IHB netting for files in specified directory.
+    /// </summary>
+    /// <param name = "_SKS_EB_CommProcess">Communication buffer</param>  
+    [SuppressBPWarning('BPCheckInsertMethodInLoop','This cannot be a Record Insert List.  You have to insert these as you go, because the lines depend on this file being there.')]
+    public void SettlmtProcessAllDirectories(SKS_EB_CommProcess _SKS_EB_CommProcess)
+    {
+        #define.Error('Error')
+
+        System.Exception ex;
+
+        SKS_EB_FileHub locSKS_EB_FileHub;
+        int TempInt; 
+        List locListFilesToProcess;
+        ListEnumerator locFilesToProcessEnumerator;
+        str locFilename;
+        str locDestPath;
+        System.Text.StringBuilder errorMsg;
+        utcDateTime locFileDateTime;
+        int transCount;
+        boolean duplicateFileExists;
+
+        RecordInsertList    locRecordInsertList_FileLines;
+
+        SKS_IHB_VendNettingFilesHeader vendNettingFileHeader;
+        SKS_IHB_VendNettingFileDetails vendNettingFileLines;
+
+        setup = SKS_PP_Setup::find();
+
+        List fileRecordList;
+        
+        locRecordInsertList_FileLines = new RecordInsertList(vendNettingFileLines.TableId);
+        
+        SKS_BF_BankIntType  sks_BF_BankIntType;     //bankfabric
+        SKS_EB_FileStorage sks_eb_filestorage;      //bankfabric
+
+        select firstonly sks_eb_filestorage;  //Bankfabric
+        mbankFabricInt = (sks_eb_filestorage.StorageOption_IHB == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue) ? true : false;
+
+        if (mbankFabricInt)
+        {
+            locSKS_EB_FileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType::BankFabric);
+            sks_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+        }
+        else
+        {
+            locSKS_EB_FileHub = SKS_EB_FileHub::construct();
+            sks_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+        }
+
+        if(mbankFabricInt && setup.IHBVendorNettingBankFabricLocation)
+        {
+            locListFilesToProcess  = locSKS_EB_FileHub.runDirectoryGetFiles(setup.IHBVendorNettingBankFabricLocation);
+        }
+        else if (setup.IHBVendorNettingInboundFilePath)
+        {
+            locListFilesToProcess  = locSKS_EB_FileHub.runDirectoryGetFiles(setup.IHBVendorNettingInboundFilePath);
+        }
+        else
+        {
+            throw warning("@SKS2113");
+        }
+        locFilesToProcessEnumerator = locListFilesToProcess.getEnumerator();
+        locFilesToProcessEnumerator.reset();
+
+        while(locFilesToProcessEnumerator.moveNext())
+        {
+
+            duplicateFileExists = false;
+
+            errorMsg = new System.Text.StringBuilder();
+            locFilename = locFilesToProcessEnumerator.current();
+
+            if (mbankFabricInt)   //bankfabric
+            {
+                locFilename = System.IO.Path::Combine(setup.IHBVendorNettingBankFabricLocation, locFilename);
+            }
+
+            locSKS_EB_FileHub.setFileName(locFilename);
+            locSKS_EB_FileHub.runFileInquire();
+            locFileDateTime = locSKS_EB_FileHub.attrFileModified();
+                    
+            if (this.checkDuplicatesSettlementFiles(locFilename, locFileDateTime))
+            {
+                errorMsg.AppendLine(strFmt("@SKS3156", locFilename));
+                duplicateFileExists = true;
+            }
+
+            TempInt = errorMsg.get_Length();
+            boolean noRecordExists;
+
+            if(TempInt == 0)
+            {
+                fileRecordList = this.getFile(locFilename, sks_BF_BankIntType);
+
+                if(fileRecordList.empty())
+                {
+                    noRecordExists = true;
+                }
+                       
+            }
+            transCount = 0;
+
+            // Even if errors, we will still insert the file into SKS_SCF_Settlement
+            ttsBegin;
+            vendNettingFileHeader.FilePathName = locFilename;
+            vendNettingFileHeader.ImportDateTime = DateTimeUtil::getSystemDateTime();
+            vendNettingFileHeader.FileDateTime = locFileDateTime;
+            vendNettingFileHeader.CommunicationId = _SKS_EB_CommProcess.CommID;
+            vendNettingFileHeader.FileId = NumberSeq::newGetNum(SKS_PP_Setup::numRefIHBVendNettingFileId()).num();
+            vendNettingFileHeader.ErrorNotes = "@SKS:SKGIHBVendNettingTransStatus";
+            vendNettingFileHeader.insert();
+
+            SKS_IHB_VendNettingImportJournalHelper helper = SKS_IHB_VendNettingImportJournalHelper::construct(vendNettingFileHeader);
+
+            boolean isTrailerControlSumNotValid;
+            boolean transRecordsExits, trailerRecordsExits;
+
+            if (!noRecordExists && !duplicateFileExists)
+            {
+                ListEnumerator enumerator = fileRecordList.getEnumerator();
+                SKS_IHB_RF_Structure structure;
+                SKS_IHB_VendNettingFileDetails vendNettingDetails;               
+
+                Amount totalLineAmt = 0;
+                boolean ok, isAmtInvalid;
+                while (enumerator.moveNext())
+                {
+                    structure = enumerator.current();
+
+                    Ok = true;
+                    vendNettingDetails.clear();                       
+                    if (structure.getText() == 'X')
+                    {
+
+                        if (!structure.getVendAccount() || !structure.getVendCompany()   || !structure.getVendName() 
+                            || structure.getDueDate() == dateNull()  || !structure.parmAmountStr()  || !structure.getCurrencyCode())
+                        {
+                            vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                            vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingValuesMissing";
+                            ok = false;
+                        }
+
+                        transRecordsExits = true;
+                        vendNettingDetails.VendorAccount = structure.getVendAccount();
+                        vendNettingDetails.VendorCompany = structure.getVendCompany();
+                        vendNettingDetails.VendorName    = structure.getVendName();                      
+                        vendNettingDetails.DueDate       = structure.getDueDate();
+                        vendNettingDetails.InvoiceNum    = structure.getInvoiceNum();
+                        vendNettingDetails.CurrencyCode  = structure.getCurrencyCode();
+                        vendNettingDetails.VendNettingHeaderRecid =  vendNettingFileHeader.RecId;
+
+                        if (ok)
+                        {
+                            // Switch board
+                            SKS_IHB_SwitchboardExternalVendor switchBoardExtVend = SKS_IHB_SwitchboardExternalVendor::find(vendNettingDetails.VendorAccount, vendNettingDetails.VendorCompany);
+
+                            if (switchBoardExtVend)
+                            {
+                                vendNettingDetails.VendIHBAccount  = switchBoardExtVend.VendorIHBBank;
+                                vendNettingDetails.CustIHBAccount  = switchBoardExtVend.CustomerIHBBank;
+                                vendNettingDetails.CustomerCompany = switchBoardExtVend.CustomerCompany;
+                                vendNettingDetails.CustomerAccount = switchBoardExtVend.CustomerAccount;
+                            }
+                            else
+                            {
+                                vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                                vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingSwitchBoardFailed";
+                                ok = false;
+                            }
+                        }
+                       
+                        //Currency validation
+                        if (strLen(vendNettingDetails.CurrencyCode) > 3 || !Currency::exist(vendNettingDetails.CurrencyCode))
+                        {                            
+                            vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                            vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingCurrencyInvalid";
+                            ok = false;
+                        }
+                        
+                        // Amount format validation
+
+                        #define.Comma(',')
+                        #define.Hyphen('-')
+
+                        int lenDecSep;
+                        str amt = structure.parmAmountStr();
+                        int found = strFind(amt,"@#$%^&*()_+=[{]};:'<>/?/*+",1,strLen(amt));
+                        int commFound = strFind(amt,#Comma,1,strLen(amt));
+                        int commaPos = strFind(amt,#Comma,1,strLen(amt));
+                        int commaPosNegFound = strFind(amt,#Hyphen,1,strLen(amt)); // to check -ve symbol in the amount
+                        str commaPosNeg = subStr(amt,1,1);                // to check -ve symbol at the prefix in the amount
+
+                        if(commFound && commaPos)
+                        {
+                            lenDecSep = this.getDecimalSeparatorLenght(amt);// to get the lenght of the decimals after the decimal separator(,)
+                        }
+
+                        // validate if comma is present other than as decimal separator
+                        if (str2num(amt) == 0 || (strLen(amt) -2 != commaPos && commFound && lenDecSep == 2) || (strLen(amt) -1 != commaPos && commFound && lenDecSep == 1) || (commaPosNeg != #Hyphen && commaPosNegFound))
+                        {
+                            vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                            vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingInvalidAmnt";
+                            ok = false;
+                            isAmtInvalid = true;
+                        }
+                        else if (found != 0)
+                        {
+                            // Validate if any special charecters present in the amount
+                            vendNettingDetails.TransactionStatus = SKS_IHB_TransactionStatus::RequiresReview;
+                            vendNettingDetails.ErrorNotes = "@SKS:SKGIHBVendNettingInvalidAmnt";
+                            ok = false;
+                            isAmtInvalid = true;
+                        }
+                        if((strLen(amt) -2 == commaPos && commFound && lenDecSep == 2) || (strLen(amt) -1 == commaPos && commFound && lenDecSep == 1))//Replace the amount with decimal separator as ".", instead of ","
+                        {
+                            amt = strReplace(amt,",",".");
+                            vendNettingDetails.InvoiceAmount = str2num(amt);
+                        }
+                        else
+                        {
+                            vendNettingDetails.InvoiceAmount = str2num(amt);
+                        }
+
+                        // Check for CustPaymJournal
+                        if (vendNettingDetails.CustomerAccount && vendNettingDetails.CustomerCompany)
+                        {
+                            CustTable custTable;
+
+                            select firstonly crosscompany RecId from custTable
+                                where custTable.AccountNum == vendNettingDetails.CustomerAccount
+                                && custTable.DataAreaId == vendNettingDetails.CustomerCompany;
+
+                            if (custTable.RecId)
+                            {
+                                vendNettingDetails.IsCustPaymJournal = NoYes::Yes;
+                            }
+                        }
+
+                        //If all validations are successful
+                        if (ok)
+                        {
+                            vendNettingDetails.IsValidationOK = NoYes::Yes;
+                        }
+
+                        if (!isAmtInvalid)
+                        {
+                            totalLineAmt += vendNettingDetails.InvoiceAmount;
+                        }
+                        transCount = transCount + 1;
+                        
+
+                        locRecordInsertList_FileLines.add(vendNettingDetails);
+                    }
+                    else if (structure.getText() == 'T')
+                    {   
+                        // Amount format validation
+                        #define.Comma(',')
+                        #define.Hyphen('-')
+
+                        int lenDecSep;
+                        trailerRecordsExits = true;
+                        str amt = structure.parmControlSum();
+                        int found = strFind(amt,"@#$%^&*()_+=[{]};:'<>/?/*+",1,strLen(amt));
+                        int commFound = strFind(amt,#Comma,1,strLen(amt));
+                        int commaPos = strFind(amt,#Comma,1,strLen(amt));
+                        int commaPosNegFound = strFind(amt,#Hyphen,1,strLen(amt)); // to check -ve symbol in the amount
+                        str commaPosNeg = subStr(amt,1,1);                // to check -ve symbol at the prefix in the amount
+
+                        if(commFound && commaPos)
+                        {
+                            lenDecSep = this.getDecimalSeparatorLenght(amt);// to get the lenght of the decimals after the decimal separator(,)
+                        }
+
+                        // validate if comma is present other than as decimal separator
+                        if (str2num(amt) == 0 || (strLen(amt) -2 != commaPos && commFound && lenDecSep == 2) || (strLen(amt) -1 != commaPos && commFound && lenDecSep == 1) || (commaPosNeg != #Hyphen && commaPosNegFound))
+                        {
+                            vendNettingFileHeader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::RequiresReview;
+                            vendNettingFileHeader.ErrorNotes = "@SKS:SKGIHBVendNettingInvalidCntrlSumAmnt";
+                            vendNettingFileHeader.FileError  = NoYes::Yes;
+                            isTrailerControlSumNotValid = true;
+                            
+                        }
+                        else if (found != 0)
+                        {
+                            // Validate if any special charecters present in the amount
+                            vendNettingFileHeader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::RequiresReview;
+                            vendNettingFileHeader.ErrorNotes = "@SKS:SKGIHBVendNettingInvalidCntrlSumAmnt";
+                            vendNettingFileHeader.FileError  = NoYes::Yes;
+                            
+                            isTrailerControlSumNotValid = true;
+                            
+                        }
+                        if((strLen(amt) -2 == commaPos && commFound && lenDecSep == 2) || (strLen(amt) -1 == commaPos && commFound && lenDecSep == 1))//Replace the amount with decimal separator as ".", instead of ","
+                        {
+                            amt = strReplace(amt,",",".");
+                            locControlSum  = amt;
+                        }
+                        else
+                        {
+                           
+                            locControlSum  = amt;
+                        }
+
+                        //Trailer record
+                        ttsbegin;
+                        if (!isTrailerControlSumNotValid)
+                        {
+                            vendNettingFileHeader.FileSum = str2Num(locControlSum);
+                        }
+                        vendNettingFileHeader.selectForUpdate(true);
+                        vendNettingFileHeader.ActualSum = totalLineAmt;
+                        vendNettingFileHeader.ActualTransctionCount = transCount;
+                        vendNettingFileHeader.FileTransctionCount = structure.getTransactionCount();
+
+                        vendNettingFileHeader.update();
+                        ttscommit;
+                    }
+                }//End while
+                locRecordInsertList_FileLines.insertDatabase();
+                
+            }        
+            
+            // Validate files contains transaction records(Started with 'X').
+            boolean noTransactionRecExists;
+
+            if(!trailerRecordsExits)  //Devops- 21289
+            {
+                SKS_IHB_VendNettingFileDetails locSKS_VendorNettingFileDtls;
+
+                delete_from locSKS_VendorNettingFileDtls where locSKS_VendorNettingFileDtls.VendNettingHeaderRecid == vendNettingFileHeader.RecId;
+            }
+            if (!duplicateFileExists)
+            {
+                if (noRecordExists || (!transRecordsExits || !trailerRecordsExits))
+                {
+                    errorMsg.Clear();
+                    errorMsg.AppendLine(strFmt("@SKS:SCFInboundNoRecordsValidation", locFilename));
+
+                    // If no lines exists in file to import
+                    ttsbegin;
+                    vendNettingFileHeader.selectForUpdate(true);
+
+                    vendNettingFileHeader.FileError = NoYes::Yes;
+                    vendNettingFileHeader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::RequiresReview;
+                    vendNettingFileHeader.ErrorNotes = "@SKS560";
+
+                    helper.insertErrorLog(vendNettingFileHeader.FileId, errorMsg.ToString());
+
+                    vendNettingFileHeader.update();
+                    ttscommit;
+
+                    noTransactionRecExists = true;
+                }
+            }
+            else
+            {
+                ttsbegin;
+                vendNettingFileHeader.selectForUpdate(true);
+
+                vendNettingFileHeader.FileError = NoYes::Yes;
+                vendNettingFileHeader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::RequiresReview;
+                vendNettingFileHeader.ErrorNotes = "@SKS:SKGFileImported";
+                helper.insertErrorLog(vendNettingFileHeader.FileId, errorMsg.ToString());
+
+                vendNettingFileHeader.update();
+                ttscommit;
+            }
+
+            // Validate control sum, actual sum, control count, actual count
+            if (!duplicateFileExists && !noTransactionRecExists)
+            {
+                if (!isTrailerControlSumNotValid)
+                {
+                    // Set status
+                    this.checkForRequiredReviewStatus(vendNettingFileHeader);
+                }
+            }
+            boolean isJourNameMissing;
+
+            // Verify intercompany and GL journal name in parameter setup
+            if (!setup.IHBVendorNettingJournalName)
+            {
+                isJourNameMissing = true;
+                vendNettingFileHeader.ErrorNotes = "@SKS:SKGIHBVendNettingJournameRequired";
+            }
+            else if (!setup.IHB_GLJournalName)
+            {
+                isJourNameMissing = true;
+                vendNettingFileHeader.ErrorNotes = "@SKS:SKGIHBVendNettingInterCompanyRequired";
+            }
+
+            // Update respective status if journal name is missing
+            if (isJourNameMissing)
+            {
+                vendNettingFileHeader.FileError = NoYes::Yes;
+                this.updateVendNettingFilesheaderStatus(vendNettingFileHeader);
+            }
+            ttscommit;
+
+            if (vendNettingFileHeader.FileError == NoYes::Yes)
+            {
+                // Move file to error floder
+                locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFilename), #Error));
+                locDestPath = this.appendFileNbr(locFilename, vendNettingFileHeader.FileId);
+                locDestPath = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locDestPath), #Error, System.IO.Path::GetFileName(locDestPath));
+                locSKS_EB_FileHub.runFileMoveTo(locDestPath);
+
+                this.updateFilePath(vendNettingFileHeader, locDestPath);
+            }
+
+            if(vendNettingFileHeader.FileError == NoYes::No)
+            {
+                infolog().clear();
+
+                LedgerJournalTable journalGL;
+
+                // General journal posting for customer outside
+                try
+                {
+                    helper.createJournal(true, conNull());
+
+                    ttsbegin;
+                    journalGL = helper.parmLedgerJournalTableGL();
+
+                    if (journalGL && journalGL.numOfLines() > 0)
+                    {
+                        helper.postGLJournal(journalGL, vendNettingFileHeader);
+                    }
+                    ttscommit;
+                }
+                catch (ex)
+                {
+                    helper.insertErrorLog(vendNettingFileHeader.FileId, ex.Message);
+                    helper.insertJournalHistory(journalGL.JournalNum, vendNettingFileHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourPostFailed);
+                    helper.updateVendNettingFilesheaderStatus(vendNettingFileHeader, true);
+                    helper.updateHeaderErrorNotes(vendNettingFileHeader, SKS_IHB_VendorNettingJournalAction::GenJourPostFailed);
+
+                    helper.updateNettingLinesForOutsideCustomer(journalGL.JournalNum);
+                    this.updateJournalTableNettingOutCustFailedStatus(journalGL);
+                }
+
+                // General journal and customer payment journal posting for inside customer.
+                LedgerJournalTable journalheaderGL;
+                try
+                {
+                    boolean isJourPosted;
+                    infolog().clear();
+
+                    //Create and post GL
+                    journalheaderGL =  helper.CreateGLJourforInsideCust();
+
+                    ttsbegin;
+                    if (journalheaderGL && journalheaderGL.numOfLines() > 0)
+                    {
+                        helper.parmGLJournalId(journalheaderGL.JournalNum);   //Devops- 21318
+                        isJourPosted = helper.postGLForInsideCustomer(journalheaderGL);
+                    }
+
+                    if (isJourPosted == NoYes::Yes)
+                    {
+
+                        Map jourNumMap = helper.createCustPaymJournal();
+                        helper.validateAndPostCustPaymJour(jourNumMap);
+                    }
+                    ttscommit;
+                }
+                catch (ex)
+                {                   
+                    helper.insertErrorLog(vendNettingFileHeader.FileId, ex.Message);
+                    helper.insertJournalHistory(helper.parmErrorJournalId(), vendNettingFileHeader.FileId, helper.parmError());
+                    helper.updateVendNettingFilesheaderStatus(vendNettingFileHeader, true);
+                    helper.updateHeaderErrorNotes(vendNettingFileHeader, helper.parmError());
+
+                    helper.updateNettingLinesForInsideCustomer();
+                    this.updateJournalTableNettingFailedStatus(journalheaderGL);
+                }
+            }
+            
+            if (vendNettingFileHeader.FileError == NoYes::No)
+            {
+                //Move file to Archive
+                locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFilename), 'Archive'));
+                locDestPath = this.appendFileNbr(locFilename, vendNettingFileHeader.FileId);
+                locDestPath = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locDestPath),#Archive,System.IO.Path::GetFileName(locDestPath));
+                locSKS_EB_FileHub.runFileMoveTo(locDestPath);
+
+                this.updateFilePath(vendNettingFileHeader, locDestPath);
+            }
+        }          
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForRequiredReviewStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set vendor netting header status.
+    /// </summary>
+    /// <param name = "_vendNettingFilesheader"> buffer to update </param>
+    public void checkForRequiredReviewStatus(SKS_IHB_VendNettingFilesHeader _vendNettingFilesheader)
+    {
+        boolean updateNeeded;
+        str errorMsg;
+
+        if (_vendNettingFilesheader.ActualSum != _vendNettingFilesheader.FileSum)
+        {                  
+            errorMsg = "@SKS:SKGIHBVendNettingControlSumValidation";
+            updateNeeded = true;
+        }
+
+        if (_vendNettingFilesheader.ActualTransctionCount != _vendNettingFilesheader.FileTransctionCount)
+        {  
+            if (strLen(errorMsg) > 1)
+            {
+                errorMsg += ', ' + "@SKS:SKGIHBVendNettingTransCountValidation";
+            }
+            else
+            {
+                errorMsg = "@SKS:SKGIHBVendNettingTransCountValidation";
+            }
+            updateNeeded = true;
+        }
+
+        if (strLen(errorMsg) > 1)
+        {
+            _vendNettingFilesheader.ErrorNotes = errorMsg;
+        }
+
+
+        if (updateNeeded)
+        {
+            _vendNettingFilesheader.FileError = NoYes::Yes;            
+            this.updateVendNettingFilesheaderStatus(_vendNettingFilesheader);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVendNettingFilesheaderStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update vend nettign header status
+    /// </summary>
+    /// <param name = "_vendNettingFilesheader"> buffer to update </param>
+    private void updateVendNettingFilesheaderStatus(SKS_IHB_VendNettingFilesHeader _vendNettingFilesheader)
+    {
+        if (_vendNettingFilesheader)
+        {
+            ttsbegin;
+            _vendNettingFilesheader.selectForUpdate(true);
+            _vendNettingFilesheader.TransactionStatusSummary = SKS_IHB_TransactionStatusSummary::RequiresReview;
+            _vendNettingFilesheader.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get files from directory
+    /// </summary>
+    /// <param name = "_filePath">File path to pick files inside</param>
+    /// <param name = "_SKS_BF_BankIntType">returns files list</param>
+    /// <returns>returns the list</returns>///
+
+    private List getFile(str _filePath, SKS_BF_BankIntType _SKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal)
+    {        
+        SKS_IHB_RF_VendNettingImport vendNettingImport = new SKS_IHB_RF_VendNettingImport();
+        
+        return vendNettingImport.getFile(_filePath, _SKS_BF_BankIntType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkDuplicatesSettlementFiles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check duplicate file
+    /// </summary>
+    /// <param name = "_FileName"> File path to check </param>
+    /// <param name = "_UtcDateTimeModified"> UTC date time</param>
+    /// <returns> returns true if duplicate exists otherwise; false </returns>
+    private boolean checkDuplicatesSettlementFiles(Filename _FileName, utcdatetime _UtcDateTimeModified)
+    {
+        boolean rtnval;
+        SKS_EB_FilePath locSKS_EB_Filename;
+        SKS_IHB_VendNettingFilesHeader vendNettingFilesHeader;
+        System.DateTime locSystemDateTime;
+        utcDateTime locModifiedDateTimeMIN, locModifiedDateTimeMAX;
+
+
+        locSystemDateTime = _UtcDateTimeModified;
+        locModifiedDateTimeMIN  = locSystemDateTime.AddSeconds(-1);
+        locModifiedDateTimeMAX  = locSystemDateTime.AddSeconds(1);
+        locSKS_EB_Filename = System.IO.Path::Combine(
+                                System.IO.Path::Combine(System.IO.Path::GetDirectoryName(_FileName),
+                                                        #Archive),
+        System.IO.Path::GetFileNameWithoutExtension(_FileName));
+
+        while select FilePathName, recid from vendNettingFilesHeader
+            where vendNettingFilesHeader.FileDateTime >= locModifiedDateTimeMIN
+            && vendNettingFilesHeader.FileDateTime <= locModifiedDateTimeMAX
+        {
+            if (strScan(vendNettingFilesHeader.FilePathName, locSKS_EB_Filename,1,strLen(vendNettingFilesHeader.FilePathName)))
+            {
+                rtnval = true;
+                break;
+            }
+        }
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>appendFileNbr</Name>
+				<Source><![CDATA[
+    private str appendFileNbr(str _PathFileName,SKS_SCF_RF_NextFileNumber _SKS_SCF_RF_NextFileNumber )
+    {
+        str rtnval = '';
+        System.String locPath;
+        System.Text.StringBuilder locFileNameBuilder;
+        System.String locFileExtension;
+
+        locFileNameBuilder = new System.Text.StringBuilder();
+
+        locPath = System.IO.Path::GetDirectoryName(_PathFileName);
+        locFileNameBuilder.Append(System.IO.Path::GetFileNameWithoutExtension(_PathFileName));
+        if(System.IO.Path::HasExtension(_PathFileName))
+        {
+            locFileExtension = System.IO.Path::GetExtension(_PathFileName);
+        }
+
+        locFileNameBuilder.Append('-');
+        locFileNameBuilder.Append(_SKS_SCF_RF_NextFileNumber);
+
+        if(System.IO.Path::HasExtension(_PathFileName))
+        {
+            locFileNameBuilder.Append(locFileExtension);
+        }
+
+        rtnval = System.IO.Path::Combine(locPath, locFileNameBuilder.ToString());
+
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFilePath</Name>
+				<Source><![CDATA[
+    private void updateFilePath(SKS_IHB_VendNettingFilesHeader _vendNettingFileHeader, str _updateFilePath)
+    {
+        ttsbegin;
+        _vendNettingFileHeader.selectForUpdate(true);
+        _vendNettingFileHeader.FilePathName = _updateFilePath;
+        _vendNettingFileHeader.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournalTableNettingFailedStatus</Name>
+				<Source><![CDATA[
+    private void updateJournalTableNettingFailedStatus(LedgerJournalTable _ledgerJournalTable)
+    {
+        if (_ledgerJournalTable)
+        {
+            ttsbegin;
+            _ledgerJournalTable.selectForUpdate(true);
+            _ledgerJournalTable.IsExtVendNettingJournalAutoFailed = NoYes::Yes;
+            _ledgerJournalTable.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournalTableNettingOutCustFailedStatus</Name>
+				<Source><![CDATA[
+    private void updateJournalTableNettingOutCustFailedStatus(LedgerJournalTable _ledgerJournalTable)
+    {
+        if (_ledgerJournalTable)
+        {
+            ttsbegin;
+            _ledgerJournalTable.selectForUpdate(true);
+            _ledgerJournalTable.IsExtVendNettingJournalOutCustAutoFailed = NoYes::Yes;
+            _ledgerJournalTable.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDecimalSeparatorLenght</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// To get the decimal separator lenght - Devops - 21291
+    /// </summary>
+    /// <param name = "_amt"></param>
+    /// <returns>int</returns>
+    private int getDecimalSeparatorLenght(str _amt)
+    {
+        List paramAsList;
+        ListEnumerator le;
+        str lenDecimalSeparator;
+
+        paramAsList = strSplit(_amt, ",");
+        le = paramAsList.getEnumerator();
+
+        while(le.moveNext())
+        {
+            lenDecimalSeparator = le.current();
+        }
+
+        int decSepLen = strLen(lenDecimalSeparator);
+
+        return decSepLen;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

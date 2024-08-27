@@ -1,0 +1,557 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocAlertSummaryEmailDistributorService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The DocAlertSummaryEmailDistributorService class is a service for alert summary email distributor.
+/// </summary>
+public class DocAlertSummaryEmailDistributorService extends SysOperationServiceBase
+{
+    #OCCRetryCount
+    private DocAlertSummaryEmailDistributorContract dataContract;
+    private Query query;
+    private int emailsSentCnt;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes alert summary emails.
+    /// </summary>
+    /// <param name = "_dataContract">An instance of the DocAlertSummaryEmailDistributorContract class</param>
+    public void process(DocAlertSummaryEmailDistributorContract _dataContract)
+    {
+        /*********************************   DOCENTRIC AX FREE EDITION LICENSE NOTICE   *********************************/
+        /*
+        In case that you are using Docentric AX Free Edition, changing these parts of the source code related to the licensing
+        is STRICTLY FORBIDDEN and DOES NOT COMPLY with Docentric AX Free Edition License, which you accepted by installing
+        the Docentric AX Free Edition product.
+        You must keep intact all parts of the source code related to the licensing of the full product version.
+        Read more: https://ax.docentric.com/free-edition-license/
+        */
+        /*********************************   DOCENTRIC AX FREE EDITION LICENSE NOTICE   *********************************/
+        try
+        {
+            // If the Alert summary emails are used, check the license. This feature cannot be used with Free Edition!
+            // This call will throw an exception if the license is not found or if the license is invalid, expired or insufficient.
+            DocLicenseMng::checkLicense(DocConstant::FeatureAlertSummaryEmails, "@DocentricAX4:AlertSummaryEmailDistributorProcessFailed");
+        }
+        catch
+        {
+            if (this.isExecutingInBatch())
+            {
+                // Non-interactive mode (process executing in batch)
+                // Batch job must end with status rror if license is not valid.
+                throw Exception::Error;
+            }
+            else
+            {
+                // Interactive mode
+                return;
+            }
+        }
+
+        // Process alert summary emails
+        this.processInternal(_dataContract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes alert summary emails.
+    /// </summary>
+    /// <param name = "_dataContract">An instance of the DocAlertSummaryEmailDistributorContract class</param>
+    protected void processInternal(DocAlertSummaryEmailDistributorContract _dataContract)
+    {
+        dataContract = _dataContract;
+        query = dataContract.getQuery();
+
+        QueryRun queryRun = new QueryRun(query);
+
+        // Create a unique Id to mark all the records being processed
+        SysEmailProcessorId thisProcessorId = newGuid();
+        // Get current user session. It is used for cleanup if the session was crashed during alert processing.
+        xSession xSession = new xSession(sessionId());
+
+        RefRecId batchJobHeaderId;
+        UserId batchJobUserId;
+
+        // Get information about the current batch job execution
+        if (this.isExecutingInBatch())
+        {
+            batchJobHeaderId = this.getCurrentBatchHeader().parmBatchHeaderId();
+            batchJobUserId = this.getCurrentBatchTask().ExecutedBy;
+        }
+
+        DocAlertSummaryEmailStatusTable docAlertSummaryEmailStatusTable;
+        DocAlertSummaryEmailStatusLine docAlertSummaryEmailStatusLine;
+
+        try
+        {
+            // Update the status of alerts (InProcessing -> Created) that could not be successfully processed due to sessions that crashed in the past
+            this.cleanup();
+
+
+            // Mark all alerts currently available as being processed by this session
+            int ttsLevel = appl.ttsLevel();
+
+            // Iterate through the records with statuses: Created, PartiallyProcessed and Error.
+            while (queryRun.next())
+            {
+                docAlertSummaryEmailStatusTable = queryRun.get(tableNum(DocAlertSummaryEmailStatusTable));
+                docAlertSummaryEmailStatusLine = queryRun.get(tableNum(DocAlertSummaryEmailStatusLine));
+
+                // Check whether the DocAlertSummaryEmailStatusTable record has been changed
+                if (queryRun.changed(tableNum(DocAlertSummaryEmailStatusTable)))
+                {
+                    // Commit the current transaction if the TTS level has been changed
+                    if (ttsLevel < appl.ttsLevel())
+                    {
+                        ttscommit;
+                    }
+                    // Start a new transaction
+                    ttsbegin;
+
+                    // Update the status of current DocAlertSummaryEmailStatusTable record
+                    docAlertSummaryEmailStatusTable.selectForUpdate(true);
+                    docAlertSummaryEmailStatusTable.SessionId = xSession.sessionId();
+                    docAlertSummaryEmailStatusTable.SessionLoginDateTime = xSession.loginDateTime();
+                    docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::InProcessing;
+                    docAlertSummaryEmailStatusTable.ProcessorId = thisProcessorId;
+
+                    docAlertSummaryEmailStatusTable.update();
+                }
+
+                // Update the status of current DocAlertSummaryEmailStatusLine record
+                docAlertSummaryEmailStatusLine.selectForUpdate(true);
+                docAlertSummaryEmailStatusLine.ProcessorId = thisProcessorId;
+                docAlertSummaryEmailStatusLine.Status = DocAlertSummaryEmailStatus::InProcessing;
+                docAlertSummaryEmailStatusLine.BatchJobId = batchJobHeaderId;
+                docAlertSummaryEmailStatusLine.BatchJobUserId = batchJobUserId;
+                docAlertSummaryEmailStatusLine.update();
+            }
+            // Commit the current transaction if the TTS level has been changed
+            if (ttsLevel < appl.ttsLevel())
+            {
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            queryRun.reset();
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    queryRun.reset();
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:AlertSummaryEmailDistributorProcessMarkAlertsError");
+        }
+        finally
+        {
+            // Process emails for marked alerts
+            this.processEmails(thisProcessorId);
+
+            // Update the status of processed alerts
+            this.updateStatus(thisProcessorId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processEmails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes alert summary emails for the specified processor Id.
+    /// </summary>
+    /// <param name = "_processorId">Processor Id</param>
+    protected void processEmails(SysEmailProcessorId _processorId)
+    {
+        DocAlertSummaryEmailStatusTable docAlertSummaryEmailStatusTableGroup, docAlertSummaryEmailStatusTable;
+        DocAlertSummaryEmailStatusLine docAlertSummaryEmailStatusLineGroup, docAlertSummaryEmailStatusLine, docAlertSummaryEmailStatusLineTmp;
+
+        emailsSentCnt = 0;
+        // Group all marked alerts by email recipient and prepare an alert summary email for each recipient
+        while select optimisticlock EmailRecipient, count(RecId)
+            from docAlertSummaryEmailStatusLineGroup
+                group by EmailRecipient
+                where docAlertSummaryEmailStatusLineGroup.Status == DocAlertSummaryEmailStatus::InProcessing
+                   && docAlertSummaryEmailStatusLineGroup.ProcessorId == _processorId
+            exists join optimisticlock docAlertSummaryEmailStatusTableGroup
+                where docAlertSummaryEmailStatusTableGroup.RecId == docAlertSummaryEmailStatusLineGroup.AlertSummaryEmailStatusTableRecId
+                   && docAlertSummaryEmailStatusTableGroup.Status == DocAlertSummaryEmailStatus::InProcessing
+                   && docAlertSummaryEmailStatusTableGroup.ProcessorId == _processorId
+        {
+            int infologLine = infologLine();
+            int alertsProcessed = int642int(docAlertSummaryEmailStatusLineGroup.RecId);
+            int alertsIncluded = 0;
+            List alertList = new List(Types::Record);
+            docAlertSummaryEmailStatusLineTmp.setTmp();
+
+            try
+            {
+                // Loop through all marked alerts for the specified email recipient
+                while select optimisticlock docAlertSummaryEmailStatusLine
+                    order by EmailRecipient, AlertSummaryEmailStatusTableRecId
+                    where docAlertSummaryEmailStatusLine.EmailRecipient == docAlertSummaryEmailStatusLineGroup.EmailRecipient
+                       && docAlertSummaryEmailStatusLine.Status == DocAlertSummaryEmailStatus::InProcessing
+                       && docAlertSummaryEmailStatusLine.ProcessorId == _processorId
+                    join optimisticlock docAlertSummaryEmailStatusTable
+                        where docAlertSummaryEmailStatusTable.RecId == docAlertSummaryEmailStatusLine.AlertSummaryEmailStatusTableRecId
+                           && docAlertSummaryEmailStatusTable.Status == DocAlertSummaryEmailStatus::InProcessing
+                           && docAlertSummaryEmailStatusTable.ProcessorId == _processorId
+                {
+                    EventInbox eventInbox = EventInbox::findRecId(docAlertSummaryEmailStatusTable.EventInboxRecId);
+                    if (eventInbox)
+                    {
+                        alertList.addEnd(eventInbox);
+                    }
+
+                    // Add the processed alert for the current email recipient to the temporary table to update the status later
+                    docAlertSummaryEmailStatusLineTmp.data(docAlertSummaryEmailStatusLine);
+                    docAlertSummaryEmailStatusLineTmp.doInsert();
+
+                    alertsIncluded++;
+
+                    // Check if number of alerts for current email recipient exceeds the specified limit
+                    if (alertsIncluded == dataContract.parmMaxAlertsInSummary())
+                    {
+                        break;
+                    }
+                }
+
+                // Set alert summary email context info
+                DocAlertSummaryEmailContextInfoParams alertSummaryEmailContextInfoParams = DocAlertSummaryEmailContextInfoParams::construct(
+                    _processorId,
+                    docAlertSummaryEmailStatusLineGroup.EmailRecipient,
+                    dataContract.parmMaxAlertsInSummary(),
+                    alertsProcessed,
+                    alertsProcessed - alertsIncluded);
+                this.setAlertSummaryEmailContextInfoParams(alertSummaryEmailContextInfoParams);
+
+                // Create and send alert summary email notification
+                DocSendAlertEmailNotificationsResult sendAlertEmailNotificationsResult = DocEmailTemplateManager::sendAlertSummaryEmailNotifications(
+                    alertList,
+                    dataContract.parmSysEmailTemplateId(),
+                    docAlertSummaryEmailStatusLineGroup.EmailRecipient,
+                    alertSummaryEmailContextInfoParams);
+
+                SysOutgoingEmailTable outgoingEmailTable;
+                if (sendAlertEmailNotificationsResult)
+                {
+                    outgoingEmailTable = sendAlertEmailNotificationsResult.parmSendMailResult().parmOutgoingEmailTable();
+                }
+
+                // Count the sent emails
+                emailsSentCnt++;
+
+                // Update the status of successfully processed alerts for the current email recipient
+                update_recordset docAlertSummaryEmailStatusLine
+                    setting Status = DocAlertSummaryEmailStatus::FullyProcessed,
+                            EmailItemId = outgoingEmailTable.EmailItemId,
+                            ErrorMessage = ''
+                      where docAlertSummaryEmailStatusLine.ProcessorId == _processorId
+                exists join docAlertSummaryEmailStatusLineTmp
+                      where docAlertSummaryEmailStatusLineTmp.AlertSummaryEmailStatusTableRecId == docAlertSummaryEmailStatusLine.AlertSummaryEmailStatusTableRecId
+                         && docAlertSummaryEmailStatusLineTmp.EmailRecipient == docAlertSummaryEmailStatusLine.EmailRecipient;
+            }
+            catch
+            {
+                // Get error messages from infolog
+                str errorMsg = DocGlobalHelper::getInfoLogMessages(infologLine + 1, '', true);
+
+                // Update the status of failed processed alerts for the current email recipient
+                update_recordset docAlertSummaryEmailStatusLine
+                    setting Status = DocAlertSummaryEmailStatus::Error,
+                            ErrorMessage = errorMsg
+                      where docAlertSummaryEmailStatusLine.ProcessorId == _processorId
+                exists join docAlertSummaryEmailStatusLineTmp
+                      where docAlertSummaryEmailStatusLineTmp.AlertSummaryEmailStatusTableRecId == docAlertSummaryEmailStatusLine.AlertSummaryEmailStatusTableRecId
+                         && docAlertSummaryEmailStatusLineTmp.EmailRecipient == docAlertSummaryEmailStatusLine.EmailRecipient;
+            }
+            finally
+            {
+                // Update the status of processed alerts that have exceeded the MaxAlertsInSummary limit
+                update_recordset docAlertSummaryEmailStatusLine
+                    setting Status = DocAlertSummaryEmailStatus::PartiallyProcessed,
+                            ErrorMessage = ''
+                      where docAlertSummaryEmailStatusLine.EmailRecipient == docAlertSummaryEmailStatusLineGroup.EmailRecipient
+                         && docAlertSummaryEmailStatusLine.ProcessorId == _processorId
+                         && docAlertSummaryEmailStatusLine.Status == DocAlertSummaryEmailStatus::InProcessing;
+
+                // Delete the temporary table for the next loop
+                delete_from docAlertSummaryEmailStatusLineTmp;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the status of processed alerts for specified processor Id.
+    /// </summary>
+    /// <param name = "_processorId">Processor Id</param>
+    protected void updateStatus(SysEmailProcessorId _processorId)
+    {
+        DocAlertSummaryEmailStatusTable docAlertSummaryEmailStatusTable;
+        DocAlertSummaryEmailStatusLine docAlertSummaryEmailStatusLine;
+
+        int totalProcessedHeaderCnt = 0;
+        int failedHeaderCnt = 0;
+        int partiallyProcessedHeaderCnt = 0;
+        int fullyProcessedHeaderCnt = 0;
+        int exceededMaxAlertsInSummaryHeaderCnt = 0;
+
+        try
+        {
+            // Loop through all marked alerts to update the status
+            while select optimisticlock docAlertSummaryEmailStatusTable
+                where docAlertSummaryEmailStatusTable.Status == DocAlertSummaryEmailStatus::InProcessing
+                   && docAlertSummaryEmailStatusTable.ProcessorId == _processorId
+            {
+                totalProcessedHeaderCnt++;
+
+                int createdCnt = 0;
+                int partiallyProcessedCnt = 0;
+                int fullyProcessedCnt = 0;
+                int failedCnt = 0;
+                int exceededMaxAlertsInSummaryCnt = 0;
+                str errorMsg = '';
+
+                // Count the statuses and summarise the error messages for all email recipients for the specified alert 
+                while select docAlertSummaryEmailStatusLine
+                    where docAlertSummaryEmailStatusLine.AlertSummaryEmailStatusTableRecId == docAlertSummaryEmailStatusTable.RecId
+                {
+                    switch (docAlertSummaryEmailStatusLine.Status)
+                    {
+                        case DocAlertSummaryEmailStatus::Created:
+                            createdCnt++;
+                            break;
+                        case DocAlertSummaryEmailStatus::PartiallyProcessed:
+                            partiallyProcessedCnt++;
+                            if (!exceededMaxAlertsInSummaryCnt && docAlertSummaryEmailStatusLine.ProcessorId == _processorId)
+                            {
+                                exceededMaxAlertsInSummaryCnt = 1;
+                                exceededMaxAlertsInSummaryHeaderCnt += exceededMaxAlertsInSummaryCnt;
+                            }
+                            break;
+                        case DocAlertSummaryEmailStatus::FullyProcessed:
+                            fullyProcessedCnt++;
+                            break;
+                        case DocAlertSummaryEmailStatus::Error:
+                            failedCnt++;
+                            break;
+                    }
+                    if (docAlertSummaryEmailStatusLine.ErrorMessage)
+                    {
+                        errorMsg += errorMsg ? '\r\n' : '' + docAlertSummaryEmailStatusLine.ErrorMessage;
+                    }
+                }
+
+                // Set the status for each processed alert
+                if (failedCnt > 0)
+                {
+                    docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::Error;
+                    failedHeaderCnt++;
+                }
+                else if ((partiallyProcessedCnt > 0) || (createdCnt > 0 && fullyProcessedCnt > 0))
+                {
+                    docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::PartiallyProcessed;
+                    partiallyProcessedHeaderCnt++;
+                } 
+                else if (fullyProcessedCnt > 0)
+                {
+                    docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::FullyProcessed;
+                    fullyProcessedHeaderCnt++;
+                }
+                else
+                {
+                    docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::Created;
+                }
+                docAlertSummaryEmailStatusTable.LatestStatusChangeDateTime = DateTimeUtil::getSystemDateTime();
+                docAlertSummaryEmailStatusTable.LastErrorMessage = errorMsg;
+
+                ttsbegin;
+
+                docAlertSummaryEmailStatusTable.selectForUpdate(true);
+                docAlertSummaryEmailStatusTable.update();
+
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:AlertSummaryEmailDistributorProcessUpdateStatusError");
+        }
+        finally
+        {
+            if (totalProcessedHeaderCnt == fullyProcessedHeaderCnt)
+            {
+                DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:AlertSummaryEmailDistributorProcessCompletedInfo", _processorId, totalProcessedHeaderCnt, emailsSentCnt));
+            }
+            else
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:AlertSummaryEmailDistributorProcessCompletedWarning",
+                    _processorId, totalProcessedHeaderCnt, fullyProcessedHeaderCnt, partiallyProcessedHeaderCnt, exceededMaxAlertsInSummaryHeaderCnt, failedHeaderCnt, emailsSentCnt));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the status of alerts that could not be successfully processed due to sessions that crashed in the past.
+    /// </summary>
+    protected void cleanup()
+    {
+        DocAlertSummaryEmailStatusTable docAlertSummaryEmailStatusTable;
+        DocAlertSummaryEmailStatusLine docAlertSummaryEmailStatusLine;
+
+        try
+        {
+            while select optimisticlock docAlertSummaryEmailStatusTable
+                where docAlertSummaryEmailStatusTable.Status == DocAlertSummaryEmailStatus::InProcessing
+            {
+                // Check if the specified session is alive or not (a crashed session)
+                if (!this.isSessionActive(docAlertSummaryEmailStatusTable))
+                {
+                    ttsbegin;
+
+                    docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::Created;
+                    docAlertSummaryEmailStatusTable.LatestStatusChangeDateTime = DateTimeUtil::getSystemDateTime();
+                    docAlertSummaryEmailStatusTable.update();
+
+                    update_recordset docAlertSummaryEmailStatusLine
+                        setting Status = DocAlertSummaryEmailStatus::Created
+                          where docAlertSummaryEmailStatusLine.AlertSummaryEmailStatusTableRecId == docAlertSummaryEmailStatusTable.RecId
+                             && docAlertSummaryEmailStatusLine.Status == DocAlertSummaryEmailStatus::InProcessing;
+
+                    ttscommit;
+                }
+            }
+        }
+        catch(Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:AlertSummaryEmailDistributorProcessCleanupError");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSessionActive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag indicating whether the specified session is alive or not.
+    /// </summary>
+    /// <param name = "_docAlertSummaryEmailStatusTable">The DocAlertSummaryEmailStatusTable record</param>
+    /// <returns>True if the specified session is alive; otherwise false</returns>
+    private boolean isSessionActive(DocAlertSummaryEmailStatusTable _docAlertSummaryEmailStatusTable)
+    {
+        boolean  isAlive = false;
+        if (isSessionActive(_docAlertSummaryEmailStatusTable.SessionId, _docAlertSummaryEmailStatusTable.SessionLoginDateTime, false)
+                && isSessionActive(_docAlertSummaryEmailStatusTable.SessionId, _docAlertSummaryEmailStatusTable.SessionLoginDateTime, true))
+        {
+            isAlive = true;
+        }
+        return isAlive;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setAlertSummaryEmailContextInfoParams</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets alert summary email context info parameters.
+    /// </summary>
+    /// <param name = "_alertSummaryEmailContextInfoParams">An instance of the DocAlertSummaryEmailContextInfoParams class</param>
+    private void setAlertSummaryEmailContextInfoParams(DocAlertSummaryEmailContextInfoParams _alertSummaryEmailContextInfoParams)
+    {
+        _alertSummaryEmailContextInfoParams.parmEmailCcAddr(dataContract.parmEmailCc());
+        _alertSummaryEmailContextInfoParams.parmEmailBccAddr(dataContract.parmEmailBcc());
+        _alertSummaryEmailContextInfoParams.parmEmailSendingMode(dataContract.parmEmailSendingMode());
+        _alertSummaryEmailContextInfoParams.parmEmailProcessingDesc(dataContract.parmEmailProcessingDesc());
+        _alertSummaryEmailContextInfoParams.parmEmailContextInfo(DocGlobalHelper::getQueryCriteria(query, true, false, false, false));
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

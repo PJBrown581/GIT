@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CardTransDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[
+    SRSReportParameterAttribute(classStr(SKS_CC_CardTransContract))
+]
+public class SKS_CC_CardTransDP extends SrsReportDataProviderPreProcessTempDB
+{
+    CustAccount             custAccount;
+    SKS_CC_CardTransTmp     sKS_CC_CardTransTmp;
+    TransDate               fromDate;
+    TransDate               toDate;
+    CreditCardNumber        creditCardNumber;
+    CreditCardTypeName      creditCardTypeName;
+    CreditCardAuthorization approvalCode;
+    Query                   query;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getSKS_CC_CardTransTmp</Name>
+				<Source><![CDATA[
+    [SRSReportDataSetAttribute(tableStr(SKS_CC_CardTransTmp))]
+    public SKS_CC_CardTransTmp getSKS_CC_CardTransTmp()
+    {
+        select sKS_CC_CardTransTmp;
+        return sKS_CC_CardTransTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    public void processReport()
+    {
+        CreditCardAuthTrans         creditCardAuthTrans;
+        SKS_CC_CustPaymTable        sks_CC_CustPaymTable;
+        CreditCardCust              creditCardCustLocal;
+        SKS_CC_CardTransContract    contract = this.parmDataContract() as SKS_CC_CardTransContract;
+        QueryRun                    queryRun;
+        LedgerJournalTrans          ledgerJournalTrans;
+        CustInvoiceJour             custInvoiceJour;
+        CompanyName                 transSetupId = CompanyInfo::find().Name;
+
+        custAccount                 = contract.parmCustAccount();
+        fromDate                    = contract.parmFromDate();
+        toDate                      = contract.parmToDate();
+        creditCardNumber            = contract.parmCCNumber();
+        creditCardTypeName          = contract.parmCreditCardType();
+        approvalCode                = contract.parmApprovalCode();
+
+        queryRun = new QueryRun(this.setRanges());
+
+        while(queryRun.next())
+        {
+            creditCardAuthTrans = queryRun.get(tableNum(CreditCardAuthTrans));
+
+            sKS_CC_CardTransTmp.clear();
+            sKS_CC_CardTransTmp.ApprovalAmountCur = creditCardAuthTrans.ApprovalAmountCur;
+            sKS_CC_CardTransTmp.CurrencyCode      = creditCardAuthTrans.CurrencyCode;
+            sKS_CC_CardTransTmp.Authorization     = creditCardAuthTrans.SKS_CC_ApprovalCode;
+            sKS_CC_CardTransTmp.Message           = creditCardAuthTrans.ApprovalType;
+
+            sKS_CC_CardTransTmp.ProcessorStatus = creditCardAuthTrans.ProcessorStatus;
+            sKS_CC_CardTransTmp.Description  = enum2str(creditCardAuthTrans.ProcessorStatus);
+
+            sKS_CC_CardTransTmp.ProcessingDate  = DateTimeUtil::date(creditCardAuthTrans.ApprovedDateTime);
+            sKS_CC_CardTransTmp.CustAccount     = custAccount;
+
+            select firstonly CreditCardTransStatus, CreditCardTransAmountCur, RefOriginId, RefRecId,  RefTableId, CreditCardCustRefId
+            from sks_CC_CustPaymTable
+                where sks_CC_CustPaymTable.RecId == creditCardAuthTrans.SKS_CC_CustPaymTable
+            join Voucher, PaymReference from ledgerJournalTrans
+                where ledgerJournalTrans.RecId == sks_CC_CustPaymTable.RefRecId &&
+                   sks_CC_CustPaymTable.RefTableId == ledgerJournalTrans.TableId;
+
+            sKS_CC_CardTransTmp.CreditCardTypeName = creditCardAuthTrans.CreditCardTypeName;
+
+            if (creditCardAuthTrans.CreditCardNumber)
+            {
+                sKS_CC_CardTransTmp.CreditCardNumber  = creditCardAuthTrans.CreditCardNumber;
+            }
+            else
+            {
+                if (sks_CC_CustPaymTable.CreditCardCustRefId)
+                {
+                    creditCardCustLocal = CreditCardCust::find(sks_CC_CustPaymTable.CreditCardCustRefId);
+                }
+
+                if (!creditCardCustLocal.RecId && creditCardAuthTrans.UniqueCardId)
+                {
+                    creditCardCustLocal = CreditCardCust::findByUniqueCardId(creditCardAuthTrans.UniqueCardId);
+                }
+
+                if (creditCardCustLocal.RecId)
+                {
+                    if (creditCardCustLocal.CardNumber)
+                    {
+                        sKS_CC_CardTransTmp.CreditCardNumber = creditCardCustLocal.CardNumber;
+                    }
+
+                    if (!sKS_CC_CardTransTmp.CreditCardTypeName && creditCardCustLocal.CreditCardTypeName)
+                    {
+                        sKS_CC_CardTransTmp.CreditCardTypeName = creditCardCustLocal.CreditCardTypeName;
+                    }
+                }
+            }
+
+            sKS_CC_CardTransTmp.UserID = creditCardAuthTrans.createdBy;
+
+            sKS_CC_CardTransTmp.Voucher = ledgerJournalTrans.Voucher;
+
+            if (ledgerJournalTrans.PaymReference)
+            {
+                sKS_CC_CardTransTmp.TrxType = SKS_CC_TransActionType::PrePayment;
+            }
+            else if (creditCardAuthTrans.ApprovalAmountCur > 0)
+            {
+                sKS_CC_CardTransTmp.TrxType = SKS_CC_TransActionType::Sale;
+            }
+            else
+            {
+                sKS_CC_CardTransTmp.TrxType = SKS_CC_TransActionType::Refund;
+            }
+
+            sKS_CC_CardTransTmp.OriginationId = creditCardAuthTrans.Authorization;
+
+            if (sks_CC_CustPaymTable)
+            {
+                sKS_CC_CardTransTmp.LastStatus    = sks_CC_CustPaymTable.CreditCardTransStatus;
+                sKS_CC_CardTransTmp.Source = SKS_CC_Source::PaymentJournal;
+
+                if (creditCardAuthTrans.ApprovalAmountCur > 0)
+                {
+                    sKS_CC_CardTransTmp.Type    = SKS_CC_Type::Payment;
+                }
+                else
+                {
+                    sKS_CC_CardTransTmp.Type    = SKS_CC_Type::Refund;
+                }
+            }
+            else
+            {
+                // tax amount for the invoice
+                select firstonly SumTax, InvoiceId from custInvoiceJour
+                where custInvoiceJour.InvoiceId == creditCardAuthTrans.SalesInvoiceId;
+
+                sKS_CC_CardTransTmp.TaxAmount = custInvoiceJour.SumTax;
+
+                sKS_CC_CardTransTmp.Type = SKS_CC_Type::Invoice;
+                sKS_CC_CardTransTmp.Source = SKS_CC_Source::Salesorder;
+                sKS_CC_CardTransTmp.Voucher = creditCardAuthTrans.SalesInvoiceId;
+                if (custInvoiceJour.InvoiceId)
+                {
+                    sKS_CC_CardTransTmp.LastStatus = CreditCardProcessorStatus::Approved;
+                }
+                else
+                {
+                    sKS_CC_CardTransTmp.LastStatus = sKS_CC_CardTransTmp.ProcessorStatus;
+                }
+            }
+
+            sKS_CC_CardTransTmp.SetupId = transSetupId;
+
+            sKS_CC_CardTransTmp.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setRanges</Name>
+				<Source><![CDATA[
+    protected  Query setRanges()
+    {
+        QueryBuildDataSource        qbdCreditCardCust,qbdCreditCardAuthTrans;
+        QueryBuildRange             qbrCustAcc,qbrCCNum,qbrCCType,qbrAppCode,qbrDate;
+
+        if (custAccount)
+        {
+            query = new Query();
+            qbdCreditCardCust = query.addDataSource(tableNum(CreditCardCust));
+            qbrCustAcc = qbdCreditCardCust.addRange(fieldNum(CreditCardCust, CustAccount));
+            qbrCustAcc.value(SysQuery::value(custAccount));
+            qbdCreditCardCust.addOrderByField(fieldNum(CreditCardCust, CardNumber));
+            qbdCreditCardAuthTrans = qbdCreditCardCust.addDataSource(tableNum(CreditCardAuthTrans));
+            qbdCreditCardAuthTrans.addLink(fieldNum(CreditCardCust, UniqueCardId), fieldNum(CreditCardAuthTrans, UniqueCardId));
+            qbdCreditCardAuthTrans.joinMode(JoinMode::InnerJoin);
+            qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, ApprovalType)).value(strFmt('%1, %2, %3',
+                                                                                                          enum2Str(CreditCardOperation::AuthorizeAndCapture),
+                                                                                                          enum2Str(CreditCardOperation::CaptureAfterAuthorize),
+                                                                                                          enum2Str(CreditCardOperation::Refund)));
+            qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, ProcessorStatus)).value(strFmt('%1, %2',
+                                                                                                          enum2str(CreditCardProcessorStatus::Approved),
+                                                                                                          enum2str(CreditCardProcessorStatus::Declined)));
+            qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, ApprovalVoid)).value(enum2str(NoYes::No));
+
+            if (creditCardNumber)
+            {
+                qbrCCNum =qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, CreditCardNumber));
+                qbrCCNum.value(SysQuery::value(creditCardNumber));
+            }
+
+            if (fromDate || toDate)
+            {
+                qbrDate = qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, ApprovedDateTime));
+
+                if (fromDate && toDate)
+                {
+                    qbrDate.value(SysQuery::range(DateTimeUtil::newDateTime(fromDate, 0), DateTimeUtil::newDateTime(toDate, 86400)));
+                }
+                else if (!fromDate)
+                {
+                    qbrDate.value(SysQuery::range(DateTimeUtil::minValue(), DateTimeUtil::newDateTime(toDate, 86400)));
+                }
+                else
+                {
+                    qbrDate.value(SysQuery::range(DateTimeUtil::newDateTime(fromDate, 0), DateTimeUtil::maxValue()));
+                }
+            }
+
+            if (creditCardTypeName)
+            {
+                qbrCCType =  qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, CreditCardTypeName));
+                qbrCCType.value(SysQuery::value(creditCardTypeName));
+            }
+
+            if(approvalCode)
+            {
+                qbrAppCode = qbdCreditCardAuthTrans.addRange(fieldNum(CreditCardAuthTrans, SKS_CC_ApprovalCode));
+                qbrAppCode.value(SysQuery::value(approvalCode));
+            }
+            return query;
+        }
+        else
+        {
+            throw warning("@SKS6439");
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

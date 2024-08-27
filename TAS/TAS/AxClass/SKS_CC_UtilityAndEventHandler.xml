@@ -1,0 +1,2661 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_UtilityAndEventHandler</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Retail=Microsoft.Dynamics.Retail;
+
+class SKS_CC_UtilityAndEventHandler
+{    
+    const boolean Decrypt = false;    
+
+    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>SKS_IsPayFabricPaymentConnector</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets whether the current authorization transaction is using PayFabric payment connector.
+    /// </summary>
+    /// <returns>
+    /// true if payment connector is PayFabric; otherwise, false.
+    /// </returns>
+    static boolean SKS_IsPayFabricPaymentConnector(CreditCardPaymentProperties _properties)
+    {
+        str                         nsConnector = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_Connector();            
+        CreditCardPaymentProperty   property;
+        str                         connectorName;
+        boolean                     ret;
+
+        property = _properties.find(nsConnector, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.ConnectorProperties::get_ConnectorName());
+        if (property)
+        {
+            connectorName = property.parmStringValue();
+        }
+
+        if (connectorName == SKS_CC_PayFabricWalletHandler::getPayFabricConnectorName())
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_HandlePayFabricAvsAndCvcResponse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handles PayFabric AVS and CVC response codes and maps to AX result codes
+    /// </summary>
+    /// <returns>
+    /// A container that contains the AVS result, AVS detail, and CVC result
+    /// </returns>
+    static container SKS_HandlePayFabricAvsAndCvcResponse(CreditCardPaymentProperties _properties)
+    {
+        str                                 nsMerchantAccount = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_MerchantAccount();
+        str                                 ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_AuthorizationResponse();
+        CreditCardPaymentProperty           property;
+        Retail.PaymentSDK.Portable.PaymentProperty[]         propertiesAcctSetup;
+        Retail.PaymentSDK.Portable.PaymentProperty           propertyAcctSetup;
+        SKS_CC_AVSZipResponseCode           pfAvsZipResponse;
+        SKS_CC_AVSAddressResponseCode       pfAvsAddrResponse;
+        SKS_CC_CVCResponseCode              pfCvcResult;
+        SKS_CC_TenderTypes                  pfCreditCardTypeName;
+        str                                 pfServiceAccountId, pfCurServiceAccountId;
+        SKS_CC_PaymentGatewayName           paymentGatewayName;
+        CreditCardProcessors                creditCardProcessors;
+        CreditCardAccountSetup              creditCardAccountSetup;
+        SKS_CC_ResponseCodeMapping          responseCodeMapping;
+        CreditCardAddressVerificationResult addrVerificationResult = CreditCardAddressVerificationResult::NotReturned;
+        CreditCardMSAVSDetailCode           addrVerificationDetail = CreditCardMSAVSDetailCode::None;
+        CreditCardMSCVCResultCode           cvcVerificationResultCode = CreditCardMSCVCResultCode::Unknown;
+        container                           conRet;
+        
+        property = _properties.find(nsMerchantAccount, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.MerchantAccountProperties::get_ServiceAccountId());
+        if (property)
+        {
+            pfServiceAccountId = property.parmStringValue();
+        }
+
+        while select creditCardAccountSetup
+        exists join creditCardProcessors
+            where creditCardProcessors.RecId == creditCardAccountSetup.CreditCardProcessors
+               && !creditCardProcessors.NotUsed
+        {
+            var merchant = creditCardAccountSetup.manageEncryptionForSecureMerchantProperties(Decrypt, '');
+            if (!merchant)
+            {
+                continue;
+            }
+
+            propertiesAcctSetup = Retail.PaymentSDK.Portable.PaymentProperty::ConvertXMLToPropertyArray(merchant);
+
+            propertyAcctSetup = CreditCardConnectorSetup::findPropertyByName(propertiesAcctSetup,
+                                                                             nsMerchantAccount,                                                                    
+                                                                             Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.MerchantAccountProperties::get_ServiceAccountId());
+            property = CreditCardPaymentProperty::fromProperty(propertyAcctSetup);
+            if (property)
+            {
+                pfCurServiceAccountId = property.parmStringValue();
+                if (pfServiceAccountId == pfCurServiceAccountId)
+                {
+                    paymentGatewayName = creditCardAccountSetup.SKS_CC_PaymentGatewayName;
+                }
+            }
+        }
+
+        property = _properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::get_CardType());
+        if (property)
+        {
+            pfCreditCardTypeName = property.parmStringValue();
+        }
+
+        if (pfCreditCardTypeName)
+        {
+            pfCreditCardTypeName = strFmt('*%1*', pfCreditCardTypeName);
+        }
+
+        const str PayFabricAvsZipResponse = 'PayFabricAvsZipResponse';
+        const str PayFabricAvsAddressResponse = 'PayFabricAvsAddressResponse';
+        const str PayFabricCVV2Result = 'PayFabricCVV2Result';
+
+        property = _properties.find(ns, PayFabricAvsZipResponse);            
+        if (property)
+        {
+            pfAvsZipResponse = property.parmStringValue();
+            if (pfAvsZipResponse)
+            {
+                pfAvsZipResponse = strFmt('*,%1,*', pfAvsZipResponse);
+            }
+        }
+
+        property = _properties.find(ns, PayFabricAvsAddressResponse);            
+        if (property)
+        {
+            pfAvsAddrResponse = property.parmStringValue();
+            if (pfAvsAddrResponse)
+            {
+                pfAvsAddrResponse = strFmt('*,%1,*', pfAvsAddrResponse);
+            }
+        }
+
+        property = _properties.find(ns, PayFabricCVV2Result);            
+        if (property)
+        {
+            pfCvcResult = property.parmStringValue();
+            if (pfCvcResult)
+                pfCvcResult = strFmt('*,%1,*', pfCvcResult);
+        }
+
+        if (pfAvsZipResponse && pfAvsAddrResponse)
+        {
+            responseCodeMapping = SKS_CC_ResponseCodeMapping::getAVSResponse(paymentGatewayName,
+                                                                             pfCreditCardTypeName,
+                                                                             pfAvsZipResponse,
+                                                                             pfAvsAddrResponse);
+
+            if (responseCodeMapping.RecId)
+            {
+                addrVerificationResult = responseCodeMapping.CreditCardAddressVerificationResult;
+                addrVerificationDetail = responseCodeMapping.CreditCardAddressVerificationLevel;
+            }
+        }
+
+        if (pfCvcResult)
+        {
+            responseCodeMapping = SKS_CC_ResponseCodeMapping::getCVVResponse(paymentGatewayName,
+                                                                             pfCreditCardTypeName,
+                                                                             pfCvcResult);
+
+            if (responseCodeMapping.RecId)
+            {
+                cvcVerificationResultCode = responseCodeMapping.CreditCardMSCVCResultCode;
+            }
+        }
+
+        conRet = [addrVerificationResult, addrVerificationDetail, cvcVerificationResultCode];
+
+        return conRet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTableType_Post_validateDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate that sales order does not have an approved pending pre-authorization before it can be deleted.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(SalesTableType), methodStr(SalesTableType, validateDelete))]
+    public static void SalesTableType_Post_validateDelete(XppPrePostArgs _ppArgs)
+    {
+        boolean ok = _ppArgs.getReturnValue();
+        SKS_PP_Setup sksParms = SKS_PP_Setup::find();
+
+        if (ok && sksParms.ModCC == NoYes::Yes)
+        {
+            boolean mcrCancel = _ppArgs.getArg(identifierStr(_mcrCancel));
+
+            if (!mcrCancel)
+            {
+                SalesTableType  salesTableType = _ppArgs.getThis() as SalesTableType;
+                if (salesTableType)
+                {
+                    SalesTable salesTable = salesTableType.parmSalesTable();
+                    if (salesTable && !salesTable.cancelPreAuthorization())
+                    {
+                        ok = checkFailed(strFmt("@SKS6033", salesTable.SalesId));
+                    }
+                    else
+                    {
+                        if (sksParms.CCPLEnablePayLinks == NoYes::Yes &&
+                            SKS_CC_PayLinkQueue::salesOrderHasPendingPayLink(salesTable))
+                        {
+                            ok = checkFailed(strFmt("@SKS:SKGCCSalesOrderCannotBeDeletedDueToPendingPayLink", salesTable.SalesId));
+                        }
+                    }
+                }
+            }            
+        }
+
+        _ppArgs.setReturnValue(ok);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderAuthorizationResult_Post_constructFromResponse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector AVS and CVC responses using custom response code mapping.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderAuthorizationResult), staticMethodStr(CreditCardProviderAuthorizationResult, constructFromResponse))]
+    public static void creditCardProviderAuthorizationResult_Post_constructFromResponse(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderAuthorizationResult creditCardProviderAuthorizationResult = _ppArgs.getReturnValue() as CreditCardProviderAuthorizationResult;
+        if (creditCardProviderAuthorizationResult)
+        {
+            SKS_CC_UtilityAndEventHandler::convertPayFabricAvsAndCvcResponse(creditCardProviderAuthorizationResult);            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderAuthorizationResult_Post_constructFromXmlString</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector AVS and CVC responses using custom response code mapping.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderAuthorizationResult), staticMethodStr(CreditCardProviderAuthorizationResult, constructFromXmlString))]
+    public static void creditCardProviderAuthorizationResult_Post_constructFromXmlString(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderAuthorizationResult creditCardProviderAuthorizationResult = _ppArgs.getReturnValue() as CreditCardProviderAuthorizationResult;
+        if (creditCardProviderAuthorizationResult)
+        {
+            SKS_CC_UtilityAndEventHandler::convertPayFabricAvsAndCvcResponse(creditCardProviderAuthorizationResult);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderCaptureResult_Post_constructFromResponse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector approval response code.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderCaptureResult), staticMethodStr(CreditCardProviderCaptureResult, constructFromResponse))]
+    public static void creditCardProviderCaptureResult_Post_constructFromResponse(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderCaptureResult creditCardProviderCaptureResult = _ppArgs.getReturnValue() as CreditCardProviderCaptureResult;
+        if (creditCardProviderCaptureResult)
+        {
+            CreditCardPaymentProperties properties = creditCardProviderCaptureResult.parmProperties();
+            if (properties)
+            {
+                if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+                {
+                    str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_CaptureResponse();
+                    CreditCardPaymentProperty property;
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_ApprovalCode());
+                    if (property)
+                    {
+                        creditCardProviderCaptureResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                    }
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_ProviderTransactionId());
+                    if (property)
+                    {
+                        creditCardProviderCaptureResult.parmSKS_CC_Authorization(property.parmStringValue());
+                    }
+                    else
+                    {
+                        property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::get_ProviderTransactionId());
+                        if (property)
+                        {
+                            creditCardProviderCaptureResult.parmSKS_CC_Authorization(property.parmStringValue());
+                        }
+
+                    }
+                }
+            }            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderCaptureResult_Post_constructFromXmlString</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector approval response code.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderCaptureResult), staticMethodStr(CreditCardProviderCaptureResult, constructFromXmlString))]
+    public static void creditCardProviderCaptureResult_Post_constructFromXmlString(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderCaptureResult creditCardProviderCaptureResult = _ppArgs.getReturnValue() as CreditCardProviderCaptureResult;
+        if (creditCardProviderCaptureResult)
+        {
+            CreditCardPaymentProperties properties = creditCardProviderCaptureResult.parmProperties();
+            if (properties)
+            {
+                if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+                {
+                    str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_CaptureResponse();
+                    CreditCardPaymentProperty property;
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_ApprovalCode());
+                    if (property)
+                    {
+                        creditCardProviderCaptureResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                    }
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_ProviderTransactionId());
+                    if (property)
+                    {
+                        creditCardProviderCaptureResult.parmSKS_CC_Authorization(property.parmStringValue());
+                    }
+                    else
+                    {
+                        property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::get_ProviderTransactionId());
+                        if (property)
+                        {
+                            creditCardProviderCaptureResult.parmSKS_CC_Authorization(property.parmStringValue());
+                        }
+
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderRefundResult_Post_constructFromResponse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector approval response code.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderRefundResult), staticMethodStr(CreditCardProviderRefundResult, constructFromResponse))]
+    public static void creditCardProviderRefundResult_Post_constructFromResponse(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderRefundResult creditCardProviderRefundResult = _ppArgs.getReturnValue() as CreditCardProviderRefundResult;
+        if (creditCardProviderRefundResult)
+        {
+            CreditCardPaymentProperties properties = creditCardProviderRefundResult.parmProperties();
+            if (properties)
+            {
+                if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+                {
+                    str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_RefundResponse();
+                    CreditCardPaymentProperty property;
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.RefundResponseProperties::get_ApprovalCode());
+                    if (property)
+                    {
+                        creditCardProviderRefundResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                    }
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.RefundResponseProperties::get_ProviderTransactionId());
+                    if (property)
+                    {
+                        creditCardProviderRefundResult.parmSKS_CC_Authorization(property.parmStringValue());
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderRefundResult_Post_constructFromXmlString</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector approval response code.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderRefundResult), staticMethodStr(CreditCardProviderRefundResult, constructFromXmlString))]
+    public static void creditCardProviderRefundResult_Post_constructFromXmlString(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderRefundResult creditCardProviderRefundResult = _ppArgs.getReturnValue() as CreditCardProviderRefundResult;
+        if (creditCardProviderRefundResult)
+        {
+            CreditCardPaymentProperties properties = creditCardProviderRefundResult.parmProperties();
+            if (properties)
+            {
+                if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+                {
+                    str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_RefundResponse();
+                    CreditCardPaymentProperty property;
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.RefundResponseProperties::get_ApprovalCode());
+                    if (property)
+                    {
+                        creditCardProviderRefundResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                    }
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.RefundResponseProperties::get_ProviderTransactionId());
+                    if (property)
+                    {
+                        creditCardProviderRefundResult.parmSKS_CC_Authorization(property.parmStringValue());
+                    }                    
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderVoidResult_Post_constructFromResponse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector approval response code.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderVoidResult), staticMethodStr(CreditCardProviderVoidResult, constructFromResponse))]
+    public static void creditCardProviderVoidResult_Post_constructFromResponse(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderVoidResult creditCardProviderVoidResult = _ppArgs.getReturnValue() as CreditCardProviderVoidResult;
+        if (creditCardProviderVoidResult)
+        {
+            CreditCardPaymentProperties properties = creditCardProviderVoidResult.parmProperties();
+            if (properties)
+            {
+                if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+                {
+                    str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_VoidResponse();
+                    CreditCardPaymentProperty property;
+
+                    property = properties.find(ns, 'ApprovalCode');
+                    if (property)
+                    {
+                        creditCardProviderVoidResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                    }
+                    else
+                    {
+                        property = properties.find(ns, 'ExternalReceipt');
+                        if (property)
+                        {
+                            creditCardProviderVoidResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                        }
+                    }
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.VoidResponseProperties::get_ProviderTransactionId());
+                    if (property)
+                    {
+                        creditCardProviderVoidResult.parmSKS_CC_Authorization(property.parmStringValue());
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCardProviderVoidResult_Post_constructFromXmlString</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle PayFabric connector approval response code.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProviderVoidResult), staticMethodStr(CreditCardProviderVoidResult, constructFromXmlString))]
+    public static void creditCardProviderVoidResult_Post_constructFromXmlString(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProviderVoidResult creditCardProviderVoidResult = _ppArgs.getReturnValue() as CreditCardProviderVoidResult;
+        if (creditCardProviderVoidResult)
+        {
+            CreditCardPaymentProperties properties = creditCardProviderVoidResult.parmProperties();
+            if (properties)
+            {
+                if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+                {
+                    str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_VoidResponse();
+                    CreditCardPaymentProperty property;
+
+                    property = properties.find(ns, 'ApprovalCode');
+                    if (property)
+                    {
+                        creditCardProviderVoidResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                    }
+                    else
+                    {
+                        property = properties.find(ns, 'ExternalReceipt');
+                        if (property)
+                        {
+                            creditCardProviderVoidResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                        }
+                    }
+
+                    property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.VoidResponseProperties::get_ProviderTransactionId());
+                    if (property)
+                    {
+                        creditCardProviderVoidResult.parmSKS_CC_Authorization(property.parmStringValue());
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertPayFabricAvsAndCvcResponse</Name>
+				<Source><![CDATA[
+    public static void convertPayFabricAvsAndCvcResponse(CreditCardProviderAuthorizationResult creditCardProviderAuthorizationResult)
+    {
+        CreditCardPaymentProperties properties = creditCardProviderAuthorizationResult.parmProperties();
+        if (properties)
+        {
+            if (SKS_CC_UtilityAndEventHandler::SKS_IsPayFabricPaymentConnector(properties))
+            {
+                CreditCardAddressVerificationResult pfAddrVerificationResult;
+                CreditCardMSAVSDetailCode           pfAddrVerificationDetail;
+                CreditCardMSCVCResultCode           pfCvcVerificationResultCode;
+            
+                [pfAddrVerificationResult, pfAddrVerificationDetail, pfCvcVerificationResultCode] = SKS_CC_UtilityAndEventHandler::SKS_HandlePayFabricAvsAndCvcResponse(properties);
+                creditCardProviderAuthorizationResult.parmAvsResult(pfAddrVerificationResult);
+                creditCardProviderAuthorizationResult.parmAvsDetail(pfAddrVerificationDetail);
+                creditCardProviderAuthorizationResult.parmCvcResult(pfCvcVerificationResultCode);
+
+                str ns = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_AuthorizationResponse();
+                CreditCardPaymentProperty property;
+
+                property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::get_ApprovalCode());
+                if (property)
+                {
+                    creditCardProviderAuthorizationResult.parmSKS_CC_ApprovalCode(property.parmStringValue());
+                }  
+              
+                property = properties.find(ns, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::get_ProviderTransactionId());
+                if (property)
+                {
+                    creditCardProviderAuthorizationResult.parmSKS_CC_Authorization(property.parmStringValue());
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isAuthorizationPayFabricPaymentConnector</Name>
+				<Source><![CDATA[
+    public static boolean isAuthorizationPayFabricPaymentConnector(CreditCardPaymentProperties _properties)
+    {
+        str                         nsConnector = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_Connector();
+        CreditCardPaymentProperty   property;
+        str                         connectorName;
+        boolean                     ret;
+
+        property = _properties.find(nsConnector, Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.ConnectorProperties::get_ConnectorName());
+        if (property)
+            connectorName = property.parmStringValue();
+
+        if (connectorName == SKS_CC_PayFabricWalletHandler::getPayFabricConnectorName())
+            ret = true;
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCard_Pre_addMerchantAccountProperties</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pre event handler for method addMerchantAccountProperties.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(classStr(CreditCard), staticMethodStr(CreditCard, addMerchantAccountProperties))]
+    public static void CreditCard_Pre_addMerchantAccountProperties(XppPrePostArgs _ppArgs)
+    {
+        CreditCardPaymentProperties properties = _ppArgs.getArg(identifierStr(_properties));
+
+        if (properties)
+        {
+            str transNamespace = Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::TransactionData;
+
+            CreditCardPaymentProperty propertyCardNbr = properties.find(transNamespace,
+                                                                        Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.TransactionDataProperties::CardNumber);
+
+            if (!propertyCardNbr)
+            {
+                str creditCardLastFourDigits = '';                
+
+                CreditCardPaymentProperty property = properties.find(Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::AuthorizationResponse,
+                                                                     Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::UniqueCardId);
+    
+                if (property)
+                {
+                    str uniqueCardId = '';
+                    uniqueCardId = property.parmStringValue();
+                    if (uniqueCardId)
+                    {
+                        creditCardLastFourDigits = CreditCardCust::findByUniqueCardId(uniqueCardId).CardNumber;
+                    }
+                }
+            
+                if (creditCardLastFourDigits)
+                {      
+                    properties.add(CreditCardPaymentProperty::newValue(transNamespace,
+                                                                       Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.TransactionDataProperties::CardNumber,
+                                                                       creditCardLastFourDigits));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAccountSetup_Pre_insert</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pre event handler for method insert in table CreditCardAccountSetup.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(tableStr(CreditCardAccountSetup), tableMethodStr(CreditCardAccountSetup, insert))]
+    public static void CreditCardAccountSetup_Pre_insert(XppPrePostArgs _ppArgs)
+    {
+        CreditCardAccountSetup creditCardAccountSetup = _ppArgs.getThis() as CreditCardAccountSetup;
+        SKS_CC_UtilityAndEventHandler::ValidateModuleIsActive(creditCardAccountSetup, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAccountSetup_Pre_update</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pre event handler for method update in table CreditCardAccountSetup.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(tableStr(CreditCardAccountSetup), tableMethodStr(CreditCardAccountSetup, update))]
+    public static void CreditCardAccountSetup_Pre_update(XppPrePostArgs _ppArgs)
+    {
+        CreditCardAccountSetup creditCardAccountSetup = _ppArgs.getThis() as CreditCardAccountSetup;
+        SKS_CC_UtilityAndEventHandler::ValidateModuleIsActive(creditCardAccountSetup, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateModuleIsActive</Name>
+				<Source><![CDATA[
+    static boolean ValidateModuleIsActive(CreditCardAccountSetup _creditCardAccountSetup, boolean _throw = false)
+    {
+        boolean ret = true;
+
+        if (_creditCardAccountSetup.ConnectorName == SKS_CC_PayFabricWalletHandler::getPayFabricConnectorName())
+        {
+            if (SKS_PP_Setup::find().ModCC == NoYes::No)
+            {
+                if (_throw)
+                {    
+                    throw error("@SKS6032");
+                }
+                else
+                {
+                    ret = checkFailed("@SKS6032");
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTableListPageInteraction_Post_selectionChanged</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post event handler for SelectionChanged on SalesTableListPage.
+    /// </summary>
+    /// <remarks>
+    /// This event handler has been added to ensure 'Authorize' button is only enabled when a CC payment term has been specified. This is an AX issue.    
+    /// </remarks>
+    /// <param name="args"></param>
+    [PostHandlerFor(classStr(SalesTableListPageInteraction), methodStr(SalesTableListPageInteraction, selectionChanged))]
+    public static void SalesTableListPageInteraction_Post_selectionChanged(XppPrePostArgs _ppArgs)
+    {
+        SalesTableListPageInteraction salesTableLPI = _ppArgs.getThis() as SalesTableListPageInteraction;
+        SalesTable salesTableLocal = salesTableLPI.listPage().activeRecord(formDataSourceStr(SalesTableListPage, SalesTable));
+        SalesTableInteractionHelper salesTableInteractionHelperLocal = SalesTableInteractionHelper::newFromListPage(salesTableLocal);
+        salesTableInteractionHelperLocal.initHeaderActions(salesTableLocal);
+
+        SKS_PP_Setup sKS_PP_Setup = SKS_PP_Setup::find();
+        if (sks_PP_Setup.CCDisallowPaymEntryFormFromSalesOrder == NoYes::No)
+        {
+            salesTableLPI.listPage().actionPaneControlVisible(formControlStr(SalesTableListPage, SKS_CC_CustPaymTable), false);
+        }
+        else
+        {
+            salesTableLPI.listPage().actionPaneControlVisible(
+                formControlStr(SalesTableListPage, SKS_CC_CustPaymTable),
+                (salesTableLocal.RecId != 0 &&
+                 sks_PP_Setup.ModCC == NoYes::Yes &&
+                 (salesTableLocal.SalesStatus != SalesStatus::Invoiced &&
+                  salesTableLocal.SalesStatus != SalesStatus::Canceled)));
+        }
+
+        boolean canPreAuthSKS;
+        if (CustParameters::find().CreditCardPreAuthorization && sKS_PP_Setup.CCDisableStdSalesOrderPreAuth == NoYes::No)
+        {
+            canPreAuthSKS = true;
+        }
+
+        boolean isCreditCardPaymTypeSKS;
+        if (salesTableLocal.payment().CreditCardPaymentType == CreditCardPaymentType::CreditCard)
+        {
+            isCreditCardPaymTypeSKS = true;
+        }
+
+        boolean canSendLinkSKS = salesTableLocal.SalesStatus != SalesStatus::Invoiced &&
+            salesTableLocal.SalesStatus != SalesStatus::Canceled &&
+            salesTableLocal.SalesType != SalesType::ReturnItem && !salesTableLocal.ProjId;
+
+        boolean isModCCEnabled = salesTableLocal.RecId != 0 && sks_PP_Setup.ModCC == NoYes::Yes;
+
+        salesTableLPI.listPage().actionPaneControlVisible(formControlStr(SalesTableListPage, SKS_CC_SalesOrderPrePaymentDialog), 
+            isModCCEnabled);
+            
+        if (isModCCEnabled)
+        {
+            salesTableLPI.listPage().actionPaneControlEnabled(formControlStr(SalesTableListPage, SKS_CC_SalesOrderPrePaymentDialog),
+                canSendLinkSKS);
+        }
+
+        salesTableLPI.listPage().actionPaneControlEnabled(formControlStr(SalesTableListPage, CreditCardPreauthorize),
+            salesTableInteractionHelperLocal.parmCanCreditCardPreAuthorizeEnabled());
+        
+        boolean linksEnabledSKS = sKS_PP_Setup.ModCC == NoYes::Yes &&
+            !(salesTableLocal.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTableLocal)) &&
+            (sKS_PP_Setup.CCPLEnablePayLinks || sKS_PP_Setup.CCPLEnableWalletLinks);
+        
+        salesTableLPI.listPage().actionPaneControlVisible(formControlStr(SalesTableListPage, SKS_CC_PaylinkBtnGrp), linksEnabledSKS);
+
+        if (linksEnabledSKS)
+        {
+            salesTableLPI.listPage().actionPaneControlEnabled(formControlStr(SalesTableListPage, SKS_CC_SendPreAuthPayLink),
+                canPreAuthSKS && canSendLinkSKS && sKS_PP_Setup.CCPLEnablePayLinks && isCreditCardPaymTypeSKS);
+
+            salesTableLPI.listPage().actionPaneControlEnabled(formControlStr(SalesTableListPage, SKS_CC_SendCapturePayLink),
+                canSendLinkSKS && sKS_PP_Setup.CCPLEnablePayLinks);
+
+            boolean hasPendingLinkSKS = SKS_CC_PayLinkQueue::salesOrderHasPendingPayLink(salesTableLocal);
+            salesTableLPI.listPage().actionPaneControlEnabled(formControlStr(SalesTableListPage, SKS_CC_PayLinkQueueRefresh),
+                canSendLinkSKS && sKS_PP_Setup.CCPLEnablePayLinks && hasPendingLinkSKS);            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_PayLinkQueueRefresh_OnClicked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormControlEventHandler(formControlStr(SalesTableListPage, SKS_CC_PayLinkQueueRefresh), FormControlEventType::Clicked)]
+    public static void SKS_CC_PayLinkQueueRefresh_OnClicked(FormControl _sender, FormControlEventArgs _e)
+    {
+        //SalesTable salesTableLocal = _sender.formRun().defaultDataSource().cursor() as SalesTable;
+        SalesTable salesTableLocal = _sender.formRun().dataSource().cursor();
+        if (salesTableLocal)
+        {
+            SKS_CC_PayLinkQueue payLinkQueueSKS = SKS_CC_PayLinkQueue::getSalesOrderPendingPayLink(salesTableLocal);
+            if (payLinkQueueSKS)
+            {
+                Args argsSKSLoc = new Args();
+                    
+                argsSKSLoc.record(payLinkQueueSKS);                
+
+                MenuFunction menuFunction;
+                menuFunction = new MenuFunction(menuitemActionStr(SKS_CC_PayLinkQueueRefresh), MenuItemType::Action);
+                menuFunction.run(argsSKSLoc);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCard_Post_recordVoid</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to update void transaction for void trans when void failure.
+    /// </summary>
+    /// <param name="args"></param>
+    [PostHandlerFor(classStr(CreditCard), staticMethodStr(CreditCard, recordVoid))]
+    public static void CreditCard_Post_recordVoid(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesTable salesTable = _ppArgs.getArg(identifierStr(_salesTable));
+        CreditCardAuthTrans creditCardAuthTrans, creditCardAuthTransVoid;
+
+        if (salesTable.SalesId)
+        {
+            select firstonly creditCardAuthTransVoid
+                order by RecId desc
+                where creditCardAuthTransVoid.SalesId == salesTable.SalesId
+                    && creditCardAuthTransVoid.ApprovalType == CreditCardOperation::Void
+                    && creditCardAuthTransVoid.ProcessorStatus == CreditCardProcessorStatus::Approved;
+
+            if (creditCardAuthTransVoid.RecId)
+            {                
+                str voidFailure;
+
+                if (creditCardAuthTransVoid.CardTokenRequest)
+                {
+                    var requestProperties = CreditCardPaymentProperties::fromXmlString(creditCardAuthTransVoid.CardTokenResult);
+                    if (requestProperties)
+                    {
+                        var property = requestProperties.find(Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::VoidResponse,
+                                                              'PayFabricVoidFailed');
+
+                        if (property)
+                        {
+                            voidFailure = property.parmStringValue();
+                        }
+                    }
+
+                    if (voidFailure == 'Y')
+                    {
+                        select firstonly creditCardAuthTrans
+                            where creditCardAuthTrans.SalesId == salesTable.SalesId
+                               && creditCardAuthTrans.ApprovalType == CreditCardOperation::Authorize
+                               && !creditCardAuthTrans.ApprovalExpired
+                               && !creditCardAuthTrans.ApprovalVoid
+                               && creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved;
+
+                        if (creditCardAuthTrans.RecId)
+                        {
+                            CreditCardAuthTrans::setVoidApproval(creditCardAuthTrans.RecId);
+                
+                            str description;
+                            var property = requestProperties.find(Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.GenericNamespace::VoidResponse,
+                                Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.VoidResponseProperties::get_ProviderMessage());
+
+                            if (property)
+                            {
+                                description = property.parmStringValue();
+                            }
+
+                            ttsbegin;
+                            creditCardAuthTransVoid.selectForUpdate(true);
+                            if (description)
+                            {
+                                creditCardAuthTransVoid.Description = description;
+                            }
+                            creditCardAuthTransVoid.doUpdate();
+                            ttscommit;
+                        }
+                    }
+                }
+            }
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LedgerJournalEngine_CustPayment_Post_initFromCustTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to initialize payment mode on journal line.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(LedgerJournalEngine_CustPayment), methodStr(LedgerJournalEngine_CustPayment, initFromCustTable))]
+    public static void LedgerJournalEngine_CustPayment_Post_initFromCustTable(XppPrePostArgs _ppArgs)
+    {
+        LedgerJournalTrans ledgerJournalTrans = _ppArgs.getArg(identifierStr(ledgerJournalTrans));
+        CustTable custTable = CustTable::findByLedgerDimension(ledgerJournalTrans.parmLedgerDimension());
+        if (custTable.SKS_CC_JournalPaymMode)
+        {
+            ledgerJournalTrans.PaymMode = custTable.SKS_CC_JournalPaymMode;
+            ledgerJournalTrans.PaymSpec = '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LedgerJournalTrans_Post_checkCreditRemainAmountCur</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate journal line credit amount.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(LedgerJournalTrans), tableMethodStr(LedgerJournalTrans, checkCreditRemainAmountCur))]
+    public static void LedgerJournalTrans_Post_checkCreditRemainAmountCur(XppPrePostArgs _ppArgs)
+    {
+        LedgerJournalTrans ledgerJournalTrans = _ppArgs.getThis() as LedgerJournalTrans;
+        boolean ret = _ppArgs.getReturnValue();
+
+        ret = SKS_CC_UtilityAndEventHandler::checkJournalLineAmount(ledgerJournalTrans) && ret;
+
+        _ppArgs.setReturnValue(ret);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LedgerJournalTrans_Post_checkReleaseDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate journal line amount.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(LedgerJournalTrans), tableMethodStr(LedgerJournalTrans, checkReleaseDate))]
+    public static void LedgerJournalTrans_Post_checkReleaseDate(XppPrePostArgs _ppArgs)
+    {
+        LedgerJournalTrans ledgerJournalTrans = _ppArgs.getThis() as LedgerJournalTrans;
+        boolean ret = _ppArgs.getReturnValue();
+
+        ret = SKS_CC_UtilityAndEventHandler::checkJournalLineAmount(ledgerJournalTrans) && ret;
+
+        _ppArgs.setReturnValue(ret);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkJournalLineAmount</Name>
+				<Source><![CDATA[
+    public static boolean checkJournalLineAmount(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        boolean isValid = true;
+        Amount  journalLineAmount, ccPaymentAmount;
+        LedgerJournalTable ledgerJournalTable = _ledgerJournalTrans.ledgerJournalTable();
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return isValid;
+        }
+
+        if (ledgerJournalTable.JournalType != ledgerJournalType::CustPayment)
+        {
+            return isValid;
+        }
+
+        if (!_ledgerJournalTrans)
+        {
+            return isValid;
+        }
+
+        journalLineAmount = abs(_ledgerJournalTrans.amount());
+        if (!journalLineAmount)
+        {
+            return isValid;
+        }
+
+        if (_ledgerJournalTrans.AccountType == LedgerJournalACType::Cust &&
+            CustPaymModeTable::find(_ledgerJournalTrans.PaymMode).PaymentType == CustPaymentType::CreditCard)
+        {
+            if (_ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::Confirmed &&            
+                SKS_CC_CustPaymTable::hasApprovedCreditCardPayments(_ledgerJournalTrans.TableId, _ledgerJournalTrans.RecId))
+            {            
+                ccPaymentAmount = abs(SKS_CC_CustPaymTable::getCreditCardAmountCharged(_ledgerJournalTrans.TableId, _ledgerJournalTrans.RecId));
+                if (ccPaymentAmount && journalLineAmount != ccPaymentAmount)
+                {
+                    isValid = checkFailed(strFmt("@SKS6493", journalLineAmount, ccPaymentAmount));
+                }
+            }
+            
+            if (isValid)
+            {                
+                boolean hasPendingPayLink = SKS_CC_PayLinkQueue::journalLineHasPendingPayLink(_ledgerJournalTrans);
+                if (hasPendingPayLink)
+                {
+                    isValid = checkFailed(strFmt("@SKS:SKGCCJournalMayNotBePostedDueToPendingPayLink",
+                        _ledgerJournalTrans.JournalNum, _ledgerJournalTrans.Voucher));
+                }
+            }
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTableInteractionHelper_Post_parmCanCreditCardPreAuthorizeEnabled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to disallow manual pre-authorizations.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(SalesTableInteractionHelper), methodStr(SalesTableInteractionHelper, parmCanCreditCardPreAuthorizeEnabled))]
+    public static void SalesTableInteractionHelper_Post_parmCanCreditCardPreAuthorizeEnabled(XppPrePostArgs _ppArgs)
+    {
+        boolean ret = _ppArgs.getReturnValue();
+        SKS_PP_Setup sksParms = SKS_PP_Setup::find();
+
+        if (sksParms.ModCC == NoYes::Yes)
+        {
+            if (sksParms.CCDisableStdSalesOrderPreAuth == NoYes::Yes)
+            {
+                ret = false;
+            }
+        }
+
+        _ppArgs.setReturnValue(ret);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPayFabricJSONPayload</Name>
+				<Source><![CDATA[
+    public static str getPayFabricJSONPayload(CreditCardPaymentProperties _properties)
+    {
+        const str PayFabricJSONPayload = 'PayFabricJSONPayload';
+        str propValue;
+        ListEnumerator enumProps = _properties.enumerator();
+        CreditCardPaymentProperty property;
+
+        while (enumProps.moveNext())
+        {
+            property = enumProps.current();
+            if (property.parmValueType() == CreditCardPropertyDataType::PropertyList)
+            {
+                // flatten sub-properties
+                propValue = SKS_CC_UtilityAndEventHandler::getPayFabricJSONPayload(property.parmPropertyListValue());
+                if (propValue)
+                {
+                    break;
+                }                
+            }
+
+            if (property.parmValueType() == CreditCardPropertyDataType::String &&
+                property.parmName() == PayFabricJSONPayload)
+            {
+                propValue = property.parmStringValue();
+                break;
+            }
+        }
+
+        return propValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustTrans_OnActivated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to control menu item for CC payment reversal.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormDataSourceEventHandler(formDataSourceStr(CustTrans, CustTrans), FormDataSourceEventType::Activated)]
+    public static void CustTrans_OnActivated(FormDataSource _sender, FormDataSourceEventArgs _e)
+    {
+        FormRun formRun = _sender.formRun();
+        CustTrans custTrans = _sender.cursor();
+        boolean canBeCancelled = true;
+
+        FormControl sKS_CC_CustCreditCardPaymCancelCtrl = formRun.Design().controlName(formControlStr(CustTrans, SKS_CC_CustCreditCardPaymCancel));
+        if (!sKS_CC_CustCreditCardPaymCancelCtrl.visible())
+        {
+            return;
+        }
+        
+        if (custTrans.TransType == LedgerTransType::Payment)
+        {
+            // If the payment has been cancelled, we can not cancel it again.
+            if (custTrans.CancelledPayment == NoYes::Yes)
+            {
+                canBeCancelled = false;
+            }
+            else
+            {
+                // disable if there is a post dated check
+                if (CustVendPDCRegister::existsForCustTrans(custTrans.RecId))
+                {
+                    canBeCancelled = false;
+                }
+
+                if (custTrans.BankLCExportLine != 0)
+                {
+                    canBeCancelled = false;
+                }
+            }
+        }
+        else
+        {
+            canBeCancelled = false;
+        }
+
+
+        if (sKS_CC_CustCreditCardPaymCancelCtrl.visible())
+        {
+            sKS_CC_CustCreditCardPaymCancelCtrl.enabled(
+                canBeCancelled &&
+                custTrans.AmountCur < 0 &&
+                !custTrans.Invoice &&
+                CustPaymModeTable::find(custTrans.PaymMode).PaymentType == CustPaymentType::CreditCard);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustTrans_OnInitialized</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to control visibility of CC payment reversal menu item button.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormEventHandler(formStr(CustTrans), FormEventType::Initialized)]
+    public static void CustTrans_OnInitialized(xFormRun _sender, FormEventArgs _e)
+    {
+        FormControl sKS_CC_CustCreditCardPaymCancelCtrl = _sender.Design().controlName(formControlStr(CustTrans, SKS_CC_CustCreditCardPaymCancel));
+        sKS_CC_CustCreditCardPaymCancelCtrl.visible(SKS_PP_Setup::find().ModCC == NoYes::Yes);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustTable_OnActivated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to control visibility of CC payment menu item button.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormDataSourceEventHandler(formDataSourceStr(CustTable, CustTable), FormDataSourceEventType::Activated)]
+    public static void CustTable_OnActivated(FormDataSource _sender, FormDataSourceEventArgs _e)
+    {
+        CustTable custTableSKSLoc = _sender.cursor();
+        SKS_PP_Setup sksParmsLoc = SKS_PP_Setup::find();
+
+        FormControl btngrpSKS_CC_CustPaymTableCtrl = _sender.formRun().Design().controlName(formControlStr(CustTable, btngrpSKS_CC_CustPaymTable));
+        btngrpSKS_CC_CustPaymTableCtrl.visible(sksParmsLoc.ModCC == NoYes::Yes);
+
+        FormControl CustTable_SKS_CC_JournalPaymModeCtrl = _sender.formRun().Design().controlName(formControlStr(CustTable, CustTable_SKS_CC_JournalPaymMode));
+        CustTable_SKS_CC_JournalPaymModeCtrl.visible(sksParmsLoc.ModCC == NoYes::Yes);
+
+        if (sksParmsLoc.ModCC == NoYes::Yes)
+        {
+            FormControl SKS_CC_CustPaymTableCtrl = _sender.formRun().Design().controlName(formControlStr(CustTable, SKS_CC_CustPaymTable));
+            SKS_CC_CustPaymTableCtrl.enabled(!sksParmsLoc.CCUseOneTimeCustomerLogic || !custTableSKSLoc.OneTimeCustomer);
+
+            FormControl SKS_CC_PayLinkQueueCtrl = _sender.formRun().Design().controlName(formControlStr(CustTable, SKS_CC_PayLinkQueue));
+            SKS_CC_PayLinkQueueCtrl.enabled(sksParmsLoc.CCPLEnablePayLinks || sksParmsLoc.CCPLEnableWalletLinks);
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_LedgerJournalCheckPost_runInternalPostPostJournalDelegate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Remove credit cards for one-time customers
+    /// when the customer payment journal is posted.
+    /// </summary>
+    /// <param name="_ledgerJournalCheckPost">The instance of the <c>LedgerJournalCheckPost</c> class.</param>
+    /// <param name="_postingSuccess">A boolean value indicating if the journal was posted successfully.</param>
+    /// <param name="_intercompanyPostingSuccess">A boolean value indicating if the intercompany part of the journal was posted successfully.</param>
+    [SubscribesTo(classStr(LedgerJournalCheckPost), delegateStr(LedgerJournalCheckPost, runInternalPostPostJournalDelegate))]
+    public static void SKS_CC_LedgerJournalCheckPost_runInternalPostPostJournalDelegate(LedgerJournalCheckPost _ledgerJournalCheckPost, boolean _postingSuccess, boolean _intercompanyPostingSuccess)
+    {
+        LedgerJournalTable                  ledgerJournalTable = _ledgerJournalCheckPost.parmLedgerJournalTable();
+        LedgerJournalTrans                  ledgerJournalTrans;
+        SKS_CC_CustPaymTable                sKS_CC_CustPaymTable;
+
+        SKS_PP_Setup sks_pp_setup = SKS_PP_Setup::find();
+        if (sks_pp_setup.ModCC == NoYes::No ||
+            sks_pp_setup.CCUseOneTimeCustomerLogic == NoYes::No)
+        {
+            return;
+        }
+
+        if (_postingSuccess &&
+            _intercompanyPostingSuccess &&
+            ledgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+        {
+            while select Company, LedgerDimension, TableId, RecId from ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+            exists join sKS_CC_CustPaymTable
+                where sKS_CC_CustPaymTable.RefTableId == ledgerJournalTrans.TableId
+                   && sKS_CC_CustPaymTable.RefRecId == ledgerJournalTrans.RecId
+            {
+                changecompany(ledgerJournalTrans.Company)
+                {
+                    CustTable custTable = null;
+                    custTable = CustTable::findByLedgerDimension(ledgerJournalTrans.LedgerDimension);
+                    if (!custTable.OneTimeCustomer)
+                    {
+                        continue;
+                    }
+
+                    CreditCardCust creditCardCustOneTimeSKS = null;
+                    while select creditCardCustOneTimeSKS
+                        where creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefTableId == ledgerJournalTable.TableId
+                           && creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefRecId == ledgerJournalTable.RecId
+                           && creditCardCustOneTimeSKS.CustAccount == custTable.AccountNum
+                    {
+                        if (!creditCardCustOneTimeSKS.UniqueCardId)
+                        {
+                            continue;
+                        }
+
+                        SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+                        pfWalletHandler.parmCustAccount(creditCardCustOneTimeSKS.CustAccount);
+                        pfWalletHandler.parmOneTimeCustRefTableId(creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefTableId);
+                        pfWalletHandler.parmOneTimeCustRefRecId(creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefRecId);
+                        pfWalletHandler.setPayFabricCustomerNbr();
+
+                        boolean pfDeleteCardResult = pfWalletHandler.removePayFabricWallet(creditCardCustOneTimeSKS.UniqueCardId, creditCardCustOneTimeSKS.CardNumber);
+
+                        if (pfDeleteCardResult)
+                        {
+                            try
+                            {
+                                ttsbegin;
+                                creditCardCustOneTimeSKS.selectForUpdate(true);
+                                creditCardCustOneTimeSKS.delete();
+                                ttscommit;
+                            }
+                            catch (Exception::Error)
+                            {
+                                ttsabort;
+                                error("@SKS6039");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCard_Pre_checkExpireDate</Name>
+				<Source><![CDATA[
+    [PreHandlerFor(classStr(CreditCard), staticMethodStr(CreditCard, checkExpireDate))]
+    public static void CreditCard_Pre_checkExpireDate(XppPrePostArgs _ppArgs)
+    {
+        str curExpireMonthYear = _ppArgs.getArg(identifierStr(_expireMonthYear));
+        if (!curExpireMonthYear)
+        {            
+            if (SKS_PP_Setup::find().ModCC == NoYes::Yes)
+            {
+                int maxDateMonth = mthOfYr(dateMax());
+                int maxDateYear = Year(dateMax());
+                curExpireMonthYear = int2Str(maxDateMonth) + '/' + int2Str(maxDateYear);
+                _ppArgs.setArg(identifierStr(_expireMonthYear), curExpireMonthYear);
+            }
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>McrSalesOrderCancellation_Post_cancelOrder</Name>
+				<Source><![CDATA[
+    [PostHandlerFor(classStr(McrSalesOrderCancellation), staticMethodStr(McrSalesOrderCancellation, cancelOrder))]
+    public static void McrSalesOrderCancellation_Post_cancelOrder(XppPrePostArgs _ppArgs)
+    {
+        SKS_PP_Setup sksParms = SKS_PP_Setup::find();
+        if (sksParms.ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesTable salesTableSKSLoc = _ppArgs.getArg(identifierStr(_salesTable));
+        if (salesTableSKSLoc)
+        {
+            salesTableSKSLoc.voidCreditCardPreauthorize();
+        }
+
+        if (sksParms.CCUseOneTimeCustomerLogic)
+        {
+            if (salesTableSKSLoc.SalesStatus == SalesStatus::Invoiced || salesTableSKSLoc.SalesStatus == SalesStatus::Canceled &&
+                salesTableSKSLoc.custTable_InvoiceAccount().OneTimeCustomer)
+            {
+                CreditCardCust creditCardCustOneTimeSKS;
+                while select creditCardCustOneTimeSKS
+                    where creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefTableId == salesTableSKSLoc.TableId
+                        && creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefRecId == salesTableSKSLoc.RecId
+                        && creditCardCustOneTimeSKS.CustAccount == salesTableSKSLoc.InvoiceAccount
+                {
+                    if (!creditCardCustOneTimeSKS.UniqueCardId)
+                    {
+                        continue;
+                    }
+
+                    SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+                    pfWalletHandler.parmCustAccount(creditCardCustOneTimeSKS.CustAccount);
+                    pfWalletHandler.parmOneTimeCustRefTableId(creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefTableId);
+                    pfWalletHandler.parmOneTimeCustRefRecId(creditCardCustOneTimeSKS.SKS_CC_OneTimeCustRefRecId);
+                    pfWalletHandler.setPayFabricCustomerNbr();
+
+                    boolean pfDeleteCardResult = pfWalletHandler.removePayFabricWallet(creditCardCustOneTimeSKS.UniqueCardId, creditCardCustOneTimeSKS.CardNumber);
+
+                    if (pfDeleteCardResult)
+                    {
+                        try
+                        {
+                            ttsbegin;
+                            creditCardCustOneTimeSKS.selectForUpdate(true);
+                            creditCardCustOneTimeSKS.delete();
+                            ttscommit;
+                        }
+                        catch (Exception::Error)
+                        {
+                            ttsabort;
+                            error("@SKS6039");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MCRCustPaymTable_Post_getPostedAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used by CCA one-time customer functionality to determine
+    /// if a credit MCRCustPaymTable should be allowed.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(MCRCustPaymTable), tableMethodStr(MCRCustPaymTable, getPostedAmount))]
+    public static void MCRCustPaymTable_Post_getPostedAmount(XppPrePostArgs _ppArgs)
+    {
+        if (!SKS_PP_Setup::isCreditCardOneTimeCustLogicEnabled())
+        {
+            return;
+        }
+
+        AmountCur curPostedAmountSKS = _ppArgs.getReturnValue();
+        if (!curPostedAmountSKS)
+        {
+            return;
+        }
+
+        MCRCustPaymTable MCRCustPaymTableSKSLoc = _ppArgs.getThis() as MCRCustPaymTable;
+        if (MCRCustPaymTableSKSLoc.CustPaymType == MCRCustPaymType::CreditCard &&
+            MCRCustPaymTableSKSLoc.RefTableId == tablenum(SalesTable) &&
+            MCRCustPaymTableSKSLoc.custTable().OneTimeCustomer &&
+            (MCRCustPaymTableSKSLoc.Status == MCRCustPaymStatus::Posted ||
+             MCRCustPaymTableSKSLoc.Status == MCRCustPaymStatus::Paid))
+        {
+            _ppArgs.setReturnValue(0);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardProcess_Pre_doPreAuth</Name>
+				<Source><![CDATA[
+    [PreHandlerFor(classStr(CreditCardProcess), staticMethodStr(CreditCardProcess, doPreAuth))]
+    public static void CreditCardProcess_Pre_doPreAuth(XppPrePostArgs _ppArgs)
+    {
+        SKS_PP_Setup sksParms = SKS_PP_Setup::find();
+        if (sksParms.ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesTable salesTableSKSLoc = _ppArgs.getArg(identifierStr(_salesTable));
+        if (sksParms.CCPLEnablePayLinks == NoYes::Yes && SKS_CC_PayLinkQueue::salesOrderHasPendingPayLink(salesTableSKSLoc))
+        {
+            throw error(strFmt("@SKS:SKGCCProcessNotAllowedForSOSincePayLinkExist", salesTableSKSLoc.SalesId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_onUpdating</Name>
+				<Source><![CDATA[
+    [DataEventHandler(tableStr(SalesTable), DataEventType::Updating)]
+    public static void SalesTable_onUpdating(Common _sender, DataEventArgs _e)
+    {
+        SalesTable salesTableSKSUP = _sender;
+        if (salesTableSKSUP &&
+            (salesTableSKSUP.SalesStatus == SalesStatus::Invoiced || salesTableSKSUP.SalesStatus == SalesStatus::Canceled))
+        {
+            if (SKS_PP_Setup::find().ModCC == NoYes::Yes)
+            {
+                if (salesTableSKSUP.SKS_CC_InvoiceErrorAfterCapture != SKS_CC_InvoiceErrorAfterCCCaptureSuccess::None)
+                {
+                    salesTableSKSUP.SKS_CC_InvoiceErrorAfterCapture = SKS_CC_InvoiceErrorAfterCCCaptureSuccess::None;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_findCharge</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>findCharge</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, findCharge))]
+    public static void CreditCardAuthTrans_Post_findCharge(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+            
+        SalesId salesId = _ppArgs.getArg(identifierStr(_salesId));
+        CreditCardAuthTrans creditCardAuthTrans;
+
+        select creditCardAuthTrans
+        where creditCardAuthTrans.SalesId == salesId &&
+              (creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+               creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+              creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+              creditCardAuthTrans.ApprovalVoid == NoYes::No;
+
+        _ppArgs.setReturnValue(creditCardAuthTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_findChargeByInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>findChargeByInvoice</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, findChargeByInvoice))]
+    public static void CreditCardAuthTrans_Post_findChargeByInvoice(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesId salesId = _ppArgs.getArg(identifierStr(_salesId));
+        SalesInvoiceId salesInvoiceId = _ppArgs.getArg(identifierStr(_salesInvoiceId));
+        CreditCardAuthTrans creditCardAuthTrans;
+
+        select creditCardAuthTrans
+            where creditCardAuthTrans.SalesId == salesId &&
+                  creditCardAuthTrans.SalesInvoiceId == salesInvoiceId &&
+                  (creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+                   creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+                  creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+                  creditCardAuthTrans.ApprovalVoid == NoYes::No;
+
+        _ppArgs.setReturnValue(creditCardAuthTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_findFinalizedPreApproval</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>findFinalizedPreApproval</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, findFinalizedPreApproval))]
+    public static void CreditCardAuthTrans_Post_findFinalizedPreApproval(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesId salesId = _ppArgs.getArg(identifierStr(_salesId));
+            
+        CreditCardAuthTrans creditCardAuthTrans;
+
+        select creditCardAuthTrans
+        where creditCardAuthTrans.SalesId == salesId &&
+              creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize &&
+              creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+              creditCardAuthTrans.ApprovalVoid == NoYes::No;
+
+        _ppArgs.setReturnValue(creditCardAuthTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_findRefundCharge</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>findRefundCharge</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, findRefundCharge))]
+    public static void CreditCardAuthTrans_Post_findRefundCharge(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesId salesId = _ppArgs.getArg(identifierStr(_salesId));
+        boolean forUpdateParm = _ppArgs.getArg(identifierStr(_forUpdate));
+        CreditCardAuthTrans creditCardAuthTrans;
+        
+        creditCardAuthTrans.selectForUpdate(forUpdateParm);
+
+        select creditCardAuthTrans
+        where creditCardAuthTrans.SalesId == salesId &&
+              creditCardAuthTrans.RefundStatus == CreditCardRefundStatus::Marked &&
+              (creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+               creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+              creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+              creditCardAuthTrans.ApprovalVoid == NoYes::No;
+        
+        _ppArgs.setReturnValue(creditCardAuthTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_isAuthorizedAndApproved</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>isAuthorizedAndApproved</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, isAuthorizedAndApproved))]
+    public static void CreditCardAuthTrans_Post_isAuthorizedAndApproved(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        boolean ret;
+        SalesId salesId = _ppArgs.getArg(identifierStr(_salesId));
+        CreditCardAuthTrans creditCardAuthTrans = CreditCardAuthTrans::findLatest(salesId);
+
+        ret = (creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+               creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+              creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+              creditCardAuthTrans.ApprovalVoid == NoYes::No;
+
+        _ppArgs.setReturnValue(ret);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_mcrFindCharge</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>mcrFindCharge</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, mcrFindCharge))]
+    public static void CreditCardAuthTrans_Post_mcrFindCharge(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        CreditCardAuthTrans creditCardAuthTrans;
+        RecId mcrCustPaymRecId = _ppArgs.getArg(identifierStr(_mcrCustPaymRecId));
+        
+        if (mcrCustPaymRecId)
+        {
+            select creditCardAuthTrans
+            where creditCardAuthTrans.MCRPaymRecId == mcrCustPaymRecId &&
+                  (creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+                  creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+                  creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+                  creditCardAuthTrans.ApprovalVoid == NoYes::No;
+        }
+        
+        _ppArgs.setReturnValue(creditCardAuthTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_mcrFindRefundCharge</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>mcrFindRefundCharge</c> method to ensure that
+    /// ApprovalVoid field is part of the where clause for the select statement.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, mcrFindRefundCharge))]
+    public static void CreditCardAuthTrans_Post_mcrFindRefundCharge(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        RecId mcrCustPaymRecId = _ppArgs.getArg(identifierStr(_mcrCustPaymRecId));
+        boolean forUpdateParm = _ppArgs.getArg(identifierStr(_forUpdate));
+        CreditCardAuthTrans creditCardAuthTrans;
+
+        creditCardAuthTrans.selectForUpdate(forUpdateParm);
+
+        if (mcrCustPaymRecId)
+        {
+            select creditCardAuthTrans
+            where creditCardAuthTrans.MCRPaymRecId == mcrCustPaymRecId &&
+                  (creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+                  creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture) &&
+                  creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved &&
+                  creditCardAuthTrans.ApprovalVoid == NoYes::No;
+        }
+        
+        _ppArgs.setReturnValue(creditCardAuthTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_setVoidApproval</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>setVoidApproval</c> method to ensure that if a
+    /// <c>sKS_CC_CustPaymTable</c> record related to the <c>CreditCardAuthTrans</c> record
+    /// is found, it is updated with the void approval action.
+    /// Also, update the <c>LedgerJournalTrans</c> record as needed.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, setVoidApproval))]
+    public static void CreditCardAuthTrans_Post_setVoidApproval(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        RefRecId authTransRecId = _ppArgs.getArg(identifierStr(_authTransRecId));
+        UserConnection connection = new UserConnection();
+        CreditCardAuthTrans authTrans;
+        SKS_CC_CustPaymTable sKS_CC_CustPaymTable;
+        LedgerJournalTrans ledgerJournalTransSKSUpd;
+
+        sKS_CC_CustPaymTable.setConnection(connection);
+
+        authTrans.setConnection(connection);
+
+        connection.ttsbegin();
+
+        select firstonly forupdate authTrans
+            where authTrans.RecId == authTransRecId;
+
+        if (authTrans && authTrans.ApprovalVoid == NoYes::No)
+        {
+            authTrans.ApprovalVoid = NoYes::Yes;
+            authTrans.update();
+        }
+
+        if (authTrans.SKS_CC_CustPaymTable)
+        {
+            if (authTrans.ApprovalType == CreditCardOperation::Authorize)
+            {
+                select firstonly forupdate sKS_CC_CustPaymTable
+                where sKS_CC_CustPaymTable.RecId == authTrans.SKS_CC_CustPaymTable
+                   && sKS_CC_CustPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Authorization
+                   && sKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::Approved
+                   && sKS_CC_CustPaymTable.ApprovalVoid == NoYes::No
+                   && sKS_CC_CustPaymTable.ApprovalExpired == NoYes::No;
+            }
+            else
+            {
+                select firstonly forupdate sKS_CC_CustPaymTable
+                where sKS_CC_CustPaymTable.RecId == authTrans.SKS_CC_CustPaymTable
+                   && (sKS_CC_CustPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Capture ||
+                       sKS_CC_CustPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Refund)
+                   && sKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::Approved
+                   && sKS_CC_CustPaymTable.ApprovalVoid == NoYes::No
+                   && sKS_CC_CustPaymTable.ApprovalExpired == NoYes::No;
+            }
+
+            if (sKS_CC_CustPaymTable)
+            {
+                sKS_CC_CustPaymTable.ApprovalVoid = NoYes::Yes;
+                sKS_CC_CustPaymTable.update();
+
+                if (sKS_CC_CustPaymTable.RefTableId == tableNum(LedgerJournalTrans))
+                {
+                    ledgerJournalTransSKSUpd = LedgerJournalTrans::findRecId(sKS_CC_CustPaymTable.RefRecId, true);
+                    if (ledgerJournalTransSKSUpd && ledgerJournalTransSKSUpd.PaymentStatus == CustVendPaymStatus::Confirmed &&
+                    ledgerJournalTransSKSUpd.ledgerJournalTable().Posted == NoYes::No)
+                    {
+                        ledgerJournalTransSKSUpd.setConnection(connection);
+                        ledgerJournalTransSKSUpd.PaymentStatus = CustVendPaymStatus::None;
+                        ledgerJournalTransSKSUpd.doUpdate();
+                    }
+                }
+            }
+        }
+
+        connection.ttscommit();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Pre_updateExpiredApproval</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PreHandler event method for <c>updateExpiredApproval</c> method to ensure that if a
+    /// <c>sKS_CC_CustPaymTable</c> record related to the <c>CreditCardAuthTrans</c> record
+    /// is found, it is updated with the expire approval action.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, updateExpiredApproval))]
+    public static void CreditCardAuthTrans_Pre_updateExpiredApproval(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesId salesId = _ppArgs.getArg(identifierStr(_salesId));
+        
+        UserConnection connection = new UserConnection();
+        CreditCardAuthTrans authTrans;
+        CreditCardPreapprovalLastNoOfDays days = CustParameters::find().CreditCardPreapprovalLastNoOfDays;
+    
+        SKS_CC_CustPaymTable sKS_CC_CustPaymTable;
+        sKS_CC_CustPaymTable.setConnection(connection);
+
+        authTrans.setConnection(connection);
+
+        connection.ttsbegin();
+
+        while select forupdate authTrans
+            where authTrans.SalesId == salesId &&
+                  authTrans.ApprovalType == CreditCardOperation::Authorize &&
+                  !authTrans.ApprovalExpired &&
+                  authTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+        {
+            if (DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - DateTimeUtil::date(authTrans.ApprovedDateTime) > days)
+            {
+                if (authTrans.SKS_CC_CustPaymTable)
+                {
+                    authTrans.ApprovalExpired = true;
+                    authTrans.update();
+
+                    while select forupdate sKS_CC_CustPaymTable
+                        where sKS_CC_CustPaymTable.RecId == authTrans.SKS_CC_CustPaymTable &&
+                              (sKS_CC_CustPaymTable.CreditCardTransType == SKS_CC_CreditCardTransType::Authorization ||
+                               sKS_CC_CustPaymTable.CreditCardTransTypeOrig == SKS_CC_CreditCardTransType::Authorization) &&
+                              sKS_CC_CustPaymTable.CreditCardTransStatus == CreditCardProcessorStatus::Approved &&
+                              sKS_CC_CustPaymTable.ApprovalExpired == NoYes::No
+                    {
+                        sKS_CC_CustPaymTable.ApprovalExpired = NoYes::Yes;
+                        sKS_CC_CustPaymTable.update();
+                    }
+                }
+            }
+        }
+
+        connection.ttscommit();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Post_mcrFindLatest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Used to stop standard D365 MCR code from deleting
+    ///     void capture transactions during SO cancellations.
+    /// </summary>
+    /// <param name="args"></param>
+    [PostHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, mcrFindLatest))]
+    public static void CreditCardAuthTrans_Post_mcrFindLatest(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+        
+        boolean isForUpdate = _ppArgs.getArg(identifierStr(_forUpdate));
+        if (!isForUpdate)
+        {
+            return;
+        }
+
+        CreditCardAuthTrans creditCardAuthTrans = _ppArgs.getReturnValue();
+
+        if (creditCardAuthTrans &&
+            creditCardAuthTrans.MCRPaymRecId &&
+            creditCardAuthTrans.SalesId &&
+            creditCardAuthTrans.ApprovalType == CreditCardOperation::Void &&
+            creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved)
+        {
+            SalesTable salesTable = SalesTable::find(creditCardAuthTrans.SalesId);
+            if (salesTable &&
+                salesTable.mcrIsCallCenter() &&
+                RetailMCRChannelTable::mcrEnableOrderCompletion(salesTable) &&
+                (salesTable.SalesStatus == SalesStatus::Canceled ||
+                 salesTable.SalesStatus == SalesStatus::Invoiced))
+            {
+                MCRCustPaymTable mcrCustPaymTableSKS;
+                mcrCustPaymTableSKS = MCRCustPaymTable::findByRecID(creditCardAuthTrans.MCRPaymRecId);
+                if (!mcrCustPaymTableSKS.Amount)
+                {
+                    creditCardAuthTrans = null;
+                    _ppArgs.setReturnValue(creditCardAuthTrans);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardAuthTrans_Pre_mcrUpdateExpiredApproval</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PreHandler event method for <c>mcrUpdateExpiredApproval</c> method to ensure that if a
+    /// <c>CreditCardAuthTrans</c> record is expired then a re-authorization should be attempted.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(tableStr(CreditCardAuthTrans), tableStaticMethodStr(CreditCardAuthTrans, mcrUpdateExpiredApproval))]
+    public static void CreditCardAuthTrans_Pre_mcrUpdateExpiredApproval(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        if (!CustParameters::find().CreditCardPreAuthorization)
+        {
+            return;
+        }
+
+        RecId mcrCustPaymRecId = _ppArgs.getArg(identifierStr(_mcrCustPaymRecId));
+
+        UserConnection connection;
+        CreditCardAuthTrans authTrans;
+        CreditCardPreapprovalLastNoOfDays days;
+
+        if (mcrCustPaymRecId)
+        {
+            days = CustParameters::find().CreditCardPreapprovalLastNoOfDays;
+            connection = new UserConnection();
+            boolean hasExpiredAuthTrans;
+
+            try
+            {
+                authTrans.setConnection(connection);
+                connection.ttsbegin();
+                while select forupdate authTrans
+                    where authTrans.MCRPaymRecId == mcrCustPaymRecId
+                    && authTrans.ApprovalType == CreditCardOperation::Authorize
+                    && !authTrans.ApprovalExpired
+                    && !authTrans.ApprovalVoid
+                    && authTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+                {
+                    if (DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - DateTimeUtil::date(authTrans.ApprovedDateTime) > days)
+                    {
+                        authTrans.ApprovalExpired = true;
+                        authTrans.update();
+                        hasExpiredAuthTrans = true;
+                    }
+                }
+                connection.ttscommit();
+            }
+            finally
+            {
+                connection.finalize();
+            }
+
+            if (hasExpiredAuthTrans)
+            {
+                MCRCustPaymTable mcrCustPaymTable = MCRCustPaymTable::findByRecID(mcrCustPaymRecId);
+                if (mcrCustPaymTable &&
+                    mcrCustPaymTable.RefTableId == tableNum(SalesTable) &&
+                    mcrCustPaymTable.RefRecId)
+                {
+                    if (!MCRCustPaymTable::processIfAuthStale(mcrCustPaymTable.RefRecId))
+                    {
+                        throw error(strFmt("@MCR37103", mcrCustPaymTable.salesTable().SalesId));
+                    }
+                }
+            }
+        }
+        else
+        {
+            throw error(error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustTable_Post_validateField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>validateField</c> method to validate
+    /// field <c>SKS_CC_JournalPaymMode</c> in <c>CustTable</c> record.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CustTable), tableMethodStr(CustTable, validateField))]
+    public static void CustTable_Post_validateField(XppPrePostArgs _ppArgs)
+    {
+        FieldId fieldIdParm = _ppArgs.getArg(identifierStr(p1));
+        boolean ret = _ppArgs.getReturnValue();
+        
+        CustTable custTableThis = _ppArgs.getThis() as CustTable;
+
+        if (ret)
+        {
+            switch (fieldIdParm)
+            {
+                case  fieldNum(CustTable, SKS_CC_JournalPaymMode):
+                    if (custTableThis.SKS_CC_JournalPaymMode)
+                    {
+                        CustPaymModeTable paymMode = CustPaymModeTable::find(custTableThis.SKS_CC_JournalPaymMode);
+                        if (paymMode.RecId)
+                        {
+                            if (PaymMode.PaymentType != CustPaymentType::CreditCard)
+                            {
+                                ret = checkFailed(strFmt("@SKS6475", enum2str(CustPaymentType::CreditCard)));
+                            }
+                            else
+                            {
+                                if (paymMode.PaymStatus != CustVendPaymStatus::Confirmed)
+                                {
+                                    ret = checkFailed(strFmt("@SKS6476", enum2str(CustVendPaymStatus::Confirmed)));
+                                }
+                            }
+                        }
+                    }
+                    break;
+                case fieldNum(CustTable, OneTimeCustomer):
+                    if (custTableThis.OneTimeCustomer &&
+                        SKS_PP_Setup::isCreditCardOneTimeCustLogicEnabled())
+                    {
+                        CreditCardCust creditCardCustSKS;
+                        select firstonly CustAccount from creditCardCustSKS
+                            where creditCardCustSKS.SKS_CC_OneTimeCustRefTableId == 0
+                               && creditCardCustSKS.SKS_CC_OneTimeCustRefRecId == 0
+                               && creditCardCustSKS.CustAccount == custTableThis.AccountNum;
+
+                        if (creditCardCustSKS.CustAccount)
+                        {
+                            ret = checkFailed(strFmt("@SKS:SKGCCOneTimeCustValidateMsg", custTableThis.AccountNum));
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        _ppArgs.setReturnValue(ret);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustTrans_Post_settledPrepaidAmountCur</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>settledPrepaidAmountCur</c> method to get
+    /// full settlement amount related to <c>CustTrans</c> record.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(CustTrans), tableMethodStr(CustTrans, settledPrepaidAmountCur))]
+    public static void CustTrans_Post_settledPrepaidAmountCur(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        RefRecId onlySelectPrePayment = _ppArgs.getArg(identifierStr(_onlySelectPrePayment));
+        
+        CustTrans custTransThis = _ppArgs.getThis() as CustTrans;
+        CustTrans custTrans;
+        CustSettlement custSettlement;
+        AmountCur prepaidAmountCur;
+        CompanyId offsetCompany = curext();
+
+        while select OffsetCompany, OffsetRecid, SettleAmountCur from custSettlement
+            where custSettlement.TransRecId == custTransThis.RecId
+        {
+            if (custSettlement.OffsetCompany)
+            {
+                offsetCompany = custSettlement.OffsetCompany;
+            }
+            else
+            {
+                offsetCompany = curext();
+            }
+
+            changecompany(offsetCompany)
+            {
+                custTrans = null;
+
+                if (onlySelectPrePayment)
+                {
+                    select firstonly custTrans
+                        where custTrans.RecId == custSettlement.OffsetRecid &&
+                              custTrans.Prepayment == NoYes::Yes;
+                }
+                else
+                {
+                    select firstonly custTrans
+                        where custTrans.RecId == custSettlement.OffsetRecid;
+                }
+
+                if (custTrans)
+                {
+                    prepaidAmountCur += custSettlement.SettleAmountCur;
+                }
+            }
+        }
+
+        _ppArgs.setReturnValue(prepaidAmountCur);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustVoucher_Post_newCustVoucherJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to determine if voucher is a payment reversal
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CustVoucher), staticMethodStr(CustVoucher, newCustVoucherJournal))]
+    public static void CustVoucher_Post_newCustVoucherJournal(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        LedgerJournalTrans ledgerJournalTrans = _ppArgs.getArg(identifierStr(_ledgerJournalTrans));
+        CustVoucher custVoucher = _ppArgs.getReturnValue();
+
+        if (ledgerJournalTrans && custVoucher)
+        {
+            SKS_CC_CustPaymTable sKS_CC_CustPaymTableRev;
+
+            select firstOnly1 RecId from sKS_CC_CustPaymTableRev
+                where sKS_CC_CustPaymTableRev.IsPaymentReversal == NoYes::Yes
+                   && sKS_CC_CustPaymTableRev.CreditCardTransType == SKS_CC_CreditCardTransType::Refund
+                   && sKS_CC_CustPaymTableRev.CreditCardTransStatus == CreditCardProcessorStatus::Approved
+                   && sKS_CC_CustPaymTableRev.ApprovalVoid == NoYes::No
+                   && sKS_CC_CustPaymTableRev.RefTableId == ledgerJournalTrans.TableId
+                   && sKS_CC_CustPaymTableRev.RefRecId == ledgerJournalTrans.RecId;
+
+            if (sKS_CC_CustPaymTableRev.RecId)
+            {
+                custVoucher.parmCancelledPayment(true);
+                custVoucher.parmIsPaymentReversal_SKS(true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustVoucher_Post_post</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set CanBeReversed to No to disallow any additional reversals.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CustVoucher), methodStr(CustVoucher, post))]
+    public static void CustVoucher_Post_post(XppPrePostArgs _ppArgs)
+    {
+        CustVoucher custVoucher = _ppArgs.getThis();
+        if (!custVoucher.parmIsPaymentReversal_SKS())
+        {
+            return;
+        }
+
+        CustTrans custTrans = _ppArgs.getArg(identifierStr(_custTrans));
+
+        if (custTrans)
+        {
+            CustSettlement custSettlement;
+            
+            custSettlement.skipDatabaseLog(true);
+            custSettlement.skipDataMethods(true);            
+
+            update_recordset custSettlement
+                setting CanBeReversed = NoYes::No
+                where custSettlement.CanBeReversed == NoYes::Yes &&
+                        (custSettlement.TransRecId == custTrans.RecId ||
+                        (custSettlement.OffsetRecid == custTrans.RecId &&
+                        custSettlement.OffsetCompany == custTrans.company()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjInvoiceProposalCreateLines_Pre_closeOk</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to validate CCA entries before allowing form to close.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(formStr(ProjInvoiceProposalCreateLines), formMethodStr(ProjInvoiceProposalCreateLines, closeOk))]
+    public static void ProjInvoiceProposalCreateLines_Pre_closeOk(XppPrePostArgs _ppArgs)
+    {
+        FormRun formRun = _ppArgs.getThis() as FormRun;
+
+        if (!formRun.SKS_CC_ValidateInvoiceProposalLines())
+        {
+            throw info("@SYS70800");
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjInvoiceProposalCreateLines_Post_modifiedTransFilter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to set values for CCA controls.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(formStr(ProjInvoiceProposalCreateLines), formMethodStr(ProjInvoiceProposalCreateLines, modifiedTransFilter))]
+    public static void ProjInvoiceProposalCreateLines_Post_modifiedTransFilter(XppPrePostArgs _ppArgs)
+    {
+        FormRun formRun = _ppArgs.getThis() as FormRun;
+
+        formRun.sKS_CC_SetServiceOrderAuthValues();
+        formRun.sKS_CC_SetValueOnServiceOrderAuthCtrls();
+ 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjInvoiceProposalCreateLines_Post_updateTotalsDisplay</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to set values for CCA controls.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(formStr(ProjInvoiceProposalCreateLines), formMethodStr(ProjInvoiceProposalCreateLines, updateTotalsDisplay))]
+    public static void ProjInvoiceProposalCreateLines_Post_updateTotalsDisplay(XppPrePostArgs _ppArgs)
+    {
+        FormRun formRun = _ppArgs.getThis() as FormRun;
+
+        formRun.sKS_CC_SetServiceOrderAuthValues();
+        formRun.sKS_CC_SetValueOnServiceOrderAuthCtrls();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjInvoiceProposalCreateLines_Post_getQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CCA: This method has been created to solve a standard D365 issue with project item transactions
+    /// when creating project invoice proposals from a service order or for an specific service order.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(ProjInvoiceProposalCreateLines), methodStr(ProjInvoiceProposalCreateLines, getQuery))]
+    public static void ProjInvoiceProposalCreateLines_Post_getQuery(XppPrePostArgs _ppArgs)
+    {
+        TableId tableIdForQuery = _ppArgs.getArg(identifierStr(_tableIdTrans));
+        Query queryForItemTrans = _ppArgs.getReturnValue();
+        SMAServiceOrderTable serviceOrderTable;
+        ProjInvoiceProposalCreateLines projInvoiceProposalCreateLines = _ppArgs.getThis();
+        if (projInvoiceProposalCreateLines)
+        {
+            serviceOrderTable = projInvoiceProposalCreateLines.parmProposalCreateLinesParams().parmServiceOrderTable();
+        }
+
+        if (tableIdForQuery == tableNum(ProjItemTrans) && serviceOrderTable &&
+            queryForItemTrans && SKS_PP_Setup::isCreditCardServiceOrderEnabled())
+        {
+            SMAServiceOrderLine serviceOrderLine;
+            SalesLine salesLine;
+            boolean hasServiceOrderTrans;
+
+            select firstonly ServiceOrderId from serviceOrderLine
+                where serviceOrderLine.ServiceOrderId     == serviceOrderTable.ServiceOrderId
+                   && serviceOrderLine.TransactionType    == SMATransactionType::Item
+                   && serviceOrderLine.ServiceOrderStatus == SMAServiceOrderStatus::Posted;
+
+            if (serviceOrderLine.ProjTransId)
+            {
+                hasServiceOrderTrans = true;
+            }
+            else
+            {
+                select firstonly ProjTransId from salesLine
+                    where salesLine.SalesType      == SalesType::ItemReq
+                       && salesLine.ProjId         == serviceOrderTable.ProjId
+                       && salesLine.ServiceOrderId == serviceOrderTable.ServiceOrderId
+                       && salesLine.SalesStatus    == SalesStatus::Invoiced;
+
+                if (salesLine.ServiceOrderId)
+                {
+                    hasServiceOrderTrans = true;
+                }
+            }
+
+            if (!hasServiceOrderTrans)
+            {
+                // Since no project item transactions linked to the current service order
+                // have been found then force range value to a zero string to avoid
+                // returning any records which do not belong to the current service order.
+                queryForItemTrans.dataSourceTable(tableNum(ProjItemTrans)).addRange(fieldNum(ProjItemTrans, ProjTransIdRef)).value('0');
+                _ppArgs.setReturnValue(queryForItemTrans);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjInvoiceProposalDetail_Post_setButtonAccess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to set visibility of CCA controls.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(formStr(ProjInvoiceProposalDetail), formMethodStr(ProjInvoiceProposalDetail, setButtonAccess))]
+    public static void ProjInvoiceProposalDetail_Post_setButtonAccess(XppPrePostArgs _ppArgs)
+    {
+        FormRun formRun = _ppArgs.getThis() as FormRun;
+
+        formRun.sKS_CC_SetButtonAccess();
+        formRun.sKS_CC_SetCCDisplayFields();
+        formRun.sKS_CC_SetValueOnCCCtrls();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjProposalJour_onValidatingFieldValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Used to validate change to <c>Payment</c> field
+    ///     when payment type is credit card payment.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [DataEventHandler(tableStr(ProjProposalJour), DataEventType::ValidatingFieldValue)]
+    public static void ProjProposalJour_onValidatingFieldValue(Common _sender, DataEventArgs _e)
+    {
+        SMAServiceOrderTable serviceOrderTableSKS;
+        ProjProposalJour projProposalJourSKS = _sender as ProjProposalJour;
+        ValidateFieldValueEventArgs validateEventArgs = _e as ValidateFieldValueEventArgs;
+        CustPaymTermId origPaymentSKS = projProposalJourSKS.orig().Payment;
+
+        boolean ret = validateEventArgs.parmValidateResult();
+        FieldName fieldName = validateEventArgs.parmFieldName();
+        switch (fieldName)
+        {
+            case fieldStr(ProjProposalJour, Payment):
+                if (ret && projProposalJourSKS.RecId && SKS_PP_Setup::isCreditCardInvoiceProposalEnabled() &&
+                    origPaymentSKS != projProposalJourSKS.Payment && SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(origPaymentSKS))
+                {
+                    if (projProposalJourSKS.SKS_CC_ServiceOrderId)
+                    {
+                        serviceOrderTableSKS = SMAServiceOrderTable::find(projProposalJourSKS.SKS_CC_ServiceOrderId);
+                        if (serviceOrderTableSKS)
+                        {
+                            ret = ret && SKS_CC_CustPaymTable::cancelPreAuthorization(serviceOrderTableSKS);
+                        }
+                    }
+
+                    if (ret && SKS_CC_CustPaymTable::hasPendingPayment(projProposalJourSKS.TableId, projProposalJourSKS.RecId))
+                    {
+                        SKS_CC_CustPaymTable::delete_CC_CustPaymTable(
+                            projProposalJourSKS.TableId,
+                            projProposalJourSKS.RecId,
+                            0,
+                            0,
+                            true);
+                    }
+
+                    if (projProposalJourSKS.SKS_CC_CreditCardAuthorizationError == NoYes::Yes)
+                    {
+                        projProposalJourSKS.SKS_CC_CreditCardAuthorizationError = NoYes::No;
+                    }
+                }
+                break;
+        }
+
+        validateEventArgs.parmValidateResult(ret);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjProposalJour_Pre_calcDue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>calcDue</c> method
+    /// to set CCA fields <c>Payment</c> and <c>SKS_CC_ServiceOrderId</c>.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PreHandlerFor(tableStr(ProjProposalJour), tableMethodStr(ProjProposalJour, calcDue))]
+    public static void ProjProposalJour_Pre_calcDue(XppPrePostArgs _ppArgs)
+    {
+        ProjProposalJour projProposalJourSKS = _ppArgs.getThis() as ProjProposalJour;
+        if (projProposalJourSKS.RecId && SKS_PP_Setup::isCreditCardServiceOrderEnabled())
+        {
+            SKS_CC_CustPaymTable::setPaymTermFromServiceOrder(projProposalJourSKS);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_Post_enableHeaderCreditCardMenuItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to enable menu item based on TAS parameter.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(formStr(SalesTable), formMethodStr(SalesTable, enableHeaderCreditCardMenuItems))]
+    public static void SalesTable_Post_enableHeaderCreditCardMenuItems(XppPrePostArgs _ppArgs)
+    {
+        FormRun formRun = _ppArgs.getThis();
+        FormControl creditCardPreauthorize = formRun.Design().controlName(formControlStr(SalesTable, creditCardPreauthorize));
+        
+        if (SKS_PP_Setup::find().CCDisableStdSalesOrderPreAuth == NoYes::Yes)
+        {
+            creditCardPreauthorize.enabled(false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_Post_mcrOrderEntryModeInit</Name>
+				<Source><![CDATA[
+    [PostHandlerFor(formStr(SalesTable), formMethodStr(SalesTable, mcrOrderEntryModeInit))]
+    public static void SalesTable_Post_mcrOrderEntryModeInit(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().CCDisableStdSalesOrderPreAuth == NoYes::Yes)
+        {
+            FormRun formRun = _ppArgs.getThis();
+            FormControl sKS_CC_Payment_M_editCreditCardCtrl = formRun.Design().controlName(formControlStr(SalesTable, SKS_CC_Payment_M_editCreditCard));
+            
+            FormDataSource salesTableDSSKSLoc = formRun.dataSource(identifierStr(SalesTable));
+            SalesTable salesTableSKSLoc = salesTableDSSKSLoc.cursor();
+
+            if (sKS_CC_Payment_M_editCreditCardCtrl.visible() &&
+                !RetailMCRChannelTable::findChannelBySalesTable(salesTableSKSLoc).mcrEnableOrderCompletion)
+            {
+                sKS_CC_Payment_M_editCreditCardCtrl.enabled(false);
+                sKS_CC_Payment_M_editCreditCardCtrl.skip(true);
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_Post_initFromCustInvoiceJour</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>initFromCustInvoiceJour</c> method to initialize
+    /// field <c>PaymMode</c> in <c>SalesTable</c> record for ReturnItem order type.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(SalesTable), tableMethodStr(SalesTable, initFromCustInvoiceJour))]
+    public static void SalesTable_Post_initFromCustInvoiceJour(XppPrePostArgs _ppArgs)
+    {
+        SKS_PP_Setup sksParms = SKS_PP_Setup::find();
+        if (sksParms.ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        CustInvoiceJour custInvoiceJour = _ppArgs.getArg(identifierStr(custInvoiceJour));
+        SalesTable salesTableThis = _ppArgs.getThis() as SalesTable;
+
+        SalesTable salesTableSKS;
+
+        if (custInvoiceJour.SalesId && salesTableThis.SalesType == SalesType::ReturnItem)
+        {
+            salesTableSKS = custInvoiceJour.salesTable();
+
+            if (salesTableSKS.isCreditCardPaymentType())
+            {
+                if (sksParms.CCUseOneTimeCustomerLogic && CustInvoiceJour.custTable_InvoiceAccount().OneTimeCustomer)
+                {
+                    salesTableThis.Payment = '';
+                }
+                else
+                {
+                    if (!salesTableSKS.sKS_CC_IsCreditCardPaymMode())
+                    {
+                        throw error(strFmt("@SKS6480", salesTableSKS.SalesId, salesTableSKS.Payment, salesTableSKS.PaymMode,
+                                       enum2str(CustPaymentType::CreditCard), enum2str(CustVendPaymStatus::None)));
+                    }
+                }
+            }
+
+            salesTableThis.PaymMode = salesTableSKS.PaymMode;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_Post_initFromCustTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>initFromCustTable</c> method
+    /// to handle setting default credit card <c>CreditCardCustRefId</c>
+    /// field in <c>SalesTable</c> record.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(SalesTable), tableMethodStr(SalesTable, initFromCustTable))]
+    public static void SalesTable_Post_initFromCustTable(XppPrePostArgs _ppArgs)
+    {
+        SalesTable salesTableThis = _ppArgs.getThis() as SalesTable;
+        salesTableThis.sKS_CC_SetDefaultCreditCard();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_Post_initFromPayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>initFromPayment</c> method
+    /// to handle setting default credit card <c>CreditCardCustRefId</c>
+    /// field in <c>SalesTable</c> record.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(SalesTable), tableMethodStr(SalesTable, initFromPayment))]
+    public static void SalesTable_Post_initFromPayment(XppPrePostArgs _ppArgs)
+    {
+        SalesTable salesTableThis = _ppArgs.getThis() as SalesTable;
+        salesTableThis.sKS_CC_SetDefaultCreditCard();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SalesTable_Post_initFromSalesTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>initFromPayment</c> method
+    /// to handle setting default credit card <c>CreditCardCustRefId</c>
+    /// field in <c>SalesTable</c> record.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(SalesTable), tableMethodStr(SalesTable, initFromSalesTable))]
+    public static void SalesTable_Post_initFromSalesTable(XppPrePostArgs _ppArgs)
+    {
+        SalesTable salesTableThis = _ppArgs.getThis() as SalesTable;
+        salesTableThis.sKS_CC_SetDefaultCreditCard();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SMAServiceOrderTable_onDeleted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>Delete</c> method to
+    /// remove related <c>SKS_CC_CustPaymTable</c> records.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [DataEventHandler(tableStr(SMAServiceOrderTable), DataEventType::Deleted)]
+    public static void SMAServiceOrderTable_onDeleted(Common _sender, DataEventArgs _e)
+    {
+        SMAServiceOrderTable serviceOrderTable = _sender as SMAServiceOrderTable;
+
+        if (serviceOrderTable.RecId && SKS_PP_Setup::isCreditCardServiceOrderEnabled())
+        {
+            ttsBegin;
+            SKS_CC_CustPaymTable::delete_CC_CustPaymTable(serviceOrderTable.TableId, serviceOrderTable.RecId, 0, 0, true);
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SMAServiceOrderTable_onValidatedDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>ValidatedDelete</c> method to check
+    /// if an approved pre-authorization exists that needs to be canceled.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [DataEventHandler(tableStr(SMAServiceOrderTable), DataEventType::ValidatedDelete)]
+    public static void SMAServiceOrderTable_onValidatedDelete(Common _sender, DataEventArgs _e)
+    {
+        ValidateEventArgs validateEventArgs = _e as ValidateEventArgs;
+        SMAServiceOrderTable serviceOrderTable = _sender as SMAServiceOrderTable;
+        
+        if (SKS_PP_Setup::isCreditCardServiceOrderEnabled())
+        {
+            if (!SKS_CC_CustPaymTable::cancelPreAuthorization(serviceOrderTable))
+            {
+                validateEventArgs.parmValidateResult(false);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SMAServiceOrderTable_Post_initFromAgreement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>initFromAgreement</c> method
+    /// to set <c>SKS_CC_Payment</c> field.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(SMAServiceOrderTable), tableMethodStr(SMAServiceOrderTable, initFromAgreement))]
+    public static void SMAServiceOrderTable_Post_initFromAgreement(XppPrePostArgs _ppArgs)
+    {
+        SMAServiceOrderTable sMAServiceOrderTableSKS = _ppArgs.getThis() as SMAServiceOrderTable;
+        sMAServiceOrderTableSKS.sKS_CC_InitPaymentFromProjFundingSource(sMAServiceOrderTableSKS.ProjId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SMAServiceOrderTable_Post_modifiedField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PostHandler event method for <c>modifiedField</c> method
+    /// to set <c>SKS_CC_Payment</c> field when ProjId is changed.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(SMAServiceOrderTable), tableMethodStr(SMAServiceOrderTable, modifiedField))]
+    public static void SMAServiceOrderTable_Post_modifiedField(XppPrePostArgs _ppArgs)
+    {
+        SMAServiceOrderTable sMAServiceOrderTableSKS = _ppArgs.getThis() as SMAServiceOrderTable;
+        FieldId fieldIdToCheckSKS = _ppArgs.getArg(identifierStr(_fieldId));
+        
+        switch (fieldIdToCheckSKS)
+        {
+            case fieldNum(SMAServiceOrderTable, ProjId) :
+                sMAServiceOrderTableSKS.sKS_CC_InitPaymentFromProjFundingSource(sMAServiceOrderTableSKS.ProjId);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SMAServiceOrderTable_onValidatingFieldValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to validate change to <c>SKS_CC_Payment</c> field
+    /// when payment type is credit card payment.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [DataEventHandler(tableStr(SMAServiceOrderTable), DataEventType::ValidatingFieldValue)]
+    public static void SMAServiceOrderTable_onValidatingFieldValue(Common _sender, DataEventArgs _e)
+    {
+        SMAServiceOrderTable serviceOrderTableSKS = _sender as SMAServiceOrderTable;
+        ValidateFieldValueEventArgs validateEventArgs = _e as ValidateFieldValueEventArgs;
+        CustPaymTermId  origSKS_CC_Payment = serviceOrderTableSKS.orig().SKS_CC_Payment;
+
+        boolean ret = validateEventArgs.parmValidateResult();
+        FieldName fieldName = validateEventArgs.parmFieldName();
+        switch (fieldName)
+        {
+            case fieldStr(SMAServiceOrderTable, SKS_CC_Payment):
+                if (ret && serviceOrderTableSKS.RecId && origSKS_CC_Payment != serviceOrderTableSKS.SKS_CC_Payment &&
+                    SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(origSKS_CC_Payment))
+                {
+                    ret = ret && SKS_CC_CustPaymTable::cancelPreAuthorization(serviceOrderTableSKS);
+
+                    if (ret && SKS_CC_CustPaymTable::hasPendingAuthorization(serviceOrderTableSKS.TableId, serviceOrderTableSKS.RecId))
+                    {
+                        SKS_CC_CustPaymTable::delete_CC_CustPaymTable(
+                            serviceOrderTableSKS.TableId,
+                            serviceOrderTableSKS.RecId,
+                            SKS_CC_CreditCardTransType::Authorization,
+                            CreditCardProcessorStatus::NA,
+                            false);
+                    }
+                }
+                break;
+        }
+
+        validateEventArgs.parmValidateResult(ret);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,842 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CustCreditCardPaymCancel</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_CustCreditCardPaymCancel
+{
+    CustTrans custTrans; // payment to be reverse
+    CustTable custTable; // customer related to payment to be reverse
+    BankPaymCancel bankPaymCancel; // class that displays the dialog for collecting parameters
+    CreditCardAuthTrans creditCardAuthTrans; // credit card transaction that needs to be refunded
+    LedgerJournalTable ledgerJournalTable; // journal that contains the refund for the reversal operation
+    LedgerJournalTrans ledgerJournalTrans; // journal line that contains the debit refund transaction
+    LedgerJournalTrans ledgerJournalTransCCPaym; // original credit card payment journal line that is being refunded
+    LedgerJournalNameId journalName; // journal name to use for the refund journal
+    Set setCreditCardTransRecIdToRefund; // set that contains the CC transactions to be refunded
+    TransDate cancelDate; // date used for the refund journal line
+    ReasonCode reason; // reason code for the refund
+    ReasonComment reasonComment; // reason comment for the refund
+    ReasonRefRecID cancelReasonRef; // reason ref RecId for the reason table
+    boolean hasRefundErrors; // used to indicate that one or more errors have been encountered and notify user
+    PaymMode paymModeForRefund; // payment method to use for the refund journal line
+    SKS_PP_Setup sKs_PP_Setup; // TAS parameters
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates an new instance of the <c>SKS_CC_CustCreditCardPaymCancel</c> class.
+    /// </summary>
+    /// <param name="_custTrans">
+    ///    A <c>CustTrans</c> record.
+    /// </param>
+    /// <returns>
+    ///    A instance of the <c>SKS_CC_CustCreditCardPaymCancel</c> class.
+    /// </returns>
+    public static SKS_CC_CustCreditCardPaymCancel construct(CustTrans _custTrans)
+    {
+        if(!_custTrans || _custTrans.TableId != tablenum(CustTrans))
+        {
+            throw error(Error::wrongUseOfFunction(funcname())); // Must pass a CustTrans record
+        }
+
+        return new SKS_CC_CustCreditCardPaymCancel(_custTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(CustTrans _custTrans)
+    {
+        custTrans = _custTrans;
+        bankPaymCancel = BankPaymCancel::newBankPaymCancel(custTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        SKS_CC_CustCreditCardPaymCancel ccPaymCancel;
+
+        if(!_args || !_args.record())
+        {
+            throw error(Error::wrongUseOfFunction(funcname())); // Must pass a record (CustTrans)
+        }
+
+        ccPaymCancel = SKS_CC_CustCreditCardPaymCancel::construct(_args.record());
+        ccPaymCancel.prompt();
+        ccPaymCancel.run();
+        if(_args.caller() && formHasMethod(_args.caller(), identifierstr(setTouched)))
+        {
+            _args.caller().setTouched();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeCancellingSettlements</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the settlements created from the customer transactions so that they cannot be reversed.
+    /// </summary>
+    protected void closeCancellingSettlements()
+    {
+        CustSettlement  custSettlementToClose;
+        custTrans       custTransReversal;
+
+        // Update status of settlement records to prevent subsequent settlement reversals
+        changecompany(custTrans.company())
+        {
+            custSettlementToClose = null;
+
+            custSettlementToClose.skipDatabaseLog(true);
+            custSettlementToClose.skipDataMethods(true);            
+
+            update_recordset custSettlementToClose
+            setting CanBeReversed = NoYes::No
+            where (custSettlementToClose.TransRecId == custTrans.RecId ||
+                (custSettlementToClose.OffsetRecid == custTrans.RecId &&
+                 custSettlementToClose.OffsetCompany == custTrans.company())) &&
+                custSettlementToClose.CanBeReversed == NoYes::Yes;
+
+            custTransReversal = null;
+            custTransReversal = custTrans::find(ledgerJournalTrans.CustTransId);
+            if (!custTransReversal)
+            {
+                select firstOnly custTransReversal
+                where custTransReversal.Voucher == ledgerJournalTrans.Voucher
+                   && custTransReversal.TransDate == ledgerJournalTrans.TransDate
+                   && custTransReversal.AccountNum == custTrans.AccountNum;
+            }
+
+            if (custTransReversal)
+            {
+                this.updateCustTransCancelReason(custTransReversal);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCreditCardCustPaymRefund</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates and processes one or more credit card payment refunds.
+    /// </summary>
+    /// <returns>
+    ///    An amount representing the total amount refunded.
+    /// </returns>
+    protected AmountCur createCreditCardCustPaymRefund()
+    {
+        SetEnumerator seRecIdToRefund;
+        RecId ccTransRecId;
+        CreditCardAuthTrans ccTrans;
+        SKS_CC_CustPaymTable ccCustPaymTable, ccCustPaymTableToRefund;
+        CreditCardCust creditCardCust;
+        SKS_CC_ProcessCapture ccProcRefund;
+        Counter nbrRecCreated;
+        AmountCur refundAmt;
+
+        seRecIdToRefund = setCreditCardTransRecIdToRefund.getEnumerator();
+        while (seRecIdToRefund.moveNext())
+        {
+            ccTransRecId = seRecIdToRefund.current();
+            ccTrans = CreditCardAuthTrans::find(ccTransRecId, true);
+
+            ccCustPaymTable.clear();
+            ccCustPaymTable.initValue();
+            ccCustPaymTable.CustAccount = custTrans.AccountNum;
+            ccCustPaymTable.CreditCardTransAmountCur = -abs(ccTrans.ApprovalAmountCur);
+            ccCustPaymTable.CreditCardCurrency = ccTrans.CurrencyCode;
+            ccCustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::JournalLine;
+            ccCustPaymTable.RefTableId = ledgerJournalTrans.TableId;
+            ccCustPaymTable.RefRecId = ledgerJournalTrans.RecId;
+            ccCustPaymTable.RefOriginId = ledgerJournalTrans.JournalNum;
+            ccCustPaymTable.OrigAuthorizationForRefund = ccTrans.Authorization;
+            ccCustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::NA;
+            ccCustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Refund;
+            ccCustPaymTable.CreditCardTransStatusOrig = ccCustPaymTable.CreditCardTransStatus;
+            ccCustPaymTable.CreditCardTransTypeOrig = ccCustPaymTable.CreditCardTransType;
+            ccCustPaymTable.CreditCardTypeName = ccTrans.CreditCardTypeName;
+            ccCustPaymTable.IsPaymentReversal = NoYes::Yes;
+            creditCardCust = CreditCardCust::findByUniqueCardId(ccTrans.UniqueCardId);
+            ccCustPaymTable.CreditCardCustRefId = creditCardCust.RecId;
+            if (!ccCustPaymTable.CreditCardCustRefId)
+            {
+                error(strFmt("@SKS6561", custTable.AccountNum, ccTrans.CreditCardNumber, ccTrans.UniqueCardId));
+                hasRefundErrors = true;
+                continue;
+            }
+            ccCustPaymTable.insert();
+            nbrRecCreated++;
+            ccCustPaymTableToRefund = ccCustPaymTable;
+        }
+
+        if (!nbrRecCreated)
+        {
+            throw error(strFmt("@SKS6562", custTrans.Voucher));
+        }
+
+        ccProcRefund = SKS_CC_ProcessCapture::construct();
+        ccProcRefund.parmCallerCustPaymTable(ccCustPaymTableToRefund);
+        ccProcRefund.parmCallerCustTable(custTable);
+        ccProcRefund.parmIsSendEmail(false);
+        ccProcRefund.parmIsRefund(true);
+        ccProcRefund.run();
+
+        refundAmt = SKS_CC_CustPaymTable::getCreditCardAmountCharged(ledgerJournalTrans.TableId, ledgerJournalTrans.RecId);
+
+        return refundAmt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the journal for credit card payment refund.
+    /// </summary>
+    /// <param name="_ledgerJournalEngine">
+    ///    A <c>LedgerJournalEngine_CustPayment</c> object.
+    /// </param>
+    protected void createRefundJournal(LedgerJournalEngine_CustPayment _ledgerJournalEngine)
+    {
+        ledgerJournalTable.clear();
+        ledgerJournalTable.initValue();
+        ledgerJournalTable.JournalName = journalName;
+        ledgerJournalTable.initFromLedgerJournalName();
+        ledgerJournalTable.insert(); // Insert sets the Description (Name field)
+        ledgerJournalTable.Name = strfmt("@SKS6557", custTrans.AccountNum, custTrans.Voucher);
+        ledgerJournalTable.write();
+        _ledgerJournalEngine.newJournalActive(ledgerJournalTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates a journal transaction for credit card payment refund.
+    /// </summary>
+    /// <param name="_ledgerJournalEngine">
+    ///    A <c>LedgerJournalEngine_CustPayment</c> object.
+    /// </param>
+    /// <param name="_refundAmount">
+    ///    The amount to be refunded in the currency of the payment.
+    /// </param>
+    protected void createRefundJournalTrans(
+    LedgerJournalEngine_CustPayment _ledgerJournalEngine,
+    Amount _refundAmount)
+    {
+        _ledgerJournalEngine.preCreate(ledgerJournalTrans);
+
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+
+        _ledgerJournalEngine.initValue(ledgerJournalTrans);
+
+        ledgerJournalTrans.TransDate = bankPaymCancel.parmTransDate();
+        _ledgerJournalEngine.transDateModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.parmAccount(custTrans.AccountNum);
+        _ledgerJournalEngine.accountModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.Txt = strfmt("@SKS6558", custTrans.Voucher);
+
+        ledgerJournalTrans.AmountCurDebit = abs(_refundAmount);
+        _ledgerJournalEngine.amountCurDebitModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.CurrencyCode = custTrans.CurrencyCode;
+        _ledgerJournalEngine.currencyModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.OffsetAccountType = ledgerJournalTransCCPaym.OffsetAccountType;
+        _ledgerJournalEngine.offsetAccountTypeModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.OffsetLedgerDimension = ledgerJournalTransCCPaym.OffsetLedgerDimension;
+        _ledgerJournalEngine.offsetAccountModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.ReasonRefRecID = cancelReasonRef;
+        ledgerJournalTrans.DefaultDimension = ledgerJournalTransCCPaym.DefaultDimension;
+        ledgerJournalTrans.SettleVoucher = SettlementType::SelectedTransact;
+
+        ledgerJournalTrans.PaymMode = paymModeForRefund;
+
+        _ledgerJournalEngine.preWrite(ledgerJournalTrans);
+        _ledgerJournalEngine.preWriteUpdateDefaultDimension(ledgerJournalTrans, null);
+        ledgerJournalTrans.insert();
+        _ledgerJournalEngine.write(ledgerJournalTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>executeProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Refunds a credit card payment.
+    ///    Creates a journal and journal line, creates a refund payment and process refund.
+    ///    If successful, and parameter to auto-post is set, then post journal.
+    /// </summary>
+    /// <returns>
+    ///    An amount representing the total refunds processed.
+    /// </returns>
+    protected Amount executeProcess()
+    {
+        LedgerJournalEngine_CustPayment ledgerJournalEngine;
+        Amount amountRefunded;
+
+        // Get reason code reference for cancel process
+        reason = bankPaymCancel.parmReason();
+        reasonComment = bankPaymCancel.parmReasonComment();
+
+        if (!this.validateToCancelPayment())
+        {
+            return 0;
+        }
+
+        ttsbegin;
+        cancelReasonRef = ReasonTableRef::createReasonTableRef(reason, reasonComment);
+        // Reverse settlements involving the payment being cancelled
+        this.reverseSettlement();
+
+        ledgerJournalEngine = new LedgerJournalEngine_CustPayment();
+        this.createRefundJournal(ledgerJournalEngine);
+        this.createRefundJournalTrans(ledgerJournalEngine, custTrans.AmountCur);
+        this.markOrigPaymForSettleWithRefund();
+
+        amountRefunded = this.createCreditCardCustPaymRefund();
+        if (!amountRefunded)
+        {
+            throw error(strFmt("@SKS6559", custTrans.Voucher, custTrans.AccountNum));
+        }
+
+        this.updateCustTransCancelReason(custTrans);
+        ttscommit;
+
+        if (abs(amountRefunded) != abs(custTrans.AmountCur))
+        {
+            hasRefundErrors = true;
+        }
+
+        ledgerJournalTrans.reread();
+
+        if (hasRefundErrors || ledgerJournalTrans.PaymentStatus != CustVendPaymStatus::Confirmed)
+        {
+            error(strFmt("@SKS6556", amountRefunded, custTrans.AmountCur, custTrans.Voucher, ledgerJournalTrans.JournalNum));
+
+            this.openCustPaymJournal();
+        }
+        else
+        {
+            if (sKs_PP_Setup.CCOneClickPaymReversalAutoPost == NoYes::Yes)
+            {
+                LedgerJournalPost::postJournal(ledgerJournalTable, NoYes::Yes);
+            }
+            else
+            {
+                this.openCustPaymJournal();
+            }
+        }
+
+        try
+        {
+            ttsBegin;
+            this.updateCreditCardTransReversePaym();
+            ttsCommit;
+        }
+        catch (Exception::Error)
+        {
+            ttsAbort;
+            throw error(strFmt("@SKS6560", custTrans.Voucher));
+        }
+
+        return amountRefunded;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds the customer of the transaction being canceled.
+    /// </summary>
+    protected void getCustTable()
+    {
+        custTable = CustTable::findByCompany(custTrans.company(), custTrans.AccountNum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markOrigPaymForSettleWithRefund</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Marks for settlement the original credit card payment customer transaction
+    ///    with the newly created journal line that contains the credit card refund.
+    /// </summary>
+    private void markOrigPaymForSettleWithRefund()
+    {
+        CustTransOpen custTransOpen;
+        SpecTransManager specTransManager;
+
+        select firstonly crosscompany custTransOpen
+        where custTransOpen.RefRecId == custTrans.RecId;
+
+        if (!custTransOpen.RecId)
+        {
+            throw error(strfmt("@SKS6569", custTrans.AccountNum, custTrans.Voucher));
+        }
+
+        // marking of the transaction for settlement
+        specTransManager = SpecTransManager::newFromSpec(ledgerJournalTrans);
+
+        if (specTransManager.existForOtherSpec(custTransOpen.company(), custTransOpen.TableId, custTransOpen.RecId))
+        {
+            throw error(strfmt("@SKS6570", custTrans.Voucher, custTrans.AccountNum));
+        }
+
+        specTransManager.insert(custTransOpen.company(),
+                            custTransOpen.TableId,
+                            custTransOpen.RecId,
+                            custTrans.AmountCur,
+                            custTrans.CurrencyCode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openCustPaymJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Opens customer payment journal form with newly created journal selected.
+    ///    Called when errors are encountered or journal auto-post parameter is not set.
+    /// </summary>
+    void openCustPaymJournal()
+    {
+        FormRun formrun;
+        Args args = new Args();
+        args.record(ledgerJournalTable);
+
+        formrun = new MenuFunction(menuitemdisplaystr(LedgerJournalTable_CustPaym), MenuItemType::Display).create(args);
+        formrun.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prompt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Displays messages and dialog boxes before the credit card payment reversal process.
+    /// </summary>
+    protected void prompt()
+    {
+        this.setCreditCardTransToRefund();
+        this.showBankPaymCancel();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reportResults</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Displays a message that summarizes the credit card payment refund process.
+    /// </summary>
+    /// <param name="_totalRefund">
+    ///    An amount.
+    /// </param>
+    /// <param name="_isFullRefund">
+    ///    Used to indicate that a full refund was processed.
+    /// </param>
+    /// <remarks>
+    ///    This method is only called after successfully running the <c>executeProcess</c> method.
+    /// </remarks>
+    protected void reportResults(Amount _totalRefund, boolean _isFullRefund = false)
+    {
+        str infoMsg;
+        ledgerJournalTable.reread();
+
+        if (_isFullRefund)
+        {
+            if (ledgerJournalTable.Posted == NoYes::Yes)
+            {
+                infoMsg = strfmt("@SKS6563",
+                            abs(custTrans.AmountCur),
+                            custTrans.CurrencyCode,
+                            custTrans.AccountNum,
+                            custTable.name(),
+                            ledgerJournalTable.JournalNum);
+            }
+            else
+            {
+                infoMsg = strfmt("@SKS6564",
+                            abs(custTrans.AmountCur),
+                            custTrans.CurrencyCode,
+                            custTrans.AccountNum,
+                            custTable.name(),
+                            ledgerJournalTable.JournalNum);
+            }
+
+        }
+        else
+        {
+            infoMsg = strfmt("@SKS6565",
+                        abs(custTrans.AmountCur),
+                        custTrans.CurrencyCode,
+                        custTrans.AccountNum,
+                        custTable.name(),
+                        ledgerJournalTable.JournalNum,
+                        abs(_totalRefund));
+        }
+
+        info(infoMsg);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reverses settlements corresponding to transactions paid by customer transaction.
+    /// </summary>
+    protected void reverseSettlement()
+    {
+        CustSettlement reverseCustSettlement;
+        SpecTransManager specTransManager;
+        CompanyId refCompany;
+
+        refCompany = custTrans.company();
+
+        changecompany(refCompany)
+        {
+            // Create SpecTransManager
+            specTransManager = SpecTransManager::newFromSpec(custTable);
+
+            // Mark settlements for reversal
+            while select reverseCustSettlement
+                where reverseCustSettlement.TransCompany == custTrans.DataAreaId &&
+                    reverseCustSettlement.TransRecId == custTrans.RecId &&
+                    reverseCustSettlement.CanBeReversed == NoYes::Yes
+            {
+                reverseCustSettlement.CustVendSettlement::markThisAndRelatedOffsets(specTransManager, custTrans.CurrencyCode);
+
+                if (BrazilParameters::isEnabled() &&
+                        reverseCustSettlement.SettlementGroup)
+                {
+                    // Mark withholding tax settlement transactions when exists
+                    TaxWithhold::markRelatedVouchers_BR(custTrans.CurrencyCode, reverseCustSettlement, specTransManager);
+                }
+            }
+
+            if (specTransManager.getSpecTransCount() > 0)
+            {
+                if (BrazilParameters::isEnabled())
+                {
+                    // Reverse settlements
+                    CustTrans::reverseTransact(custTable,
+                                               null,
+                                               SettleDatePrinc::SelectDate,
+                                               bankPaymCancel.parmTransDate(),
+                                               true,
+                                               custTrans.Voucher,
+                                               true);                    
+                }
+                else
+                {
+                    // Reverse settlements
+                    CustTrans::reverseTransact(custTable,
+                                                null,
+                                                SettleDatePrinc::SelectDate,
+                                                bankPaymCancel.parmTransDate(),
+                                                false,
+                                                '',
+                                                true);                    
+                }
+
+                // Clean up SpecTrans records for reversal
+                specTransManager.deleteAll();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Executes the payment reversal process and reports the result.
+    /// </summary>
+    /// <param name="_showResults">
+    ///    true if the results should be displayed; otherwise, false.
+    /// </param>
+    public void run(boolean _showResults = true)
+    {
+        Amount totalRefund = this.executeProcess();
+
+        if (totalRefund != 0 && _showResults)
+        {
+            this.reportResults(totalRefund, custTrans.AmountCur == totalRefund);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCreditCardTransToRefund</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets the credit card transactions related
+    ///    to current customer payment transaction
+    ///    that need to be refunded.
+    /// </summary>
+    protected void setCreditCardTransToRefund()
+    {
+        LedgerJournalTable ledgerJournalTableOrig;
+        SKS_CC_CustPaymTable ccCustPaymTable;
+
+        sKs_PP_Setup = SKS_PP_Setup::find();
+
+        // Get customer - will be used for reversals & settlements
+        this.getCustTable();
+
+        setCreditCardTransRecIdToRefund = new Set (Types::Int64);
+
+        select firstOnly1 ledgerJournalTransCCPaym
+            where ledgerJournalTransCCPaym.CustTransId == custTrans.RecId;
+
+        if (!ledgerJournalTransCCPaym.RecId)
+        {
+            select firstOnly1 ledgerJournalTransCCPaym
+            where ledgerJournalTransCCPaym.Voucher == custTrans.Voucher
+               && ledgerJournalTransCCPaym.TransDate == custTrans.TransDate
+               && ledgerJournalTransCCPaym.LedgerDimension == LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(custTrans.AccountNum, LedgerJournalACType::Cust);
+        }
+
+        if (ledgerJournalTransCCPaym.RecId)
+        {
+            ledgerJournalTableOrig = ledgerJournalTable::find(ledgerJournalTransCCPaym.JournalNum);
+            journalName = ledgerJournalTableOrig.JournalName;
+        }
+
+        if (custTrans.PaymReference)
+        {
+            // Search for transaction using payment reference set from sales order invoice
+            select firstonly RecId from creditCardAuthTrans
+            order by LineNum desc
+            where creditCardAuthTrans.Authorization == custTrans.PaymReference
+               && creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+               && creditCardAuthTrans.ApprovalVoid == NoYes::No
+               && (creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture ||
+                   creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize);
+        }
+
+        if (creditCardAuthTrans)
+        {
+            setCreditCardTransRecIdToRefund.add(creditCardAuthTrans.RecId);
+            if (!journalName)
+            {
+                journalName = CreditCardTypeSetup::find(CreditCardProcessors::find(creditCardAuthTrans.CreditCardProcessors),
+                                                    creditCardAuthTrans.CreditCardTypeName).PaymentJournal;
+            }
+        }
+        else
+        {
+            if (ledgerJournalTransCCPaym.RecId)
+            {
+                // Search for transactions using journal line relation set from credit card payments
+                while select RecId from creditCardAuthTrans
+                order by LineNum desc
+                where creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+                   && creditCardAuthTrans.ApprovalVoid == NoYes::No
+                   && (creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture ||
+                       creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize)
+            exists join ccCustPaymTable
+                where ccCustPaymTable.RecId == creditCardAuthTrans.SKS_CC_CustPaymTable
+                   && ccCustPaymTable.RefRecId == ledgerJournalTransCCPaym.RecId
+                   && ccCustPaymTable.RefTableId == ledgerJournalTransCCPaym.TableId
+                {
+                    setCreditCardTransRecIdToRefund.add(creditCardAuthTrans.RecId);
+                    if (!journalName)
+                    {
+                        journalName = CreditCardTypeSetup::find(CreditCardProcessors::find(creditCardAuthTrans.CreditCardProcessors),
+                                                            creditCardAuthTrans.CreditCardTypeName).PaymentJournal;
+                    }
+                }
+            }
+        }
+
+        if(setCreditCardTransRecIdToRefund == null || !setCreditCardTransRecIdToRefund.elements())
+        {
+            Box::stop(strfmt("@SKS6566", custTrans.Voucher));
+            throw Exception::Error;
+        }
+
+        if (!journalName)
+        {
+            Box::stop(strfmt("@SKS6567", custTrans.Voucher));
+            throw Exception::Error;
+        }        
+
+        paymModeForRefund = sKs_PP_Setup.CCOneClickPaymReversalPaymMode;
+        if (!paymModeForRefund)
+        {
+            Box::stop(strfmt("@SKS6568", custTrans.Voucher));
+            throw Exception::Error;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showBankPaymCancel</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Displays the cancel payment dialog box.
+    /// </summary>
+    protected void showBankPaymCancel()
+    {
+        DialogRunbase dialog = Dialog::newFormnameRunbase(formstr(BankPaymCancel), bankPaymCancel);
+
+        dialog.caption("@SKS6571");
+        dialog.run();
+        dialog.wait();
+
+        if(!dialog.closedOk())
+        {
+            throw Exception::Error;
+        }
+
+        bankPaymCancel = dialog.runBase();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCreditCardTransReversePaym</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates all credit card transactions to flag as void to prevent subsequent reversals
+    /// </summary>
+    protected void updateCreditCardTransReversePaym()
+    {
+        SKS_CC_CustPaymTable sKS_CC_CustPaymTableRev;
+        CreditCardAuthTrans creditCardAuthTransOrig;
+        CreditCardAuthTrans creditCardAuthTransRev;
+
+        while select RecId, OrigAuthorizationForRefund from sKS_CC_CustPaymTableRev
+        where sKS_CC_CustPaymTableRev.IsPaymentReversal == NoYes::Yes
+           && sKS_CC_CustPaymTableRev.CreditCardTransType == SKS_CC_CreditCardTransType::Refund
+           && sKS_CC_CustPaymTableRev.CreditCardTransStatus == CreditCardProcessorStatus::Approved
+           && sKS_CC_CustPaymTableRev.ApprovalVoid == NoYes::No
+           && sKS_CC_CustPaymTableRev.RefTableId == ledgerJournalTrans.TableId
+           && sKS_CC_CustPaymTableRev.RefRecId == ledgerJournalTrans.RecId
+        {
+            select firstOnly forUpdate creditCardAuthTransRev
+            where creditCardAuthTransRev.SKS_CC_CustPaymTable == sKS_CC_CustPaymTableRev.RecId;
+
+            if (creditCardAuthTransRev.RecId)
+            {
+                creditCardAuthTransRev.SKS_CC_ReversedPayment = NoYes::Yes;
+                creditCardAuthTransRev.doUpdate();
+            }
+
+            if (!sKS_CC_CustPaymTableRev.OrigAuthorizationForRefund)
+            {
+                continue;
+            }
+
+            select firstOnly1 forUpdate creditCardAuthTransOrig
+            where creditCardAuthTransOrig.Authorization == sKS_CC_CustPaymTableRev.OrigAuthorizationForRefund
+                && (creditCardAuthTransOrig.ApprovalType == CreditCardOperation::AuthorizeAndCapture ||
+                    creditCardAuthTransOrig.ApprovalType == CreditCardOperation::CaptureAfterAuthorize)
+                && creditCardAuthTransOrig.ProcessorStatus == CreditCardProcessorStatus::Approved
+                && creditCardAuthTransOrig.ApprovalVoid == NoYes::No;
+
+            if (creditCardAuthTransOrig)
+            {
+                creditCardAuthTransOrig.SKS_CC_ReversedPayment = NoYes::Yes;
+                creditCardAuthTransOrig.doUpdate();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCustTransCancelReason</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates a customer transaction involved on the payment reversal with
+    ///    the reason for the reversal and flags the transaction as 'CancelledPayment = Yes'.
+    /// </summary>
+    /// <param name="_custTrans">
+    ///    A <c>CustTrans</c> record that should be updated.
+    /// </param>
+    protected void updateCustTransCancelReason(CustTrans _custTrans)
+    {
+        changecompany(custTrans.company())
+        {
+            _custTrans.selectForUpdate(true);
+            _custTrans.reread();
+
+            _custTrans.CancelledPayment = NoYes::Yes;
+            if (!_custTrans.ReasonRefRecId && cancelReasonRef)
+            {
+                _custTrans.ReasonRefRecId = ReasonTableRef::checkCreateInCompany(cancelReasonRef, _custTrans.DataAreaId);
+            }
+
+            _custTrans.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateToCancelPayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates that the payment can be reversed.
+    /// </summary>
+    /// <returns>
+    ///    true if the payment can be reversed; otherwise, false.
+    /// </returns>
+    protected boolean validateToCancelPayment()
+    {
+        boolean isValid = true;
+        TransDate originalTransDate;
+
+        originalTransDate = custTrans.TransDate;
+        cancelDate = bankPaymCancel.parmTransDate();
+
+        // Reversal date must not be before latest posting date
+        if (originalTransDate > cancelDate)
+        {
+            isValid = checkFailed(strFmt("@SYS91506", date2StrUsr(cancelDate, DateFlags::FormatAll), date2StrUsr(originalTransDate, DateFlags::FormatAll)));
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

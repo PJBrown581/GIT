@@ -1,0 +1,629 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIDocPurchPurchaseOrderReportDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class GGIDocPurchPurchaseOrderReportDSP extends DocDataSourceProviderSrsProforma
+{
+    PurchPurchaseOrderContract      reportContract;
+    boolean                         transLineAdded, taxLineAdded;
+    PurchConfirmationRequestJour    journal_purchConfirmationRequestJour;
+    PurchTableAllVersions           journalAllVersions;
+    PurchTable                      purchTable;
+
+    /* Variables for custom placeholders */
+    str      placeholder_purchOrderDocNum;
+    date     placeholder_purchOrderDate;
+    str      placeholder_purchId;
+    str      placeholder_vendName;
+    str      placeholder_deliveryName;
+    str      placeholder_deliveryAddress;
+    str      placeholder_deliveryTerms;
+
+
+    #define.PurchOrderHeader('PurchOrderHeader')
+    #define.PurchOrderLines('PurchOrderLines')
+    #define.TaxLines('PurchOrderLines_Tax')
+    #define.PODefaultDimensionField('POFinancialDimensions')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addDataFieldsForHeader</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForHeader(DocXmlRecord _addingRecord, PurchPurchaseOrderHeader _header)
+    {
+        void addHeaderFields()
+        {
+            // Add all fields except the company related fields since we already have them
+            // in the GeneralData data section at our disposal.
+            _addingRecord.addAllFieldsExcept([
+                fieldStr(PurchPurchaseOrderHeader, CompanyName),
+                fieldStr(PurchPurchaseOrderHeader, CompanyAddress),
+                fieldStr(PurchPurchaseOrderHeader, CompanyPhone),
+                fieldStr(PurchPurchaseOrderHeader, CompanyTeleFax),
+                fieldStr(PurchPurchaseOrderHeader, CompanyGiro),
+                fieldStr(PurchPurchaseOrderHeader, CompanyCoRegNum),
+                fieldStr(PurchPurchaseOrderHeader, CompanyLogo),
+                fieldStr(PurchPurchaseOrderHeader, CompanyEnterpriseNumber),
+                fieldStr(PurchPurchaseOrderHeader, CompanyBankAccountName),
+                fieldStr(PurchPurchaseOrderHeader, CompanyBankAccountNum),
+                fieldStr(PurchPurchaseOrderHeader, CompanyBankAccountRoutingNum),
+                fieldStr(PurchPurchaseOrderHeader, CompanyCommercialRegister),
+                fieldStr(PurchPurchaseOrderHeader, CompanyCommercialRegisterInsetNumber),
+                fieldStr(PurchPurchaseOrderHeader, CompanyCommercialRegisterSection),
+                fieldStr(PurchPurchaseOrderHeader, CompanyEmail),
+                fieldStr(PurchPurchaseOrderHeader, CompanyRegNum)
+            ]);
+        }
+
+        // Setting the flag needed for Docentric NextGen.
+        _addingRecord.setSingleRecord(true);
+
+        // (1) Rename the record from 'PurchPurchaseOrderHeader' to 'PurchOrderHeader'.
+        _addingRecord.setRecordName(#PurchOrderHeader);
+        // Change the label of the record if needed.
+        //_addingRecord.setRecordLabel('Purchase order header'); // NOTE: Use literalStr("@LabelID") instead.
+
+        // (2) Fill Terms of payment because it has not been filled in the PurchPurchaseOrderDP class (as it should be).
+        _header.Payment = this.purchTableAllVersions().Payment;
+
+        // (3) Add all fields from the PurchPurchaseOrderHeader table.
+        addHeaderFields();
+
+        // (4) Add Purchase order email and Vendor primary email.
+        _addingRecord.addCalculatedField('OrderEmail', purchTable.Email);
+        VendTable vendTable_OrderAccount = purchTable.vendTable_OrderAccount();
+        _addingRecord.addCalculatedField('VendorEmail', vendTable_OrderAccount.email());
+        VendTable vendTable_InvoiceAccount = purchTable.vendTable_InvoiceAccount();
+        _addingRecord.addCalculatedField('InvoiceAccountEmail', vendTable_InvoiceAccount.email());
+        // See the references to the Account field of the CustVendAccountMap map for the explanation.
+
+        // (5) Add Customer requisition and Vendor reference.
+        _addingRecord.addCalculatedField('VendorReference', purchTable.VendorRef);
+        _addingRecord.addCalculatedField('CustomerRequisition', purchTable.PurchOrderFormNum);
+
+        // (6) Add Custom Fields defined on PurchTable and VendTable, if any.
+        // Custom Fields: https://docs.microsoft.com/en-us/dynamics365/unified-operations/fin-and-ops/get-started/user-defined-fields
+        DocCustomFieldsHelper::tryAddAllCustomFieldsToDataRecord(purchTable, _addingRecord);
+        DocCustomFieldsHelper::tryAddAllCustomFieldsToDataRecord(vendTable_OrderAccount, _addingRecord);
+        // NOTE: You don't have to add all Custom Fields but only specific ones:
+        //DocCustomFieldsHelper::addCustomFieldsToDataRecord(['CustomFieldName1', 'CustomFieldName2'], purchTable, _addingRecord);
+        //DocCustomFieldsHelper::addCustomFieldToDataRecord('CustomFieldName', purchTable, _addingRecord);
+        
+        // (7) Add Financial dimensions.
+        _addingRecord.addCalculatedFieldFromEdt(#PODefaultDimensionField, extendedTypeStr(DimensionDefault), purchTable.DefaultDimension);
+
+
+        // TODO: Add here additional fields (or records) to the single header record by using the related
+        // data to the _rdpTableRecord table buffer (PurchPurchaseOrderHeader) or reportContract.
+        // For example, get the related PurchTableAllVersions record and add the project name:
+        //PurchTableAllVersions pt = this.purchTableAllVersions();
+        //_addingRecord.addCalculatedField('ProjName', ProjTable::find(pt.ProjId).Name);
+        // Or, add the vendor VAT number:
+        //_addingRecord.addCalculatedField('VendorVAT',
+        //    purchTable.vendTable_OrderAccount().getPrimaryRegistrationNumber(TaxRegistrationTypesList::TAXID, _header.PurchOrderDate));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine(DocXmlRecord _addingRecord, PurchPurchaseOrderTmp _currentLine)
+    {
+        if (_currentLine.PurchOrderTransOrTaxTrans)
+        {
+            this.addDataFieldsForLine_Trans(_addingRecord, _currentLine);
+            transLineAdded = true;
+        }
+        else
+        {
+            this.addDataFieldsForLine_Tax(_addingRecord, _currentLine);
+            taxLineAdded = true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine_Tax</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine_Tax(DocXmlRecord _addingRecord, PurchPurchaseOrderTmp _currentLine)
+    {
+        // Rename the record from 'PurchPurchaseOrderTmp' to 'PurchOrderLines_Tax'.
+        _addingRecord.setRecordName(#TaxLines);
+        // Change the label of the record.
+        _addingRecord.setRecordLabel('Taxes'); // NOTE: use literalStr("@LabelID") instead.
+
+        // Add all fields related to the tax lines.
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxCode));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, PrintCode));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxBaseAmount));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxBaseQty));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxAmount));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxAmountMST));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxExemptDescription));
+        _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxBaseAmountMST));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine_Trans</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine_Trans(DocXmlRecord _addingRecord, PurchPurchaseOrderTmp _currentLine)
+    {
+        void addLineFields()
+        {
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, ItemId));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, Name));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, DeliveryDate));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, Qty));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, PurchUnitTxt));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, PurchPrice));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, DiscPercent));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, DiscAmount));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, LineAmount));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, TaxWriteCode));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, ExternalItemNum));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, NotesTrans));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, InventDimQtyPrint));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, PurchaseLineLineNumber));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, RFQId));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, QuoteNumber));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, InventDimStr));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, CurrencyCode));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, AgreementReferenceNotes));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, IsUpdated));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, pdsCWQty));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, pdsCWUnitId));
+            _addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, MCRDropShipComment));
+            //PJB - CR_11766_DDSP_InventTrans_PurchPurchOrder
+            _addingRecord.addCalculatedField('TTBProof',PurchLine::findInventTransId(_currentLine.PurchLineInventTransId).TTBProof);
+            _addingRecord.addCalculatedFieldFromEnum('AlcoholType',enumStr(TTBAlcoholType),InventTable::find(PurchLine::findInventTransId(_currentLine.PurchLineInventTransId).ItemId).TTBAlcoholType());
+            //end PJB
+
+
+            //-- Redundant fields.
+            //_addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, JournalRecId));
+            //_addingRecord.addField(fieldStr(PurchPurchaseOrderTmp, PurchOrderTransOrTaxTrans));
+        }
+
+
+        // Rename the record from 'PurchPurchaseOrderTmp' to 'PurchOrderLines'.
+        _addingRecord.setRecordName(#PurchOrderLines);
+        // Change the label of the record.
+        //_addingRecord.setRecordLabel('Purchase order lines'); // NOTE: use literalStr("@LabelID") instead.
+
+        // Add all fields from the PurchPurchaseOrderTmp table related to the transaction data.
+        addLineFields();
+        
+        // Add Extension fields defined on PurchPurchaseOrderTmp, if any. 
+        // NOTE: Fields will be added to the child record named ExtensionFields. Change the last parameter to false to add
+        // Extension fields on flat. If the result doesn't suit you, add your Extension fields directly using the addField() method.
+        DocExtensionFieldsHelper::tryAddAllExtensionFieldsToDataRecord(_currentLine, _addingRecord, true);
+
+        // TODO: Add here additional fields from the related PurchLineAllVersions view (or some other tables).
+        //PurchLineAllVersions purchLineAllVersion = this.purchLineAllVersions(_currentLine.PurchaseLineLineNumber);
+        //_addingRecord.addCalculatedField('BarCode', purchLineAllVersion.BarCode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForRdpTableRecord</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForRdpTableRecord(DocXmlRecord _addingRecord, Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        if (_rdpTableName == tableStr(PurchPurchaseOrderHeader))
+        {
+            this.addDataFieldsForHeader(_addingRecord, _rdpTableRecord);
+        }
+        else if (_rdpTableName == tableStr(PurchPurchaseOrderTmp))
+        {
+            this.addDataFieldsForLine(_addingRecord, _rdpTableRecord);
+        }
+        else
+        {
+            super(_addingRecord, _rdpTableRecord, _rdpTableName);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return 'Purchase order DSP';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>proformaReportStoragePrefix</Name>
+				<Source><![CDATA[
+    protected str proformaReportStoragePrefix()
+    {
+        return DocConstantDSP::Prefix_PurchPurchaseOrder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        DocXmlRecord                emptyLineDataRecord;
+        PurchPurchaseOrderTmp       emptyLine;
+        
+        //DocXmlRecord                labelInfo, labelRecord;
+        //int                         i, rows, columns;
+
+        // Add the single data record representing the header and add multilpe records representing the lines.
+        super(_recordBuilder);
+
+        // If this is design time, add main or tax lines if they haven't been already added.
+        _recordBuilder.goToTopRecord();
+        if (!this.isRuntime())
+        {
+            emptyLine.clear();
+
+            // Main lines.
+            if (!transLineAdded)
+            {
+                emptyLineDataRecord = _recordBuilder.addRecord(emptyLine);
+                this.addDataFieldsForLine_Trans(emptyLineDataRecord, emptyLine);
+                _recordBuilder.goToTopRecord();
+            }
+
+            // TaxLines.
+            if (!taxLineAdded)
+            {
+                emptyLineDataRecord = _recordBuilder.addRecord(emptyLine);
+                this.addDataFieldsForLine_Tax(emptyLineDataRecord, emptyLine);
+                _recordBuilder.goToTopRecord();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preRunGenerateDS</Name>
+				<Source><![CDATA[
+    protected void preRunGenerateDS()
+    {
+        super();
+
+        // Initialize here the class global variables.
+        reportContract = this.getSrsRdpContract();
+        
+        // Get the related PurchTable record.
+        if (!this.isPurchConfirmationRequestJournal())
+        {
+            purchTable = this.vendPurchOrderJour().purchTable();
+        }
+        else
+        {
+            PurchTableVersion purchTableVersion = PurchTableVersion::find(this.purchConfirmationRequestJour().PurchTableVersion);
+            purchTable = PurchTable::find(purchTableVersion.PurchId);
+        }
+
+        transLineAdded = false;
+        taxLineAdded = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isPurchConfirmationRequestJournal</Name>
+				<Source><![CDATA[
+    protected boolean isPurchConfirmationRequestJournal()
+    {
+        return reportContract.parmIsPurchConfirmationRequestJournal();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>vendPurchOrderJour</Name>
+				<Source><![CDATA[
+    protected VendPurchOrderJour vendPurchOrderJour()
+    {
+        if (this.isPurchConfirmationRequestJournal())
+        {
+            DocGlobalHelper::handleException(funcName(), 'This is a purchase order based on PurchConfirmationRequestJour. Use the purchConfirmationRequestJour() method instead.');
+        }
+
+        if (!journal)
+        {
+            if (this.isProforma())
+            {
+                journal = this.getProformaJournal();
+            }
+            else
+            {
+                journal = VendPurchOrderJour::findRecId(journalRecId);
+            }
+        }
+
+        return journal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purchTableAllVersions</Name>
+				<Source><![CDATA[
+    protected PurchTableAllVersions purchTableAllVersions()
+    {
+        if (!journalAllVersions)
+        {
+            if (this.isProforma())
+            {
+                journalAllVersions = this.getProformaPurchTableAllVersions();
+            }
+            else
+            {
+                if (this.isPurchConfirmationRequestJournal())
+                {
+                    select firstonly journalAllVersions
+                    where journalAllVersions.PurchTableVersionRecId == this.purchConfirmationRequestJour().PurchTableVersion;
+                }
+                else
+                {
+                    select firstonly journalAllVersions
+                    where journalAllVersions.PurchTableVersionRecId == this.vendPurchOrderJour().PurchTableVersion;
+                }
+            }
+        }
+
+        return journalAllVersions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purchLineAllVersions</Name>
+				<Source><![CDATA[
+    protected PurchLineAllVersions purchLineAllVersions(int64 _purchaseLineLineNumber)
+    {
+        PurchLineAllVersions purchLineAllVersion;
+
+        if (this.isProforma())
+        {
+            purchLineAllVersion = this.getPurchLineAllVersionsByLineNum(_purchaseLineLineNumber);
+        }
+        else
+        {
+            if (this.isPurchConfirmationRequestJournal())
+            {
+                select firstonly purchLineAllVersion
+                where purchLineAllVersion.PurchId == purchTable.PurchId &&
+                      purchLineAllVersion.PurchTableVersionRecId == this.purchConfirmationRequestJour().PurchTableVersion &&
+                      purchLineAllVersion.LineNumber == _purchaseLineLineNumber;
+            }
+            else
+            {
+                select firstonly purchLineAllVersion
+                where purchLineAllVersion.PurchId == purchTable.PurchId &&
+                      purchLineAllVersion.PurchTableVersionRecId == this.vendPurchOrderJour().PurchTableVersion &&
+                      purchLineAllVersion.LineNumber == _purchaseLineLineNumber;
+            }
+        }
+
+        return purchLineAllVersion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purchConfirmationRequestJour</Name>
+				<Source><![CDATA[
+    protected PurchConfirmationRequestJour purchConfirmationRequestJour()
+    {
+        if (!this.isPurchConfirmationRequestJournal())
+        {
+            DocGlobalHelper::handleException(funcName(), 'This is a purchase order based on VendPurchOrderJour. Use the vendPurchOrderJour() method instead.');
+        }
+
+        if (!journal_purchConfirmationRequestJour)
+        {
+            select firstonly journal_purchConfirmationRequestJour
+            where journal_purchConfirmationRequestJour.RecId == journalRecId;
+        }
+
+        return journal_purchConfirmationRequestJour;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // List of defined custom placeholders for the report:
+    #define.PurchId('PurchId')
+    #define.PurchOrderDocNum('PurchOrderDocNum')
+    #define.PurchOrderDate('PurchOrderDate')
+    #define.VendAccount('VendAccount')
+    #define.VendName('VendName')
+    #define.VendRef('VendRef')
+    #define.CustReq('CustReq')
+    #define.VendContactName('VendContactName')
+    #define.DeliveryName('DeliveryName')
+    #define.DeliveryAddress('DeliveryAddress')
+    #define.DeliveryTerms('DeliveryTerms')
+    #define.OrderEmail('OrderEmail')
+
+    [DocPlaceholderAttribute(#PurchId, 'PO - Purch ID'),
+     DocPlaceholderAttribute(#PurchOrderDocNum, 'PO - Document Number'),
+     DocPlaceholderAttribute(#PurchOrderDate, 'PO - Date'),
+     DocPlaceholderAttribute(#VendAccount, 'PO - Vendor Account ID'),
+     DocPlaceholderAttribute(#VendName, 'PO - Vendor Name'),
+     DocPlaceholderAttribute(#VendRef, 'PO - Vendor Reference'),
+     DocPlaceholderAttribute(#CustReq, 'PO - Customer Requisition'),
+     DocPlaceholderAttribute(#VendContactName, 'PO - Contact Name'),
+     DocPlaceholderAttribute(#DeliveryName, 'PO - Delivery Name'),
+     DocPlaceholderAttribute(#DeliveryAddress, 'PO - Delivery Address'),
+     DocPlaceholderAttribute(#DeliveryTerms, 'PO - Delivery Terms'),
+     DocPlaceholderAttribute(#OrderEmail, 'PO - Purch Order Email')]
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        // Set the report execution context record to the corresponding purchTable. This will affect:
+        // (1) Standard placeholders
+        // (2) Saving to Attachments -> Record type: Context record
+        // (3) Additional Attachments -> Load from: Context record
+        _reportRunContext.setReportExecutionContextRecord(purchTable);
+
+        // Replace standard placeholders.
+        DocPlaceholderManager placeholderMng = super(_reportRunContext, _replaceStandardPlaceholders);
+               
+        // Replace custom placeholders:
+        // -- Placeholder @PurchId@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#PurchId, placeholder_purchId);
+        
+        // -- Placeholder @PurchOrderDocNum@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#PurchOrderDocNum, placeholder_purchOrderDocNum);
+
+        // -- Placeholder @PurchOrderDate@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#PurchOrderDate, placeholder_purchOrderDate);
+
+        // -- Placeholder @VendName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#VendName, placeholder_vendName);
+
+        // -- Placeholder @VendRef@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#VendRef, purchTable.VendorRef);
+
+        // -- Placeholder @CustReq@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustReq, purchTable.PurchOrderFormNum);
+
+        // -- Placeholder @VendAccount@
+        str vendAccount = this.purchTableAllVersions().OrderAccount;
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#VendAccount, vendAccount);
+
+        // -- Placeholder @OrderEmail@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#OrderEmail, purchTable.Email);
+
+        // -- Placeholder @DeliveryName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#DeliveryName, placeholder_deliveryName);
+
+        // -- Placeholder @DeliveryTerms@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#DeliveryTerms, placeholder_deliveryTerms);
+
+        // -- Placeholder @VendContactName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#VendContactName, DocDspHelper::contactPersonName(purchTable.ContactPersonId));
+
+        // -- Placeholder @DeliveryAddress@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#DeliveryAddress, placeholder_deliveryAddress);
+
+
+        // Fill the Print archive contract.
+        _reportRunContext.archiveContract().setVendAccount(vendAccount);
+        _reportRunContext.archiveContract().setPurchId(placeholder_purchId);
+        _reportRunContext.archiveContract().setDocument(placeholder_purchOrderDocNum, placeholder_purchOrderDate);
+        if (this.isPurchConfirmationRequestJournal())
+        {
+            _reportRunContext.archiveContract().setJournal(this.purchConfirmationRequestJour().RecId, DocJournalType::PurchConfirmationRequestJour);
+        }
+        else
+        {
+            _reportRunContext.archiveContract().setJournal(this.vendPurchOrderJour().RecId, DocJournalType::VendPurchOrderJour);
+        }
+
+        return placeholderMng;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSelectedRdpTableRecord</Name>
+				<Source><![CDATA[
+    protected void onSelectedRdpTableRecord(Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        super(_rdpTableRecord, _rdpTableName);
+
+        if (_rdpTableName == tableStr(PurchPurchaseOrderHeader))
+        {
+            PurchPurchaseOrderHeader header = _rdpTableRecord;
+
+            // Store custom placeholders' values.
+            placeholder_purchId = header.PurchId;
+            placeholder_purchOrderDocNum = header.PurchOrderDocNum;
+            placeholder_purchOrderDate = header.PurchOrderDate;
+            placeholder_vendName = header.VendName;
+            placeholder_deliveryName = header.DeliveryName;
+            placeholder_deliveryAddress = header.DeliveryAddress;
+            placeholder_deliveryTerms = header.DlvTerm;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// -- When to use this method?
+    /// If you want to quickly generate DDSP for a sample journal record.
+    /// -- How to run it?
+    /// Set up this class as the startup object in your project.
+    /// -- NOTE
+    /// Please verify all TODOs in the method and make changes if needed.
+    /// </summary>
+    /// <param name = "_args"></param>
+    public static void main(Args _args)
+    {
+        VendPurchOrderJour vendPurchOrderJour;
+
+        // TODO: (1) Select the sample journal record.
+        select firstonly vendPurchOrderJour;
+
+        // Add it as the context record, which is going to be printed.
+        Args args = new Args();
+        args.record(vendPurchOrderJour);
+
+        PurchPurchaseOrderController controller = PurchPurchaseOrderController::construct();
+
+        // TODO: (2) Change the name SSRS Report Design if needed.
+        controller.parmReportName(PrintMgmtDocType::construct(PrintMgmtDocumentType::PurchaseOrderRequisition).getDefaultReportFormat());
+        controller.parmArgs(args);
+        
+        PurchPurchaseOrderContract rdpContract = controller.parmReportContract().parmRdpContract();
+        rdpContract.parmRecordId(vendPurchOrderJour.RecId);
+        rdpContract.parmTableId(vendPurchOrderJour.TableId);
+        rdpContract.parmIsPurchConfirmationRequestJournal(false);
+
+        // Set the Docentric Generate DS print destination settings.
+        SRSPrintDestinationSettings pds = controller.parmReportContract().parmPrintSettings();
+        pds.printMediumType(SRSPrintMediumType::GenerateDataSource_DC);
+
+        // TODO: (3) Set Design and Preview languages if needed.
+        pds.parmGenerateDSPrintDestSettings_DC().parmLanguageId(currentUserLanguage());
+        pds.parmGenerateDSPrintDestSettings_DC().parmPreviewLanguages('fr,de,it,es');
+
+        // Initalize PurchPurchOrderJournalPrint class instance because there is no other way
+        // NOT to use Print Management.
+        PurchPurchOrderJournalPrint purchPurchOrderJournalPrint = PurchPurchOrderJournalPrint::construct();
+        purchPurchOrderJournalPrint.parmPrintFormletter(NoYes::Yes);
+        purchPurchOrderJournalPrint.parmUsePrintManagement(false);
+        purchPurchOrderJournalPrint.parmPrinterSettingsFormLetter(controller.parmReportContract().parmPrintSettings().pack());
+        
+        args.caller(purchPurchOrderJournalPrint);
+        args.parmEnumType(enumNum(PrintCopyOriginal));
+        args.parmEnum(PrintCopyOriginal::OriginalPrint);
+
+        controller.parmExecutionMode(SysOperationExecutionMode::Synchronous);
+        controller.parmShowDialog(false);
+        controller.startOperation();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPInventFlexSamplingQualityValidate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     The <c>PIPInventFlexSamplingQualityValidate</c> class updates the relevant flexible sampling activity
+///     and its activity details from the validation of a quality order.
+/// </summary>
+class PIPInventFlexSamplingQualityValidate
+{
+    PIPInventFlexSamplingCurrentState       currentState;
+
+    PIPInventFlexSamplingActivityTable      activityTable;
+    InventQualityOrderTable                 inventQualityOrderTable;
+    PIPInventFlexSamplingPlanLines          currentPlanLine;
+    PIPInventFlexSamplingActivityDetails    activityDetailFromQualityOrder;
+
+    InventQualityOrderId                    qualityOrderId;
+    InventTestOrderStatus                   qualityOrderStatus;
+
+    boolean                                 achievedPassCriteria;
+    boolean                                 hitFailCriteria;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkFailAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Updates activity details from a quality order fail action.
+    /// </summary>
+    private void checkFailAction()
+    {
+        VendAccount vendAccount;
+        int         timeDiff;
+    
+        if (currentPlanLine.TimeSpanDays)
+        {
+            timeDiff = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - DateTimeUtil::date(currentState.firstActivityValidationDateTime());
+    
+            if (timeDiff >= currentPlanLine.TimeSpanDays)
+            {
+                activityTable.updateRoundsTimeExpired(currentPlanLine.TimeSpanDays);
+                currentState.update();
+            }
+        }
+    
+        if ((!currentPlanLine.Consecutive && currentState.testsFailed() >= currentPlanLine.Fails)
+            || (currentPlanLine.Consecutive && activityTable.isConsecutiveFailure(currentPlanLine)))
+        {
+            hitFailCriteria = true;
+            this.insertReference();
+    
+            vendAccount = activityTable.checkExpireAVL();
+    
+            if (currentPlanLine.FailActionCode == PIPFailActionCode::Alert || currentPlanLine.FailActionCode == PIPFailActionCode::Expire)
+            {
+                this.sendNotification(vendAccount);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkPassAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Updates activity details from a quality order pass action.
+    /// </summary>
+    private void checkPassAction()
+    {
+        PIPInventFlexSamplingActivityDetails firstActivityInSampleGroup;
+        PIPRound                             newRoundNum;
+        int                                  timeDiff;
+        boolean                              newRoundNumApplied;
+    
+        newRoundNum = currentState.largestRoundNumber() + 1;
+    
+        if (newRoundNum <= currentPlanLine.Rounds)
+        {
+            if (currentPlanLine.Skip)
+            {
+                firstActivityInSampleGroup = PIPInventFlexSamplingActivityDetails::firstActivityInSampleGroup(activityDetailFromQualityOrder, true);
+    
+                if (currentPlanLine.TestPerSampleGroup == PIPInventFlexSamplingActivityDetails::testsPassedInSampleGroup(firstActivityInSampleGroup))
+                {
+                    firstActivityInSampleGroup.RoundNumber = newRoundNum;
+                    firstActivityInSampleGroup.update();
+                    newRoundNumApplied = true;
+                }
+            }
+            else
+            {
+                timeDiff = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - DateTimeUtil::date(currentState.firstActivityValidationDateTime());
+    
+                activityDetailFromQualityOrder.RoundNumber = newRoundNum;
+                activityDetailFromQualityOrder.update();
+                newRoundNumApplied = true;
+    
+                if (currentPlanLine.TimeSpanDays && timeDiff >= currentPlanLine.TimeSpanDays)
+                {
+                    activityTable.updateRoundsTimeExpired(currentPlanLine.TimeSpanDays);
+    
+                    currentState.update();
+                    newRoundNum = currentState.largestRoundNumber();
+                }
+            }
+        }
+    
+        if (newRoundNumApplied && newRoundNum == currentPlanLine.Rounds)
+        {
+            achievedPassCriteria = true;
+            this.insertReference();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates an activity detail as a reference to indicate if activity details in the
+    ///     current level qualified for a pass or fail criteria.
+    /// </summary>
+    private void insertReference()
+    {
+        PIPInventFlexSamplingActivityDetails    referenceActivityDetail;
+        #PIPFlexibleSampling
+    
+        referenceActivityDetail.PlanActivityNumber                = currentState.lastActivityDetailCreated().PlanActivityNumber + 1;
+        referenceActivityDetail.InventFlexSamplingActivityRecId   = activityTable.RecId;
+        referenceActivityDetail.RoundTrackingNumber               = currentState.lastActivityDetailCreated().RoundTrackingNumber + 1;
+        referenceActivityDetail.Level                             = currentPlanLine.Level;
+        referenceActivityDetail.ReasonCode                        = "@PIP211";
+    
+        if (achievedPassCriteria)
+        {
+            referenceActivityDetail.PassActionLevel   = currentPlanLine.PassActionLevel;
+            referenceActivityDetail.Reference         = "@PIP360";
+        }
+        else if (hitFailCriteria)
+        {
+            referenceActivityDetail.FailActionLevel   = currentPlanLine.FailActionLevel;
+            referenceActivityDetail.FailActionCode    = currentPlanLine.FailActionCode;
+            referenceActivityDetail.Reference         = strFmt("@PIP210", qualityOrderId);
+        }
+    
+        referenceActivityDetail.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmQualityOrderId</Name>
+				<Source><![CDATA[
+    public InventQualityOrderId parmQualityOrderId(InventQualityOrderId _qualityOrderId = qualityOrderId)
+    {
+        qualityOrderId = _qualityOrderId;
+    
+        return qualityOrderId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendNotification</Name>
+				<Source><![CDATA[
+    private void sendNotification(VendAccount _vendAccount)
+    {
+        PIPInventFlexSamplingAlertHandler   alertHandler;
+        str                                 eventMessage;
+        str                                 subject;
+
+        currentState.refreshLastActivityDetailCreated();
+
+        alertHandler = PIPInventFlexSamplingAlertHandler::construct();
+    
+        eventMessage = strFmt("@PIP149",
+                DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getCompanyTimeZone()),
+                DateTimeUtil::getCompanyTimeZone(),
+                qualityOrderId,
+                activityTable.FlexibleSamplingPlanId,
+                activityDetailFromQualityOrder.Level,
+                currentState.testsFailed(),
+                currentState.nextPlanLine().Level,
+                currentState.nextPlanLine().ItemSamplingId,
+                currentState.nextPlanLine().TestGroupId,
+                activityTable.ReferenceType,
+                activityTable.AccountRelation,
+                activityTable.ItemId);
+    
+        if (_vendAccount)
+        {
+            eventMessage += "\n" + strFmt("@PIP505",_vendAccount,activityTable.ItemId);
+        }
+    
+        subject = strFmt("@PIP507",activityTable.FlexibleSamplingPlanId);
+    
+        alertHandler.parmSubject(subject);
+        alertHandler.parmMessage(eventMessage);
+        alertHandler.parmShowPopUp(true);
+        alertHandler.parmEventAlertedFor("@PIP506");
+        alertHandler.parmSendEmail(false);
+        alertHandler.parmAlertTableId(tableNum(PIPInventFlexSamplingActivityDetails));
+        alertHandler.parmAlertFieldId(fieldNum(PIPInventFlexSamplingActivityDetails, FailActionCode));
+        alertHandler.parmEventTypeTrigger(EventTypeTrigger::FieldChanged);
+        alertHandler.parmSecurityRoleName(currentPlanLine.flexibleSamplingPlan().SecurityRole);
+        alertHandler.parmMenuItemType(MenuItemType::Display);
+        alertHandler.parmMenuItemName(menuItemDisplayStr(PIPInventFlexSamplingTrackingListPage));
+        alertHandler.createUserList();
+        alertHandler.send();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateActivities</Name>
+				<Source><![CDATA[
+    public void updateActivities()
+    {
+        inventQualityOrderTable = InventQualityOrderTable::find(qualityOrderId);
+    
+        select forUpdate firstOnly activityDetailFromQualityOrder
+            where activityDetailFromQualityOrder.QualityOrder == qualityOrderId;
+    
+        if (!activityDetailFromQualityOrder)
+        {
+            return;
+        }
+    
+        activityTable = activityDetailFromQualityOrder.inventFlexSamplingActivityTable();
+    
+        ttsBegin;
+    
+        activityDetailFromQualityOrder.QualityOrder         = inventQualityOrderTable.QualityOrderId;
+        activityDetailFromQualityOrder.OrderStatus          = inventQualityOrderTable.OrderStatus;
+        activityDetailFromQualityOrder.ValidatedByWorker    = inventQualityOrderTable.ValidatedByWorker;
+        activityDetailFromQualityOrder.ValidatedDateTime    = inventQualityOrderTable.ValidatedDateTime;
+
+        activityDetailFromQualityOrder.update();
+    
+        currentState = PIPInventFlexSamplingCurrentState::newFromTable(activityTable);
+    
+        currentPlanLine = currentState.currentPlanLine();
+    
+        if (currentState.firstActivityDetail() && activityDetailFromQualityOrder.createdDateTime >= currentState.firstActivityDetail().createdDateTime)
+        {
+            if (inventQualityOrderTable.OrderStatus == InventTestOrderStatus::Pass)
+            {
+                this.checkPassAction();
+            }
+            else
+            {
+                this.checkFailAction();
+            }
+        }
+    
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    private static PIPInventFlexSamplingQualityValidate construct()
+    {
+        return new PIPInventFlexSamplingQualityValidate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromQualityOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Initializes a new instance of the <c>PIPInventFlexSamplingQualityValidate</c> class.
+    /// </summary>
+    /// <param name="_inventQualityOrderId">
+    ///     The quality order id of the quality order being validated.
+    /// </param>
+    /// <returns>
+    ///     A new instance of the <c>PIPInventFlexSamplingQualityValidate</c> class.
+    /// </returns>
+    public static PIPInventFlexSamplingQualityValidate newFromQualityOrder(InventQualityOrderId _inventQualityOrderId)
+    {
+        PIPInventFlexSamplingQualityValidate inventFlexSamplingQualityValidate = PIPInventFlexSamplingQualityValidate::construct();
+    
+        inventFlexSamplingQualityValidate.parmQualityOrderId(_inventQualityOrderId);
+    
+        return inventFlexSamplingQualityValidate;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

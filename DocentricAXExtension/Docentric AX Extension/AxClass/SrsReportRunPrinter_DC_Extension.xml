@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SrsReportRunPrinter_DC_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The class SrsReportRunPrinter_DC_Extension is an extension of the class SrsReportRunPrinter.
+/// </summary>
+[ExtensionOf(classStr(SrsReportRunPrinter))]
+final class SrsReportRunPrinter_DC_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>SrsReportRunPrinter_Pre_printReport_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// If the some of the printer restrictions (Report-restricted printers or User-allowed printers)
+    /// should also be applied to SSRS Printer print destination, then check here if the selected printer 
+    /// is restricted for the current report and/or is not allowed for the current user.
+    /// If so, throw an exception and prevent the report from printing.
+    /// </summary>
+    /// <param name = "_args">An instance of the XppPrePostArgs class</param>
+    /// <remarks>
+    /// CoC extension has been replaced with pre-event handler, so that method is not visible in the callstack of later SSRS pipeline execution.
+    /// If MS suport finds any custom code in the error callstack, they often refuse to help our customers (even for apparent errors in the standard).
+    /// </remarks>
+    [PreHandlerFor(classStr(SrsReportRunPrinter), methodStr(SrsReportRunPrinter, printReport))]
+    public static void SrsReportRunPrinter_Pre_printReport_DC(XppPrePostArgs _args)
+    {
+        SrsReportRunPrinter srsReportRunPrinter = _args.getThis();
+        SRSPrintDestinationSettings printSettings = srsReportRunPrinter.printSettings;
+        SrsReportDataContract reportContract = srsReportRunPrinter.reportContract;
+
+        if (printSettings.printMediumType() == SRSPrintMediumType::Printer)
+        {
+            boolean checkFailed = false;
+            str errorMessage;
+            DocRestrictPrinters restrictPrintersMode = DocPrinterManager::getRestrictPrintersMode();
+            DocUserPrinterMode userPrintersMode = DocPrinterManager::getUserPrintersMode();
+
+            if (restrictPrintersMode == DocRestrictPrinters::DocentricAndSSRS &&
+                userPrintersMode == DocUserPrinterMode::UserAllowedPrintersDocentricAndSSRS)
+            {
+                // Check if the printer is restricted for the current report and allowed for the current user.
+                if (!DocPrinterManager::isPrinterActiveAndAllowed(printSettings.printerName(), printSettings.printerName(), true, reportContract.parmReportName(), reportContract, curUserId()))
+                {
+                    errorMessage = "@DocentricAX4:CantPrintToPrinterDueToRestrictedAndUserPrintersSetup";
+                    checkFailed = true;
+                }
+            }
+            else if (restrictPrintersMode == DocRestrictPrinters::DocentricAndSSRS)
+            {
+                // Check if the printer is restricted for the current report..
+                if (!DocPrinterManager::isPrinterAllowedForReport(printSettings.printerName(), printSettings.printerName(), true, reportContract.parmReportName(), reportContract))
+                {
+                    errorMessage = "@DocentricAX3:CantPrintToPrinterDueToRestrictedPrintersSetup";
+                    checkFailed = true;
+                }
+            }
+            else if (userPrintersMode == DocUserPrinterMode::UserAllowedPrintersDocentricAndSSRS)
+            {
+                // Check if the printer is allowed for the current user.
+                if (!DocPrinterManager::isPrinterActiveAndAllowedForUser(curUserId(), printSettings.printerName(), printSettings.printerName(), true))
+                {
+                    errorMessage = "@DocentricAX4:CantPrintToPrinterDueToUserPrintersSetup";
+                    checkFailed = true;
+                }
+            }
+
+            if (checkFailed)
+            {
+                // Print the final error message.
+                DocGlobalHelper::handleError(errorMessage);
+
+                if (DocGlobalHelper::isRunningInBatch())
+                {
+                    Message::Add(MessageSeverity::Error, '*******'); // Dummy message which will be removed by SrsReportRunController.displayReportRunException().
+                }
+
+                throw Exception::Error;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SRSPrintDestinationSettingsDelegates_printReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Event handler for the SRSPrintDestinationSettingsDelegates.printReport delegate,
+    /// which is invoked from the SrsReportRunPrinter.printReport() method.
+    /// It runs the executing SSRS report with Docentric but only if the target print destination is a Docentric destination.
+    /// </summary>
+    /// <param name = "printer">An instance of the SrsReportRunPrinter class that contains the SRSReportExecutionInfo object.</param>
+    /// <param name = "dataContract">An instance of the SrsReportDataContract class that contains the info on the executing SSRS report.</param>
+    /// <param name = "paramArray">The parameters of the executing SSRS report.</param>
+    [SubscribesTo(classStr(SRSPrintDestinationSettingsDelegates), delegateStr(SRSPrintDestinationSettingsDelegates, printReport))]
+    public static void SRSPrintDestinationSettingsDelegates_printReport(
+        SrsReportRunPrinter printer,
+        SrsReportDataContract dataContract,
+        Microsoft.Dynamics.AX.Framework.Reporting.Shared.ReportingService.ParameterValue[] paramArray)
+    {
+        /****** TRACING ******/
+        if (DocTrace::isTraceCategoryEnabled(DocConstantDiagnostics::TraceSSRS))
+        {
+            DocTraceContextSsrs traceContext = DocTraceContextSsrs::construct(printer, dataContract);
+            DocTrace::info(DocConstantDiagnostics::TraceSSRS, DocConstantDiagnostics::TraceSsrsOnPrintReport, traceContext.getTraceMessage(), traceContext);
+        }
+
+        // Check if a Docentric print destination is selected. If so, run the report using Docentric.
+        if (dataContract != null && dataContract.parmPrintSettings() != null &&
+            DocSrsReportRunUtil::isDocentricPrintDestination(dataContract.parmPrintSettings().printMediumType()))
+        {
+            // Create PrintDestinationRunId, a new guid as a unique identifier given to each print destination run.
+            // This becomes a meaningful information when a report is printed to a Preconfigured print destination,
+            // which usually contains multiple print destinations.
+            dataContract.parmPrintSettings().parmSrsPrintReportSettings_DC().setPrintDestinationRunId();
+
+            /****** RUN REPORT WITH DOCENTRIC ******/
+            // We'll turn off data security because some report data sources require permissions
+            // which are in contradiction with their roles (e.g. Purchase order).
+            unchecked(Uncheck::TableSecurityPermission)
+            {
+                DocSrsReportRunUtil::runSrsDocentricReport(printer, dataContract);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

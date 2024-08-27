@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_Sys</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_Sys
+{
+    private SKS_EB_CommProcess gSKS_EB_CommProcess;
+    private container locFilesToSkip;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setSKS_EB_CommProcess</Name>
+				<Source><![CDATA[
+    public void setSKS_EB_CommProcess(SKS_EB_CommProcess _SKS_EB_CommProcess)
+    {
+        gSKS_EB_CommProcess = _SKS_EB_CommProcess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_EB_CommProcess</Name>
+				<Source><![CDATA[
+    public SKS_EB_CommProcess getSKS_EB_CommProcess()
+    {
+        return gSKS_EB_CommProcess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CCR_ProcessFolder</Name>
+				<Source><![CDATA[
+    public str CCR_ProcessFolder( str FolderName, str FileName, SKS_BF_BankIntType _SKS_BF_BankIntType, int registered = 1)
+    {
+        SKS_PP_Bank tempSKS_PP_Bank;
+        SKS_PP_Setup tempSKS_PP_Setup;
+        SKS_BR_FileFormat tempSKS_BR_FileFormat;
+        SKS_EB_FilePath temp_FolderName;
+        SKS_CCR_Matching localSKS_CCR_Matching;
+        SKS_CCR_ImportResult localSKS_CCR_ImportResult;
+        str infoResults;        // debugging/error results of the run.
+        ;
+
+        // must be using Advance Bank Req.
+        Select firstonly tempSKS_PP_Setup;
+
+        temp_FolderName = FolderName;
+        infoResults = "@SYS80257" + ' = ' + temp_FolderName + ' ' + "@SYS4047" + ' = ' + FileName;
+        tempSKS_PP_Bank = null;
+        Select firstonly tempSKS_PP_Bank
+            where tempSKS_PP_Bank.CCR_FormatID != '' && ((_SKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal && tempSKS_PP_Bank.CCR_Path == temp_FolderName)
+            || (_SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric && tempSKS_PP_Bank.CCR_BankFabricLocation == temp_FolderName));
+            //tempSKS_PP_Bank.CCR_Path == temp_FolderName
+                //&& tempSKS_PP_Bank.CCR_FormatID != '';
+
+        if (tempSKS_PP_Bank.RecId == 0)
+        {
+            infoResults += ' ' + "@SKS365" + ' ' +  "@SKS231" + ' ';
+            // must be using setup.
+            Select firstonly RecId from tempSKS_PP_Setup where tempSKS_PP_Setup.CCRPath == temp_FolderName;
+            if (tempSKS_PP_Setup.RecId)
+            {
+                Select CCR_FormatID from tempSKS_PP_Bank where tempSKS_PP_Bank.CCR_FromSetup == true;
+            }
+            else
+            {
+                infoResults += ' ' + "@SKS365" + ' ' +  "@SKS225" + ' ';
+            }
+        }
+
+        if (tempSKS_PP_Bank.RecId)
+        {
+            infoResults += ' ' +  "@SYS68887" + ' ' + "@SKS316" + ' = ' + tempSKS_PP_Bank.CCR_FormatID;
+
+            select firstonly tempSKS_BR_FileFormat where tempSKS_BR_FileFormat.FormatId == tempSKS_PP_Bank.CCR_FormatID
+                && tempSKS_BR_FileFormat.CCR_IsCCRFormat == NoYes::Yes; /// SKS_FDD_13903 - To make sure that its picking only CCR format
+            if (tempSKS_BR_FileFormat.RecId == 0)
+            {
+                // none found: fail.
+                infoResults = "@SKS296";
+            }
+            else
+            {
+                // Call read file process here.
+
+                localSKS_CCR_ImportResult = this.CCR_ImportFormat(tempSKS_BR_FileFormat,
+                                          _SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric ? System.IO.Path::Combine(FolderName, FileName) : FileName, 
+                                            _SKS_BF_BankIntType);
+                if(localSKS_CCR_ImportResult == null)
+                    return '';
+                
+                infoResults = localSKS_CCR_ImportResult.getInfoResult();
+                
+                localSKS_CCR_Matching = new SKS_CCR_Matching();
+                if(localSKS_CCR_ImportResult.getSKS_CCR_BankHeaderRecID() > 0)
+                {
+                    localSKS_CCR_Matching.matchIntermediate(localSKS_CCR_ImportResult.getSKS_CCR_BankHeaderRecID(), true);
+                    SKS_CCR_BankAcctStmt::ReconcileStatement(localSKS_CCR_ImportResult.getSKS_CCR_BankHeaderRecID());
+                    SKS_CCR_ReadFile::updateImportHitRate(localSKS_CCR_ImportResult.getSKS_CCR_BankHeaderRecID());// TFS 7335
+                }
+                else
+                    error("@SKS3045");
+            }
+        }
+        else
+        {
+            // none found: fail.
+            infoResults = "@SKS317";
+        }
+        return infoResults;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CCR_ImportFormat</Name>
+				<Source><![CDATA[
+    SKS_CCR_ImportResult CCR_ImportFormat(SKS_BR_FileFormat tempSKS_BR_FileFormat, str fileName,  SKS_BF_BankIntType _SKS_BF_BankIntType)
+    {
+        SKS_EB_FileHub locSKS_EB_FileHub = SKS_EB_FileHub::construct(_SKS_BF_BankIntType);
+        SKS_EB_FileHub locHDRSKS_EB_FileHub = SKS_EB_FileHub::construct(_SKS_BF_BankIntType);
+        //SKS_EB_FileHub locDTLSKS_EB_FileHub = SKS_EB_FileHub::construct(_SKS_BF_BankIntType);
+        SKS_CCR_ReadFileFixed readFixedFile;
+        SKS_CCR_ReadFileClassesBase locSKS_CCR_ReadFileClassesBase;
+        UtcDateTime fileDateTime;
+        SKS_CCR_ImportResult localSKS_CCR_ImportResult;
+        str infoResults;
+        SKS_CCR_BankHeaderRecID localSKS_CCR_BankHeaderRecID;
+        SKS_PP_CommBRPreImportScriptPath locBRPreReadScript;
+        str locBRPreReadScriptParams;
+        SKS_PP_CommBRPostImportScriptPath locBRPostReadScript;
+        str locBRPostReadScriptParams;
+        SKS_CCR_ReadParseBase locSKS_CCR_ReadParseBase;
+        SKS_CCR_ReadFileClassesCustomActionsBase locSKS_CCR_ReadFileClassesCustomActionsBase;
+        int locMultiCashIndicatorLocation;
+        ListEnumerator locFilesToProcessEnum;
+        SKS_EB_FilePathName locSearchPattern;
+        str locHeaderPreCut;
+        str locHeaderPostCut;
+        
+        localSKS_CCR_ImportResult = new SKS_CCR_ImportResult();
+        if(conFind(locFilesToSkip, fileName) != 0)
+            return null;        //IF you don't have a commid, you can't have any pre/post arguments, so skip this section.
+        if(strLen(gSKS_EB_CommProcess.CommID) > 0)
+        {
+            //prep any pre-import script & script params
+            locBRPreReadScriptParams = SKS_EB_Send::getParams(gSKS_EB_CommProcess,System.IO.Path::GetFileName(fileName), System.IO.Path::GetDirectoryName(fileName), fileName, SKS_EB_ParamGroup::BRInboundPreParam);
+            locBRPreReadScript = gSKS_EB_CommProcess.BRPreImportScriptPath;
+            //prep any post-import script & script params
+            locBRPostReadScriptParams = SKS_EB_Send::getParams(gSKS_EB_CommProcess,System.IO.Path::GetFileName(fileName), System.IO.Path::GetDirectoryName(fileName), fileName, SKS_EB_ParamGroup::BRInboundPostParam);
+            locBRPostReadScript = gSKS_EB_CommProcess.BRPostImportScriptPath;
+        }
+
+        locSKS_EB_FileHub.runFileInquire(fileName);
+        fileDateTime = locSKS_EB_FileHub.attrFileModified();
+
+        switch (tempSKS_BR_FileFormat.CCR_FileType)
+        {
+            case SKS_CCR_FileType::FixedField:
+                readFixedFile = new SKS_CCR_ReadFileFixed();
+                readFixedFile.setSKS_BF_BankIntType(_SKS_BF_BankIntType);
+                readFixedFile.setPreReadScript(locBRPreReadScript);
+                readFixedFile.setPreReadScriptParams(locBRPreReadScriptParams);
+                readFixedFile.setPostReadScript(locBRPostReadScript);
+                readFixedFile.setPostReadScriptParams(locBRPostReadScriptParams);
+                readFixedFile.setFileName(fileName);
+                readFixedFile.setFileDateTime(fileDateTime);
+                readFixedFile.setFormatId(tempSKS_BR_FileFormat.formatId);
+                readFixedFile.setOmitHeaderRecsNbr(tempSKS_BR_FileFormat.OmitHeaderRecs);
+                readFixedFile.setOmitTrailerRecsNbr(tempSKS_BR_FileFormat.OmitTrailerRecs);
+                localSKS_CCR_BankHeaderRecID = readFixedFile.run();
+                infoResults = readFixedFile.getEventLogText();
+                break;
+            //ANY NEW FORMATS SHOULD FALL UNDER THIS SECTION.
+            //AX DEV DOCS
+            case SKS_CCR_FileType::Delimited:
+            case SKS_CCR_FileType::Teller:
+            case SKS_CCR_FileType::HeartlandFDF:
+            case SKS_CCR_FileType::Adyen:   //SKS_FDD_15121
+            case SKS_CCR_FileType::PayPal:  //SKS_FDD_15121
+                // // SKS_FDD_13903 Below scenarios are not valid for CCR
+                locSKS_CCR_ReadFileClassesBase = new SKS_CCR_ReadFileClassesBase();
+                // // SKS_FDD_13903 Below scenarios are not valid for CCR
+                switch (tempSKS_BR_FileFormat.CCR_FileType)
+                {
+                    case SKS_CCR_FileType::Delimited: //Delimited formats
+                        locSKS_CCR_ReadParseBase = new SysDictClass(className2Id('SKS_CCR_ReadParseDelimited')).makeObject();
+                        locSKS_CCR_ReadParseBase.setDelimiter(tempSKS_BR_FileFormat.FileFieldDelimiter);
+                        break;
+                    case SKS_CCR_FileType::Teller: //Delimited formats
+                        locSKS_CCR_ReadParseBase = new SysDictClass(className2Id('SKS_CCR_ReadParseTeller')).makeObject();
+                        locSKS_CCR_ReadParseBase.setDelimiter(',');//Teller should always be comma delimited.
+                        break;
+                    case SKS_CCR_FileType::HeartlandFDF: //Delimited formats
+                        locSKS_CCR_ReadParseBase = new SysDictClass(className2Id('SKS_CCR_ReadParseHeartlandFDF')).makeObject();
+                        break;
+                    case SKS_CCR_FileType::Adyen: //Delimited formats   //SKS_FDD_15121
+                        locSKS_CCR_ReadParseBase = new SysDictClass(className2Id('SKS_CCR_ReadParseAdyen')).makeObject();
+                        locSKS_CCR_ReadParseBase.setDelimiter(',');//Adyen should always be comma delimited.
+                        break;
+                    case SKS_CCR_FileType::PayPal: //Delimited formats   //SKS_FDD_15816
+                        locSKS_CCR_ReadParseBase = new SysDictClass(className2Id('SKS_CCR_ReadParsePayPal')).makeObject();
+                        locSKS_CCR_ReadParseBase.setDelimiter(',');//Adyen should always be comma delimited.
+                        break;
+                    default: //Custom_Type
+                        locSKS_CCR_ReadParseBase = new SysDictClass(className2Id(tempSKS_BR_FileFormat.CustomFormatClass)).makeObject();
+                }
+
+                locSKS_CCR_ReadParseBase.setPreReadScript(locBRPreReadScript);
+                locSKS_CCR_ReadParseBase.setPreReadScriptParams(locBRPreReadScriptParams);
+                locSKS_CCR_ReadParseBase.setPostReadScript(locBRPostReadScript);
+                locSKS_CCR_ReadParseBase.setPostReadScriptParams(locBRPostReadScriptParams);
+                locSKS_CCR_ReadFileClassesBase.setSKS_BF_BankIntType(_SKS_BF_BankIntType);
+                locSKS_CCR_ReadFileClassesBase.setParseRule(locSKS_CCR_ReadParseBase);
+                locSKS_CCR_ReadFileClassesBase.setFileName(fileName);
+                locSKS_CCR_ReadFileClassesBase.setFileDateTime(fileDateTime); // internal data will override this
+                locSKS_CCR_ReadFileClassesBase.setFormatId(tempSKS_BR_FileFormat.formatId);
+                localSKS_CCR_BankHeaderRecID = locSKS_CCR_ReadFileClassesBase.run();
+                infoResults = locSKS_CCR_ReadFileClassesBase.getEventLogText();
+              break;
+        }
+
+        localSKS_CCR_ImportResult.setInfoResult(infoResults);
+        localSKS_CCR_ImportResult.setSKS_CCR_BankHeaderRecID(localSKS_CCR_BankHeaderRecID);
+        return localSKS_CCR_ImportResult;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,475 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_ReverseReconcile</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class handles the reversal of reconciliation
+/// </summary>
+/// SKS_FDD_13903 - This class has been duplicated from SKS_BRR_ReverseReconcile
+///  CR-9689
+class SKS_CCR_ReverseReconcile
+{
+    BankAccountStatement bankAccountStatement;
+    LedgerJournalTable ledgerJournalTable;
+    LedgerJournalEngine     ledgerJournalEngine;
+    TransDate reversalDate;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args _args)
+    {
+        SKS_CCR_ReverseReconcile reverseReconcile = SKS_CCR_ReverseReconcile::construct();
+
+        if(_args.record().TableId == tableNum(BankAccountStatement))
+        {
+            reverseReconcile.parmBankAccountStatement(_args.record());
+            reverseReconcile.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CCR_ReverseReconcile construct()
+    {
+        return new SKS_CCR_ReverseReconcile();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        changecompany(bankAccountStatement.DataAreaId)
+        {
+            // SKS_FDD_13903 -->
+            // Check whether currency adjustment needs to be reversed for this statement
+            //if(SKS_CCR_ReverseCurrencyAdjustment::reverseCurrencyAdjustmentIsRequired(bankAccountStatement))
+            /*{
+                Args args = new Args();
+                args.record(bankAccountStatement);
+                SKS_CCR_ReverseCurrencyAdjustment::main(args);
+            }*/
+            // SKS_FDD_13903 <--
+            if(!this.transExist())
+            {
+                this.reverseReconcile();
+            }
+            else
+            {
+                if(this.validateReconciledStatementTransAvail())
+                {
+                    reversalDate = SKS_CCR_ReverseReconcile::getRevereReconcileDate(bankAccountStatement.AccountStatementDate);
+                    ttsbegin;
+                    this.createReversalForCorrect();
+                    this.postReversalJournal();
+                    this.reverseReconcile();
+                    ttscommit;
+                }
+                // SKS_FDD_13903 The below code has been commented since it is not used in CCR
+                //Note: It has to reverse the reconcile alwasy(if it was reconciled from reconcile statement button(Process credit card statment form) or while importing)
+                /*else
+                {
+                    throw error("@SKS:SKGValidateReverseReconcile");
+                }*/
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateReconciledStatementTransAvail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public boolean validateReconciledStatementTransAvail()
+    {
+        BankAccountTrans bankAccountTrans;
+
+        select firstonly RecId from bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::Yes;
+                // && bankAccountTrans.SKS_CCR_MarkedFromReconcileStatement == NoYes::Yes; // SKS_FDD_13903 This code has been commented since it is not used in CCR
+
+        return bankAccountTrans.RecId != 0 ? true: false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRevereReconcileDate</Name>
+				<Source><![CDATA[
+    private static TransDate getRevereReconcileDate(TransDate _origDate)
+    {
+        TransDate reversalDate;
+        RefRecId fiscalCalendarRecId = Ledger::fiscalCalendar(CompanyInfo::find().RecId);
+
+        Dialog dialog = new Dialog("@SKS:SKGReverseReconcile");
+        DialogField dialogField = dialog.addField(extendedTypeStr(TransDate), "@SYS4082848");
+        dialogField.value(_origDate);
+        dialog.defaultButton(DialogDefaultButton::Cancel);
+        dialog.dialogForm().buildDesign().control('OkButton').text("@SYS22850");
+
+        if (dialog.run())
+        {
+            if(LedgerFiscalCalendar::checkDateIsValid(fiscalCalendarRecId, dialogField.value(), FiscalPeriodType::Operating, false))
+            {
+                reversalDate = dialogField.value();
+            }
+            else
+            {
+                throw error(strFmt("@SYS18414", dialogField.value()));
+            }
+        }
+        else
+        {
+            throw Exception::Break;
+        }
+
+        return reversalDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBankAccountStatement</Name>
+				<Source><![CDATA[
+    public BankAccountStatement parmBankAccountStatement(BankAccountStatement _bankAccountStatement = bankAccountStatement)
+    {
+        bankAccountStatement = _bankAccountStatement;
+
+        return bankAccountStatement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transExist</Name>
+				<Source><![CDATA[
+    public boolean transExist()
+    {
+        BankAccountTrans locBankAccountTrans;
+        boolean locRtnVal = false;
+
+        select firstonly recid from locBankAccountTrans
+            where locBankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && locBankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && locBankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum;
+
+        if(locBankAccountTrans)
+        {
+            locRtnVal = true;
+        }
+        return locRtnVal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseReconcile</Name>
+				<Source><![CDATA[
+    public void reverseReconcile()
+    {
+        BankAccountTrans bankAccountTrans;
+        bankAccountTrans.skipDataMethods(true);
+
+        ttsbegin;
+
+        update_recordset bankAccountTrans
+            setting Reconciled = NoYes::No
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::Yes;
+                //&& bankAccountTrans.SKS_CCR_MarkedFromReconcileStatement == NoYes::Yes;// SKS_FDD_13903 This code has been commented since it is not used in CCR
+
+        if(bankAccountStatement)
+        {
+            bankAccountStatement.selectForUpdate(true);
+            bankAccountStatement.ReconcileDate = dateNull();
+            bankAccountStatement.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postReversalJournal</Name>
+				<Source><![CDATA[
+    private void postReversalJournal()
+    {
+        if(ledgerJournalTable)
+        {
+            LedgerJournalCheckPost ledgerJournalCheckPost  = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable, NoYes::Yes);
+            ledgerJournalCheckPost.run();
+            ledgerJournalTable.reread();
+            if(ledgerJournalTable.Posted)
+            {
+                info(strFmt("@SKS:SKGReverseJournalPostInfo",ledgerJournalTable.JournalNum));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerTrans</Name>
+				<Source><![CDATA[
+    private void createLedgerTrans(
+        BankAccountTrans _bankAccountTrans)
+    {
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        GeneralJournalEntry generalJournalEntry;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+        LedgerJournalTrans      journaltrans, journaltransAdjustment;
+        LedgerJournalTrans      journaltransPosted;
+        SKS_PP_Setup            sks_PP_Setup = SKS_PP_Setup::find();
+        Voucher                 nextVoucher;
+        NumberSeq               numSeq;
+        NumberSequenceTable     numberSequenceTable;
+        GeneralJournalEntryJournalNumber prevJournalNumber;
+        LedgerJournalName ledgerJournalName = LedgerJournalName::find(sks_PP_Setup.CCR_ReverseReconcilJournalName);
+        DimensionDynamicAccount bankLedgerDimension;
+
+        select firstonly LedgerDimension, GeneralJournalEntry from generalJournalAccountEntry
+            where generalJournalAccountEntry.PostingType == LedgerPostingType::Bank
+                join generalJournalEntry order by JournalNumber
+                    where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry
+                       && generalJournalEntry.Ledger == Ledger::current()
+                       && generalJournalEntry.JournalCategory == LedgerTransType::Payment
+                join subledgerVoucherGeneralJournalEntry
+            where subledgerVoucherGeneralJournalEntry.GeneralJournalEntry == generalJournalEntry.RecId
+               && subledgerVoucherGeneralJournalEntry.Voucher == _bankAccountTrans.Voucher
+               && subledgerVoucherGeneralJournalEntry.AccountingDate == _bankAccountTrans.TransDate
+               && subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == _bankAccountTrans.DataAreaId;
+
+        bankLedgerDimension = generalJournalAccountEntry.LedgerDimension;
+
+        while select  * from generalJournalAccountEntry
+            where generalJournalAccountEntry.PostingType == LedgerPostingType::Bank
+                join generalJournalEntry order by JournalNumber
+                    where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry
+                       && generalJournalEntry.Ledger == Ledger::current()
+            // Added LedgerTransType::GeneralJournal to include the adjusment entry, since Adjustment JournalCategory is always  LedgerTransType::GeneralJournal
+            && (generalJournalEntry.JournalCategory == LedgerTransType::Bank || generalJournalEntry.JournalCategory == LedgerTransType::GeneralJournal)
+                join subledgerVoucherGeneralJournalEntry
+            where subledgerVoucherGeneralJournalEntry.GeneralJournalEntry == generalJournalEntry.RecId
+               && subledgerVoucherGeneralJournalEntry.Voucher == _bankAccountTrans.Voucher
+               && subledgerVoucherGeneralJournalEntry.AccountingDate == _bankAccountTrans.TransDate
+               && subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == _bankAccountTrans.DataAreaId
+        {
+            select firstonly RecId from journaltransPosted where journaltransPosted.SKS_CCR_ReconciliationReversalRefRecId == generalJournalAccountEntry.RecId;
+            if(!journaltransPosted.RecId)
+            {
+                if(!sks_PP_Setup.CCR_ReverseReconcilJournalName)
+                {
+                    throw error("@SKS:SKGJournalNameEmptyVal");
+                }
+
+                if(!ledgerJournalTable)
+                {
+                    ledgerJournalTable = this.createJournalHeader(sks_PP_Setup.CCR_ReverseReconcilJournalName);
+                }
+
+                if(prevJournalNumber == '' || prevJournalNumber != generalJournalEntry.JournalNumber)
+                {
+                    select firstonly NumberSequence, NumberSequenceScope from numberSequenceTable
+                                where numberSequenceTable.RecId == ledgerJournalName.NumberSequenceTable;
+                    ttsbegin; // SKS_Bug_10429
+                    NumberSeqScope locNumberSeqScope = NumberSeqScope::find(numberSequenceTable.NumberSequenceScope);
+                    numSeq = numberseq::newGetNumFromCode(numberSequenceTable.NumberSequence, locNumberSeqScope);
+                    nextVoucher = numSeq.num();
+                    ttscommit; // SKS_Bug_10429
+                }
+
+                journaltrans.clear();
+                journaltrans.initValue();
+                journaltrans.JournalNum = ledgerJournalTable.JournalNum;
+                if(reversalDate == dateNull()) //Reversal date should be set from dialog. If not, set to today's date
+                {
+                    reversalDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                }
+                journaltrans.TransDate = reversalDate;
+
+                if(bankLedgerDimension == generalJournalAccountEntry.LedgerDimension)
+                {
+                    journaltrans.AccountType = LedgerJournalACType::Bank;
+                    journaltrans.LedgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_bankAccountTrans.AccountId, LedgerJournalACType::Bank);
+                    journaltrans.DefaultDimension = _bankAccountTrans.DefaultDimension;
+                }
+                else
+                {
+                    journaltrans.AccountType = LedgerJournalACType::Ledger;
+                    journaltrans.LedgerDimension = generalJournalAccountEntry.LedgerDimension;
+                }
+                // populate the Ledger and Offset dimension values from Currency Adjustment journal
+                if(_bankAccountTrans.SKS_CCR_IsCurrencyAdjustment == NoYes::Yes && _bankAccountTrans.SKS_CCR_IsPartOfReversal == NoYes::Yes)
+                {
+                    journaltransAdjustment  = LedgerJournalTrans::findRecId(_bankAccountTrans.SourceRecId, false);
+                    journaltrans.AccountType = journaltransAdjustment.AccountType;
+                    journaltrans.LedgerDimension = journaltransAdjustment.LedgerDimension;
+                    journaltrans.DefaultDimension = journaltransAdjustment.DefaultDimension;
+                    journaltrans.OffsetAccountType = journaltransAdjustment.OffsetAccountType;
+                    journaltrans.OffsetLedgerDimension = journaltransAdjustment.OffsetLedgerDimension;
+                }
+                ledgerJournalEngine.accountModified(journaltrans);
+                ledgerJournalEngine.initTaxItemGroup(journaltrans);
+                journaltrans.Voucher = nextVoucher;
+                journaltrans.PaymentStatus = CustVendPaymStatus::None;
+                journaltrans.PaymSpec = '';
+                journaltrans.PaymReference = '';
+                journaltrans.BankTransType = _bankAccountTrans.BankTransType;
+                if(generalJournalAccountEntry.TransactionCurrencyAmount > 0)
+                {
+                    journaltrans.AmountCurDebit = 0;
+                    journaltrans.AmountCurCredit = abs(generalJournalAccountEntry.TransactionCurrencyAmount);
+                }
+                else
+                {
+                    journaltrans.AmountCurCredit = 0;
+                    journaltrans.AmountCurDebit = abs(generalJournalAccountEntry.TransactionCurrencyAmount);
+                }
+                journaltrans.CashDiscAmount = 0;
+                journaltrans.CurrencyCode = generalJournalAccountEntry.TransactionCurrencyCode;
+                LedgerJournalTrans  LJT =  LedgerJournalTrans::findRecId(_bankAccountTrans.SourceRecId, false);
+                journaltrans.ExchRate = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(journaltrans.Company).RecId), journaltrans.CurrencyCode, journaltrans.TransDate).getExchangeRate1();
+                //81 added new reporting currency fields. The below method check will ensure those fields exist on the version before attempting to populate them
+                SysDictClass sysDictClass = new SysDictClass(className2Id(classStr(LedgerJournalEngine_Server)));
+                if (sysDictClass && sysDictClass.hasStaticMethod('reportingCurrencyModified'))
+                {
+                    journaltrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate'))  = LJT.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate'));
+                    journaltrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary'))  = LJT.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary'));
+                }
+                journaltrans.CashDiscCode = '';
+                journaltrans.TransactionType = LedgerTransType::GeneralJournal;
+                journaltrans.Approved     = NoYes::Yes;
+
+                if(_bankAccountTrans.SKS_CCR_IsCurrencyAdjustment == NoYes::Yes && _bankAccountTrans.SKS_CCR_IsPartOfReversal == NoYes::Yes)
+                {
+                    journaltrans.Txt  = strFmt("@SKS:SKGCCRReversalCurrencyAdjstmt", generalJournalAccountEntry.TransactionCurrencyCode);
+                }
+                else
+                {
+                    journaltrans.Txt  = strFmt("@SKS:SKGCCRReversalCCStmt", _bankAccountTrans.AccountStatement);
+                }
+                journaltrans.SKS_CCR_ReconciliationReversalRefRecId = generalJournalAccountEntry.RecId;
+
+                if(journaltrans.validateWrite())
+                {
+                    journaltrans.insert();
+
+                    if(_bankAccountTrans.SKS_CCR_IsCurrencyAdjustment == NoYes::Yes && _bankAccountTrans.SKS_CCR_IsPartOfReversal == NoYes::Yes)
+                    {
+                        SKS_CCR_BankTran locSKS_CCR_BankTran;
+                        BankAccountTrans bankAccountTransUpdate = null;
+
+                        ttsbegin;
+
+                        select forupdate bankAccountTransUpdate
+                            where bankAccountTransUpdate.RecId == _bankAccountTrans.RecId;
+                        // Updating the Adjsutment _bankAccountTrans.SKS_CCR_IsPartOfReversal = no to execulde this for next iterations
+                        bankAccountTransUpdate.SKS_CCR_IsPartOfReversal = NoYes::No;
+                        bankAccountTransUpdate.doUpdate();
+                       
+                        update_recordset locSKS_CCR_BankTran
+                            setting ReverseCurrencyAdjusmentLedgerJournalRecId = journaltrans.RecId
+                                where locSKS_CCR_BankTran.AccountId == _bankAccountTrans.AccountId &&
+                                locSKS_CCR_BankTran.AccountStatementDate == _bankAccountTrans.AccountStatementDate &&
+                                locSKS_CCR_BankTran.AccountStatementNum == _bankAccountTrans.AccountStatement &&
+                                locSKS_CCR_BankTran.CurrencyAdjusmentLedgerJournalRecId ==  journaltransAdjustment.RecId &&
+                                locSKS_CCR_BankTran.MatchIndicator == SKS_BR_MatchIndicator::Green &&
+                                locSKS_CCR_BankTran.Matched == NoYes::Yes;
+
+                        ttscommit;
+                    }
+                }
+                prevJournalNumber = generalJournalEntry.JournalNumber;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalHeader</Name>
+				<Source><![CDATA[
+    public LedgerJournalTable createJournalHeader(LedgerJournalNameId _reverseJournalName)
+    {
+        LedgerJournalTable  journalheader;
+
+        journalheader.clear();
+        journalheader.JournalName = _reverseJournalName;
+        journalheader.initFromLedgerJournalName(journalheader.JournalName);
+        journalheader.insert();
+
+        ledgerJournalEngine = LedgerJournalEngine_Daily::construct();
+        ledgerJournalEngine.ledgerJournalTable(journalheader);
+        ledgerJournalEngine.newJournalActive(journalheader);
+
+
+        return journalheader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createReversalForCorrect</Name>
+				<Source><![CDATA[
+    private void createReversalForCorrect()
+    {
+        BankAccountTrans bankAccountTrans;
+        Counter progressTotal;
+        #define.CheckMainAccountBlocked(true)
+
+        select count(RecId) from bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::Yes
+                && (bankAccountTrans.AmountCorrect || bankAccountTrans.Manual || (bankAccountTrans.SKS_CCR_IsCurrencyAdjustment && bankAccountTrans.SKS_CCR_IsPartOfReversal == NoYes::Yes));
+
+        progressTotal = any2int(bankAccountTrans.RecId);
+
+        if (progressTotal)
+        {
+            while select bankAccountTrans
+                where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                    && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                    && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                    && bankAccountTrans.Included == NoYes::Yes
+                    && bankAccountTrans.Reconciled == NoYes::Yes
+                    && (bankAccountTrans.AmountCorrect || bankAccountTrans.Manual || (bankAccountTrans.SKS_CCR_IsCurrencyAdjustment && bankAccountTrans.SKS_CCR_IsPartOfReversal == NoYes::Yes))
+            {
+                if (!bankAccountTrans.BankTransType
+                    && !bankAccountTrans.LedgerDimension)
+                {
+                    throw error("@SYS76193");
+                }
+
+                this.createLedgerTrans(bankAccountTrans);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

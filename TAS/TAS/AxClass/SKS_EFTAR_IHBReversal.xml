@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFTAR_IHBReversal</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EFTAR_IHBReversal
+{
+    LedgerJournalId         ledgerJournalId;
+    MapIterator             miIHBJournals;
+    int                     countRecId;
+    boolean                 isCallFromIHBInterCompRev;
+    Map                     insertIHBJournals = new Map(Types::String, Types::Record);
+    container               conInHouseVoucher;
+    ListEnumerator          listEnumInHouseVoucher;
+    container               peekInHouseVoucher;
+    List listInHouseVoucher = new List(Types::Container);
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void  run()
+    {
+        LedgerJournalTrans      ledgerJourTransLoc;
+        LedgerJournalTrans      ledgerJournalTransReversed;
+        LedgerJournalTrans      ledgerJournalTransIntercompany;
+        LedgerJournalTable      ledgerJournalTableReversal;
+        SKS_BR_BankTran         sKS_BR_BankTran;
+        boolean                 isIHBModuleActive = SKS_PP_Setup::find().IHB_Active;
+
+        if(countRecId > 0)
+        {
+            while select SKS_BR_BankTranRecId,Voucher from ledgerJourTransLoc
+                    group by SKS_BR_BankTranRecId,Voucher
+                where ledgerJourTransLoc.JournalNum == ledgerJournalId
+            {
+                select crosscompany RevVoucher, OrigBankVoucher, RecId
+                    from sKS_BR_BankTran
+                        where (sKS_BR_BankTran.RecId == ledgerJourTransLoc.SKS_BR_BankTranRecId
+                            && sKS_BR_BankTran.RevVoucher == ledgerJourTransLoc.Voucher);
+                if(sKS_BR_BankTran)
+                {
+                    SKS_EFT_Reversal::markBankAccountTrans(ledgerJourTransLoc.SKS_BR_BankTranRecId, ledgerJourTransLoc.Voucher);
+                    if(isIHBModuleActive)
+                    {
+                        this.reverseIHBPostedBankTrans(sKS_BR_BankTran);
+                    }
+                }
+            }
+        }
+        else
+        {
+            if(isIHBModuleActive)
+            {
+                while select ledgerJourTransLoc
+                    where ledgerJourTransLoc.JournalNum == ledgerJournalId
+                {
+                    select DataAreaId, Voucher, JournalNum, SKS_EFTAR_IHBBankAccount, SKS_EFTGL_IHBBankAccount, SKS_IHB_InterComp, RecId
+                        from ledgerJournalTransReversed
+                            where ledgerJournalTransReversed.RecId == ledgerJourTransLoc.SKS_EFTAR_RevOrigRecId;
+                    if(ledgerJournalTransReversed.SKS_EFTAR_IHBBankAccount || ledgerJournalTransReversed.SKS_EFTGL_IHBBankAccount
+                        || ledgerJournalTransReversed.SKS_IHB_InterComp)
+                    {
+                        if(ledgerJourTransLoc.Company !=  curExt() && ledgerJourTransLoc.RecId)
+                        {
+                            changeCompany(ledgerJourTransLoc.Company)
+                            {
+                                LedgerJournalTrans  localLedgerjournaltrans;
+                                select Voucher, DataAreaId, JournalNum, TransDate from localLedgerjournaltrans
+                                    where localLedgerjournaltrans.ForeignVoucher == ledgerJourTransLoc.Voucher
+                                        && localLedgerJournalTrans.ForeignCompany == ledgerJourTransLoc.DataAreaId
+                                        && localLedgerjournaltrans.Invoice == ledgerJourTransLoc.Invoice
+                                        && localLedgerjournaltrans.AmountCurCredit == ledgerJourTransLoc.AmountCurCredit
+                                        && localLedgerjournaltrans.AmountCurDebit == ledgerJourTransLoc.AmountCurDebit
+                                        && localLedgerjournaltrans.TransDate == ledgerJourTransLoc.TransDate
+                                        && localLedgerjournaltrans.LedgerDimension == ledgerJourTransLoc.LedgerDimension;
+                                ledgerJournalTransIntercompany = localLedgerjournaltrans;
+                            }
+                        }
+                        if(ledgerJournalTransReversed.RecId)
+                        {
+                            this.createIHBReversalJournal(ledgerJournalTransReversed.Voucher, ledgerJourTransLoc, ledgerJournalTransIntercompany);
+                        }
+                    }
+                }
+            }
+        }
+        miIHBJournals = new MapIterator(insertIHBJournals);
+
+        while (miIHBJournals.more())
+        {
+            ledgerJournalTableReversal = miIHBJournals.value();
+            changecompany(miIHBJournals.key())
+            {
+                SKS_EFTAR_PaymJourCreate::AutoPostJournal(ledgerJournalTableReversal);
+            }
+            miIHBJournals.next();
+        }
+        // Update the IHB voucher details in voucher form.
+        listEnumInHouseVoucher = listInHouseVoucher.getEnumerator();
+
+        while(listEnumInHouseVoucher.moveNext())
+        {
+            peekInHouseVoucher = listEnumInHouseVoucher.current();
+            SKS_EFTAR_PaymJourCreate::updateVoucherLinkForPostedIHBTrans(conPeek(peekInHouseVoucher,1), conPeek(peekInHouseVoucher,2), conPeek(peekInHouseVoucher,3), conPeek(peekInHouseVoucher,4));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setledgerJournalId</Name>
+				<Source><![CDATA[
+    void setledgerJournalId(LedgerJournalId _ledgerJournalId)
+    {
+        ledgerJournalId = _ledgerJournalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLedgeralTransCount</Name>
+				<Source><![CDATA[
+    void setLedgeralTransCount(int _countRecId)
+    {
+        countRecId = _countRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCallFromIHBInterCompRev</Name>
+				<Source><![CDATA[
+    //changes done for bug 10556
+    boolean isCallFromIHBInterCompRev(boolean _isCallFromIHBInterCompRev)
+    {
+        isCallFromIHBInterCompRev = _isCallFromIHBInterCompRev;
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createIHBReversalJournal</Name>
+				<Source><![CDATA[
+    public void createIHBReversalJournal(Voucher  _voucher,
+        LedgerJournalTrans _ledgerJournalTransReversed = null,
+        LedgerJournalTrans _ledgerJournalTransIntercompany = null)
+    {
+        GeneralJournalEntry     generalJournalEntry;
+        LedgerJournalNameId     journalName;
+        NumberSeq               numSeq;
+        NumberSeqScope          locNumberSeqScope;
+        Voucher                 nextRec;
+        LedgerJournalName       ledgerJournalName;
+        LedgerEntryJournal      ledgerEntryJournal;
+        CustVendTrans           custVendTrans;
+        TransDate               reversalDate;
+
+        while select LedgerEntryJournal, SubledgerVoucherDataAreaId, SubledgerVoucher from generalJournalEntry
+            where generalJournalEntry.SKS_EFTAR_OrigPaymVouch == _voucher
+                && generalJournalEntry.SKS_EFTAR_OrigPaymVouch != generalJournalEntry.SubledgerVoucher
+                && generalJournalEntry.JournalCategory
+        {
+            select JournalNumber from ledgerEntryJournal
+                where ledgerEntryJournal.RecId == generalJournalEntry.LedgerEntryJournal;
+            if(ledgerEntryJournal.JournalNumber && generalJournalEntry.SubledgerVoucherDataAreaId && generalJournalEntry.RecId)
+            {
+                changecompany(generalJournalEntry.SubledgerVoucherDataAreaId)
+                {
+                    LedgerJournalTable      ledgerJourTable;
+                    LedgerJournalTrans      ledgerJourTrans;
+                    NumberSequenceTable     numberSequenceTable;
+                    LedgerDimensionAccount  ledgerDimension; // SKS_Bug_10597
+                    if(insertIHBJournals.exists(generalJournalEntry.SubledgerVoucherDataAreaId))
+                    {
+                        ledgerJourTable = insertIHBJournals.lookup(generalJournalEntry.SubledgerVoucherDataAreaId);
+                    }
+                    journalName = SKS_EFTAR_PaymJourCreate::findInHouseBankJournal();
+                    ledgerJournalName = LedgerJournalName::find(journalName);
+                    select NumberSequence, NumberSequenceScope from numberSequenceTable
+                        where numberSequenceTable.RecId == ledgerJournalName.NumberSequenceTable;
+                    ttsbegin;
+                    locNumberSeqScope = NumberSeqScope::find(numberSequenceTable.NumberSequenceScope);
+                    numSeq  = numberseq::newGetNumFromCode(numberSequenceTable.NumberSequence, locNumberSeqScope);
+                    nextRec = numSeq.num();
+                    ttscommit;
+                    if(journalName)
+                    {
+                        reversalDate = ClassFactory.globalCache().get(curUserId(), 'reversalDate', null);
+
+                        if(!reversalDate)
+                        {
+                            if(_ledgerJournalTransReversed.TransDate != dateNull())
+                            {
+                                reversalDate = SKS_PP_Sys::getReversalDate(_ledgerJournalTransReversed.TransDate, true);
+                            }
+                            else
+                            {
+                                select maxof(TransDate) from ledgerJourTrans
+                                where ledgerJourTrans.JournalNum == ledgerEntryJournal.JournalNumber
+                                    && ledgerJourTrans.Voucher == generalJournalEntry.SubledgerVoucher;
+
+                                reversalDate = SKS_PP_Sys::getReversalDate(ledgerJourTrans.TransDate, true);
+                            }
+                        }
+
+                        while select ledgerJourTrans
+                            where ledgerJourTrans.JournalNum == ledgerEntryJournal.JournalNumber
+                                && ledgerJourTrans.Voucher == generalJournalEntry.SubledgerVoucher
+                        {
+                            if(ledgerJourTrans.AccountType == LedgerJournalACType::Cust)
+                            {
+                                ledgerJourTable = SKS_EFT_Reversal::createCustVendBankReversal(ledgerJourTable, ledgerJourTrans, null, reversalDate, null, nextRec, journalName, null, true);
+                            }
+                            else
+                            {
+                                // SKS_Bug_10597 -->
+                                if(ledgerJourTrans.AccountType == LedgerJournalACType::Ledger)
+                                {
+                                    if(_ledgerJournalTransReversed.DataAreaId == generalJournalEntry.SubledgerVoucherDataAreaId)
+                                    {
+                                        ledgerDimension = this.findInterCompanyLedgerDimension(_ledgerJournalTransReversed);
+                                    }
+                                    if(_ledgerJournalTransIntercompany.DataAreaId == generalJournalEntry.SubledgerVoucherDataAreaId)
+                                    {
+                                        ledgerDimension = this.findInterCompanyLedgerDimension(_ledgerJournalTransIntercompany);
+                                    }
+                                    ledgerJourTable = SKS_EFT_Reversal::CreatePaymJournal(custVendTrans, ledgerJourTrans, '', reversalDate, journalName, ledgerJourTable, nextRec, true, ledgerDimension);
+                                }
+                                else
+                                {
+                                    // SKS_Bug_10597 <--
+                                    ledgerJourTable = SKS_EFT_Reversal::CreatePaymJournal(custVendTrans, ledgerJourTrans, '', reversalDate, journalName, ledgerJourTable, nextRec, true);
+                                }
+                                // SKS_Bug_10597
+                            }
+                        }
+                        if(!insertIHBJournals.exists(ledgerJourTable.DataAreaId))
+                        {
+                            insertIHBJournals.insert(ledgerJourTable.DataAreaId, ledgerJourTable);
+                        }
+                        // Insert the reversed IHB Bank voucher details.
+                        conInHouseVoucher = [nextRec, _ledgerJournalTransReversed.Voucher, ledgerJourTable.DataAreaId, ledgerJourTable.JournalNum];
+                        listInHouseVoucher.addEnd(conInHouseVoucher);
+                        ledgerJourTable = null;
+                    }
+                }
+            }
+        }
+        if(_ledgerJournalTransReversed)
+        {
+            // Insert the reversed vendor payment voucher details.
+            conInHouseVoucher = [_ledgerJournalTransReversed.Voucher, _ledgerJournalTransReversed.Voucher, _ledgerJournalTransReversed.DataAreaId, _ledgerJournalTransReversed.JournalNum];
+            listInHouseVoucher.addEnd(conInHouseVoucher);
+        }
+        if(_ledgerJournalTransIntercompany)
+        {
+            // Insert the standard intercompany reversed vendor voucher details.
+            conInHouseVoucher = [_ledgerJournalTransIntercompany.Voucher, _ledgerJournalTransReversed.Voucher, _ledgerJournalTransIntercompany.DataAreaId, _ledgerJournalTransIntercompany.JournalNum];
+            listInHouseVoucher.addEnd(conInHouseVoucher);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseIHBPostedBankTrans</Name>
+				<Source><![CDATA[
+    public void reverseIHBPostedBankTrans(SKS_BR_BankTran _sKS_BR_BankTran)
+    {
+        LedgerJournalTrans      ledgerJournalTrans;
+        LedgerJournalTrans      ledgerJournalTransReversed;
+
+        select Voucher from ledgerJournalTrans
+            where ledgerJournalTrans.SKS_BR_BankTranRecId == _sKS_BR_BankTran.RecId
+                && ledgerJournalTrans.Voucher == _sKS_BR_BankTran.OrigBankVoucher;
+
+        select Voucher, DataAreaId, JournalNum, TransDate from ledgerJournalTransReversed
+            where ledgerJournalTransReversed.SKS_BR_BankTranRecId == _sKS_BR_BankTran.RecId
+                && ledgerJournalTransReversed.Voucher == _sKS_BR_BankTran.RevVoucher;
+
+        this.createIHBReversalJournal(ledgerJournalTrans.Voucher, ledgerJournalTransReversed);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create IHB intercompany reversal.
+    /// </summary>
+    server static void main(Args args)
+    {
+        LedgerJournalTrans                  ledgerJournalTrans;
+        SKS_EFTAR_IHBReversal      sKS_EFTAR_IHBReversal = new SKS_EFTAR_IHBReversal();
+
+        if (Box::yesNo("@SKS:SKSYesNoReversalConfirm", DialogButton::Yes))
+        {
+            if(args.record().TableId == tableNum(LedgerJournalTrans))
+            {
+                ledgerJournalTrans = args.record() as LedgerJournalTrans;
+            }
+            sKS_EFTAR_IHBReversal.setledgerJournalId(ledgerJournalTrans.JournalNum);
+            sKS_EFTAR_IHBReversal.isCallFromIHBInterCompRev(true);
+            sKS_EFTAR_IHBReversal.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createIHBInterCompReversal</Name>
+				<Source><![CDATA[
+    //changes done for bug 10556
+    public LedgerJournalTable createIHBInterCompReversal(LedgerJournalTrans _ledgerJournalTrans, LedgerJournalTable _paymJournal)
+    {
+        LedgerJournalTrans      ledgerJournalTrans;
+        BankChequeTable         lBankChequeTable;
+        LedgerJournalTable      paymJournal;
+        LedgerJournalNameId     revJournalName;
+        Args                    argsBankChequeTable = new Args();
+        TransDate               reversalDate = ClassFactory.globalCache().get(curUserId(), 'reversalDate', null);
+
+        revJournalName = LedgerJournalTable::find(_ledgerJournalTrans.JournalNum).JournalName;
+        ledgerJournalTrans = _ledgerJournalTrans;
+        //while
+        //select ledgerJournalTrans
+        //where ledgerJournalTrans.JournalNum == _ledgerJournalTrans.JournalNum; //Bug 10556
+        //{
+        if(ledgerJournalTrans.SKS_IHB_InterComp)
+        {
+            if(ledgerJournalTrans.BankChequeNum != '')
+            {
+                select lBankChequeTable where lBankChequeTable.ChequeNum == ledgerJournalTrans.BankChequeNum
+                        && lBankChequeTable.AccountID == ledgerJournalTrans.BankAccountId;
+                argsBankChequeTable.record(lBankChequeTable);
+
+                BankChequeCancel::main(argsBankChequeTable);
+
+                info(strFmt("@SKS3042", lBankChequeTable.ChequeNum));
+            }
+            else
+            {
+                ttsBegin;
+
+                if (!reversalDate)
+                {
+                    reversalDate = SKS_PP_Sys::getReversalDate(ledgerJournalTrans.TransDate);
+                    ClassFactory.globalCache().set(curUserId(), 'reversalDate', reversalDate);
+                }
+
+                paymJournal = SKS_EFT_Reversal::createCustVendBankReversal(_paymJournal, ledgerJournalTrans, ledgerJournalTrans.PaymMode, reversalDate, null, null, revJournalName);
+                ttsCommit;
+            }
+        }
+        //}
+        //Bug 10556
+        //if(paymJournal)
+        //{
+        //    SKS_EFT_reversal::AutoPostJournal(true, paymJournal);
+        //}
+        return paymJournal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInterCompanyLedgerDimension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// To find intercompany ledger which is posted.
+    /// </summary>
+    /// <param name = "_ledgerJournalTrans"></param>
+    /// <returns>Return LedgerDimension.</returns>
+    // SKS_Bug_10597
+    private LedgerDimensionAccount findInterCompanyLedgerDimension(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        GeneralJournalAccountEntry              generalJournalAccountEntry;
+        SubledgerVoucherGeneralJournalEntry     subledgerVoucherLink;
+
+        select firstonly * from generalJournalAccountEntry
+                    where generalJournalAccountEntry.PostingType == LedgerPostingType::InterCompany
+            exists join subledgerVoucherLink
+                where subledgerVoucherLink.GeneralJournalEntry == generalJournalAccountEntry.GeneralJournalEntry
+                    && subledgerVoucherLink.AccountingDate == _ledgerJournalTrans.TransDate
+                    && subledgerVoucherLink.Voucher == _ledgerJournalTrans.Voucher;
+        return generalJournalAccountEntry.LedgerDimension;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

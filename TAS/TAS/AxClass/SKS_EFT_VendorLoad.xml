@@ -1,0 +1,678 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_VendorLoad</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EFT_VendorLoad
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreateEFTRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create EFT records
+    /// </summary>
+    /// <param name = "_VendTable"></param>
+    /// <param name = "setupEmail"></param>
+    [SuppressBPWarning("BPCheckParametersModified", "Parameter needs to be passed to other method")]
+    public static server void CreateEFTRecords(VendTable _VendTable, boolean setupEmail = false)
+    {
+        SKS_EFT_Setup local_SKS_EFT_Setup;
+        VendPaymModeTable local_VendPaymModeTable;
+        SKS_EFT_FileFormatPaymSpec local_SKS_EFT_FileFormatPaymSpec;
+        //boolean setupEmail = false;
+        ;
+
+        local_SKS_EFT_Setup = SKS_EFT_Setup::find();
+        if (local_SKS_EFT_Setup)  //Only create the records if EFT is setup
+        {
+            local_VendPaymModeTable = VendPaymModeTable::find(_VendTable.PaymMode);
+            if (local_VendPaymModeTable.SKS_EFT_PaymMode == NoYes::Yes)  //If method of payment is EFt+
+            {
+                if(local_SKS_EFT_Setup.APCreateVendeBankRecord && _VendTable.paymmode != '' && _VendTable.PaymSpec != '' && _VendTable.BankAccount != '')
+                {
+                    ttsBegin;
+                    select firstOnly FormatId, PaymSpec, EmailOff from local_SKS_EFT_FileFormatPaymSpec where
+                        local_SKS_EFT_FileFormatPaymSpec.FormatId == local_VendPaymModeTable.SKS_EFT_FormatId &&
+                        local_SKS_EFT_FileFormatPaymSpec.PaymSpec == _VendTable.PaymSpec &&
+                        local_SKS_EFT_FileFormatPaymSpec.EmailOff == NoYes::No;
+
+                    // If payment spec has e-mail On and setup has e-mail On
+                    if(!setupEmail)
+                    {
+                        if(local_SKS_EFT_FileFormatPaymSpec && local_SKS_EFT_Setup.ModAPEmail)
+                        {
+                            setupEmail = true;
+                        }
+                    }
+
+                    SKS_EFT_VendorLoad::CreateVendorRecord(_VendTable, local_SKS_EFT_Setup, true, true, setupEmail);
+                    SKS_EFT_VendorLoad::CreateVendorPaymRecord(_VendTable,local_SKS_EFT_Setup,_VendTable.PaymMode, _VendTable.PaymSpec, _VendTable.BankAccount);
+                    ttsCommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateVendorPaymRecord</Name>
+				<Source><![CDATA[
+    static server boolean CreateVendorPaymRecord(VendTable _VendTable, SKS_EFT_Setup _sks_eft_setup,PaymMode _paymMode,PaymSpec _paymSpec, VendBankAccountId _vendBankAccountId,
+    CompanyBankAccountId _companyBankAccountId = '', int SetPreNote = false, companyId _companyId = curExt())
+    {
+        SKS_EFT_VendorPaym  local_SKS_EFT_VendorPaym;
+        SKS_EFT_FileFormatPaymSpec local_SKS_EFT_FileFormatPaymSpec;
+        SKS_EFT_FileFormat      local_SKS_EFT_FileFormat;
+        DirPartyContactInfoview local_DirPartyContactInfoview;
+        VendPaymModeTable local_VendPaymModeTable;
+        VendBankAccount mVendBankAccount;
+        boolean Updateprenote;
+        ;
+
+        local_SKS_EFT_VendorPaym = SKS_EFT_VendorPaym::find(_companyId, _VendTable.AccountNum, _paymMode, _paymSpec, _vendBankAccountId);
+        if(local_SKS_EFT_VendorPaym)
+        {
+
+            return false;
+        }
+
+        //primary index fields
+        local_SKS_EFT_VendorPaym.VendCompany = _companyId;
+        local_SKS_EFT_VendorPaym.PaymMode = _paymMode;
+        local_SKS_EFT_VendorPaym.PaymSpec = _paymSpec;
+        local_SKS_EFT_VendorPaym.BankAccountId = _companyBankAccountId;
+        local_SKS_EFT_VendorPaym.AllowDR = SKS_EFT_Setup::find().APAllowVendBankDebit;
+
+        local_SKS_EFT_VendorPaym.VendBankAccountId = _vendBankAccountId;
+        local_SKS_EFT_VendorPaym.VendAccount = _VendTable.AccountNum;
+
+        //Default information
+        local_SKS_EFT_VendorPaym.RecordSummary = _sks_eft_setup.APACHRecordSummary;
+
+        select firstOnly SKS_EFT_FormatId, PaymMode from local_VendPaymModeTable
+            where local_VendPaymModeTable.PaymMode == _paymMode;
+        local_SKS_EFT_VendorPaym.FormatId = local_VendPaymModeTable.SKS_EFT_FormatId;
+
+        select firstOnly EDI820DefaultPartner, FormatId, PaymSpec, WireTabs from local_SKS_EFT_FileFormatPaymSpec
+            where local_SKS_EFT_FileFormatPaymSpec.FormatId == local_SKS_EFT_VendorPaym.FormatId &&
+                  local_SKS_EFT_FileFormatPaymSpec.PaymSpec == _paymSpec;
+
+        select firstOnly MastAcctList from local_SKS_EFT_FileFormat where local_SKS_EFT_FileFormat.formatid == local_SKS_EFT_VendorPaym.FormatId;
+
+        if(local_SKS_EFT_FileFormat.MastAcctList == NoYes::Yes)
+        {
+            local_DirPartyContactInfoview = conPeek(SKS_EFT_Vendorload::PrimaryEmail(local_SKS_EFT_VendorPaym.VendCompany, local_SKS_EFT_VendorPaym.VendAccount), 2);
+            local_SKS_EFT_VendorPaym.LogisticsLocationRecID = local_DirPartyContactInfoview.Location;
+            local_SKS_EFT_VendorPaym.MALStatus = SKS_EFT_MALStatus::New;
+        }
+        else
+        {
+            local_SKS_EFT_VendorPaym.MALStatus = SKS_EFT_MALStatus::NotApplic;
+        }
+
+        if(local_SKS_EFT_FileFormatPaymSpec.WireTabs)
+        {
+            SKS_EFT_Vendorload::UpdateVendorAddresses(local_SKS_EFT_VendorPaym, false, local_SKS_EFT_FileFormat.MastAcctList);
+            SKS_EFT_Vendorload::UpdateVendorBankAddresses(local_SKS_EFT_VendorPaym);
+            SKS_EFT_VendorLoad::UpdateVendorIntermediaryBank(local_SKS_EFT_VendorPaym);
+            SKS_EFT_VendorLoad::UpdateVendorCreditParty(local_SKS_EFT_VendorPaym);
+        }
+
+        local_SKS_EFT_VendorPaym.EDI820Layout = local_SKS_EFT_FileFormatPaymSpec.EDI820DefaultPartner;
+
+        //SKS_DevOps_17129--->
+        if(local_SKS_EFT_VendorPaym.FormatId == 'US-ACH' && local_SKS_EFT_VendorPaym.PaymSpec == 'CCD+')
+        {
+            local_SKS_EFT_VendorPaym.EDIVersion = SKS_EFT_EDIVersion::v003040;
+        }
+        //SKS_DevOps_17129<---
+
+        if(local_SKS_EFT_VendorPaym.validateWrite())
+        {
+            local_SKS_EFT_VendorPaym.insert();
+        }
+        else
+        {
+            return false;
+        }
+
+        updateprenote = sks_eft_vendorload::validatePreNote(local_SKS_EFT_VendorPaym.PaymMode, local_SKS_EFT_VendorPaym.PaymSpec);
+
+        If(updateprenote)
+        {
+
+            changeCompany(_companyId)
+            {
+
+                select forupdate mvendbankaccount where mvendbankaccount.AccountID == _vendBankAccountId
+                    && mvendbankaccount.VendAccount ==  _VendTable.AccountNum;
+
+                if(mvendbankaccount)
+                {
+                    ttsbegin;
+                    if(mvendbankaccount.SKS_EFT_PreNoteStatus == SKS_EB_PreNoteStatus::NotApplicable && !SetPreNote)
+                    {
+                        mVendBankAccount.SKS_EFT_PreNoteStatus = SKS_EB_PreNoteStatus::New;
+                        mVendBankAccount.SKS_EFT_PreNoteDate = str2date('', 0);
+
+                    }
+                    if(mvendbankaccount.SKS_EFT_PreNoteStatus == SKS_EB_PreNoteStatus::NotApplicable && SetPreNote)
+                    {
+                        mVendBankAccount.SKS_EFT_PreNoteStatus = sks_eb_prenotestatus::Approved;
+                        mVendBankAccount.SKS_EFT_PreNoteDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                    }
+                    mVendBankAccount.update();
+                    ttscommit;
+                }
+
+            }
+
+        }
+        return True;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateVendorRecord</Name>
+				<Source><![CDATA[
+    static server boolean CreateVendorRecord(VendTable _VendTable, SKS_EFT_Setup _sks_eft_setup, boolean Setactive = True, boolean EnableInPayJournal = True, boolean UseEmail = False, companyId _companyId = curExt(), boolean _isCallfromSwitchBoard = false)// SKS_Bug_10435
+    {
+        SKS_EB_Vendor   local_SKS_EB_Vendor;
+        ;
+
+
+        local_SKS_EB_Vendor = SKS_EB_Vendor::find(_companyId, _VendTable.AccountNum);
+        if(local_SKS_EB_Vendor)
+        {
+            return false;
+        }
+
+        //primary index fields
+        local_SKS_EB_Vendor.VendAccount = _VendTable.AccountNum;
+        local_SKS_EB_Vendor.VendCompany = _companyId;
+
+        If(SetActive)
+        {
+            local_SKS_EB_Vendor.Active = NoYes::Yes;
+        }
+        else
+        {
+            local_SKS_EB_Vendor.Active = NoYes::No;
+        }
+        IF(EnableInPayJournal)
+        {
+            local_SKS_EB_Vendor.PaymCanChange = NoYes::Yes;
+        }
+        else
+        {
+            local_SKS_EB_Vendor.PaymCanChange = NoYes::No;
+        }
+
+        IF(UseEmail)
+        {
+            local_SKS_EB_Vendor.EMNotification = NoYes::Yes;
+        }
+
+        // <16710>
+        /*
+        if(SKS_EFT_VendorLoad::PrimaryVendorEmailExists(local_SKS_EB_Vendor.VendCompany, local_SKS_EB_Vendor.VendAccount))
+        {
+            local_SKS_EB_Vendor.EM1Vendor = NoYes::Yes;
+        }
+        */
+        local_SKS_EB_Vendor.EM1Vendor = NoYes::Yes;
+
+        local_SKS_EB_Vendor.EMReplyToFromBank = NoYes::Yes;
+        local_SKS_EB_Vendor.EMTemplateFromBank = NoYes::Yes;
+
+        // Template default.
+        local_SKS_EB_Vendor.APTemplateFromSetup = NoYes::Yes;
+        local_SKS_EB_Vendor.APTemplateAttachment     = _sks_eft_setup.APTemplateAttachment;
+        local_SKS_EB_Vendor.APSRS1Attachment         = _sks_eft_setup.APSRS1Attachment;
+        local_SKS_EB_Vendor.APSRS2Attachment         = _sks_eft_setup.APSRS2Attachment;
+
+        //Remit Attach Detail
+        local_SKS_EB_Vendor.EMTemplateWithAttachFromBank = NoYes::Yes;
+        // local_SKS_EB_Vendor.EMTemplateAttach = _sks_eft_setup.APEMTemplateAttach;  #16465
+
+        local_SKS_EB_Vendor.EMTemplateFromSetup = NoYes::Yes;
+        local_SKS_EB_Vendor.EMAttachNbrDocs = _sks_eft_setup.APEMAttachNbrDocs;
+        local_SKS_EB_Vendor.EMAttachFileName = _sks_eft_setup.APEMAttachFileName;
+        local_SKS_EB_Vendor.EMAttachInclDate = _sks_eft_setup.APEMAttachInclDate;
+        local_SKS_EB_Vendor.EMAttachInclVend = _sks_eft_setup.APEMAttachInclVend;
+        local_SKS_EB_Vendor.EMAttachFileExt = _sks_eft_setup.APEMAttachFileExt;
+
+        // SRS1 attachment default
+        local_SKS_EB_Vendor.APSRS1EMTemplateFromSetup = NoYes::Yes;
+        local_SKS_EB_Vendor.APSRS1EmailSSRS          = _sks_eft_setup.APSRS1EmailSSRS;
+        local_SKS_EB_Vendor.APSRS1FileName           = _sks_eft_setup.APSRS1FileName;
+        local_SKS_EB_Vendor.APSRS1FileType           = _sks_eft_setup.APSRS1FileType;
+
+        // SRS2 attachment deafult
+        local_SKS_EB_Vendor.APSRS2EMTemplateFromSetup = NoYes::Yes;
+        local_SKS_EB_Vendor.APSRS2EmailSSRS          = _sks_eft_setup.APSRS2EmailSSRS;
+        local_SKS_EB_Vendor.APSRS2FileName           = _sks_eft_setup.APSRS2FileName;
+        local_SKS_EB_Vendor.APSRS2FileType           = _sks_eft_setup.APSRS2FileType;
+
+        local_SKS_EB_Vendor.insert();
+        return True;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLocationFromRole</Name>
+				<Source><![CDATA[
+    //copied from dir party table
+    //Order by Primary Address
+    static LogisticsLocationRecId getLocationFromRole(DirPartyRecId _party,LogisticsLocationRoleType _roleType, TransDateTime _transDateTime = DateTimeUtil::getSystemDateTime())
+    {
+        DirPartyLocation        partyLocation;
+        DirPartyLocationRole    partyLocationRole;
+        LogisticsLocationRole   locationRole;
+
+        select Location, IsPrimary from partyLocation
+            order by partyLocation.IsPrimary desc
+                where partyLocation.Party == _party
+            exists join partyLocationRole
+                where partyLocationRole.PartyLocation == partyLocation.RecId
+            exists join locationRole
+                where locationRole.Type == _roleType &&
+                      partyLocationRole.LocationRole == locationRole.RecId;
+
+        // If a remit-to address is not available, use primary if that exists.
+        if (!partyLocation)
+        {
+            select Location, IsPrimary from partyLocation
+            order by partyLocation.IsPrimary desc
+                where partyLocation.Party == _party && partyLocation.IsPrimary;
+        }
+
+
+        return partyLocation.Location;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>primaryEmail</Name>
+				<Source><![CDATA[
+    public static container primaryEmail(companyId _vendCompany, CustVendAC _vendAccount, RemittanceLocation _WBeneRemittanceLocation = 0)
+    {
+        VendTable   locVendTable;
+        SKS_EFT_EmailPurpose locSKS_EFT_EmailPurpose;
+        DirPartyContactInfoView locDirPartyContactInfoview;
+        DirPartyLocation locDirPartyLocation;
+        DirPartyPostalAddressView locDirPartyPostalAddressView;
+        LogisticsElectronicAddressRole locLogisticsElectronicAddressRole;
+        LogisticsLocation locLEALogisticsLocation;
+        LogisticsLocation locLPALogisticsLocation;
+        LogisticsElectronicAddress locLogisticsElectronicAddress;
+        LogisticsLocationRole locLogisticsLocationRole;
+        container rtnval;
+        ;
+
+
+        //As emails are sent per vendor, we first need to lookup the vendor for which we want to send an email.
+        locVendTable = VendTable::findByCompany(_vendCompany, _vendAccount);
+
+        //We are going to retreive the list of SKS_EFT_EmailPurpose records for this company(Order by SKS_EB_HierarchyOrder Ascending)
+        //  We will loop thourgh this list until we are successful in finding an email address, then abort the list.
+        While select SKS_EFT_EmailAddressType, SKS_EB_ContactPurpose, RecId from locSKS_EFT_EmailPurpose order by locSKS_EFT_EmailPurpose.SKS_EB_OrderHierarchy asc
+        {
+            if(locSKS_EFT_EmailPurpose.SKS_EFT_EmailAddressType == SKS_EFT_EmailAddressType::VendorPrimaryContact)
+            {
+                select * from locDirPartyContactInfoview
+                where locDirPartyContactInfoview.Party == locVendTable.Party
+                    && locDirPartyContactInfoview.IsPrimary == true
+                    &&  locDirPartyContactInfoview.Type == LogisticsElectronicAddressMethodType::Email;
+            }
+            else if(locSKS_EFT_EmailPurpose.SKS_EFT_EmailAddressType == SKS_EFT_EmailAddressType::VendorAddressPrimaryContact)
+            {
+                //_SKS_EFT_VendorPaym.VendBankAccountId MUST be used for this comparison. SKS_EFT_VendorPaym may not be saved yet so you cannot just use IF(SKS_EFT_VendorPaym).
+                //      it would return false being not saved.
+                if(_WBeneRemittanceLocation) // The payment spec already exists, so check the spec's address
+                {
+                    select location, City from locDirPartyPostalAddressView
+                        where locDirPartyPostalAddressView.Party == locVendTable.Party
+                            && locDirPartyPostalAddressView.Location == _WBeneRemittanceLocation
+                        join RecId from locLPALogisticsLocation
+                            where locLPALogisticsLocation.RecId == locDirPartyPostalAddressView.Location
+                        join ParentLocation, RecId from locLEALogisticsLocation
+                            where locLEALogisticsLocation.ParentLocation == locLPALogisticsLocation.RecId
+                        join Description, Locator, recid from locLogisticsElectronicAddress
+                            where locLogisticsElectronicAddress.Location == locLEALogisticsLocation.Recid
+                                && locLogisticsElectronicAddress.IsPrimary == true
+                                && locLogisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Email;
+                }
+                else //no payment spec was passed in
+                {
+                    //Get the Primary Address's Primary Email.
+                    select location, City from locDirPartyPostalAddressView
+                        where locDirPartyPostalAddressView.Party == locVendTable.Party
+                            && locDirPartyPostalAddressView.IsPrimary == true
+                        join RecId from locLPALogisticsLocation
+                            where locLPALogisticsLocation.RecId == locDirPartyPostalAddressView.Location
+                        join ParentLocation, RecId from locLEALogisticsLocation
+                            where locLEALogisticsLocation.ParentLocation == locLPALogisticsLocation.RecId
+                        join Description, Locator, recid from locLogisticsElectronicAddress
+                            where locLogisticsElectronicAddress.Location == locLEALogisticsLocation.Recid
+                                && locLogisticsElectronicAddress.IsPrimary == true
+                                && locLogisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Email;
+                }
+
+                locDirPartyContactInfoview.Locator = locLogisticsElectronicAddress.Locator;
+                locDirPartyContactInfoview.Location = locLEALogisticsLocation.ParentLocation;
+                locDirPartyContactInfoview.LocationName = locLogisticsElectronicAddress.Description;
+            }
+            else if(locSKS_EFT_EmailPurpose.SKS_EFT_EmailAddressType == SKS_EFT_EmailAddressType::VendorContactPurpose)
+            {
+                Select Location, RecId from locDirPartyLocation
+                    where locDirPartyLocation.Party == locVendTable.Party
+                join Description, Location, Locator, RecId, Type from locLogisticsElectronicAddress
+                    where locLogisticsElectronicAddress.Location == locDirPartyLocation.Location
+                        && locLogisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Email
+                join ElectronicAddress, LocationRole, Recid from locLogisticsElectronicAddressRole
+                    where locLogisticsElectronicAddressRole.ElectronicAddress == locLogisticsElectronicAddress.RecId
+                join Name, RecId from locLogisticsLocationRole
+                    where locLogisticsLocationRole.RecId == locLogisticsElectronicAddressRole.LocationRole
+                        && locLogisticsLocationRole.Name == locSKS_EFT_EmailPurpose.SKS_EB_ContactPurpose;
+
+                locDirPartyContactInfoview.Locator = locLogisticsElectronicAddress.Locator;
+                locDirPartyContactInfoview.Location = locLogisticsElectronicAddress.Location;
+                locDirPartyContactInfoview.LocationName = locLogisticsElectronicAddress.Description;
+            }
+            if(locDirPartyContactInfoview.Locator)
+            {
+                //Email Found. Exit loop.
+                break;
+            }
+
+        }
+
+        rtnval = [locSKS_EFT_EmailPurpose, locDirPartyContactInfoview];
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PrimaryVendorEmailExists</Name>
+				<Source><![CDATA[
+    public server static boolean PrimaryVendorEmailExists(companyId _vendCompany, CustVendAC _vendAccount, RemittanceLocation _RemittanceLocation = 0)
+    {
+        DirPartyContactInfoview local_DirPartyContactInfoview;
+        boolean ret = false;
+        ;
+
+        if(_vendCompany)
+        {
+            local_DirPartyContactInfoview = conPeek(SKS_EFT_VendorLoad::primaryemail(_vendCompany, _vendAccount, _RemittanceLocation), 2);
+
+            if(local_DirPartyContactInfoview.Locator)
+            {
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateVendorAddresses</Name>
+				<Source><![CDATA[
+    public static server void UpdateVendorAddresses(SKS_EFT_VendorPaym  _SKS_EFT_VendorPaym, boolean _blankout = false, boolean _MAL = false, LogisticsLocationRecId _location = 0)
+    {
+        VendTable vendTable;
+        LogisticsLocation logisticsLocation;
+        LogisticsPostalAddress logisticsPostalAddress;
+        Array vendAddrArray = new Array(Types::String);
+        SKS_EB_Address addrLine1;
+        SKS_EB_Address addrLine2;
+
+        vendTable = VendTable::findByCompany(_SKS_EFT_VendorPaym.VendCompany, _SKS_EFT_VendorPaym.VendAccount);
+
+        if(_location)
+        {
+            logisticsLocation = LogisticsLocation::find(_location);
+        }
+        else
+        {
+            logisticsLocation = LogisticsLocation::find(SKS_EFT_VendorLoad::getLocationFromRole(vendTable.Party,logisticsLocationRoleType::RemitTo));
+        }
+        logisticsPostalAddress = LogisticsLocationEntity::location2PostalAddress(logisticsLocation.RecId, DateTimeUtil::getSystemDateTime(), true);
+
+        if ((logisticsPostalAddress && !_blankout) || _MAL)
+        {
+            vendAddrArray = SKS_PP_50000Bas::StreetToAddressLineArray(logisticsPostalAddress.Street,2);
+
+            if (vendAddrArray.exists(1))
+            {
+                addrLine1 = vendAddrArray.value(1);
+                if (vendAddrArray.exists(2))
+                {
+                    addrLine2 = vendAddrArray.value(2);
+                }
+            }
+
+            _SKS_EFT_VendorPaym.WBeneUseVendAddr = NoYes::Yes;
+            _SKS_EFT_VendorPaym.WBeneRemittanceLocation = logisticsLocation.RecId;
+            _SKS_EFT_VendorPaym.WBeneName = logisticsLocation.Description;
+            _SKS_EFT_VendorPaym.WBeneAddr = addrLine1;
+            _SKS_EFT_VendorPaym.WBeneAddr2 = addrLine2;
+            _SKS_EFT_VendorPaym.WBeneCity = logisticsPostalAddress.City;
+            _SKS_EFT_VendorPaym.WBeneState = logisticsPostalAddress.State;
+            _SKS_EFT_VendorPaym.WBeneZipPostal = logisticsPostalAddress.ZipCode;
+            _SKS_EFT_VendorPaym.WBeneCountryRegionId = logisticsPostalAddress.CountryRegionId;
+        }
+        else
+        {
+            _SKS_EFT_VendorPaym.WBeneUseVendAddr = NoYes::No;
+            _SKS_EFT_VendorPaym.WBeneRemittanceLocation = 0;
+            _SKS_EFT_VendorPaym.WBeneName = '';
+            _SKS_EFT_VendorPaym.WBeneAddr = '';
+            _SKS_EFT_VendorPaym.WBeneAddr2 = '';
+            _SKS_EFT_VendorPaym.WBeneCity = '';
+            _SKS_EFT_VendorPaym.WBeneState = '';
+            _SKS_EFT_VendorPaym.WBeneZipPostal = '';
+            _SKS_EFT_VendorPaym.WBeneCountryRegionId = '';
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateVendorBankAddresses</Name>
+				<Source><![CDATA[
+    public static server void UpdateVendorBankAddresses(SKS_EFT_VendorPaym  _SKS_EFT_VendorPaym, boolean _blankout = false)
+    {
+        VendBankAccount vendBankAccount;
+        LogisticsLocation logisticsLocation;
+        LogisticsPostalAddress logisticsPostalAddress;
+
+        vendBankAccount = VendBankAccount::findByCompany(_SKS_EFT_VendorPaym.VendCompany,_SKS_EFT_VendorPaym.VendAccount,_SKS_EFT_VendorPaym.VendBankAccountId);
+
+        if (vendBankAccount && !_blankout)
+        {
+            logisticsLocation = LogisticsLocation::find(vendBankAccount.Location);
+            logisticsPostalAddress = LogisticsLocationEntity::location2PostalAddress(logisticsLocation.RecId, DateTimeUtil::getSystemDateTime(), true);
+
+            _SKS_EFT_VendorPaym.WBeneUseVendBankAcc = NoYes::Yes;
+            _SKS_EFT_VendorPaym.WBenBankName = vendBankAccount.Name;
+            _SKS_EFT_VendorPaym.WBenBankAddr = strRem(logisticsPostalAddress.Street, '\r\n');
+            _SKS_EFT_VendorPaym.WBenBankCity = logisticsPostalAddress.City;
+            _SKS_EFT_VendorPaym.WBenBankCountryRegionId = logisticsPostalAddress.CountryRegionId;
+        }
+        else
+        {
+            _SKS_EFT_VendorPaym.WBeneUseVendBankAcc = NoYes::No;
+            _SKS_EFT_VendorPaym.WBenBankName = '';
+            _SKS_EFT_VendorPaym.WBenBankAddr = '';
+            _SKS_EFT_VendorPaym.WBenBankCity = '';
+            _SKS_EFT_VendorPaym.WBenBankCountryRegionId = '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateVendorIntermediaryBank</Name>
+				<Source><![CDATA[
+    public static server void UpdateVendorIntermediaryBank(SKS_EFT_VendorPaym  _SKS_EFT_VendorPaym, boolean _blankout = false)
+    {
+        VendBankAccount vendBankAccount;
+
+        vendBankAccount = VendBankAccount::findByCompany(_SKS_EFT_VendorPaym.VendCompany,
+                                                         _SKS_EFT_VendorPaym.VendAccount,
+                                                         _SKS_EFT_VendorPaym.VendBankAccountId);
+
+        if (vendBankAccount && !_blankout)
+        {
+            _SKS_EFT_VendorPaym.WIntUseVendBankAcc = NoYes::Yes;
+            _SKS_EFT_VendorPaym.WIntBankAcct = vendBankAccount.SKS_IHB_WIntBankAcct;
+            _SKS_EFT_VendorPaym.WIntBankAddr = vendBankAccount.SKS_IHB_WIntBankAddr;
+            _SKS_EFT_VendorPaym.WIntBankAddr2 = vendBankAccount.SKS_IHB_WIntBankAddr2;
+            _SKS_EFT_VendorPaym.WIntBankBranch = vendBankAccount.SKS_IHB_WIntBankBranch;
+            _SKS_EFT_VendorPaym.WIntBankCity = vendBankAccount.SKS_IHB_WIntBankCity;
+            _SKS_EFT_VendorPaym.WIntBankCountryRegionId = vendBankAccount.SKS_IHB_WIntBankCountryRegionId;
+            _SKS_EFT_VendorPaym.WIntBankId = vendBankAccount.SKS_IHB_WIntBankId;
+            _SKS_EFT_VendorPaym.WIntBankName = vendBankAccount.SKS_IHB_WIntBankName;
+            _SKS_EFT_VendorPaym.WIntBankSwift = vendBankAccount.SKS_IHB_WIntBankSwift;
+        }
+        else
+        {
+            _SKS_EFT_VendorPaym.WIntUseVendBankAcc = NoYes::No;
+            _SKS_EFT_VendorPaym.WIntBankAcct = '';
+            _SKS_EFT_VendorPaym.WIntBankAddr = '';
+            _SKS_EFT_VendorPaym.WIntBankAddr2 = '';
+            _SKS_EFT_VendorPaym.WIntBankBranch = '';
+            _SKS_EFT_VendorPaym.WIntBankCity = '';
+            _SKS_EFT_VendorPaym.WIntBankCountryRegionId = '';
+            _SKS_EFT_VendorPaym.WIntBankId = '';
+            _SKS_EFT_VendorPaym.WIntBankName = '';
+            _SKS_EFT_VendorPaym.WIntBankSwift = '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateVendorCreditParty</Name>
+				<Source><![CDATA[
+    public static server void UpdateVendorCreditParty(SKS_EFT_VendorPaym  _SKS_EFT_VendorPaym, boolean _blankout = false)
+    {
+        VendBankAccount vendBankAccount;
+
+        vendBankAccount = VendBankAccount::findByCompany(_SKS_EFT_VendorPaym.VendCompany,
+                                                         _SKS_EFT_VendorPaym.VendAccount,
+                                                         _SKS_EFT_VendorPaym.VendBankAccountId);
+
+        if (vendBankAccount && !_blankout)
+        {
+            _SKS_EFT_VendorPaym.WCrePartyUseVendBankAcc = NoYes::Yes;
+            _SKS_EFT_VendorPaym.WCrePartyAcct = vendBankAccount.SKS_IHB_WCrePartyAcct;
+            _SKS_EFT_VendorPaym.WCrePartyAddr = vendBankAccount.SKS_IHB_WCrePartyAddr;
+            _SKS_EFT_VendorPaym.WCrePartyBankId = vendBankAccount.SKS_IHB_WCrePartyBankId;
+            _SKS_EFT_VendorPaym.WCrePartyBankName = vendBankAccount.SKS_IHB_WCrePartyBankName;
+            _SKS_EFT_VendorPaym.WCrePartyCity = vendBankAccount.SKS_IHB_WCrePartyCity;
+            _SKS_EFT_VendorPaym.WCrePartyCountryRegionId = vendBankAccount.SKS_IHB_WCrePartyCountryRegionId;
+            _SKS_EFT_VendorPaym.WCrePartyName = vendBankAccount.SKS_IHB_WCrePartyName;
+            _SKS_EFT_VendorPaym.WCrePartySwift = vendBankAccount.SKS_IHB_WCrePartySwift;
+        }
+        else
+        {
+            _SKS_EFT_VendorPaym.WCrePartyUseVendBankAcc = NoYes::No;
+            _SKS_EFT_VendorPaym.WCrePartyAcct = '';
+            _SKS_EFT_VendorPaym.WCrePartyAcctType = '';
+            _SKS_EFT_VendorPaym.WCrePartyAddr = '';
+            _SKS_EFT_VendorPaym.WCrePartyAdvice = '';
+            _SKS_EFT_VendorPaym.WCrePartyBankId = '';
+            _SKS_EFT_VendorPaym.WCrePartyBankName = '';
+            _SKS_EFT_VendorPaym.WCrePartyCity = '';
+            _SKS_EFT_VendorPaym.WCrePartyCountryRegionId = '';
+            _SKS_EFT_VendorPaym.WCrePartyName = '';
+            _SKS_EFT_VendorPaym.WCrePartySwift = '';
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validatePreNote</Name>
+				<Source><![CDATA[
+    Static boolean validatePreNote(PaymMode _PayMode, PaymSpec _PaymSpec)
+    {
+
+        SKS_EFT_FileFormat  sks_eft_fileformat;
+        SKS_EFT_FileFormatPaymSpec  sks_eft_fileformatpaymspec;
+        SKS_EFT_Setup sks_eft_setup;
+        VendPaymModeTable vendpaymmodetable;
+        Boolean PrenoteSet;
+        ;
+
+        changeCompany(sks_eft_setup.dataAreaId)
+        {
+            sks_eft_setup = SKS_EFT_Setup::find();
+            If(sks_eft_setup.APReqPreNote == True)
+            {
+
+                select * from vendpaymmodetable where
+                vendpaymmodetable.PaymMode == _PayMode
+                  join PreNote, FormatId from sks_eft_fileformat where
+                    sks_eft_FileFormat.FormatId == vendpaymmodetable.SKS_EFT_FormatId &&
+                    sks_eft_FileFormat.PreNote == NoYes::Yes
+                  join PreNote, FormatId, PaymSpec from sks_eft_fileformatpaymspec where
+                    sks_eft_fileformatpaymspec.FormatId == sks_eft_fileformat.FormatId &&
+                    sks_eft_fileformatpaymspec.PaymSpec == _PaymSpec &&
+                    sks_eft_fileformatpaymspec.PreNote == NoYes::Yes;
+
+                if(vendpaymmodetable)
+                {
+                    PrenoteSet = True;
+                }
+                else
+                {
+                    PrenoteSet = false;
+                }
+            } /*setup for prenote */
+            else
+            {
+                PrenoteSet = false;
+            }
+        } /*changecompany */
+        return PrenoteSet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>VendorAddressPrimaryContactPurposeInUse</Name>
+				<Source><![CDATA[
+    public static boolean VendorAddressPrimaryContactPurposeInUse()
+    {
+        SKS_EFT_EmailPurpose locSKS_EFT_EmailPurpose;
+        select RecId from locSKS_EFT_EmailPurpose where locSKS_EFT_EmailPurpose.SKS_EFT_EmailAddressType == SKS_EFT_EmailAddressType::VendorAddressPrimaryContact;
+        if(locSKS_EFT_EmailPurpose)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_TransConfirmDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[SRSReportParameterAttribute(classStr(SKS_CC_TransConfirmContract))]
+    class SKS_CC_TransConfirmDP extends SrsReportDataProviderPreProcessTempDB
+{
+    SKS_CC_TransConfirmTmp sKS_CC_TransConfirmTmp;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getCompanyAddress</Name>
+				<Source><![CDATA[
+    public AddressStreet getCompanyAddress()
+    {
+        CompanyInfo     companyInfo = CompanyInfo::find();
+        AddressStreet   address;
+                
+        address = companyInfo.postalAddress().Address;
+        address = companyInfo.Name + '\n' + address;
+
+        return address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustAddress</Name>
+				<Source><![CDATA[
+    protected LogisticsAddressing getCustAddress (CustTable _custTable , LogisticsLocationRoleType _type)
+    {
+        LogisticsPostalAddress  postalAddress;
+        DirPartyLocation        partyLocation;
+        LogisticsLocationRole   locationRole;
+        DirPartyLocationRole    partyLocationRole;
+
+        // check primary adress with the pupose of _type (parameter)
+        select firstonly Address
+        from postalAddress
+            exists join locationRole
+                where locationRole.Type  == _type
+            exists join partyLocation
+                where partyLocation.Location == postalAddress.Location &&
+                    partyLocation.Party == _custTable.party &&
+                    partyLocation.IsPrimary == true
+            exists join partyLocationRole
+                where partyLocationRole.PartyLocation == partyLocation.RecId &&
+                    partyLocationRole.LocationRole == locationRole.RecId;
+
+        // check the primary address
+        if(!postalAddress)
+        {
+            select firstonly Address
+            from postalAddress
+                exists join partyLocation
+                    where partyLocation.Location == postalAddress.Location &&
+                        partyLocation.IsPrimary == true &&
+                        partyLocation.Party == _custTable.party;
+        }
+        return  postalAddress.Address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPaidAmountCur</Name>
+				<Source><![CDATA[
+    protected Amount getPaidAmountCur(LedgerJournalTrans _ledgerjournalTrans, CustTransOpen _custTransOpen )
+    {        
+        CustVendOpenTransManager manager;
+
+        manager = CustVendOpenTransManager::construct(_ledgerjournalTrans);
+
+        return manager.getSettleAmount(_custTransOpen);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransConfirmTmp</Name>
+				<Source><![CDATA[
+    [SRSReportDataSetAttribute(tableStr(SKS_CC_TransConfirmTmp))]
+    public SKS_CC_TransConfirmTmp getTransConfirmTmp()
+    {
+        select * from sKS_CC_TransConfirmTmp;
+        return sKS_CC_TransConfirmTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processInvoiceSections</Name>
+				<Source><![CDATA[
+    protected void processInvoiceSections(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        SpecTrans               specTrans;
+        CustTrans               custTrans, custTransOffset;
+        CustTransOpen           custTransOpen;
+        CustSettlement          custSettlement;
+        LedgerJournalTrans      ledgerJournalTransForeign;
+
+        // posted Transactions
+        if(_ledgerJournalTrans.ledgerJournalTable().Posted)
+        {
+            if(_ledgerJournalTrans.Company == curext())
+            {
+                select firstOnly  RecId, dataAreaId, AccountNum from custTrans
+                where custTrans.Voucher   == _ledgerJournalTrans.Voucher
+                    && custTrans.TransDate == _ledgerJournalTrans.TransDate
+                    && custTrans.AccountNum == _ledgerJournalTrans.parmAccount()
+                    && custTrans.dataAreaId == _ledgerJournalTrans.Company;
+
+                while select OffsetRecid, OffsetCompany, OffsetAccountNum, SettleAmountCur from custSettlement
+                where custSettlement.TransRecId   ==  custTrans.RecId
+                    && custSettlement.TransCompany == custTrans.dataAreaId
+                    && custSettlement.AccountNum  == custTrans.AccountNum
+                    && custSettlement.CanBeReversed == NoYes::Yes
+                join Invoice, Voucher, TransDate, AmountCur, CurrencyCode from custTransOffset
+                    where custTransOffset.RecId  == custSettlement.OffsetRecid
+                        && custTransOffset.dataAreaId == custSettlement.OffsetCompany
+                        && custTransOffset.AccountNum == custSettlement.OffsetAccountNum
+                {
+                    sKS_CC_TransConfirmTmp.clear();
+                    sKS_CC_TransConfirmTmp.EnableCCSec      = NoYes::No;
+                    sKS_CC_TransConfirmTmp.InvoiceId        = custTransOffset.Invoice;
+                    sKS_CC_TransConfirmTmp.InvoiceVoucher   = custTransOffset.Voucher;
+                    sKS_CC_TransConfirmTmp.InvoiceDate      = custTransOffset.TransDate;
+                    sKS_CC_TransConfirmTmp.InvoiceAmount    = custTransOffset.AmountCur;
+                    sKS_CC_TransConfirmTmp.PaidAmount       = custSettlement.SettleAmountCur;
+                    sKS_CC_TransConfirmTmp.InvoiceCurrency  = custTransOffset.CurrencyCode;
+
+                    sKS_CC_TransConfirmTmp.insert();
+                }
+            }
+
+            // for intercompany posted transactions
+            else
+            {
+                changeCompany(_ledgerJournalTrans.Company)
+                {
+                    select Voucher, TransDate from ledgerJournalTransForeign
+                    where ledgerJournalTransForeign.ForeignVoucher == _ledgerJournalTrans.Voucher
+                    && ledgerJournalTransForeign.ForeignCompany == _ledgerJournalTrans.dataAreaId
+                join RecId, dataAreaId, AccountNum from custTrans
+                    where custTrans.Voucher   == ledgerJournalTransForeign.Voucher
+                    && custTrans.TransDate == ledgerJournalTransForeign.TransDate
+                    && custTrans.AccountNum == _ledgerJournalTrans.parmAccount()
+                    && custTrans.dataAreaId == _ledgerJournalTrans.Company;
+
+                    while select SettleAmountCur from custSettlement
+                    where custSettlement.TransRecId == custTrans.RecId
+                    && custSettlement.TransCompany == custTrans.dataAreaId
+                    && custSettlement.AccountNum == custTrans.AccountNum
+                    && custSettlement.CanBeReversed == NoYes::Yes
+                join Invoice, Voucher, TransDate, AmountCur, CurrencyCode from  custTransOffset
+                    where custTransOffset.RecId  == custSettlement.OffsetRecid
+                    && custTransOffset.dataAreaId == custSettlement.OffsetCompany
+                    && custTransOffset.AccountNum == custSettlement.OffsetAccountNum
+                    {
+                        sKS_CC_TransConfirmTmp.clear();
+                        sKS_CC_TransConfirmTmp.EnableCCSec      = NoYes::No;
+                        sKS_CC_TransConfirmTmp.InvoiceId        = custTransOffset.Invoice;
+                        sKS_CC_TransConfirmTmp.InvoiceVoucher   = custTransOffset.Voucher;
+                        sKS_CC_TransConfirmTmp.InvoiceDate      = custTransOffset.TransDate;
+                        sKS_CC_TransConfirmTmp.InvoiceAmount    = custTransOffset.AmountCur;
+                        sKS_CC_TransConfirmTmp.PaidAmount       = custSettlement.SettleAmountCur;
+                        sKS_CC_TransConfirmTmp.InvoiceCurrency  = custTransOffset.CurrencyCode;
+
+                        sKS_CC_TransConfirmTmp.insert();
+                    }
+                }
+            }
+        }
+
+        // Open Transactions
+        else
+        {
+            changeCompany(_ledgerJournalTrans.Company)
+            {
+                while select RefTableId, RefRecId from specTrans
+                    where specTrans.SpecRecId == _ledgerJournalTrans.RecId
+                    && specTrans.SpecTableId == _ledgerJournalTrans.TableId
+                join RefRecId, AccountNum, AmountCur from custTransOpen
+                    where custTransOpen.TableId == specTrans.RefTableId
+                    && custTransOpen.RecId ==  specTrans.RefRecId
+                join Invoice, Voucher, TransDate, CurrencyCode from custTrans
+                    where custTrans.RecId == custTransOpen.RefRecId
+                    && custTrans.AccountNum == custTransOpen.AccountNum
+                {
+                    sKS_CC_TransConfirmTmp.clear();
+                    sKS_CC_TransConfirmTmp.EnableCCSec      = NoYes::No;
+                    sKS_CC_TransConfirmTmp.InvoiceId        = custTrans.Invoice;
+                    sKS_CC_TransConfirmTmp.InvoiceVoucher   = custTrans.Voucher;
+                    sKS_CC_TransConfirmTmp.InvoiceDate      = custTrans.TransDate;
+                    sKS_CC_TransConfirmTmp.InvoiceAmount    = custTransOpen.AmountCur;
+                    sKS_CC_TransConfirmTmp.PaidAmount       = this.getPaidAmountCur(_ledgerJournalTrans, custTransOpen);
+                    sKS_CC_TransConfirmTmp.InvoiceCurrency  = custTrans.CurrencyCode;
+
+                    sKS_CC_TransConfirmTmp.insert();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    public void processReport()
+    {
+        SKS_CC_TransConfirmContract contract = this.parmDataContract();
+        SKS_CC_CustPaymTable        sks_CC_CustPaymTable;
+        CustTable                   custTable;
+        Notes                       selectedRecIDS;
+        Query                       query = new Query();
+        QueryRun                    queryRun;
+        QueryBuildDataSource        qbds;
+        LedgerJournalTrans          ledgerJournalTrans;
+        CreditCardAuthTrans         creditCardAuthTrans;
+        CreditCardCust              creditCardCustLocal;
+
+        selectedRecIDS  = contract.parmSelectedRecIDS();
+        if (!selectedRecIDS)
+        {
+            return;
+        }
+
+        qbds = query.addDataSource(tableNum(SKS_CC_CustPaymTable));
+        qbds.addRange(fieldNum(SKS_CC_CustPaymTable,RecId)).value(selectedRecIDS);
+
+        queryRun = new QueryRun(query);
+
+        while (queryRun.next())
+        {
+            sks_CC_CustPaymTable = queryRun.get(tableNum(SKS_CC_CustPaymTable));
+
+            select Voucher, LedgerDimension, CurrencyCode, PaymReference from ledgerJournalTrans
+                where ledgerJournalTrans.RecId == sks_CC_CustPaymTable.RefRecId;
+
+            custTable = CustTable::findByCompany(ledgerJournalTrans.Company, sks_CC_CustPaymTable.CustAccount);
+
+            sKS_CC_TransConfirmTmp.clear();
+            // Report Header Sections
+            sKS_CC_TransConfirmTmp.CompanyAddress   = this.getCompanyAddress();
+            sKS_CC_TransConfirmTmp.Voucher          = ledgerJournalTrans.Voucher;
+            sKS_CC_TransConfirmTmp.CurrencyCode     = ledgerJournalTrans.CurrencyCode;
+            sKS_CC_TransConfirmTmp.CustomerId       = sks_CC_CustPaymTable.CustAccount;
+            sKS_CC_TransConfirmTmp.CustomerName     = custTable.name();
+            sKS_CC_TransConfirmTmp.BillingAddress   = this.getCustAddress(custTable, LogisticsLocationRoleType::Invoice); // Customer invoice address
+            sKS_CC_TransConfirmTmp.ShippingAddress  = this.getCustAddress(custTable, LogisticsLocationRoleType::Delivery); // Customer delivery address
+
+            if(ledgerJournalTrans.PaymReference && SalesTable::find(ledgerJournalTrans.PaymReference).RecId)
+            {
+                sKS_CC_TransConfirmTmp.SalesId = ledgerJournalTrans.PaymReference;
+                sKS_CC_TransConfirmTmp.TransActionType = SKS_CC_TransActionType::PrePayment;
+            }
+            else if (ledgerJournalTrans.AmountCurCredit)
+            {
+                sKS_CC_TransConfirmTmp.TransActionType = SKS_CC_TransActionType::Sale;
+            }
+            else
+            {
+                sKS_CC_TransConfirmTmp.TransActionType = SKS_CC_TransActionType::Refund;
+            }
+
+            // Report Body Sections
+            select ApprovedDateTime, CreditCardTypeName, CreditCardNumber, ApprovalAmountCur,
+               ProcessorStatus, Description, Authorization, SKS_CC_ApprovalCode
+            from creditCardAuthTrans
+                where creditCardAuthTrans.SKS_CC_CustPaymTable == sks_CC_CustPaymTable.RecId;
+
+            sKS_CC_TransConfirmTmp.ProcessorStatus = creditCardAuthTrans.ProcessorStatus;
+            sKS_CC_TransConfirmTmp.Description  = enum2str(creditCardAuthTrans.ProcessorStatus);
+            sKS_CC_TransConfirmTmp.EnableCCSec          = NoYes::Yes;
+            sKS_CC_TransConfirmTmp.TransactionDate      = DateTimeUtil::date(creditCardAuthTrans.ApprovedDateTime);
+            sKS_CC_TransConfirmTmp.CreditCardTypeName   = creditCardAuthTrans.CreditCardTypeName;
+
+            if (creditCardAuthTrans.CreditCardNumber)
+            {
+                sKS_CC_TransConfirmTmp.CreditCardNumber = creditCardAuthTrans.CreditCardNumber;
+            }
+            else
+            {
+                if (sks_CC_CustPaymTable.CreditCardCustRefId)
+                {
+                    creditCardCustLocal = CreditCardCust::find(sks_CC_CustPaymTable.CreditCardCustRefId);
+                }
+
+                if (!creditCardCustLocal.RecId && creditCardAuthTrans.UniqueCardId)
+                {
+                    creditCardCustLocal = CreditCardCust::findByUniqueCardId(creditCardAuthTrans.UniqueCardId);
+                }
+
+                if (creditCardCustLocal.RecId)
+                {
+                    if (creditCardCustLocal.CardNumber)
+                    {
+                        sKS_CC_TransConfirmTmp.CreditCardNumber = creditCardCustLocal.CardNumber;
+                    }
+
+                    if (!sKS_CC_TransConfirmTmp.CreditCardTypeName && creditCardCustLocal.CreditCardTypeName)
+                    {
+                        sKS_CC_TransConfirmTmp.CreditCardTypeName = creditCardCustLocal.CreditCardTypeName;
+                    }
+                }
+            }
+
+            sKS_CC_TransConfirmTmp.ApprovalAmountCur    = creditCardAuthTrans.ApprovalAmountCur;
+            sKS_CC_TransConfirmTmp.Authorization        = creditCardAuthTrans.Authorization;
+            sKS_CC_TransConfirmTmp.RespAuthCode         = creditCardAuthTrans.SKS_CC_ApprovalCode;
+
+            sKS_CC_TransConfirmTmp.insert();
+        }
+
+        this.processInvoiceSections(ledgerJournalTrans);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

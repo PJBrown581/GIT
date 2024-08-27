@@ -1,0 +1,683 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_ReadFileFixed</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_BR_ReadFileFixed extends SKS_BR_ReadFile
+{
+    SKS_EB_FileHub gSKS_EB_FileHub;
+    System.String[] gRecords;
+    SKS_BR_FileFormatDetail fixedFormat;
+    int maxlinelengthneeded;
+    int maxFieldFormats;
+    container FieldFormat[];
+    str Fields[];
+    str Raw_Fields[];
+    const System.String gCarriageReturnPlaceholder = 'Ю牛귨';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>closeFile</Name>
+				<Source><![CDATA[
+    void closeFile()
+    {
+        if(gSKS_EB_FileHub)
+            gSKS_EB_FileHub.streamClose();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBankBalance</Name>
+				<Source><![CDATA[
+    protected void createBankBalance(Date asOfDate, CompanyBankAccountId bankAcct, AmountCur amount)
+    {
+        SKS_BR_BankBalance sks_br_bankbalance;
+        ;
+
+        select firstonly forupdate * from sks_br_bankbalance where
+         sks_br_bankbalance.BankHeaderRecId == bankHeaderRecId &&
+         sks_br_bankbalance.AccountId == bankAcct &&
+         sks_br_bankbalance.AsOfDate == asOfDate;
+
+        //if it exists, we only want to update it if the ending balance position is the last in this account records.
+        if(sks_br_bankbalance &&  sks_br_fileformat.EndBalancePosition == SKS_BR_EndingBalancePosition::Last)
+        {
+            sks_br_bankbalance.EndBalance = amount;
+            sks_br_bankbalance.update();
+        }
+        //if it doesn't exist, we want to create an ending balance.  This will over both first and last(on the chance there is only one record)
+        else if(!sks_br_bankbalance)
+        {
+            sks_br_bankbalance.AccountId = bankAcct;
+            sks_br_bankbalance.AsOfDate = asOfDate;
+            sks_br_bankbalance.EndBalance = amount;
+            sks_br_bankbalance.BankHeaderRecId = bankHeaderRecId;
+            sks_br_bankbalance.insert();
+        }
+        //the case we are skipping "if balance exists and is first", is ignored because if it exists, we already have the first
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFormattedField</Name>
+				<Source><![CDATA[
+    str getFormattedField( int item )
+    {
+        str val;
+        ;
+        val = Fields[ item ];
+
+        return val;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRawField</Name>
+				<Source><![CDATA[
+    str getRawField( int item )
+    {
+        str val;
+        ;
+        val = Raw_Fields[item];
+        return val;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    boolean openFile()
+    {
+        System.Text.StringBuilder locStringBuilder;
+        System.String locString;
+        gSKS_EB_FileHub = SKS_EB_FileHub::construct(gSKS_BF_BankIntType);
+        gSKS_EB_FileHub.runFileInquire(fileName);
+        if (!gSKS_EB_FileHub.attrfileExists())
+        {
+            this.handleError(bankHeaderRecId, (strfmt("@SYS62207",fileName)), 0);
+            return false;
+        }
+        gSKS_EB_FileHub.runFileLoad(Filename,gBRPreReadScript,gBRPreReadScriptParams,gBRPostReadScript,gBRPostReadScriptParams);
+        try
+        {
+            gSKS_EB_FileHub.streamInit();
+        }
+        catch
+        {
+            //file could not be opened
+            this.handleError(bankHeaderRecId, (strfmt("@SYS19312",fileName)), 0);
+            return false;
+        }
+
+        locStringBuilder = new System.Text.StringBuilder(gSKS_EB_FileHub.fileBody());
+        this.closeFile();
+        //Normalize Carriage returns
+        locStringBuilder = locStringBuilder.Replace('\r\n',gCarriageReturnPlaceholder);
+        locStringBuilder = locStringBuilder.Replace('\n\r', gCarriageReturnPlaceholder);
+        locStringBuilder = locStringBuilder.Replace('\r', gCarriageReturnPlaceholder);
+        locStringBuilder = locStringBuilder.Replace('\n', gCarriageReturnPlaceholder);
+        locStringBuilder = locStringBuilder.Replace(gCarriageReturnPlaceholder, '\r');
+        locString = locStringBuilder.ToString();
+        locStringBuilder = null;
+        gRecords = locString.Split('\r');
+        
+        maxlinelengthneeded = 0;
+        maxFieldFormats = 0;
+        while select * from fixedFormat order by FieldNbr where
+            fixedFormat.FormatId == formatId
+            && fixedFormat.CCR_IsCCRFormat == NoYes::No /// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+        {
+            // Preload each field information to reduce database calls below.
+            maxFieldFormats += 1;
+            FieldFormat[maxFieldFormats] += fixedFormat.FieldType;
+            FieldFormat[maxFieldFormats] += fixedFormat.FieldStart;
+            FieldFormat[maxFieldFormats] += fixedFormat.FieldEnd;
+            // Decide the minimum line length that is needed to satisfy the format
+            if( fixedFormat.FieldEnd > maxlinelengthneeded )
+            {
+                maxlinelengthneeded = fixedFormat.FieldEnd;
+            }
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readFile</Name>
+				<Source><![CDATA[
+    void readFile()
+    {
+        boolean hasBankAcct = false;
+        boolean bankCredit;
+        boolean doNotImport = false;
+        boolean ignoreThisTransaction = false;
+        str locErrorMessage;
+        real locTempFee;
+
+        //the variable locEndingBalancesSet is used for setting the ending balance of a statment in
+        //  a file with a SKS_BR_EndingBalancePosition of FIRST.  This way, if the file contains
+        //  multiple, non-grouped accounts, hitting the same account twice won't cause the balance
+        // to be reset.
+        Container locEndingBalancesSet;
+        container line;
+
+        date locStatementDate;
+        date importedAcctStatementDate;
+
+        int i;
+        int linecnt = 0;
+        int64 lineCount;
+        real locEndingBalance;
+        boolean locIsCreditAmt;
+
+        RecId bankAccountRecId;
+        str companyContext = curExt();
+        RecId fileBankAccountRecId;
+        str lineStr;
+        str value;
+        System.String locValueString;
+        utcDateTime locFileUtcDateTime;
+
+        BankAccountTable bankAccountTable;
+        SKS_pp_Bank locSKS_PP_Bank;
+        SKS_BR_BankTran companySKS_BR_BankTran;
+        CompanyBankAccountId locPrevAccountId;
+        SKS_BR_BankAcctStmt locSKS_BR_BankAcctStmt;
+        DataAreaId locPrevCompanyContext;
+        BankAccountStatementNum locPrevStatementNum;
+        BankAccountStatementNum locStatementNum;
+        BankAccountStatementNum importedAcctStatementNum;
+        AmountMST tranAmount;
+        SKS_BR_TranTypeProcessing tranTypeProcessing;
+        System.DateTime locDtemp = System.DateTime::Now;
+        int locSecond = locDtemp.Second;
+        int locMillisecond = locDtemp.Millisecond;
+        locSecond = locSecond * 1000;
+
+        locSKS_BR_BankAcctStmt =  new SKS_BR_BankAcctStmt();
+        ImportCount = 0;
+
+        str bankNumLocal; // SKS 16487
+
+        if (!this.openFile())
+        {
+            return;
+        }
+        lineCount = gRecords.Length;
+        locFileUtcDateTime = FileDateTime;
+
+        locStatementDate = mkDate(DateTimeUtil::day(locFileUtcDateTime),
+                                    DateTimeUtil::month(locFileUtcDateTime),
+                                    DateTimeUtil::year(locFileUtcDateTime));
+        locStatementNum  = SKS_PP_StringFormats::strFill(2,int2str(DateTimeUtil::hour(locFileUtcDateTime)), SKS_PP_FillCharacter::Zero, SKS_PP_FillSide::Left) +
+                            SKS_PP_StringFormats::strFill(2,int2str(DateTimeUtil::minute(locFileUtcDateTime)), SKS_PP_FillCharacter::Zero, SKS_PP_FillSide::Left) +
+                            SKS_PP_StringFormats::int642BaseSKG34(locSecond + locMillisecond);
+
+        ttsbegin;
+        for(int64 locRecordCounter = 0; locRecordCounter < gRecords.Length; locRecordCounter++)
+        {
+            line = gRecords.GetValue(locRecordCounter);
+            linecnt++;
+            bankCredit = true;
+
+            if(line && linecnt > OmitHeaderRecsNbr && linecnt < (lineCount - OmitTrailerRecsNbr + 1) )
+            {
+                this.initSKS_BR_BankTran();
+                banktran.LineNumInFile = linecnt;
+                [lineStr] = line;
+                lineStr = strrem(lineStr, '\r');
+
+                if(strlen(con2Str(line)) == 0) //skip blank lines
+                {
+                    continue;
+                }
+
+                doNotImport = false;
+                locIsCreditAmt = true;
+                for (i=1; i<=maxFieldFormats; i+=1)
+                {
+                    fixedFormat.FieldType = conPeek(FieldFormat[i], 1);
+                    fixedFormat.FieldStart = conPeek(FieldFormat[i], 2);
+                    fixedFormat.FieldEnd = conPeek(FieldFormat[i], 3);
+
+                    // Assuming 1 based values for Field End and Field Start.
+                    if(fixedFormat.FieldType == SKS_BR_FieldType::TxnDescription && i == maxFieldFormats)
+                        value = SKS_PP_StringFormats::strSub(lineStr,fixedFormat.FieldStart);
+                    else
+                        value = substr(lineStr, fixedFormat.FieldStart, fixedFormat.FieldEnd - fixedFormat.FieldStart + 1);
+
+                    switch(fixedFormat.FieldType)
+                    {
+                        case SKS_BR_FieldType::BankAccountNumber:
+                            bankAccountTable = SKS_EB_Bank::getBankAccount(global::strLRTrim(value));
+                            fileBankAccountRecId = bankAccountTable.RecId;
+                            hasBankAcct = true;
+                            break;
+                        case SKS_BR_FieldType::Amount,
+                              SKS_BR_FieldType::BankCreditAmount:
+                            // convert the string to a numerica value using the appropriate number
+                            // of decimal places
+                            value = strReplace(value, ',', '.');
+                            tranAmount = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            if(tranAmount != 0)
+                            {
+                                locIsCreditAmt = true;
+                                bankTran.TranAmount = tranAmount;
+                                if ( Decimal_Places == 0 )
+                                {
+                                    bankTran.TranAmount = bankTran.TranAmount / power( 10, 2 );
+                                }
+                            }
+                            break;
+                        case SKS_BR_FieldType::BankDebitAmount:
+                            // convert the string to a numerica value using the appropriate number
+                            // of decimal places
+                            value = strReplace(value, ',', '.');
+                            tranAmount = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            if(tranAmount != 0)
+                            {
+                                locIsCreditAmt = false;
+                                bankTran.TranAmount = tranAmount * -1;
+                                if ( Decimal_Places == 0 )
+                                {
+                                    bankTran.TranAmount = bankTran.TranAmount / power( 10, 2 );
+                                }
+                            }
+                            break;
+                        case SKS_BR_FieldType::DateMM_DD_YY,
+                              SKS_BR_FieldType::DateMM_DD_YYYY,
+                              SKS_BR_FieldType::DateMMDDYY,
+                              SKS_BR_FieldType::DateMMDDYYYY:
+                            bankTran.TranDate = str2date(value,213);
+                            break;
+                        case SKS_BR_FieldType::DateYY_MM_DD,
+                              SKS_BR_FieldType::DateYYMMDD,
+                              SKS_BR_FieldType::DateYYYY_MM_DD,
+                              SKS_BR_FieldType::DateYYYYMMDD:
+                            bankTran.TranDate = str2date(value,321);
+                            break;
+                        case SKS_BR_FieldType::DateDD_MM_YY,
+                              SKS_BR_FieldType::DateDD_MM_YYYY,
+                              SKS_BR_FieldType::DateDD_MM_YYYY_Dashes,
+                              SKS_BR_FieldType::DateDDMMYY,
+                              SKS_BR_FieldType::DateDDMMYYYY:
+                            bankTran.TranDate = str2date(value,123);
+                            break;
+                        case SKS_BR_FieldType::TxnDescription:
+                            locValueString = new System.Text.StringBuilder().Append(value).Replace(System.Convert::ToChar(4),System.Convert::ToChar(32)).ToString();
+
+                            if(bankTran.TranDescription == '')
+                            {
+                                bankTran.TranDescription = locValueString;
+                            }
+                            else
+                            {
+                                bankTran.TranDescription += ' ' + locValueString;
+                            }
+                            // Populate User note also here
+                            bankTran.TranDescriptionUser = bankTran.TranDescription;
+                            break;
+                        case SKS_BR_FieldType::BankReferenceNumber:
+                            if(bankTran.BankNum == '')
+                            {
+                                bankNumLocal    = strRem(value, '\r\n');  // SKS 16487
+                                bankTran.BankNum = this.parseRefernceNumber(value);
+                            }
+                            else
+                            {
+                                bankNumLocal    += ' ' + strRem(value, '\r\n');  // SKS 16487
+                                bankTran.BankNum += ' ' + this.parseRefernceNumber(value);
+                            }
+                            break;
+                        case SKS_BR_FieldType::BankCustomerReferenceNumber:
+                            if(bankTran.BankCustomerNum == '')
+                            {
+                                bankTran.BankCustomerNum = this.parseRefernceNumber(value);
+                            }
+                            else
+                            {
+                                bankTran.BankCustomerNum += ' ' + this.parseRefernceNumber(value);    
+                            }
+                            break;
+                        case SKS_BR_FieldType::TxnType:
+                            if(bankTran.FileTranType == '')
+                            {
+                                bankTran.FileTranType = global::strLRTrim(value);
+                            }
+                            else
+                            {
+                                bankTran.FileTranType += ' ' + global::strLRTrim(value);
+                            }
+                            break;
+                        case SKS_BR_FieldType::Balance:
+                            value = strReplace(value, ',', '.');
+                            locEndingBalance = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            if(locEndingBalance != 0)
+                            {
+                                if ( Decimal_Places == 0 )
+                                {
+                                    locEndingBalance = locEndingBalance / power( 10, 2 );
+                                }
+                            }
+                            break;
+                        case SKS_BR_FieldType::FeeAmount:
+                            locTempFee = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            if(locTempFee != 0)
+                            {
+                                if ( Decimal_Places == 0 )
+                                {
+                                    locTempFee = locTempFee / power( 10, 2 );
+                                }
+                                bankTran.TransactionFeesAmt += locTempFee;
+                            }
+                            break;
+                    }
+                }
+
+                //SKS 17411
+                if (bankTran.BankCustomerNum != '')
+                {
+                    bankTran.TranDescription = bankTran.TranDescription == '' ?  'BankCustNbr: ' + bankTran.BankCustomerNum : bankTran.TranDescription + ' ' + 'BankCustNbr: ' + bankTran.BankCustomerNum;
+                }
+                bankTran.TranDescriptionUser = bankTran.TranDescriptionUser == '' ? bankTran.BankCustomerNum : bankTran.TranDescriptionUser + ' ' + bankTran.BankCustomerNum;
+                //SKS 17411
+
+                if (bankNumLocal != '')
+                {
+                    bankTran.TranDescription = bankTran.TranDescription == '' ?  'BankNbr: ' + bankNumLocal : bankTran.TranDescription + ' ' + 'BankNbr: ' + bankNumLocal; // SKS 16487
+                }
+                
+                bankTran.TransactionFeesAmt = (locIsCreditAmt?bankTran.TransactionFeesAmt:bankTran.TransactionFeesAmt * -1);
+                bankTran.ValueDate = bankTran.TranDate;
+
+                // For Advanced mode, if the Bank Account Number is not a mapped field
+                // need to derive AccountId based on Format Id
+                if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced)
+                {
+                    if(!hasBankAcct)
+                    {
+                        bankAccountTable = this.getBankAccountByPath();
+                        if(bankAccountTable)
+                        {
+                            bankTran.AccountId = bankAccountTable.AccountID;
+                            companyContext = bankAccountTable.company();
+                        }
+                        else
+                        {
+                            ttsabort;
+                            this.handleError(bankHeaderRecId, ("@SKS713"), 0);
+                            ImportCount = 0;
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        bankAccountRecID = fileBankAccountRecId;
+                        bankTran.AccountId = bankAccountTable.AccountID;
+                        companyContext = bankAccountTable.company();
+
+                        changeCompany(companyContext)
+                        {
+                            // Make sure this Bank Account is setup for eBankRec
+                            if(!this.validateAccountId(bankTran.AccountId))
+                                doNotImport = true;
+                        }
+                    }
+                    ignoreThisTransaction = false;
+                    if(bankTran.FileTranType != '')
+                    {
+                        changeCompany(companyContext)
+                        {
+                            tranTypeProcessing = this.processTranType(bankTran.AccountId);
+                            if(tranTypeProcessing.getIgnoreTranType())
+                            {
+                                ignoreThisTransaction = true;
+                                continue; // return if this trantype should not be imported
+                            }
+                        }
+                        if(tranTypeProcessing.getErrorText() != '')
+                        {
+                            ttsabort;
+                            this.handleError(bankHeaderRecId, (strfmt("@SKS528", bankTran.FileTranType)), linecnt);
+                            ImportCount = 0;
+                            return;
+                        }
+
+                        bankTran.BankTranType = tranTypeProcessing.getBankTranType();
+
+                        SKS_BR_GLMappingRuleGroup mappingRuleGroup;
+
+                        select firstonly
+                                GLMatchOrCreate
+                            from mappingRuleGroup
+                            where mappingRuleGroup.RuleGroupId == tranTypeProcessing.getGLMappingRuleGroupId()
+                            && mappingRuleGroup.CCR_IsCCReconciliation == NoYes::No;    /// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+
+                        if (tranTypeProcessing.getMatchingRuleGroupId() || tranTypeProcessing.getGLMappingRuleGroupId())
+                        {
+                            bankTran.GLMappingRuleGroupId = tranTypeProcessing.getGLMappingRuleGroupId();
+                            bankTran.MatchingRuleGroupId = tranTypeProcessing.getMatchingRuleGroupId();
+                        }
+                        else // Bug 7219
+                        {
+                            bankTran.GLMappingRuleGroupId = '';
+                            bankTran.MatchingRuleGroupId = '';
+                            bankTran.GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLMatch;
+                        }
+                        bankTran.DefaultDimension = tranTypeProcessing.getDimension();
+
+                        if (importedAcctStatementNum == '')
+                        {
+                            importedAcctStatementNum = locStatementNum;
+                            importedAcctStatementDate = locStatementDate;
+                        }
+
+                        bankTran.ImportedStatementNum = importedAcctStatementNum;
+                        bankTran.ImportedStatementDate = importedAcctStatementDate;
+                    }
+                }
+                else//Standard Bank Rec
+                {
+                    //get the Bank Account Number based on the Statement's bank account number.
+                    bankAccountRecId = this.getBankAccountRecId();
+                }
+
+                changeCompany(companyContext)
+                {
+                    SKS_BR_ReadFile::setDefaultMatchGroup(bankTran);
+                    if(!this.parseValue())
+                    {
+                        return;
+                    }
+                    if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced)
+                    {
+                        if(locPrevAccountId != bankAccountTable.AccountID
+                            || locPrevCompanyContext != bankAccountTable.company())
+                        {
+
+                            sks_br_fileformat = null;
+                            locSKS_PP_Bank = null;
+                            select firstonly BRFormatID, BRCreateBankStatements from locSKS_PP_Bank
+                                where locSKS_PP_Bank.BankAccountId == bankAccountTable.AccountID
+                            join sks_br_fileformat
+                                where sks_br_fileFormat.FormatID ==locSKS_PP_Bank.BRFormatID;
+                            bankAccountStatement = null;
+                            bankAccountStatement.AccountId = bankAccountTable.AccountID;
+                            bankAccountStatement.AccountStatementDate = locStatementDate;
+                            bankAccountStatement.AccountStatementNum = locStatementNum;
+                            if (importedAcctStatementNum == '')
+                            {
+                                importedAcctStatementNum = locStatementNum;
+                                importedAcctStatementDate = locStatementDate;
+                            }
+                            bankAccountStatement.CurrencyCode = bankAccountTable.CurrencyCode;
+                        }
+                        if (sks_br_fileformat.DebitCreditIdentifier == Noyes::Yes)
+                        {
+                            if(!tranTypeProcessing)
+                            {
+                                tranTypeProcessing = this.processTranType(bankTran.AccountId);
+                            }
+                            bankCredit = tranTypeProcessing.getBankCredit();
+                        }
+                    }
+                    //ONLY IF ADVANCED
+                    //If the account is sent for FIRST Record updates ending balance and this account hasn't already
+                    //      created an ending balance(determind by its existence in the container
+                    // then create it
+                    //      OR always fire the create code if it is set to LAST record.  The create code will
+                    //          actually update an existing ending balance if it has already been created.
+                    //Do not add the Account to the locEndingBalanceSet queue yet.
+                    //      We will add it later when we create the statement.
+                    if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced
+                        && ((conFind(locEndingBalancesSet, bankAccountStatement.AccountId) == 0
+                                && SKS_BR_FileFormat.UpdateEndBalance == NoYes::Yes
+                                && sks_br_fileformat.EndBalancePosition == SKS_BR_EndingBalancePosition::First)
+                                || (SKS_BR_FileFormat.UpdateEndBalance == NoYes::Yes &&
+                                    sks_br_fileformat.EndBalancePosition == SKS_BR_EndingBalancePosition::Last)))
+                    {
+                        bankAccountStatement.EndingBalance = locEndingBalance;
+                        this.createBankBalance(bankAccountStatement.AccountStatementDate,
+                            bankAccountStatement.AccountId,
+                            bankAccountStatement.EndingBalance);
+                    }
+                    // Create the Record in the database
+                    // If this line is for the specified Account
+                    If(!hasBankAcct || ((fileBankAccountRecId) &&
+                      (bankAccountRecId == fileBankAccountRecId)))
+                    {
+                        if(!(doNotImport || ignoreThisTransaction))
+                        {
+                            if ( bankCredit == false)
+                            {
+                                bankTran.TranAmount =  bankTran.TranAmount * -1;
+                                bankTran.TransactionFeesAmt = bankTran.TransactionFeesAmt * -1;
+                            }
+                            bankTran.TransactionFeesAmt = (SKS_BR_FileFormat.CCFeeReverseSignOnFeeAmt?bankTran.TransactionFeesAmt * -1:bankTran.TransactionFeesAmt);
+
+                            //we are going to insert a SKS_BR_BankTran record, should we create a statement or update and existing statement?
+                            if(bankAccountStatement.AccountId != locPrevAccountId
+                                    || locPrevCompanyContext != companyContext
+                                    || sks_br_fileformat.EndBalancePosition == SKS_BR_EndingBalancePosition::Last)
+                            {
+
+                                if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced)
+                                {
+
+                                    if(bankAccountStatement.AccountId != locPrevAccountId
+                                        || locPrevCompanyContext != companyContext)
+                                    {
+                                        //create Statement
+                                        //inside the method, Protected so it will only create if the account is setup for automatic statement creation
+                                        //                      and is SKS_BR_EDITION::Advanced
+                                        bankAccountStatement = locSKS_BR_BankAcctStmt.createBRStatement(bankAccountStatement, bankHeaderRecId);
+                                    }
+                                    if(sks_br_fileformat.UpdateEndBalance == NoYes::yes
+                                        && sks_br_fileformat.EndBalancePosition == SKS_BR_EndingBalancePosition::Last)
+                                    {
+                                        bankAccountStatement.EndingBalance = locEndingBalance;
+                                        if(locSKS_PP_Bank.BRCreateBankStatements == NoYes::Yes)
+                                        {
+                                            if(bankAccountStatement)
+                                            {
+                                                bankAccountStatement.update();
+                                            }                                //if there is no bank account statement, then write to the import log and return
+                                            else
+                                            {
+                                                ttsAbort;//END TTS
+                                                this.handleError(bankHeaderRecId, strFmt("@SKS3488",
+                                                                    bankAccountStatement.AccountStatementNum,
+                                                                    date2str(bankAccountStatement.AccountStatementDate,
+                                                                                213,2,DateSeparator::Slash,2,DateSeparator::Slash,4, DateFlags::FormatAll),
+                                                                                bankAccountStatement.AccountId, curext()), 0);
+                                                return;
+                                            }
+                                        }//END if(locSKS_PP_Bank.BRCreateBankStatements == NoYes::Yes
+                                    }
+                                    else if(sks_br_fileformat.UpdateEndBalance == NoYes::yes
+                                        && sks_br_fileformat.EndBalancePosition == SKS_BR_EndingBalancePosition::First
+                                        && conFind(locEndingBalancesSet, bankAccountStatement.AccountId) == 0)
+                                    {
+                                        locEndingBalancesSet += bankAccountStatement.AccountId;
+                                        bankAccountStatement.EndingBalance = locEndingBalance;
+                                        if(locSKS_PP_Bank.BRCreateBankStatements == NoYes::Yes)
+                                        {
+                                            if(bankAccountStatement)
+                                            {
+                                                bankAccountStatement.update();
+                                            }                                //if there is no bank account statement, then write to the import log and return
+                                            else
+                                            {
+                                                ttsAbort;//END TTS
+                                                this.handleError(bankHeaderRecId, strFmt("@SKS3488",
+                                                                    bankAccountStatement.AccountStatementNum,
+                                                                    date2str(bankAccountStatement.AccountStatementDate,
+                                                                                213,2,DateSeparator::Slash,2,DateSeparator::Slash,4, DateFlags::FormatAll),
+                                                                                bankAccountStatement.AccountId, curext()), 0);
+                                                return;
+                                            }
+                                        }//END if(locSKS_PP_Bank.BRCreateBankStatements == NoYes::Yes
+                                    }
+                                    locPrevStatementNum = bankAccountStatement.AccountStatementNum;
+                                    locPrevAccountId = bankAccountStatement.AccountId;
+                                    locPrevCompanyContext = companyContext;
+                                }
+                            }
+                            if((bankAccountStatement && bankAccountStatement.SKS_BR_BankHeaderRecId > 0 && bankAccountStatement.SKS_BR_BankHeaderRecId == bankHeaderRecId)
+                                || (locSKS_PP_Bank.BRCreateBankStatements == NoYes::No && BankAccountStatement.RecId == 0))//only set the originalstatementrecid if we created the statement // 7526
+                            {
+                                bankTran.OriginalStatementRecId  = bankAccountStatement.RecId;
+                                //SKS_BR4_BankStatementDuplicate - Bug:7273 - Begin
+                                companySKS_BR_BankTran = null;
+                                buf2Buf(bankTran, companySKS_BR_BankTran);
+                                companySKS_BR_BankTran.doInsert();
+                                //SKS_BR4_BankStatementDuplicate - Bug:7273 - End
+                            }
+                        }
+                        ImportCount++;
+                    }
+                }
+            }
+        }
+        gRecords = null;
+        locErrorMessage = this.createCreditCardReconciliationExtensionLines(bankHeaderRecId);
+        if(locErrorMessage != '')
+        {
+            ttsAbort;
+            this.handleError(bankHeaderRecId, strfmt(locErrorMessage), 0);
+            ImportCount = 0;
+            return;
+        }
+
+        if(!this.readFileClosePreCommit())
+            return;
+
+        ttscommit;
+
+        this.readFileClosePostCommit();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDecimalPlaces</Name>
+				<Source><![CDATA[
+    void setDecimalPlaces( int Places )
+    {
+
+        Decimal_Places = Places;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

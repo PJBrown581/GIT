@@ -1,0 +1,266 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_CurrencyAdjustment</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_CurrencyAdjustment
+{
+    // SKS_FDD_13903 -->
+    LedgerJournalTable              ledgerJournalTable;
+    LedgerJournalEngine             ledgerJournalEngine;
+    // SKS_FDD_13903 <--
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processCurrencyAdjustment</Name>
+				<Source><![CDATA[
+    public static void processCurrencyAdjustment(BankAccountStatement _bankAccountStatement)
+    {
+        AmountCur                   differenceAmount;
+        SKS_CCR_BankTran            sks_ccr_bankTran;
+        BankAccountTrans            bankAccountTrans;
+        TransDate                   transActionDate = _bankAccountStatement.AccountStatementDate;
+        DataAreaId                  statementCompany = _bankAccountStatement.DataAreaId;
+        CurrencyCode                bankCurrency;
+        boolean                     ledgerJournalTableCreated = false;
+        SKS_PP_Setup                sks_pp_setup;
+        SKS_CCR_CurrencyAdjustment  currencyAdjustment = new SKS_CCR_CurrencyAdjustment();
+        Map                         currencyAdjustmentJournalMap = new Map (Types::String, Types::Record);
+        LedgerJournalTable          currencyAdjustmentJournalTable;
+        SKS_CCR_BankTran            sks_CCR_BankTranMatched;
+        int                         recCount = 0;
+
+        bankCurrency = BankaccountTable::find(_bankAccountStatement.AccountId).CurrencyCode;
+
+        // find the amount difference(to calculate the currency adjustment) from bank currency amount based BankTransCurrencyCode
+        while select sum(AmountCur) from bankAccountTrans
+            group by BankTransCurrencyCode
+            where bankAccountTrans.BankTransCurrencyCode != bankCurrency // exclude the transaction which are same as bankCurrency. Calculate the adjusment only if the transaction currency is different from bank currency
+            && bankAccountTrans.AccountId == _bankAccountStatement.AccountId
+            && bankAccountTrans.AccountStatementDate == _bankAccountStatement.AccountStatementDate
+            && bankAccountTrans.AccountStatement == _bankAccountStatement.AccountStatementNum
+            && bankAccountTrans.Reconciled == NoYes::No
+            && bankAccountTrans.Included == NoYes::Yes
+        {
+            differenceAmount = bankAccountTrans.AmountCur;
+            // if the difference is not zero need to post the journal with the difference amount
+            if(differenceAmount != 0.0)
+            {
+                sks_pp_setup = null;
+                select CCRCurrencyAdjustmentJournalName, CCRCurrencyAdjustmentBankTranType, CCRCurrencyAdjustmentGainAccount, CCRCurrencyAdjustmentLossAccount  from sks_pp_setup;
+                // If company has changed, need to load the setup for the new company's
+               /* if(prevAdjustmentCompany != _bankAccountStatement.DataAreaId
+                        || prevAdjustmentJournalName != sks_pp_setup.CCRCurrencyAdjustmentJournalName)
+                {
+                    ledgerJournalTableCreated = false;
+                    prevAdjustmentCompany = _bankAccountStatement.DataAreaId;
+                    prevAdjustmentJournalName = sks_pp_setup.CCRCurrencyAdjustmentJournalName;
+                }*/
+                //changeCompany(_bankAccountStatement.DataAreaId)
+                //{
+                    if(!ledgerJournalTableCreated)
+                    {
+                        currencyAdjustmentJournalTable = currencyAdjustment.createAdjumentLedgerJournalTable(sks_pp_setup.CCRCurrencyAdjustmentJournalName);
+                        if(!currencyAdjustmentJournalMap.exists(_bankAccountStatement.DataAreaId))
+                        {
+                            currencyAdjustmentJournalMap.insert(_bankAccountStatement.DataAreaId, currencyAdjustmentJournalTable);
+                        }
+                        ledgerJournalTableCreated = true;
+                        recCount ++;
+                    }
+                    currencyAdjustment.createAdjustmentLedgerJournalTrans(statementCompany, transActionDate, bankCurrency,
+                                                                                bankAccountTrans.BankTransCurrencyCode, sks_pp_setup,
+                                                                                differenceAmount, _bankAccountStatement);
+               // }
+            }
+        }
+        if(recCount > 0)
+        {
+            currencyAdjustment.postCurrencyAdjustementJournal(currencyAdjustmentJournalMap);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postCurrencyAdjustementJournal</Name>
+				<Source><![CDATA[
+    protected void postCurrencyAdjustementJournal(Map _currencyAdjustmentJournalMap)
+    {
+        MapIterator                 mapIte = new MapIterator(_currencyAdjustmentJournalMap);
+        LedgerJournalTable          currencyAdjustmentJournalTablePost;
+    
+        while (mapIte.more())
+        {
+            currencyAdjustmentJournalTablePost = mapIte.value();
+            changecompany(mapIte.key())
+            {
+                LedgerJournalCheckPost  jourCheckPost;
+                try
+                {
+                    jourCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(currencyAdjustmentJournalTablePost, NoYes::Yes, NoYes::No);
+                    jourCheckPost.run();
+                }
+                catch
+                {
+                    throw error("@SYS23002");
+                }
+            }
+            mapIte.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAdjumentLedgerJournalTable</Name>
+				<Source><![CDATA[
+    public  LedgerJournalTable createAdjumentLedgerJournalTable(LedgerJournalNameId _journalName)
+    {
+        
+        ledgerJournalTable = null;
+        ledgerJournalTable.JournalName = _journalName;
+        ledgerJournalTable.insert();
+        ledgerJournalEngine = LedgerJournalEngine_Daily::construct();
+        ledgerJournalEngine.ledgerJournalTable(ledgerJournalTable);
+        ledgerJournalEngine.newJournalActive(ledgerJournalTable);
+    
+        /*SKS_CCR_HistoryTable::insertEvent(SKS_CCR_Action::GLAutoCreated,
+                                         _SKS_CCR_BankHeaderRecId,
+                                         '',dateNull(),
+                                         '',
+                                         ledgerJournalTable.JournalNum
+                                        );*/
+        return ledgerJournalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAdjustmentLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    public void createAdjustmentLedgerJournalTrans(DataAreaId _adjustmentCompany, TransDate _transActionDate,
+                                                   CurrencyCode _bankCurrency, CurrencyCode _transCurrency,
+                                                   SKS_PP_Setup _sks_pp_setup, AmountCur _amountCur, BankAccountStatement _bankAccountStatement)
+    {
+        LedgerJournalTrans              ledgerJournalTrans;
+        DimensionDefault                defaultJournalDimension;
+        BankAccountId                   bankAccountId = _bankAccountStatement.AccountId;
+        //  vvv 12073 vvv
+        //this is the least significant dimension for offset dimensions.  It is from the AX Bank form's, AX vendor form's, AX customer form's, or AX project form's dimensioning.
+        //The GL Processing lookup Rule's "Offset Account Type"'s field tells us what form will be supplying the information. This dimensioning can be
+        //overridden in the following places(in order of ascending precedence): Ledger's Financial Dimensions tab, TAS Tran Type Mapping, GL Lookup's Offset Finanical Dimension sub-from
+        DimensionDefault                AccountTypeOffsetDefaultDimension;
+        // ^^^ 12073 ^^^
+    
+        DimensionDefault                ledgerDimension;
+        SKS_PP_Bank                     locSKS_PP_Bank;
+        //  vvv 12073 vvv
+        BankAccountTable                locBankAccountTable;
+        // ^^^ 12073 ^^^
+        str                             errorText;
+    
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+        ledgerJournalEngine.initValue(ledgerJournalTrans);
+        ledgerJournalTrans.JournalNum = ledgerJournalTable.JournalNum;
+        ledgerJournalTrans.AccountType = LedgerJournalACType::Bank;
+    
+        ledgerJournalEngine.accountModified(ledgerJournalTrans);
+        ledgerJournalEngine.initTaxItemGroup(ledgerJournalTrans);
+    
+        ledgerJournalTrans.Company = _adjustmentCompany;
+        ledgerJournalTrans.TransDate = _transActionDate;  //CR-7653
+        LedgerJournalTrans.CurrencyCode = _bankCurrency;
+    
+        ledgerJournalTrans.ExchRate = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(ledgerJournalTrans.Company).RecId), ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate).getExchangeRate1();
+    
+        container   ReportCurrency;
+        SysDictClass sysDictClass = new SysDictClass(className2Id(classStr(LedgerJournalEngine_Server)));
+        if (sysDictClass && sysDictClass.hasStaticMethod('reportingCurrencyModified'))
+        {
+            changecompany(ledgerJournalTrans.Company)
+            {
+                ReportCurrency = sysDictClass.callStatic('reportingCurrencyModified', LedgerJournalTrans);
+                ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate')) = conPeek(ReportCurrency, 1);
+                ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary')) = conPeek(ReportCurrency, 2);
+            }
+        }
+        ledgerJournalTrans.Txt = strFmt("@SKS:SKGCCRCurrencyAdjustment", _transCurrency);
+
+
+        if(_amountCur > 0)
+        {
+            ledgerJournalTrans.AmountCurCredit = _amountCur;
+            ledgerJournalTrans.AmountCurDebit = 0.0;
+        }
+        else
+        {
+            ledgerJournalTrans.AmountCurDebit = _amountCur * -1;
+            ledgerJournalTrans.AmountCurCredit = 0.0;
+        }
+    
+        //changeCompany(_adjustmentCompany)
+        //{
+        ledgerJournalTrans.ledgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(bankAccountId, LedgerJournalACType::Bank);
+        ledgerJournalTrans.AccountType = LedgerJournalACType::Bank;
+        ledgerJournalTrans.BankTransType = _sks_pp_setup.CCRCurrencyAdjustmentBankTranType; 
+        LedgerJournalTrans.TransactionType = LedgerTransType::GeneralJournal;
+        // vvv 12073 vvv
+        locBankAccountTable = null;
+        locBankAccountTable = BankAccountTable::find(bankAccountId);
+        defaultJournalDimension = ledgerJournalTable.DefaultDimension;
+        ledgerJournalTrans.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(defaultJournalDimension, locBankAccountTable.DefaultDimension);
+        // ^^^ 12073 ^^^
+        ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+        if(_amountCur > 0)
+        {
+            ledgerDimension = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(_sks_pp_setup.CCRCurrencyAdjustmentGainAccount);
+            AccountTypeOffsetDefaultDimension =  LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(ledgerDimension, ledgerJournalTable.DefaultDimension);
+            ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_sks_pp_setup.CCRCurrencyAdjustmentGainAccount, AccountTypeOffsetDefaultDimension);
+        }
+        else
+        {
+            ledgerDimension = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(_sks_pp_setup.CCRCurrencyAdjustmentLossAccount);
+            AccountTypeOffsetDefaultDimension =  LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(ledgerDimension, ledgerJournalTable.DefaultDimension);
+            ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_sks_pp_setup.CCRCurrencyAdjustmentLossAccount, AccountTypeOffsetDefaultDimension);
+        }
+        if(errorText != '')
+        {
+            return;
+        }
+        //}
+    
+        if(LedgerJournalTrans.validateWrite()) // validate
+        {
+            ledgerJournalTrans.insert();
+            changeCompany(_adjustmentCompany)
+            {
+                SKS_CCR_BankTran locSKS_CCR_BankTran = null;
+
+                ttsbegin;
+                // update Currency adjustment journal recId based on Transaction currency
+                update_recordset locSKS_CCR_BankTran
+                    setting CurrencyAdjusmentLedgerJournalRecId = ledgerJournalTrans.RecId
+                    where locSKS_CCR_BankTran.AccountId == _bankAccountStatement.AccountId &&
+                    locSKS_CCR_BankTran.AccountStatementDate == _bankAccountStatement.AccountStatementDate &&
+                    locSKS_CCR_BankTran.AccountStatementNum == _bankAccountStatement.AccountStatementNum &&
+                    locSKS_CCR_BankTran.TransCurrency == _transCurrency &&
+                    locSKS_CCR_BankTran.MatchIndicator == SKS_BR_MatchIndicator::Green &&
+                    locSKS_CCR_BankTran.Matched == NoYes::Yes;
+                ttscommit;
+            }
+        }
+        else
+        {
+            errorText = strFmt("@SKS:SKGCCRAdjustmntTransFailed", _transCurrency, bankAccountId, _adjustmentCompany);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,412 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_PayLinkQueueRefresh</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_PayLinkQueueRefresh extends RunBaseBatch
+{
+    SKS_CC_PayLinkQueue payLinkQueue;
+    CustAccount custAccount;
+    RefTableId oneTimeCustRefTableId;
+    RefRecId oneTimeCustRefRecId;
+    String50 payFabricCustomerNbr;
+    Counter nbrOfLinksSetToCompleted, nbrOfLinksSetToError;
+    Counter nbrOfLinksSetToCanceled, nbrOfLinksSetToExpired;
+    RecId recIdFrom, recIdTo;
+    int threadNo;
+    str threadCaption;
+    boolean isBatchMode, isSingleRecordRefresh;
+    int procStartTime, procEndTime, procExecutionTime;
+
+    ServerId serverId;
+    xSession axSession;
+
+    #Define.CurrentVersion(1)
+    #LOCALMACRO.CURRENTLIST
+        recIdFrom,
+        recIdTo,
+        threadNo,
+        threadCaption,
+        isBatchMode
+    #EndMacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {        
+        procStartTime = WinAPIServer::getTickCount();
+        if (isSingleRecordRefresh)
+        {
+            this.refreshQueueRecord();
+        }
+        else
+        {
+            this.processQueueRecordsWithRange();
+        }
+        procEndTime = WinAPIServer::getTickCount();
+        
+        this.displayLogResults();        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processQueueRecordsWithRange</Name>
+				<Source><![CDATA[
+    protected void processQueueRecordsWithRange()
+    {
+        if (!recIdFrom || !recIdTo)
+        {
+            return;
+        }
+
+        SKS_CC_PayLinkQueue payLinkQueueLoc;
+        while select payLinkQueueLoc
+            where (payLinkQueueLoc.Status == SKS_CC_PayLinkProcessStatus::Pending ||
+                   payLinkQueueLoc.Status == SKS_CC_PayLinkProcessStatus::Error)
+            && payLinkQueueLoc.RecId >= recIdFrom
+            && payLinkQueueLoc.RecId <= recIdTo
+        {
+            this.setValuesForQueueRecordToProcess(payLinkQueueLoc);
+            this.refreshQueueRecord();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayLogResults</Name>
+				<Source><![CDATA[
+    public void displayLogResults()
+    {
+        procExecutionTime = (procEndTime-procStartTime) div 1000;
+        if (procExecutionTime)
+        {
+            str execTimeUnit = "@SKS:SKGCCSecondsProcUnit";
+            if (procExecutionTime > 180)
+            {
+                // Greater than 180 seconds then convert to minutes
+                procExecutionTime = any2Int(procExecutionTime / 60);
+                execTimeUnit = "@SKS:SKGCCMinutesProcUnit";
+            }
+            info(strFmt("@SKS:SKGCCProcElapsedTimeWithProcUnit", procExecutionTime, execTimeUnit));
+        }
+
+        boolean recordsUpdated;
+        if (nbrOfLinksSetToCompleted)
+        {
+            info(strFmt("@SKS:SKGCCQueueRecordsSetToStatus", enum2Str(SKS_CC_PayLinkProcessStatus::Completed), nbrOfLinksSetToCompleted));
+            recordsUpdated = true;
+        }
+
+        if (nbrOfLinksSetToCanceled)
+        {
+            info(strFmt("@SKS:SKGCCQueueRecordsSetToStatus", enum2Str(SKS_CC_PayLinkProcessStatus::Canceled), nbrOfLinksSetToCanceled));
+            recordsUpdated = true;
+        }
+
+        if (nbrOfLinksSetToExpired)
+        {
+            info(strFmt("@SKS:SKGCCQueueRecordsSetToStatus", enum2Str(SKS_CC_PayLinkProcessStatus::Expired), nbrOfLinksSetToExpired));
+            recordsUpdated = true;
+        }
+
+        if (nbrOfLinksSetToError)
+        {
+            info(strFmt("@SKS:SKGCCQueueRecordsSetToStatus", enum2Str(SKS_CC_PayLinkProcessStatus::Error), nbrOfLinksSetToError));
+            recordsUpdated = true;
+        }
+
+        if (!recordsUpdated)
+        {
+            info("@SKS:SKGCCRefreshLinkProcessCompleted");
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>refreshQueueRecord</Name>
+				<Source><![CDATA[
+    protected void refreshQueueRecord()
+    {
+        SKS_CC_PayLinkProcessStatus linkRetStatus;        
+
+        SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+              
+        pfWalletHandler.parmCustAccount(custAccount);
+        if (oneTimeCustRefTableId && oneTimeCustRefRecId)
+        {
+            pfWalletHandler.parmOneTimeCustRefTableId(oneTimeCustRefTableId);
+            pfWalletHandler.parmOneTimeCustRefRecId(oneTimeCustRefRecId);
+        }
+        pfWalletHandler.setPayFabricCustomerNbr();
+
+        if (payLinkQueue.TransType == SKS_CC_PayLinkTransactionType::WalletLink)
+        {
+            linkRetStatus = pfWalletHandler.refreshWalletLink(payLinkQueue, isSingleRecordRefresh);
+        }
+        else if (payLinkQueue.TransType == SKS_CC_PayLinkTransactionType::PayLink)
+        {
+            linkRetStatus = pfWalletHandler.refreshPayLink(payLinkQueue, isSingleRecordRefresh);
+        }
+
+        switch (linkRetStatus)
+        {
+            case SKS_CC_PayLinkProcessStatus::Completed:
+                nbrOfLinksSetToCompleted++;
+                break;
+            case SKS_CC_PayLinkProcessStatus::Error:
+                nbrOfLinksSetToError++;
+                break;
+            case SKS_CC_PayLinkProcessStatus::Canceled:
+                nbrOfLinksSetToCanceled++;
+                break;
+            case SKS_CC_PayLinkProcessStatus::Expired:
+                nbrOfLinksSetToExpired++;
+                break;
+            default:
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsSingleRecordRefresh</Name>
+				<Source><![CDATA[
+    public boolean parmIsSingleRecordRefresh(boolean _isSingleRecordRefresh = isSingleRecordRefresh)
+    {
+        isSingleRecordRefresh = _isSingleRecordRefresh;
+        return isSingleRecordRefresh;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsBatchMode</Name>
+				<Source><![CDATA[
+    public boolean parmIsBatchMode(boolean _isBatchMode = isBatchMode)
+    {
+        isBatchMode = _isBatchMode;
+        return isBatchMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmThreadCaption</Name>
+				<Source><![CDATA[
+    public str parmThreadCaption(str _threadCaption = threadCaption)
+    {
+        threadCaption = _threadCaption;
+        return threadCaption;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmThreadNo</Name>
+				<Source><![CDATA[
+    public int parmThreadNo(int _threadNo = threadNo)
+    {
+        threadNo = _threadNo;
+        return threadNo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecIdFrom</Name>
+				<Source><![CDATA[
+    public RecId parmRecIdFrom(RecId _recIdFrom = recIdFrom)
+    {
+        recIdFrom = _recIdFrom;
+        return recIdFrom;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecIdTo</Name>
+				<Source><![CDATA[
+    public RecId parmRecIdTo(RecId _recIdTo = recIdTo)
+    {
+        recIdTo = _recIdTo;
+        return recIdTo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setValuesForQueueRecordToProcess</Name>
+				<Source><![CDATA[
+    public void setValuesForQueueRecordToProcess(SKS_CC_PayLinkQueue _payLinkQueue)
+    {
+        payLinkQueue = _payLinkQueue;
+        custAccount = payLinkQueue.AccountNum;
+        payFabricCustomerNbr = payLinkQueue.PFCustomerNbr;
+
+        if (CustTable::find(custAccount).OneTimeCustomer)
+        {
+            oneTimeCustRefTableId = payLinkQueue.RefTableId;
+            oneTimeCustRefRecId = payLinkQueue.RefRecId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newRange</Name>
+				<Source><![CDATA[
+    public static SKS_CC_PayLinkQueueRefresh newRange(
+        RecId _recIdFrom,
+        RecId _recIdTo,
+        int _threadNo,
+        str _threadCaption,
+        boolean _isBatchMode = false)
+    {
+        if (!_recIdFrom)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        if (!_recIdTo)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        SKS_CC_PayLinkQueueRefresh payLinkQueueRefresh = SKS_CC_PayLinkQueueRefresh::construct();
+        
+        payLinkQueueRefresh.parmRecIdFrom(_recIdFrom);
+        payLinkQueueRefresh.parmRecIdTo(_recIdTo);
+        payLinkQueueRefresh.parmThreadNo(_threadNo);
+        payLinkQueueRefresh.parmThreadCaption(_threadCaption);
+        payLinkQueueRefresh.parmIsBatchMode(_isBatchMode);
+        payLinkQueueRefresh.parmIsSingleRecordRefresh(false);
+
+        return payLinkQueueRefresh;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        SKS_CC_PayLinkQueueRefresh payLinkQueueRefresh = SKS_CC_PayLinkQueueRefresh::construct();
+
+        SKS_PP_Setup sKS_PP_Setup = SKS_PP_Setup::find();
+
+        if (sks_pp_setup.ModCC == NoYes::No ||
+            (sks_pp_setup.CCPLEnableWalletLinks == NoYes::No &&
+             sks_pp_setup.CCPLEnablePayLinks == NoYes::No))
+        {
+            throw error("@SKS:SKGCCRefreshLinkIsNotAllowedDueToParameters");
+        }
+
+        if (!sKS_PP_Setup.CCPayLinkEnumUpgraded)
+        {
+            throw error("@SKS:SKGCCRefreshLinkIsNotAllowedDueToUpgrade");
+        }        
+
+        if (!_args)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        if (!_args.record())
+        {
+            throw error(Error::missingRecord(funcName()));
+        }
+
+        if (_args.dataset() != tableNum(SKS_CC_PayLinkQueue))
+        {
+            throw error(Error::missingRecord(funcName()));
+        }
+
+        payLinkQueueRefresh.parmIsSingleRecordRefresh(true);
+        payLinkQueueRefresh.setValuesForQueueRecordToProcess(_args.record());
+
+        payLinkQueueRefresh.run(); 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_PayLinkQueueRefresh construct()
+    {
+        return new SKS_CC_PayLinkQueueRefresh();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS:SKGCCRefreshPayLinkOrWalletLink";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public ClassDescription caption()
+    {
+        ClassDescription ret;
+    
+        ret = super();
+
+        if (threadCaption)
+        {
+            ret = threadCaption;
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

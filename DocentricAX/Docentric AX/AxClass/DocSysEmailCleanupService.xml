@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocSysEmailCleanupService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.ApplicationPlatform.Workflow.Instrumentation;
+
+/// <summary>
+/// The DocSysEmailCleanupService class is a service for Batch email sending status clean-up.
+/// </summary>
+public class DocSysEmailCleanupService extends SysOperationServiceBase
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes the emails.
+    /// </summary>
+    /// <param name = "_dataContract">An instance of the DocSysEmailCleanupDataContract class</param>
+    public void process(DocSysEmailCleanupDataContract _dataContract)
+    {
+        QueryRun queryRun = new QueryRun(_dataContract.getQuery());
+
+        QueryBuildRange qbrCreatedDateTime = SysQuery::findOrCreateRange(queryRun.query().dataSourceTable(tableNum(SysOutgoingEmailTable)), fieldNum(SysOutgoingEmailTable, CreatedDateTime));
+        qbrCreatedDateTime.value(SysQuery::range(_dataContract.parmCreatedDateTimeFrom(), _dataContract.parmCreatedDateTimeTo()));
+
+        QueryBuildRange qbrLatestStatusChangeDateTime = SysQuery::findOrCreateRange(queryRun.query().dataSourceTable(tableNum(SysOutgoingEmailTable)), fieldNum(SysOutgoingEmailTable, LatestStatusChangeDateTime));
+        qbrLatestStatusChangeDateTime.value(SysQuery::range(_dataContract.parmLatestStatusChangeDateTimeFrom(), _dataContract.parmLatestStatusChangeDateTimeTo()));
+
+        QueryBuildRange qbrStatus = SysQuery::findOrCreateRange(queryRun.query().dataSourceTable(tableNum(SysOutgoingEmailTable)), fieldNum(SysOutgoingEmailTable, Status));
+        // Status SysEmailStatus:Executing is excluded from the DocOutgoingEmailStatusFilter::Waiting status
+        qbrStatus.value(strReplace(SysOutgoingEmailTable::getEmailStatusQueryRangeValue_DC(_dataContract.parmStatus()), queryValue(SysEmailStatus::Executing), ''));
+
+        SysOutgoingEmailTable outgoingEmailTable;
+
+        #OCCRetryCount
+
+        int totalCount = SysQuery::countTotal(queryRun);
+        int deletedCount = 0;
+        try
+        {
+            while (queryRun.next())
+            {
+                outgoingEmailTable = queryRun.get(tableNum(SysOutgoingEmailTable));
+
+                // Publish an event before deletion, giving a chance to a subscriber to process the deleting record.
+                boolean cancelDeletion = this.onProcessDeletingRecord(outgoingEmailTable, _dataContract);
+                if (cancelDeletion)
+                {
+                    // Do not delete, if subscriber demands so.
+                    continue;
+                }
+
+                // Delete the record.
+                ttsbegin;
+
+                outgoingEmailTable.selectForUpdate(true);
+                outgoingEmailTable.delete();
+                deletedCount++;
+
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            outgoingEmailTable = SysOutgoingEmailTable::find(outgoingEmailTable.EmailItemId, true, ConcurrencyModel::Optimistic);
+            
+            EmailSMTPEventSource::EventWriteEmailCleanupError(SysEmailDistributor::getEmailTableContext(outgoingEmailTable),
+                'Deadlock exception during cleanup');
+
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            EmailSMTPEventSource::EventWriteEmailTrace('Update conflict during email cleanup');
+
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    outgoingEmailTable = SysOutgoingEmailTable::find(outgoingEmailTable.EmailItemId, true, ConcurrencyModel::Optimistic);
+                    
+                    EmailSMTPEventSource::EventWriteEmailCleanupError(SysEmailDistributor::getEmailTableContext(outgoingEmailTable),
+                        'UpdateConflict during cleanup');
+
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        finally
+        {
+            DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:SysEmailCleanupOperationCompleted", totalCount, deletedCount, totalCount - deletedCount));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDeletingRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delegate for processing the deleting SysOutgoingEmailTable record.
+    /// </summary>
+    /// <param name = "_sysOutgoingEmailTable">The deleting SysOutgoingEmailTable record</param>
+    /// <param name = "_dataContract">Contains parameters for Email distributor cleanup</param>
+    /// <param name = "_result">Set result.cancelExecution(true) to cancel deletion of the record</param>
+    /// <remarks>Use this delegate to archive records before deletion or to dynamically change the deletion condition</remarks>
+    delegate void processDeletingRecord(SysOutgoingEmailTable _sysOutgoingEmailTable, DocSysEmailCleanupDataContract _dataContract, DocEventHandlerResult _result)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onProcessDeletingRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Publisher for processing the deleting SysOutgoingEmailTable record.
+    /// </summary>
+    /// <param name = "_sysOutgoingEmailTable">The deleting SysOutgoingEmailTable record</param>
+    /// <param name = "_dataContract">Contains parameters for Email distributor cleanup</param>
+    /// <returns>True, if the deletion should be canceled</returns>
+    /// <remarks>Use this delegate to archive records before deletion or to dynamically change the deletion condition</remarks>
+    public boolean onProcessDeletingRecord(SysOutgoingEmailTable _sysOutgoingEmailTable, DocSysEmailCleanupDataContract _dataContract)
+    {
+        DocEventHandlerResult result = new DocEventHandlerResult();
+        result.cancelExecution(false);
+
+        try
+        {
+            this.processDeletingRecord(_sysOutgoingEmailTable, _dataContract, result);
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), strFmt("@DocentricAX4:DocDelegateMethodError", delegateStr(DocSysEmailCleanupService, processDeletingRecord)));
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:DocDelegateMethodError", delegateStr(DocSysEmailCleanupService, processDeletingRecord)));
+        }
+
+        return result.cancelExecution();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

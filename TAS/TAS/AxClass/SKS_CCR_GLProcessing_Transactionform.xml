@@ -1,0 +1,1313 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_GLProcessing_Transactionform</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_GLProcessing_Transactionform
+{
+    LedgerJournalTable     ledgerJournalTable;
+    SKS_CCR_BankHeaderRecId headerRecId;
+    str                    errorText;
+    CustVendOpenTransManager    updateSettlementManager;
+    RefRecId prevLedgerJournalTrans;
+    SKS_LB_JournalARApplic  gSKS_LB_JournalarApplic;
+    LedgerJournalTrans      gLedgerJournalTrans;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createLedgerJournalTable</Name>
+				<Source><![CDATA[
+    public  void createLedgerJournalTable(SKS_CCR_Banktran locSKS_CCR_BankTran)
+    {
+        //Header creation
+        ledgerJournalTable.initFromLedgerJournalName(locSKS_CCR_BankTran.JournalName);
+        ledgerJournalTable.TaxObligationCompany = TaxParameters::find().TaxObligationCompany; // CR-8793
+        ledgerJournalTable.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    public  void createLedgerJournalTrans(Common _record, SKS_CCR_BankTran locSKS_CCR_BankTran, voucher _voucher)
+    {
+        LedgerJournalTrans      ledgerJournalTrans;
+        DimensionDefault        defaultBankDimension;
+        BankAccountTrans        bankaccounttrans;
+        SKS_CCR_BankTran        bankTran;
+        SKS_LB_JournalARApplic  SKS_LB_JournalARApplic;
+        BankAccountTable        bankaccounttable;
+        LedgerJournalTrans      locledgerJournalTrans;
+        CustTransOpen           CustTransOpen;
+        CustTrans               custtrans;
+        CurrencyExchangeHelper  transExchRateHelper;
+        DataAreaId              company;
+        CustTransCashDisc       applyMannualCashDisc; // 7427
+        // CR-9480 -->
+        VendTransOpen           vendTransOpen;
+        Vendtrans               vendtrans;
+        VendTransCashDisc       applyMannualVendCashDisc;
+        // CR-9480 <--
+
+        transExchRateHelper     = CurrencyExchangeHelper::construct();
+
+        changecompany(locSKS_CCR_BankTran.company())
+        {
+            //SKG_JU_4-12-2017_Bug 7449
+            //This select statement needs to be above the call to FindAndCombineLedgerJournalTrans()
+            select CurrencyCode,DataAreaId from bankaccounttable //9321
+            where bankaccounttable.AccountID == locSKS_CCR_BankTran.AccountId;
+            //SKG_JU_4-12-2017_Bug 7449
+        }
+
+        if (_record is BankAccountTrans)
+        {
+            bankaccounttrans = _record;
+            company = bankaccounttrans.company();
+        }
+        if (_record is SKS_LB_JournalARApplic)
+        {
+            SKS_LB_JournalARApplic = _record;
+            company = SKS_LB_JournalARApplic.CustTransDataAreaId;
+            if(SKS_LB_JournalARApplic.CustTransopenRecid != 0 || SKS_LB_JournalARApplic.VendTransOpenRecId) // CR-9480
+            {
+                ledgerJournalTrans = this.FindAndCombineLedgerJournalTrans(LedgerJournalTable.JournalNum, _voucher, sks_lb_journalarapplic, BankAccountTable.CurrencyCode);
+            }
+            else
+            {
+                LedgerJournalTrans = null;
+            }
+        }
+
+        if(!ledgerJournalTrans)
+        {
+            ledgerJournalTrans.JournalNum = ledgerJournalTable.JournalNum;
+
+            ledgerJournalTrans.TransDate = SKS_LB_JournalARApplic.BRGJPostingDate; //CR-7653
+
+            defaultBankDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(locSKS_CCR_BankTran.DefaultDimension, ledgerJournalTable.DefaultDimension);
+
+            if (SKS_LB_JournalARApplic )
+            {
+                ledgerJournalTrans.ledgerDimension = SKS_LB_JournalARApplic.LedgerDimension;
+                ledgerJournalTrans.AccountType = SKS_LB_JournalARApplic.AccountType;
+                // 7572 -->
+                if(ledgerJournalTrans.AccountType == LedgerJournalACType::Cust || ledgerJournalTrans.AccountType == LedgerJournalACType::Vend || ledgerJournalTrans.AccountType == LedgerJournalACType::Bank) // 7626 // 8655
+                {
+                    ledgerJournalTrans.DefaultDimension = SKS_LB_JournalARApplic.DefaultDimension;
+                }
+                else
+                {
+                    ledgerJournalTrans.DefaultDimension = defaultBankDimension;
+                    // CR-8793 -->
+                    ledgerJournalTrans.TaxGroup = SKS_LB_JournalARApplic.TaxGroup;
+                    ledgerJournalTrans.TaxItemGroup = SKS_LB_JournalARApplic.TaxItemGroup;
+                    // CR-8793 <--
+                }
+                // 7572 <--
+                ledgerJournalTrans.Company       = SKS_LB_JournalARApplic.CustTransDataAreaId;
+                if (bankaccounttable.CurrencyCode == locSKS_CCR_BankTran.TransCurrency)
+                {
+                    ledgerJournalTrans.CurrencyCode  = bankaccounttable.CurrencyCode;
+                }
+                else
+                {
+                    ledgerJournalTrans.CurrencyCode  = locSKS_CCR_BankTran.TransCurrency;
+                }
+               
+                ledgerJournalTrans.ExchRate      = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(ledgerJournalTrans.Company).RecId), ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate).getExchangeRate1();
+                //FDD-11448 --->
+                container   ReportCurrency;
+                SysDictClass sysDictClass = new SysDictClass(className2Id(classStr(LedgerJournalEngine_Server)));
+                if (sysDictClass && sysDictClass.hasStaticMethod('reportingCurrencyModified'))
+                {
+                    changecompany(ledgerJournalTrans.Company)
+                    {
+                        ReportCurrency = sysDictClass.callStatic('reportingCurrencyModified', LedgerJournalTrans);
+                        ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate')) = conPeek(ReportCurrency, 1);
+                        ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary')) = conPeek(ReportCurrency, 2);
+                    }
+                }
+                // SKS_FDD_13903 -Below code is commented since 'IHB Interest Repayment' is not used in CCR
+                /*if(SKS_LB_JournalARApplic.IHB_InterestRepayment == NoYes::Yes)
+                {
+                    changecompany(locSKS_CCR_BankTran.company())
+                    {
+                        sks_PP_Bank = sks_PP_Bank::find(LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(SKS_LB_JournalARApplic.LedgerDimension));
+                    }
+
+                    select crosscompany RecId, IHB_InterestRepaymentNonCompounded, DataAreaId from locsks_PP_Bank
+                            where locsks_PP_Bank.BankAccountId == sks_PP_Bank.BankAccountId
+                                && locsks_PP_Bank.IHB_InterestCalcMethod == SKS_IHB_InterestCalcMeth::Noncompounded
+                                && locsks_PP_Bank.SKS_IHBInhouseBank == NoYes::Yes;
+
+                    if (locsks_PP_Bank.RecId)
+                    {
+                        if(locsks_PP_Bank.IHB_InterestRepaymentNonCompounded)
+                        {
+                            ledgerJournalTrans.BankTransType = locsks_PP_Bank.IHB_InterestRepaymentNonCompounded;
+                        }
+                        else
+                        {
+                            changecompany(locsks_PP_Bank.DataAreaId)
+                            {
+                                SKS_PP_Setup    sks_pp_setup;
+                                sks_pp_setup = SKS_PP_Setup::find();
+                                ledgerJournalTrans.BankTransType = sks_pp_setup.IHB_InterestRepaymentNonCompounded;
+                            }
+                        }
+                    }
+                }
+                else //<--- FDD - 11448
+                {*/
+                ledgerJournalTrans.BankTransType = locSKS_CCR_BankTran.BankTranType;
+                // }
+                ledgerJournalTrans.Txt = SKS_LB_JournalARApplic.Description;//Sks_bug_7535
+                ledgerJournalTrans.TransactionType = LedgerTransType::GeneralJournal;
+                ledgerJournalTrans.Approved        = NoYes::Yes;
+                // SKS_FDD_13903 -Below code is commented since 'IHB' is not used in CCR
+                // SKS_10238 CR -->
+                /*ledgerJournalTrans.SKS_IHB_IntercoCompany = SKS_LB_JournalARApplic.IHBIntercoCompany;
+                ledgerJournalTrans.SKS_IHB_IntercoAccountType = SKS_LB_JournalARApplic.IHBIntercoAccountType;
+                ledgerJournalTrans.SKS_IHB_IntercoLedgerDimension = SKS_LB_JournalARApplic.IHBIntercoLedgerDimension;
+                // SKS_10238 CR <--
+                
+                if (SKS_PP_Setup::find().IHB_Active)
+                {
+                    SKS_IHB_LedgerPostingPreEventHandler::IHBDateAdjust(LedgerJournalTrans);
+                }*/
+
+                if (SKS_LB_JournalARApplic.CustTransOpenRecId || SKS_LB_JournalARApplic.VendTransOpenRecId) // CR-9480
+                {
+                    ledgerJournalTrans.SettleVoucher  = SettlementType::SelectedTransact;
+                }
+                else
+                {
+                    ledgerJournalTrans.SettleVoucher = SKS_LB_Payment::getCustParameterSettlementType();
+                }
+
+                if(SKS_LB_JournalARApplic.TransactionAmount > 0)
+                {
+                    ledgerJournalTrans.AmountCurCredit = SKS_LB_JournalARApplic.TransactionAmount;
+                }
+                else
+                {
+                    ledgerJournalTrans.AmountCurDebit = -1 * (SKS_LB_JournalARApplic.TransactionAmount);
+                }
+            }
+
+            ledgerJournalTrans.Voucher = _voucher;
+
+            //saving the journalline
+            ledgerJournalTrans.SKS_CCR_BankTranRecId = locSKS_CCR_BankTran.RecId;
+            LedgerJournalTrans.Prepayment = SKS_LB_JournalARApplic.BankRecPrepayment;
+            LedgerJournalTrans.PostingProfile = SKS_LB_JournalARApplic.BankRecCustPostingProfile;
+            if(ledgerJournalTrans.validateWrite()) // validate
+            {
+                
+                //This code resets correct dates.
+                //SKS_FDD9652 <--
+                ledgerJournalTrans.DocumentDate = locSKS_CCR_BankTran.ValueDate;
+                ledgerJournalTrans.insert();
+            }
+            // 7339 -->
+        }
+
+        select dataAreaId, RecId, TableId from locledgerJournalTrans
+            where locledgerJournalTrans.RecId == ledgerJournalTrans.RecId;
+
+        if (SKS_LB_JournalARApplic.CustTransOpenRecId)
+        {
+            changecompany(company) //7484
+            {
+                select dataAreaId, RecId, TableId, AccountNum, RefRecId, CashDiscDate from CustTransOpen
+                    join * from custtrans where custtrans.RecId == CustTransOpen.RefRecId
+                        && CustTransOpen.RecId == SKS_LB_JournalARApplic.CustTransOpenRecId;
+            }
+            // 7424 -->
+            ttsbegin;
+            if( custTrans.possibleCashDisc() == 0 && SKS_LB_JournalARApplic.DiscApplyAmount)
+            {
+                applyMannualCashDisc.CashDiscDue       = CashDiscDue::CashDisc;
+                applyMannualCashDisc.RefTableId        = CustTransOpen.TableId;
+                applyMannualCashDisc.RefRecId          = CustTransOpen.RecId;
+                applyMannualCashDisc.CashDiscdate      = locSKS_CCR_BankTran.getGLPostingDate(); //CR-7653
+                applyMannualCashDisc.CashDiscAmount    = SKS_LB_JournalARApplic.DiscApplyAmount;
+                applyMannualCashDisc.insert();
+            }
+            ttscommit;
+            changecompany(company)
+            {
+                this.insertSpecTrans(SKS_LB_JournalARApplic, locSKS_CCR_BankTran, locledgerJournalTrans, CustTransOpen, custTrans, moduleCustVend::Cust); // CR-9480
+                ledgerJournalTrans.Txt = SKS_PP_Setup::find().CustPaymentsDescription;
+                ledgerJournalTrans.update();
+                // 7427
+            }
+        }
+        // CR-9480 -->
+        else if (SKS_LB_JournalARApplic.VendTransOpenRecId)
+        {
+            changecompany(company)
+            {
+                select dataAreaId, RecId, TableId, AccountNum, RefRecId, CashDiscDate from vendTransOpen
+                    join * from vendtrans where vendtrans.RecId == vendTransOpen.RefRecId
+                        && vendTransOpen.RecId == SKS_LB_JournalARApplic.VendTransOpenRecId;
+            }
+            ttsbegin;
+            if( vendtrans.possibleCashDisc() == 0 && SKS_LB_JournalARApplic.DiscApplyAmount)
+            {
+                applyMannualVendCashDisc.CashDiscDue       = CashDiscDue::CashDisc;
+                applyMannualVendCashDisc.RefTableId        = vendTransOpen.TableId;
+                applyMannualVendCashDisc.RefRecId          = vendTransOpen.RecId;
+                applyMannualVendCashDisc.CashDiscdate      = locSKS_CCR_BankTran.getGLPostingDate(); //CR-7653
+                applyMannualVendCashDisc.CashDiscAmount    = SKS_LB_JournalARApplic.DiscApplyAmount;
+                applyMannualVendCashDisc.insert();
+            }
+            ttscommit;
+            changecompany(company)
+            {
+                if (vendTransOpen)
+                {
+                    this.insertSpecTrans(SKS_LB_JournalARApplic, locSKS_CCR_BankTran, locledgerJournalTrans,vendTransOpen, vendtrans, ModuleCustVend::Vend);
+                    ledgerJournalTrans.Txt = SKS_PP_Setup::find().VendPaymentsDescription;
+                    ledgerJournalTrans.update();
+                }
+            }
+        }
+        // CR-9480 <--
+        ttsBegin;
+        changeCompany(locSKS_CCR_BankTran.company())
+        {
+            select forUpdate PaymentJournalNum, CustAccount, CustCompany, RecId from  banktran
+                    where banktran.RecId == locSKS_CCR_BankTran.RecId;
+
+            if(banktran.RecId)
+            {
+                //Updating the recid of the journal and link in imported transaction.
+                banktran.PaymentJournalNum = ledgerJournalTable.JournalNum;
+                // 7339 -->
+                banktran.CustAccount = CustTransOpen.AccountNum;
+                banktran.CustCompany = ledgerJournalTrans.Company; // 8779 CR
+                // 7339 <--
+                banktran.update();
+            }
+        }
+
+        ttsCommit;
+        //This is for createLedgerJournalTrans chain of command customizations
+        this.setLedgerJournalTrans(ledgerJournalTrans);
+        this.setSKS_LB_JournalARApplic(SKS_LB_JournalARApplic);
+        //This is for createLedgerJournalTrans chain of command customizations
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LoadOpenTransactions</Name>
+				<Source><![CDATA[
+    // SKS_FDD_13903 -Below code is commented since 'IHB' is not used in CCR
+    /*public LedgerJournalTrans  checkAndUpdateTransdate(LedgerJournalTrans  _ledgerjournalTransUpdate)
+    {
+        LedgerjournalTrans                          ledgerjournalTransUpdate = _ledgerjournalTransUpdate;
+        TransDate                                   transDateOrig, nextDate;
+        CompanyBankAccountId                        bankAccountId;
+        SKS_IHB_InhouseBankAccountsStatementDetails inhouseBankStatementDetails;
+        BankAccountTrans                            bankAccountTransLoc;
+
+        if (SKS_PP_Setup::find().IHB_Active)
+        {
+            if(ledgerjournalTransUpdate.AccountType == LedgerJournalACType::Bank)
+            {
+                transDateOrig = ledgerjournalTransUpdate.TransDate;
+
+                bankAccountId = DimensionAttributeValueCombination::find(ledgerjournalTransUpdate.LedgerDimension).DisplayValue;
+                nextDate =  SKS_IHB_InhouseBankAccountsStatementDetails::getNextOpenDate(bankAccountId);
+                if (nextDate != ledgerjournalTransUpdate.TransDate)
+                {
+                    inhouseBankStatementDetails = SKS_IHB_InhouseBankAccountsStatementDetails::findByAccAndStatementDatePrevAndOn(bankAccountId, transDateOrig);
+                    if (inhouseBankStatementDetails)
+                    {
+                        ledgerjournalTransUpdate.TransDate = nextDate;
+                        ledgerjournalTransUpdate.SKS_IHB_ValueDate = transDateOrig;
+
+                        info(strfmt("@SKS:SKSDateChanged",  ledgerjournalTransUpdate.Voucher,
+                                                            transDateOrig,
+                                                            ledgerjournalTransUpdate.TransDate));
+                    }
+                    bankAccountTransLoc = BankAccountTrans::findByVoucher(_ledgerjournalTransUpdate.Voucher,ledgerjournalTransUpdate.TransDate);
+                    if(bankAccountTransLoc)
+                    {
+                        bankAccountTransLoc.selectForUpdate(true);
+                        bankAccountTransLoc.SKS_IHB_ValueDate = ledgerjournalTransUpdate.DocumentDate? ledgerjournalTransUpdate.DocumentDate : transDateOrig;//Bug 10342
+                        bankAccountTransLoc.update();
+                    }
+
+                }
+            }
+
+        }
+        return ledgerjournalTransUpdate;
+
+    }
+
+    private LedgerDimensionAccount getGLAccountFromBankTranType(BankTransactionType tranType, DimensionDefault defaultDim)
+    {
+        BankTransType bankTransType;
+
+        select LedgerDimension,BankTransType from bankTransType where bankTransType.BankTransType == tranType;
+        if(!bankTransType)
+        {
+            errorText = strFmt("@SKS525", tranType);
+        }
+        else
+        {
+            if(bankTransType.LedgerDimension == 0)
+            {
+                errorText = strFmt("@SKS526", tranType);
+            }
+        }
+
+        return  LedgerDimensionFacade::serviceCreateLedgerDimForDefaultDim(defaultDim, bankTransType.LedgerDimension );
+    }*/
+
+    [SuppressBPWarning('BPCheckNestedLoopinCode','Nested loop of for and while loop cannot be joined.For loop iterator all customers using containers,same container is used in while select.Joining will provide incorrect results and will impact functionality.')]    //TAS_CAR
+    Public void LoadOpenTransactions(RefRecId bankTransRecId, container virtualCompanyCompanies, Container customers )
+    {
+        CustTransOpen                       custtransopen;
+        CustTrans                           custTrans;
+        SKS_LB_JournalARApplic              journalarapplic;
+        CustAccount                         tmpCustAccount;
+        DimensionAttributeValueCombination  davcCust;
+        int                                 custCounter;
+        // TFS 7474 -->
+        boolean                             inUse = false;
+        // TFS 7474 <--
+        // 8778 CR -->
+        int                                 cnt = 0;
+        SKS_LB_JournalARApplic              locSKS_LB_JournalARApplic;
+        DimensionDefault bankDimension;
+        boolean bankDimensionLookup = false;
+        RecordInsertList        journalARApplicList = new RecordInsertList(tableNum(SKS_LB_JournalARApplic));
+        // 8778 CR <--
+        //Loading the open transactions into the grid
+        for(CustCounter = 1; CustCounter <= conLen(customers); CustCounter++)
+        {
+            custtransopen = null;
+            journalarapplic = null;
+            tmpCustAccount = conPeek(customers, CustCounter);
+
+            davcCust = null;
+            select firstonly RecId from davcCust
+                    where davcCust.DisplayValue == tmpCustAccount;
+            while select crossCompany:virtualCompanyCompanies RecId, dataAreaId, TransDate, DueDate, Invoice, AccountNum, txt from custtrans
+                order by TransDate //7486
+            join custtransopen where custtransopen.RefRecId == custtrans.RecId
+                    && custtransopen.AccountNum == tmpCustAccount
+                    && custtransopen.AmountCur != 0
+                        notexists join journalARApplic
+                            where journalARApplic.CustTransDataAreaId == custtrans.DataAreaId // 7474
+                            && custtransopen.RecId == journalARApplic.CustTransOpenRecId // 7474
+                            && journalARApplic.SKS_CCR_BankTran == bankTransRecId // 8778 CR
+            {
+                /*
+                // TFS 7474 -->
+                inUse = SpecTrans::existByRef(custtransopen.DataAreaId,custtransopen.TableId,custtransopen.RecId); // 8778 CR
+                // TFS 7474 <--
+                // 8778 CR -->
+                if(!inUse)
+                {
+                    locSKS_LB_JournalARApplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(custtransopen.RecId); // SKS_Bug_9627
+                    if (locSKS_LB_JournalARApplic.RecId)
+                    {
+                        inUse = true;
+                    }
+                }
+                // 8778 CR <--
+                */
+
+                changeCompany(custtrans.dataareaid)
+                {
+                    if(custtrans.RecId)
+                    {
+                        journalarapplic.AlreadyMarked       = inUse; // 8778 CR
+                        journalarapplic.AccountType         = LedgerJournalACType::Cust;
+                        journalarapplic.LedgerDimension     = davcCust.RecId;
+                        journalarapplic.CustTransDataAreaId = custtrans.dataAreaId;
+                        journalarapplic.CustTransRecId      = custTrans.RecId;
+                        journalarapplic.CustTransOpenRecId  = custtransopen.RecId;
+                        journalarapplic.InvoiceDate         = custTrans.TransDate;
+                        journalarapplic.InvoiceDueDate      = custTrans.DueDate;
+                        journalarapplic.Invoice             = custtrans.Invoice;
+                        journalarapplic.SKS_CCR_BankTran     = bankTransRecId;
+                        journalarapplic.DefaultDimension = SKS_LB_JournalARApplic::getCustDefaultDimension(journalarapplic);
+                        if(!bankDimensionLookup)
+                        {
+                            bankDimension = SKS_LB_JournalARApplic::getDefaultBankAccount_CCR(journalarapplic.findSKS_CCR_BankTran());
+                            bankDimensionLookup = true;
+                        }
+                        journalarapplic.DefaultBankDimension = bankDimension; //8655
+                        journalarapplic.Description = custTrans.txt;
+                        journalARApplicList.add(journalarapplic);
+                        cnt++; // 8778 CR
+                    }
+                }
+            }
+        }
+        journalARApplicList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MatchExistingBankTransactions</Name>
+				<Source><![CDATA[
+    Public boolean  MatchExistingBankTransactions(SKS_BR_BankReconciliationTrans sKS_BR_BankReconciliationTrans)
+    {
+        BankAccountTrans    locBankAccountTrans;
+        SKS_CCR_BankTran    locSKS_CCR_BankTranUpd;
+        boolean             isMapped = true;
+
+        ttsBegin;
+        while select forUpdate locBankAccountTrans
+                where locBankAccountTrans.SKS_CCR_IsSelected == NoYes::Yes
+                    && locBankAccountTrans.SKS_CCR_ManualReconciliationID == sKS_BR_BankReconciliationTrans.parmTransGuid()
+                    && locBankAccountTrans.AccountId == sKS_BR_BankReconciliationTrans.parmBankAccountId()    //8288
+        {
+
+            locBankAccountTrans.AccountStatement = sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum();
+            locBankAccountTrans.AccountStatementDate = sKS_BR_BankReconciliationTrans.parmTransDate();   // SKS_Bug_9688
+            locBankAccountTrans.Included = NOYES::Yes;
+            locBankAccountTrans.update();
+        }
+         select forupdate locSKS_CCR_BankTranUpd
+            where locSKS_CCR_BankTranUpd.ManualReconciliationID == sKS_BR_BankReconciliationTrans.parmTransGuid();
+
+        if(locSKS_CCR_BankTranUpd)
+        {
+            locSKS_CCR_BankTranUpd.AccountStatementnum    = sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum();
+            locSKS_CCR_BankTranUpd.AccountStatementDate   = sKS_BR_BankReconciliationTrans.parmTransDate();
+            locSKS_CCR_BankTranUpd.MatchStep              = 0;
+            locSKS_CCR_BankTranUpd.MatchConfidence        = 100;
+            locSKS_CCR_BankTranUpd.MatchedType            = SKS_BR_MatchedType::ManualMatch;
+            locSKS_CCR_BankTranUpd.MatchIndicator         = SKS_BR_MatchIndicator::Green;
+            locSKS_CCR_BankTranUpd.Matched                = NoYes::Yes;
+
+
+            locSKS_CCR_BankTranUpd.TranAmount             = SKS_CCR_Matching::getBankAccountTransAmt(locSKS_CCR_BankTranUpd);
+            locSKS_CCR_BankTranUpd.update();
+        }
+
+        ttsCommit;
+        return isMapped;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PostGL</Name>
+				<Source><![CDATA[
+    public boolean PostGL(RefRecId  bankTransRecId, SKS_BR_BankReconciliationTrans sKS_BR_BankReconciliationTrans)
+    {
+        SKS_PP_Setup            locSKS_PP_Setup;
+        SKS_CCR_BankTran         locSKS_CCR_BankTran;
+        SKS_CCR_BankTran         locSKS_CCR_BankTran_Posted;
+        SKS_LB_JournalARApplic  locSKS_LB_JournalARApplic;
+        SKS_LB_JournalARApplic  locSKS_LB_JournalARApplicLast;
+        BankAccountTrans        locBankAccountTransUpd;
+        LedgerJournalTable      locLedgerJournalTable;
+        LedgerJournalTable      ledgerJournalTableDelete;// SKS_Bug_10239
+        ledgerJournalCheckPost  ledgerJournalCheckPost;
+        ledgerJournalCheckPost  ledgerJournalValidate;// SKS_Bug_10239
+
+        NumberSequenceTable     numberSequenceTable;
+        Voucher                 nextRec;
+        NumberSeq               numSeq;
+        NumberSeqScope          locNumberSeqScope;
+        LedgerJournalName       ledgerJournalName;
+        boolean                 isPosted = true;
+        boolean                 isValidJournal = true; // SKS_Bug_10239
+        LedgerJournalTrans      locLedgerJournalTrans;
+
+        //Delete lines with 0 amount
+        ttsBegin;
+
+        while select forUpdate locSKS_LB_JournalARApplic
+                where locSKS_LB_JournalARApplic.SKS_CCR_BankTran == bankTransRecId
+                    && locSKS_LB_JournalARApplic.TransactionAmount == 0
+        {
+            locSKS_LB_JournalARApplic.delete();
+        }
+        ttsCommit;
+
+        select firstonly SKS_CCR_BankTran from locSKS_LB_JournalARApplic
+            where locSKS_LB_JournalARApplic.SKS_CCR_BankTran == bankTransRecId;
+
+        select crosscompany locSKS_CCR_BankTran where locSKS_CCR_BankTran.RecId == banktransrecid; //7484
+
+        if(locSKS_CCR_BankTran.company()) // 10562
+        {
+            if(locSKS_LB_JournalARApplic)
+            {
+                select CCRGLCreationCompany, CCRJournalName from locSKS_pp_Setup;
+
+                changeCompany(locSKS_CCR_BankTran.GLCreationCompany)
+                {
+                    if(!locSKS_CCR_BankTran.JournalName)
+                    {
+                        locSKS_CCR_BankTran.JournalName = locSKS_pp_Setup.CCRJournalName;
+                    }
+
+                    ledgerJournalName = LedgerJournalName::find(locSKS_CCR_BankTran.JournalName);
+
+                    select NumberSequence, NumberSequenceScope from numberSequenceTable
+                        where numberSequenceTable.RecId == ledgerJournalName.NumberSequenceTable;
+
+                    locNumberSeqScope = NumberSeqScope::find(numberSequenceTable.NumberSequenceScope);
+
+                    ttsBegin;
+                    numSeq = numberseq::newGetNumFromCode(numberSequenceTable.NumberSequence, locNumberSeqScope);
+                    nextRec = numSeq.num();
+                    ttsCommit;
+                }
+                select RecId from locSKS_LB_JournalARApplic
+                    where locSKS_LB_JournalARApplic.SKS_CCR_BankTran == bankTransRecId
+                        && locSKS_LB_JournalARApplic.TransactionAmount != 0;
+
+                if(locSKS_CCR_BankTran && locSKS_LB_JournalARApplic.RecId != 0)
+                {
+                    changeCompany(locSKS_CCR_BankTran.GLCreationCompany)
+                    {
+                        this.createLedgerJournalTable(locSKS_CCR_BankTran);
+                        // CR-8793 -->
+                        select firstonly locSKS_LB_JournalARApplicLast
+                            where locSKS_LB_JournalARApplicLast.SKS_CCR_BankTran == bankTransRecId && locSKS_LB_JournalARApplicLast.TransactionAmount != 0;
+                        this.createLedgerJournalTransOffsetBank(locSKS_LB_JournalARApplicLast,locSKS_CCR_BankTran,nextRec);
+                        // CR-8793 <--
+                        //Creating the journal lines in GJ for the selected lines in Journal Grid
+                        while select locSKS_LB_JournalARApplic
+                            where locSKS_LB_JournalARApplic.SKS_CCR_BankTran == bankTransRecId && locSKS_LB_JournalARApplic.TransactionAmount != 0
+                        {
+                            this.createLedgerJournalTrans(locSKS_LB_JournalARApplic,locSKS_CCR_BankTran,nextRec);
+                        }
+                    }
+
+                    locSKS_CCR_BankTran.reread();
+                    changeCompany(locSKS_CCR_BankTran.GLCreationCompany) //7484
+                    {
+                        select locLedgerJournalTable //7521
+                        where locLedgerJournalTable.JournalNum == locSKS_CCR_BankTran.PaymentJournalNum;
+                    }
+
+                    if (locLedgerJournalTable)
+                    {
+                        changeCompany(locLedgerJournalTable.company())
+                        {
+                            locLedgerJournalTable.reread();
+                            try
+                            {
+                                // SKS_FDD_13903 -Below code is commented since 'IHB' is not used in CCR
+                                // SKS_Bug_10239 -->
+                                //this.AdjustToNewestDate(locLedgerJournalTable.JournalNum);
+                                ledgerJournalValidate = LedgerJournalCheckPost::newLedgerJournalTable(locLedgerJournalTable, NoYes::No);
+                                ledgerJournalValidate.run();
+                                if(ledgerJournalValidate.tableErrorLog())
+                                {
+                                    isValidJournal = false;
+                                    isPosted = false;
+                                    while select forupdate ledgerJournalTableDelete
+                                        where ledgerJournalTableDelete.JournalNum == locLedgerJournalTable.JournalNum
+                                    {
+                                        ttsbegin;
+                                        ledgerJournalTableDelete.doDelete();
+                                        ttscommit;
+                                    }
+
+                                    SKS_CCR_HistoryTable::insertEvent(SKS_CCR_Action::GLAutoPostingFailed,
+                                         locSKS_CCR_BankTran.CCRHeaderRecId,
+                                        '',dateNull(),
+                                         '',
+                                         '',
+                                        ledgerJournalValidate.tableErrorLog());
+                                }
+                                else// SKS_Bug_10239 <--
+                                {
+                                    ledgerJournalCheckPost  = LedgerJournalCheckPost::newLedgerJournalTable(locLedgerJournalTable, NoYes::Yes);
+                                    ledgerJournalCheckPost.run();
+                                }
+                            }
+                            catch
+                            {
+                                error("@SKS:SKGPostingFailed");
+                                isValidJournal = false;
+                                isPosted = false;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        isValidJournal = false;
+                        isPosted = false;
+                    }
+                }
+
+                if (isValidJournal && (isPosted || locSKS_LB_JournalARApplic.RecId == 0))// SKS_Bug_10239
+                {
+                    ttsBegin;
+                    if(locSKS_CCR_BankTran.company()) //7484
+                    {
+                        changeCompany(locSKS_CCR_BankTran.GLCreationCompany) //7521
+                        {
+                            select Voucher, SKS_CCR_BankTranRecId, RecId from locLedgerJournalTrans
+                                where locLedgerJournalTrans.JournalNum == locLedgerJournalTable.JournalNum;
+                        }
+
+                        locSKS_CCR_BankTran_Posted = locSKS_CCR_BankTran;
+                    }
+
+                    if(locSKS_CCR_BankTran_Posted.RecId)
+                    {
+                        if (locSKS_CCR_BankTran_Posted.ManualReconciliationID == emptyGuid())
+                        {
+                            locSKS_CCR_BankTran_Posted.ManualReconciliationID = newGuid();
+                        }
+                        changeCompany(locSKS_CCR_BankTran.company()) //7484
+                        {
+                            while select forupdate locBankAccountTransUpd
+                                where locBankAccountTransUpd.Voucher == locLedgerJournalTrans.Voucher
+                                    && locBankAccountTransUpd.AccountId == sKS_BR_BankReconciliationTrans.parmBankAccountId()    //8288
+                            {
+                                if(locBankAccountTransUpd)
+                                {
+                                    locBankAccountTransUpd.AccountStatement = sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum();
+                                    locBankAccountTransUpd.AccountStatementDate = sKS_BR_BankReconciliationTrans.parmTransDate();
+                                    locBankAccountTransUpd.SKS_CCR_ManualReconciliationID = locSKS_CCR_BankTran_Posted.ManualReconciliationID;
+                                    locBankAccountTransUpd.Included = NOYES::Yes;
+                                    locBankAccountTransUpd.update();
+                                }
+                            }
+                        }
+
+                        locSKS_CCR_BankTran_Posted.selectForUpdate(true);
+
+                        //Updating the recid of the journal and link in imported transaction.
+                        locSKS_CCR_BankTran_Posted.LedgerJournalRecId = locLedgerJournalTable.RecId;
+                        locSKS_CCR_BankTran_Posted.Voucher = locLedgerJournalTrans.Voucher;
+                        locSKS_CCR_BankTran_Posted.MatchedType = SKS_BR_MatchedType::GLCreated;
+                        locSKS_CCR_BankTran_Posted.PaymentJournalNum = locLedgerJournalTable.JournalNum;
+                        locSKS_CCR_BankTran_Posted.MatchConfidence = 100;
+                        locSKS_CCR_BankTran_Posted.Matched = NoYes::Yes;
+                        locSKS_CCR_BankTran_Posted.MatchIndicator = SKS_BR_MatchIndicator::Green;
+                        locSKS_CCR_BankTran_Posted.AccountStatementNum = sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum();
+                        locSKS_CCR_BankTran_Posted.AccountStatementDate = sKS_BR_BankReconciliationTrans.parmTransDate();  
+                        locSKS_CCR_BankTran_Posted.TranAmount = SKS_CCR_Matching::getBankAccountTransAmt(locSKS_CCR_BankTran_Posted);
+                        changeCompany(locSKS_CCR_BankTran.company())
+                        {
+                            locSKS_CCR_BankTran_Posted.update();
+                        }
+                    }
+                    ttsCommit;
+
+
+                }
+                numSeq.used();
+            }
+        }
+        return isPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isMarkedTransaction</Name>
+				<Source><![CDATA[
+    public static boolean isMarkedTransaction(SKS_LB_JournalARApplic   _sKS_LB_JournalARApplic, refRecid _CustTransRecid)
+    {
+        CustTrans           custTrans;
+        CustTransOpen       custTransopen;
+        boolean                     lbIsMarked = false;
+        SKS_LB_JournalARApplic      locSKS_LB_JournalARApplic;
+
+        custTrans = CustTrans::find(_CustTransRecid);
+        custTransopen = CustTransOpen::findRefId( custTrans.RecId);
+        _sKS_LB_JournalARApplic.InvoiceDate         = custTrans.TransDate;
+        _sKS_LB_JournalARApplic.InvoiceDueDate      = custTrans.DueDate;
+        _sKS_LB_JournalARApplic.CustTransRecId      = custTrans.RecId ;
+        _sKS_LB_JournalARApplic.CustTransDataAreaId = custTrans.dataAreaId;
+        _sKS_LB_JournalARApplic.CustTransOpenRecId  = custTransopen.RecId;
+        _sKS_LB_JournalARApplic.AlreadyMarked       = NoYes::No;
+        _sKS_LB_JournalARApplic.TransactionAmount = 0;
+        lbIsMarked = SpecTrans::existByRef(custTransopen.DataAreaId,custTransopen.TableId,custTransopen.RecId); // 8778 CR
+        if (!lbIsMarked)
+        {
+            locSKS_LB_JournalARApplic = SKS_LB_Process_IMPORTTEMP_Records::MarkedApplicSearch(custTransopen.RecId);
+            if(locSKS_LB_JournalARApplic.RecId)
+            {
+                lbIsMarked = true;
+            }
+        }
+        return  lbIsMarked;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournalTransOffsetBank</Name>
+				<Source><![CDATA[
+    public  void createLedgerJournalTransOffsetBank(Common _record, SKS_CCR_BankTran locSKS_CCR_BankTran, voucher _voucher)
+    {
+        LedgerJournalTrans      ledgerJournalTrans;
+        BankAccountTrans        bankaccounttrans;
+        SKS_LB_JournalARApplic  SKS_LB_JournalARApplic;
+        SKS_LB_JournalARApplic  sKS_LB_JournalARApplicSum;
+        BankAccountTable        bankaccounttable;
+        DimensionDefault        defaultBankDimension;
+        container   ReportCurrency;
+
+        changecompany(locSKS_CCR_BankTran.company())
+        {
+            select CurrencyCode,DataAreaId, DefaultDimension from bankaccounttable
+                where bankaccounttable.AccountID == locSKS_CCR_BankTran.AccountId;
+
+        }
+        if (_record is BankAccountTrans)
+        {
+            bankaccounttrans = _record;
+        }
+        if (_record is SKS_LB_JournalARApplic)
+        {
+            SKS_LB_JournalARApplic = _record;
+        }
+
+        ledgerJournalTrans.JournalNum   = ledgerJournalTable.JournalNum;
+        ledgerJournalTrans.TransDate    = locSKS_CCR_BankTran.getGLPostingDate(); //CR-7653
+        ledgerJournalTrans.DocumentDate = locSKS_CCR_BankTran.ValueDate; // 10289
+
+        defaultBankDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(bankaccounttable.DefaultDimension, ledgerJournalTable.DefaultDimension);
+        if (SKS_LB_JournalARApplic )
+        {
+            ledgerJournalTrans.TransDate        = SKS_LB_JournalARApplic.BRGJPostingDate;
+            ledgerJournalTrans.DocumentDate = locSKS_CCR_BankTran.ValueDate; // 10289
+            ledgerJournalTrans.Company          = bankaccounttable.dataAreaId;
+            ledgerJournalTrans.AccountType      =  LedgerJournalACType::Bank;
+            changecompany(locSKS_CCR_BankTran.company())
+            {
+                ledgerJournalTrans.LedgerDimension  = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(locSKS_CCR_BankTran.AccountId, LedgerJournalACType::Bank);
+            }
+            ledgerJournalTrans.DefaultDimension = SKS_LB_JournalARApplic.DefaultBankDimension;//SKS_Bug_8655
+
+            if (bankaccounttable.CurrencyCode == locSKS_CCR_BankTran.TransCurrency)
+            {
+                ledgerJournalTrans.CurrencyCode  = bankaccounttable.CurrencyCode;
+            }
+            else
+            {
+                ledgerJournalTrans.CurrencyCode  = locSKS_CCR_BankTran.TransCurrency;
+            }
+
+            ledgerJournalTrans.ExchRate         = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(ledgerJournalTrans.Company).RecId), ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate).getExchangeRate1();
+            // vvv 16157 vvv
+            ReportCurrency = LedgerJournalEngine_Server::reportingCurrencyModified(ledgerJournalTrans);
+            ledgerJournalTrans.ReportingCurrencyExchRate = conPeek(ReportCurrency, 1);
+            LedgerJournalTrans.ReportingCurrencyExchRateSecondary = conPeek(ReportCurrency, 2);
+            // ^^^ 16157 ^^^^
+
+            ledgerJournalTrans.Txt              = SKS_LB_JournalARApplic.Description;
+            ledgerJournalTrans.TransactionType  = LedgerTransType::GeneralJournal;
+
+            // SKS_FDD_13903 -Below code is commented since 'IHB Interest Repayment' is not used in CCR
+            /*if(SKS_LB_JournalARApplic.IHB_InterestRepayment == NoYes::Yes)
+            {
+                changecompany(locSKS_CCR_BankTran.company())
+                {
+                    sks_PP_Bank = sks_PP_Bank::find(LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(SKS_LB_JournalARApplic.LedgerDimension));
+                    select crosscompany RecId, IHB_InterestRepaymentNonCompounded, DataAreaId from locsks_PP_Bank
+                            where locsks_PP_Bank.BankAccountId == sks_PP_Bank.BankAccountId
+                                && locsks_PP_Bank.IHB_InterestCalcMethod == SKS_IHB_InterestCalcMeth::Noncompounded
+                                && locsks_PP_Bank.SKS_IHBInhouseBank == NoYes::Yes;
+
+                    if(locsks_PP_Bank.RecId)
+                    {
+                        if(locsks_PP_Bank.IHB_InterestRepaymentNonCompounded)
+                        {
+                            ledgerJournalTrans.BankTransType = locsks_PP_Bank.IHB_InterestRepaymentNonCompounded;
+                        }
+                        else
+                        {
+                            changecompany(locsks_PP_Bank.DataAreaId)
+                            {
+                                SKS_PP_Setup    sks_pp_setup;
+                                sks_pp_setup = SKS_PP_Setup::find();
+                                ledgerJournalTrans.BankTransType = sks_pp_setup.IHB_InterestRepaymentNonCompounded;
+                            }
+                        }
+                    }
+                }
+            }
+            else //<--- FDD-11448
+            {*/
+            ledgerJournalTrans.BankTransType    = locSKS_CCR_BankTran.BankTranType; // Bug 7282
+            //}
+            ledgerJournalTrans.TransactionType = LedgerTransType::GeneralJournal;
+            ledgerJournalTrans.Approved        = NoYes::Yes;
+
+            if (SKS_LB_JournalARApplic.CustTransOpenRecId || SKS_LB_JournalARApplic.VendTransOpenRecId) // CR-9480
+            {
+                ledgerJournalTrans.SettleVoucher  = SettlementType::SelectedTransact;
+            }
+            // 7352 -->
+            changecompany(locSKS_CCR_BankTran.company())
+            {
+                select sum(TransactionAmount) from sKS_LB_JournalARApplicSum
+                        where sKS_LB_JournalARApplicSum.SKS_CCR_BankTran == locSKS_CCR_BankTran.RecId;
+            }
+            // CR-9480 -->
+            // Change voucher entries for vendor settlement.
+            // CR-9541 -- voucher entries changes for customer and vendor exists in same transactions.
+            if(sKS_LB_JournalARApplicSum.TransactionAmount > 0)
+            {
+                ledgerJournalTrans.AmountCurDebit = sKS_LB_JournalARApplicSum.TransactionAmount;
+            }
+            else
+            {
+                ledgerJournalTrans.AmountCurCredit = -1 * (sKS_LB_JournalARApplicSum.TransactionAmount);
+            }
+            // CR-9480 <--
+            // 7352 <--
+        }
+
+        ledgerJournalTrans.Voucher = _voucher;
+
+        //saving the journalline
+        ledgerJournalTrans.SKS_CCR_BankTranRecId = locSKS_CCR_BankTran.RecId;
+        if(ledgerJournalTrans.validateWrite()) // validate
+        {
+            // SKS_FDD_13903 -Below code is commented since 'IHB' is not used in CCR
+            //ledgerJournalTrans = this.checkAndUpdateTransdate(ledgerJournalTrans);// SKS_FDD 9652
+            ledgerJournalTrans.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindAndCombineLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    private LedgerJournalTrans FindAndCombineLedgerJournalTrans(LedgerJournalId   _JournalId, voucher _voucher, SKS_LB_JournalARApplic _JournalARApplic, CurrencyCode _BankAccountTableCurrencyCode)
+    {
+        LedgerJournalTrans  LedgerJournalTrans;
+
+        select FirstOnly forupdate LedgerJournalTrans where LedgerJournalTrans.JournalNum == _JournalId && LedgerJournalTrans.Voucher == _voucher && LedgerJournalTrans.company == _JournalARApplic.CustTransDataAreaID
+            && LedgerJournalTrans.AccountType == _JournalARApplic.accounttype && LedgerJournalTrans.LedgerDimension == _Journalarapplic.LedgerDimension && LedgerJournalTrans.defaultdimension == _JournalARApplic.defaultdimension
+            && LedgerJournalTrans.currencyCode == _BankAccountTableCurrencyCode && LedgerJournalTrans.SettleVoucher == SettlementType::SelectedTransact;
+
+        if(LedgerJournalTrans)
+        {
+            if (_JournalARApplic.CustTransOpenRecId)
+            {
+                ledgerJournalTrans.SettleVoucher = SettlementType::SelectedTransact;
+            }
+
+            if(ledgerJournalTrans.AmountCurCredit != 0 || (ledgerJournalTrans.AmountCurCredit == 0 && ledgerJournalTrans.AmountCurDebit == 0 && _JournalARApplic.TransactionAmount > 0))
+            {
+                if(_JournalARApplic.TransactionAmount > 0)
+                {
+                    ledgerJournalTrans.AmountCurCredit += _JournalARApplic.TransactionAmount;
+                }
+                else
+                {
+                    if(ledgerJournalTrans.AmountCurCredit >= abs(_JournalARApplic.TransactionAmount))
+                    {
+                        ledgerJournalTrans.AmountCurCredit += _JournalARApplic.TransactionAmount;
+                    }
+                    else
+                    {
+                        ledgerJournalTrans.AmountCurDebit = Abs(_JournalARApplic.TransactionAmount) - ledgerJournalTrans.AmountCurCredit;
+                        ledgerJournalTrans.AmountCurCredit = 0;
+                    }
+                }
+            }
+            else
+            {
+                if(_JournalARApplic.TransactionAmount < 0)
+                {
+                    ledgerJournalTrans.AmountCurDebit += Abs(_JournalARApplic.TransactionAmount);
+                }
+                else
+                {
+                    if(ledgerJournalTrans.AmountCurDebit >= _JournalARApplic.TransactionAmount)
+                    {
+                        ledgerJournalTrans.AmountCurDebit -= _JournalARApplic.TransactionAmount;
+                    }
+                    else
+                    {
+                        ledgerJournalTrans.AmountCurCredit = _JournalARApplic.TransactionAmount - ledgerJournalTrans.AmountCurDebit;
+                        ledgerJournalTrans.AmountCurDebit = 0;
+                    }
+                }
+            }
+            LedgerJournalTrans.update();
+            return LedgerJournalTrans;
+        }
+        return LedgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBankTranSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// 7446
+    /// </summary>
+    public static void updateBankTranSettlement(SKS_BR_ManualReconciliationID _guid, str _bankAccountId)
+    {
+        BankAccountTrans    bankAccountTransUpd;
+
+        bankAccountTransUpd.skipDataMethods();
+
+        ttsbegin;
+        update_recordset bankAccountTransUpd
+            setting SKS_CCR_IsSelected = NoYes::Yes
+            where bankAccountTransUpd.SKS_CCR_ManualReconciliationID == _guid
+                    && bankAccountTransUpd.SKS_CCR_AlreadyMarked == NoYes::Yes
+                    && bankAccountTransUpd.SKS_CCR_IsSelected == NoYes::No;
+        ttscommit;
+
+        ttsbegin;
+        update_recordset bankAccountTransUpd
+            setting SKS_CCR_IsSelected = NoYes::No, SKS_CCR_AlreadyMarked = NoYes::No
+            where bankAccountTransUpd.SKS_CCR_ManualReconciliationID == emptyGuid()
+                    && bankAccountTransUpd.SKS_CCR_AlreadyMarked == NoYes::Yes
+                    && bankAccountTransUpd.SKS_CCR_IsSelected == NoYes::Yes
+                    && bankAccountTransUpd.AccountId == _bankAccountId;
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>discTransCurToInvoiceCur</Name>
+				<Source><![CDATA[
+    public Amount discTransCurToInvoiceCur(SKS_LB_JournalARApplic _sks_LB_JournalARApplic, Amount _transAmount)
+    {
+        SKS_CCR_BankTran         sksBankTran = _sks_LB_JournalARApplic.findSKS_CCR_BankTran();
+        BankAccountTable        bankAccountTable;
+        CurrencyExchangeHelper  transExchRateHelper;
+        Amount                  amountCur;
+        Amount                  bankTransAmount;
+        Ledger                  ledger;
+        // CR-9480 -->
+        CurrencyCode            custVendCurrencyCode;
+
+        if(_sks_LB_JournalARApplic.AccountType ==  LedgerJournalACType::Vend)
+        {
+            custVendCurrencyCode = _sks_LB_JournalARApplic.findVendTransRecId().CurrencyCode;
+        }
+        else
+        {
+            custVendCurrencyCode = _sks_LB_JournalARApplic.findRecId().CurrencyCode;
+        }
+        // CR-9480 <--
+
+        changecompany(sksBankTran.company())
+        {
+            select CurrencyCode, DataAreaId from bankAccountTable
+                where bankAccountTable.AccountID == sksBankTran.AccountId;
+        }
+
+        changecompany(_sks_LB_JournalARApplic.CustTransDataAreaId)
+        {
+            if(bankAccountTable.CurrencyCode != custVendCurrencyCode) // CR-9480
+            {
+                transExchRateHelper = CurrencyExchangeHelper::construct();
+                ledger = Ledger::find(Ledger::primaryLedger(CompanyInfo::findDataArea(bankAccountTable.DataAreaId).RecId));
+
+                transExchRateHelper.parmLedgerRecId(ledger.RecId);
+                transExchRateHelper.parmExchangeDate(sksBankTran.getGLPostingDate()); //stmt date //CR-7653
+                bankTransAmount = CurrencyExchangeHelper::amount(transExchRateHelper.calculateCurrencyToCurrency(bankAccountTable.CurrencyCode, ledger.AccountingCurrency, _transAmount, true));
+                amountCur = CurrencyExchangeHelper::amount(transExchRateHelper.calculateCurrencyToCurrency(ledger.AccountingCurrency, custVendCurrencyCode, bankTransAmount, true)); // CR-9480
+            }
+            else
+            {
+                amountCur = _transAmount;
+            }
+        }
+
+        return amountCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertSpecTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert cash discount information
+    /// </summary>
+// CR-9480
+    public void insertSpecTrans(
+        SKS_LB_JournalARApplic _sKS_LB_JournalARApplic,
+        SKS_CCR_BankTran       _locSKS_CCR_BankTran,
+        LedgerjournalTrans     _locledgerJournalTrans,
+        CustVendTransOpen      _custVendTransOpen,
+        custVendTrans          _custVendTrans,
+        moduleCustVend		   _module)
+    {
+        // 9479 -->
+        CustPaymSettlementManager   SettlementManager;
+
+        if(prevLedgerJournalTrans != _locledgerJournalTrans.RecId)
+        {
+            updateSettlementManager = CustVendOpenTransManager::construct(_locledgerJournalTrans);
+            prevLedgerJournalTrans = _locledgerJournalTrans.RecId;
+        }
+
+        if(_sKS_LB_JournalARApplic.RecId)
+        {
+            Amount settlementAmount = 0;
+            Amount settlementCashDiscount = 0;
+            //CashDiscBaseDate cashDiscountDate;
+
+            updateSettlementManager.updateTransMarked(_custVendTransOpen, true);
+            if(_sKS_LB_JournalARApplic.RecId)
+            {
+                settlementAmount = updateSettlementManager.convertAmountPaymCurToAmountTransCur(_custVendTransOpen,_sKS_LB_JournalARApplic.TransactionAmount);
+                settlementCashDiscount = updateSettlementManager.convertAmountPaymCurToAmountTransCur(_custVendTransOpen,_sKS_LB_JournalARApplic.DiscApplyAmount);
+            }
+            else
+            {
+                settlementAmount = updateSettlementManager.convertAmountPaymCurToAmountTransCur(_custVendTransOpen,(_custVendTrans.AmountCur - _custVendTrans.SettleAmountCur - _custVendTrans.possibleCashDisc()));
+                settlementCashDiscount = updateSettlementManager.convertAmountPaymCurToAmountTransCur(_custVendTransOpen,_custVendTrans.possibleCashDisc());
+            }
+            // SKS_Bug_10428 <--
+            if(CustTransCashDisc::find(_custVendTransOpen.TableId, _custVendTransOpen.recid, _locledgerJournalTrans.transdate).CashDiscAmount != settlementCashDiscount)
+            {
+                if(_sKS_LB_JournalARApplic.CustTransOpenRecId)
+                {
+                    if(CustTransCashDisc::find(_custVendTransOpen.TableId, _custVendTransOpen.recid, _locledgerJournalTrans.transdate).CashDiscAmount != settlementCashDiscount)
+                    {
+                        settlementManager = CustPaymSettlementManager::construct(_locledgerJournalTrans);
+                        settlementManager.updateCashDiscAmount(_custVendTransOpen, settlementCashDiscount);
+                    }
+                }
+                else
+                {
+                    updateSettlementManager.updateCashDiscAmount(_custVendTransOpen, CustVendTransCashDisc::findLastCashDisc(moduleCustVend::Vend, _custVendTransOpen.tableid, _custVendTransOpen.recid),settlementCashDiscount);
+                }
+            }
+        }
+        // 9479 <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isMarkedVendTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// If an invoice is selected for a vendor record that is already marked the Already marked box should be checked.
+    /// </summary>
+// CR-9480
+    public static boolean isMarkedVendTransaction(SKS_LB_JournalARApplic   _sKS_LB_JournalARApplic, refRecid _vendTransRecid)
+    {
+        VendTrans                   vendTrans;
+        VendTransOpen               vendTransOpen;
+        boolean                     lbIsMarked = false;
+        SKS_LB_JournalARApplic      locSKS_LB_JournalARApplic;
+
+        vendTrans       = VendTrans::find(_vendTransRecid);
+        vendTransOpen   = VendTransOpen::findRefId( vendTrans.RecId);
+        _sKS_LB_JournalARApplic.InvoiceDate         = vendTrans.TransDate;
+        _sKS_LB_JournalARApplic.InvoiceDueDate      = vendTrans.DueDate;
+        _sKS_LB_JournalARApplic.VendTransRecId      = vendTrans.RecId ;
+        _sKS_LB_JournalARApplic.CustTransDataAreaId = vendTrans.dataAreaId;
+        _sKS_LB_JournalARApplic.VendTransOpenRecId  = vendTransOpen.RecId;
+        _sKS_LB_JournalARApplic.AlreadyMarked       = NoYes::No;
+        _sKS_LB_JournalARApplic.TransactionAmount   = 0;
+        lbIsMarked = SpecTrans::existByRef(vendTransOpen.DataAreaId,vendTransOpen.TableId,vendTransOpen.RecId);
+        if (!lbIsMarked)
+        {
+            locSKS_LB_JournalARApplic = SKS_LB_JournalARApplic::MarkedApplicSearchVend(vendTransOpen.RecId);
+
+            if (locSKS_LB_JournalARApplic.RecId)
+            {
+                lbIsMarked = true;
+            }
+        }
+        return  lbIsMarked;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadVendOpenTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a new journal line for each open vendor invoice for the vendor account specified.
+    /// </summary>
+// CR-9480
+    Public void loadVendOpenTransactions(RefRecId _bankTransRecId, container _virtualCompanyCompanies, Container _vendors )
+    {
+        VendTransOpen                       vendTransOpen;
+        SKS_LB_JournalARApplic              journalarapplic;
+        VendAccount                         tmpVendAccount;
+        int                                 vendCounter;
+
+        //Loading the open transactions into the grid
+        for(vendCounter = 1; vendCounter <= conLen(_vendors); vendCounter++)
+        {
+            vendTransOpen = null;
+            journalarapplic = null;
+            tmpVendAccount = conPeek(_vendors, vendCounter);
+
+            this.insertOpenVendTransInJournalarapplic(_bankTransRecId, tmpVendAccount, _virtualCompanyCompanies);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertOpenVendTransInJournalarapplic</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert the open vend transaction to the new journal line.
+    /// </summary>
+// CR-9480
+    public void insertOpenVendTransInJournalarapplic(RefRecId _bankTransRecId, VendAccount _tmpVendAccount, container _virtualCompanyCompanies)
+    {
+        VendTransOpen                       vendTransOpen;
+        VendTrans                           vendTrans;
+        SKS_LB_JournalARApplic              journalarapplic;
+        DimensionAttributeValueCombination  davcVend;
+        boolean                             inUse = false;
+        SKS_LB_JournalARApplic              locSKS_LB_JournalARApplic;
+
+        while select crossCompany RecId, dataAreaId, TransDate, DueDate, Invoice, AccountNum, Txt from vendTrans
+                order by TransDate
+                join vendTransOpen where vendTransOpen.RefRecId == vendTrans.RecId
+                    && vendTransOpen.AccountNum == _tmpVendAccount
+                    && vendTransOpen.AmountCur != 0
+                        notexists join journalARApplic
+                            where journalARApplic.CustTransDataAreaId == vendTrans.DataAreaId
+                            && vendTransOpen.RecId == journalARApplic.VendTransOpenRecId
+                            && journalARApplic.SKS_CCR_BankTran == _bankTransRecId
+        {
+            inUse = SpecTrans::existByRef(vendTransOpen.DataAreaId,vendTransOpen.TableId,vendTransOpen.RecId);
+
+            if(!inUse)
+            {
+                locSKS_LB_JournalARApplic = SKS_LB_JournalARApplic::MarkedApplicSearchVend(vendTransOpen.RecId);
+
+                if (locSKS_LB_JournalARApplic.RecId)
+                {
+                    inUse = true;
+                }
+            }
+
+            if (conFind(_virtualCompanyCompanies,vendTrans.dataareaid))
+            {
+                changeCompany(vendTrans.dataareaid)
+                {
+                    select RecId from davcVend
+                            where davcVend.DisplayValue == _tmpVendAccount;
+                    if(vendTrans.RecId)
+                    {
+                        journalarapplic.AlreadyMarked        = inUse;
+                        journalarapplic.AccountType          = LedgerJournalACType::Vend;
+                        journalarapplic.LedgerDimension      = davcVend.RecId;
+                        journalarapplic.CustTransDataAreaId  = vendTrans.dataAreaId;
+                        journalarapplic.VendTransRecId       = vendTrans.RecId;
+                        journalarapplic.VendTransOpenRecId   = vendTransOpen.RecId;
+                        journalarapplic.InvoiceDate          = vendTrans.TransDate;
+                        journalarapplic.InvoiceDueDate       = vendTrans.DueDate;
+                        journalarapplic.Invoice              = vendTrans.Invoice;
+                        journalarapplic.SKS_CCR_BankTran     = _bankTransRecId;
+                        journalarapplic.DefaultDimension     = SKS_LB_JournalARApplic::getCustDefaultDimension(journalarapplic);
+                        journalarapplic.DefaultBankDimension = SKS_LB_JournalARApplic::getDefaultBankAccount_CCR(journalarapplic.findSKS_CCR_BankTran());
+                        journalarapplic.Description          = VendTrans.txt;
+                        journalarapplic.insert();
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AdjustToNewestDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public void AdjustToNewestDate(LedgerJournalID   _LedgerJournalID)
+    {
+        LedgerJournalTrans LedgerJournalTransUpdateDate;
+        LedgerJournalTrans LedgerJournalTrans;
+
+        while select TransDate, BankaccountID, Voucher, AccountType, LedgerDimension from LedgerJournalTransUpdateDate
+            order by TransDate desc
+                where LedgerJournalTransUpdateDate.JournalNum == _LedgerJournalID
+                    && LedgerJournalTransUpdateDate.AccountType == LedgerJournalACType::Bank
+        {
+            if (SKS_PP_Bank::findIHBBank(DimensionAttributeValueCombination::find(LedgerJournalTransUpdateDate.LedgerDimension).DisplayValue))
+            {
+                ttsbegin;
+                update_recordset LedgerJournalTrans setting TransDate = LedgerJournalTransUpdateDate.transdate
+                    where  LedgerJournalTrans.journalnum == _LedgerJournalID;
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setSKS_LB_JournalARApplic</Name>
+				<Source><![CDATA[
+    Void setSKS_LB_JournalARApplic(SKS_LB_JournalARApplic _SKS_LB_JournalARApplic)
+    {
+        gSKS_LB_JournalARApplic = _SKS_LB_JournalARApplic;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    Void setLedgerJournalTrans(LedgerJournalTrans _LedgerJournalTrans)
+    {
+        gLedgerJournalTrans = _LedgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_LB_JournalARApplic</Name>
+				<Source><![CDATA[
+    SKS_LB_JournalARApplic getSKS_LB_JournalARApplic()
+    {
+        return gSKS_LB_JournalARApplic;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    LedgerJournalTrans getLedgerJournalTrans()
+    {
+        return gLedgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

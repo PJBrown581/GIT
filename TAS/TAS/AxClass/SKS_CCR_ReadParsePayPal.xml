@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_ReadParsePayPal</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_ReadParsePayPal extends SKS_CCR_ReadParseBase
+{
+    //*********
+    //*** do NOT use :CommaStreamIo
+    //*** do NOT use :CommaTextStreamIo
+    //*** implments a broken fields parse and malfuctions on non-comma separated files(like semi-colon delimited) with empty fields.
+    //*** use TextStreamIO this implements it's own classes and will fucntion with any infielddelimiter
+    //*** Referce link: https://www.yammer.com/dynamicsaxfeedbackprograms/#/threads/show?threadId=396866031673344
+    //*********
+    TextStreamIo locTextStreamIO;
+    container FieldFormat[];
+    int maxFieldFormats;
+    str Fields[];
+    str Raw_Fields[];
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>removeSuperfluousDecimalPlaces</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The PayPal file always includes 2 00 for decimal places for all currencies, even currencies with no decimails such as JPY
+    /// This method drop non-existant decimal places based on currency settings.
+    /// </summary>
+    /// <param name = "_Amt">Value that MAY contain decimal places that need removed</param>
+    /// <param name = "_currencycode">Currency code to determin if a decimal place should be dropped(Based on currency configuration in D365FO)</param>
+    /// <returns></returns>
+    protected static real removeSuperfluousDecimalPlaces(real _Amt, CurrencyCode _currencycode)
+    {
+        real rtnval = 0;
+        int locDecimalPlaces = SKS_EB_Currency::getCurrencyPrecision(_currencycode);
+        rtnval = _Amt/(power(10,(2 - locDecimalPlaces)));
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetInboundFile</Name>
+				<Source><![CDATA[
+    public SKS_CCR_InboundFile GetInboundFile(SKS_EB_FilePathName _FilePathAndName, SKS_BF_BankIntType _SKS_BF_BankIntType)
+    {
+        //str locTempTagName;
+        ;
+
+        this.InitializeFileInfo(_FilePathAndName, _SKS_BF_BankIntType);
+        if (!this.openFile())
+        {
+            return null;
+        }
+
+        return this.parseFile();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    boolean openFile()
+    {
+        if (!gSKS_EB_FileHub.attrfileExists())
+        {
+            throw error((strfmt("@SYS62207",gSKS_EB_FileHub.fileName())));
+        }
+        gSKS_EB_FileHub.runFileLoad(gSKS_EB_FileHub.getSKS_BF_BankIntType() == SKS_BF_BankIntType::FileHubLocal ? gSKS_EB_FileHub.fileName() : strFmt(@'%1\%2', gSKS_EB_FileHub.getBFFilePath(),gSKS_EB_FileHub.fileName())
+                                    ,gBRPreReadScript
+                                    ,gBRPreReadScriptParams
+                                    ,gBRPostReadScript
+                                    ,gBRPostReadScriptParams);
+        gSKS_EB_FileHub.streamInit();
+        locTextStreamIO = TextStreamIo::constructForRead(gSKS_EB_FileHub.streamGet());
+        if (locTextStreamIO)
+        {
+            locTextStreamIO.inFieldDelimiter(',');
+            locTextStreamIO.inRecordDelimiter('\n');
+        }
+        if (!locTextStreamIO || locTextStreamIO.status() != IO_Status::Ok )
+        {
+            //file could not be opened
+            throw error((strfmt("@SYS19312",gSKS_EB_FileHub.fileName())));
+        }
+        
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseFile</Name>
+				<Source><![CDATA[
+    protected SKS_CCR_InboundFile parseFile()
+    {
+        str notes;
+        CommaStreamIo locCommaIo;
+        str transType;
+        container locRecord;
+        str currentStmtnum;
+        str currencycode;
+        AmountMST transAmt;
+        AmountMST feeAmt;
+        
+        if (!this.openFile())
+        {
+            return null;
+        }
+
+        gSKS_EB_FileHub.StreamInit();
+        locCommaIo = CommaStreamIo::ConstructForRead(gSKS_EB_FileHub.StreamGet());
+        locCommaIo.inFieldDelimiter(',');
+        locCommaIo.inRecordDelimiter('\n');
+
+        while(locCommaIo.status() == IO_Status::Ok)
+        {
+            locRecord = locCommaIo.read();
+            //firstrecord = strLRTrim(conPeek(locRecord, 1));
+            if(conLen(locRecord) > 0)
+            {       
+                if(!gSKS_CCR_InboundFile)
+                    gSKS_CCR_InboundFile = new SKS_CCR_InboundFile();
+
+                if(strLRTrim(conPeek(locRecord, 1)) == 'FH')
+                {
+                    currentStmtnum = '';
+                    currentStmtnum = strLRTrim(conPeek(locRecord, 2));
+                }
+
+                if(strLRTrim(conPeek(locRecord, 1)) == 'SH')
+                {
+                    gSKS_CCR_InboundStmt = new SKS_CCR_InboundStmt();
+
+                    gSKS_CCR_InboundStmt.SetNbr(currentStmtnum);
+
+                    gSKS_CCR_InboundStmt.SetAccount(strLRTrim(conPeek(locRecord, 4)));
+                    gSKS_CCR_InboundStmt.SetDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(strLRTrim(conPeek(locRecord, 2)) ,321)));
+
+                    gSKS_CCR_InboundFile.PushStmt(gSKS_CCR_InboundStmt);
+                }
+                
+                if(strLRTrim(conPeek(locRecord, 1)) == 'SB')
+                {
+                    if(!gSKS_CCR_InboundTran)
+                        gSKS_CCR_InboundTran = new SKS_CCR_InboundTran();
+
+                    gSKS_CCR_InboundTran.SetDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(strLRTrim(conPeek(locRecord, 8)) ,321)));
+
+                    transType = strLRTrim(conPeek(locRecord, 6)) + strLRTrim(conPeek(locRecord, 15));
+                    gSKS_CCR_InboundTran.SetTranType(transType);
+                    gSKS_CCR_InboundTran.SetBankRefNbr(strLRTrim(conPeek(locRecord, 2)));
+                    gSKS_CCR_InboundTran.SetCustRefNbr(strLRTrim(conPeek(locRecord, 23)));
+                    currencycode = strLRTrim(conPeek(locRecord, 11));
+
+                    if(strLRTrim(conPeek(locRecord, 9)) == 'CR')
+                    {
+                        transAmt = SKS_EB_Currency::formatStringToCurrency(strLRTrim(conPeek(locRecord, 10)), currencycode, false);
+                    }
+                    else
+                    {
+                        transAmt = SKS_EB_Currency::formatStringToCurrency('-' + strLRTrim(conPeek(locRecord, 10)), currencycode, false);
+                    }
+
+                    if(strLRTrim(conPeek(locRecord, 12)) == 'CR')
+                    {
+                        feeAmt = SKS_EB_Currency::formatStringToCurrency(strLRTrim(conPeek(locRecord, 13)), currencycode, false);
+                    }
+                    else
+                    {
+                        feeAmt = SKS_EB_Currency::formatStringToCurrency('-' + strLRTrim(conPeek(locRecord, 13)), currencycode, false);
+                    }
+                    gSKS_CCR_InboundTran.SetCurrency(currencycode);
+                    transAmt = SKS_CCR_ReadParsePayPal::removeSuperfluousDecimalPlaces(transAmt, currencycode);
+                    feeAmt = SKS_CCR_ReadParsePayPal::removeSuperfluousDecimalPlaces(feeAmt, currencycode);
+                    gSKS_CCR_InboundTran.SetAmt(transAmt);
+                    gSKS_CCR_InboundTran.addToFeeSum(feeAmt);
+
+                    
+                    if(currencycode)
+                    {
+                        notes = "@SKS:SKGCCRPaypalCCY" + currencycode;
+                    }
+
+                    if(strLRTrim(conPeek(locRecord, 39)))
+                    {
+                        if(notes)
+                        {
+                            notes += ' ';
+                        }
+
+                        notes += "@SKS:SKGCCRPaypalMerch" + strLRTrim(conPeek(locRecord, 39));
+                    }
+
+                    if(strLRTrim(conPeek(locRecord, 37)))
+                    {
+                        if(notes)
+                        {
+                            notes += ' ';
+                        }
+
+                        notes += "@SKS:SKGCCRPaypalShipCtry" + strLRTrim(conPeek(locRecord, 37));
+                    }
+
+                    gSKS_CCR_InboundTran.SetDesc(notes);
+                    gSKS_CCR_InboundTran.setImportAsPositive(true);
+
+                    gSKS_CCR_InboundStmt.PushTrans(gSKS_CCR_InboundTran);
+                    gSKS_CCR_InboundTran = null;
+                    notes = null;
+                }
+            }
+        }
+
+
+        this.closeFile();
+
+        if(gSKS_CCR_InboundStmt)
+        {
+            gSKS_CCR_InboundFile.PushStmt(gSKS_CCR_InboundStmt);
+            gSKS_CCR_InboundStmt = null;
+        }
+
+        return gSKS_CCR_InboundFile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeFile</Name>
+				<Source><![CDATA[
+    void closeFile()
+    {
+        if(locTextStreamIO)
+        {
+            locTextStreamIO.finalize();
+            locTextStreamIO = null;
+            gSKS_EB_fileHub.streamClose();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

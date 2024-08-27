@@ -1,0 +1,864 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocUserPrinter</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class DocUserPrinter extends common
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>find</Name>
+				<Source><![CDATA[
+    public static DocUserPrinter find(RecId _recId, boolean _forUpdate = false)
+    {
+        DocUserPrinter userPrinter;
+
+        userPrinter.selectForUpdate(_forUpdate);
+
+        if (_recid)
+        {
+            select firstonly userPrinter where userPrinter.RecId == _recId;
+        }
+        
+        return userPrinter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findByUserAndLineNum</Name>
+				<Source><![CDATA[
+    public static DocUserPrinter findByUserAndLineNum(SysUserId _userId, LineNum _lineNum, boolean _forUpdate = false)
+    {
+        DocUserPrinter userPrinter;
+
+        userPrinter.selectForUpdate(_forUpdate);
+
+        if (_userId && _lineNum)
+        {
+            select firstonly userPrinter where userPrinter.UserId == _userId && userPrinter.LineNum == _lineNum;
+        }
+        
+        return userPrinter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findByUserAndPrinter</Name>
+				<Source><![CDATA[
+    public static DocUserPrinter findByUserAndPrinter(SysUserId _userId, PrinterName _printerName, boolean _forUpdate = false)
+    {
+        DocUserPrinter userPrinter;
+
+        userPrinter.selectForUpdate(_forUpdate);
+
+        if (_userId && _printerName)
+        {
+            select firstonly userPrinter where userPrinter.UserId == _userId && userPrinter.PrinterName == _printerName;
+        }
+        
+        return userPrinter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>upDown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is called when user clicks Up or Down buttons for sorting
+    /// the user printers order. As a result, the selected user printer record
+    /// (provided as parameter) will swap places with the first record
+    /// above or below it.
+    /// </summary>
+    /// <param name = "_down">True if Down button was clicked, false for Up button</param>
+    /// <param name = "_swapFrom">User printer record which should swap places
+    /// with the first record above (if Up is clicked) or below it (if Down is clicked)</param>
+    public server static void upDown(NoYes _down, DocUserPrinter _swapFrom)
+    {
+        DocUserPrinter swapTo;
+
+        ttsbegin;
+
+        if (_down == NoYes::Yes)
+        {
+            // Find second record as the first below the provided record
+            select firstonly forupdate swapTo
+                order by LineNum
+                where swapTo.LineNum > _swapFrom.LineNum
+                    && swapTo.UserId == _swapFrom.UserId;
+        }
+        else
+        {
+            // Find second record as the first above the provided record
+            select firstonly forupdate swapTo
+                order by LineNum desc
+                where swapTo.LineNum < _swapFrom.LineNum
+                    && swapTo.UserId == _swapFrom.UserId;
+        }
+
+        // Swap places of these records, i.e. exchange their line numbers
+        if (_swapFrom && swapTo)
+        {
+            LineNum newNum = swapTo.LineNum;
+            swapTo.LineNum = _swapFrom.LineNum;
+
+            _swapFrom.selectForUpdate(true);
+            _swapFrom.LineNum = 0; // temporary value, to avoid duplicates
+            _swapFrom.update();
+
+            swapTo.update();
+
+            _swapFrom.LineNum = newNum;
+            _swapFrom.update();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>maxLineNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the maximal line number in the user printers table for the given user.
+    /// It is used when adding a new printer, it will get the next available line number for the given user.
+    /// </summary>
+    /// <param name = "_userId">User ID of the user for which the user printers are handled.</param>
+    /// <returns>Maximal line number in the user printers table for the given user</returns>
+    public static LineNum maxLineNum(SysUserId _userId)
+    {
+        DocUserPrinter userPrinter;
+
+        select maxof(LineNum) from userPrinter where userPrinter.UserId == _userId;
+
+        return userPrinter.LineNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>minLineNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the minimal line number in the user printers table for the given user.
+    /// Not used, but it is only logical to have this method, because we have maxLineNum()
+    /// </summary>
+    /// <param name = "_userId">User ID of the user for which the user printers are handled.</param>
+    /// <returns>Minimal line number in the user printers table for the given user</returns>
+    public static LineNum minLineNum(SysUserId _userId)
+    {
+        DocUserPrinter userPrinter;
+
+        select minof(LineNum) from userPrinter where userPrinter.UserId == _userId;
+
+        return userPrinter.LineNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insert</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// When inserting new record, assign the next free line number to it
+    /// and make sure that there are no duplicates (in case of concurrent inserting
+    /// by some other user).
+    /// Pattern with line numbers and up/down behaviour copied from AccountingDistributionTemplateDetail.
+    /// Similar implementation exists in SysCustomfieldPicklist, insert() method, only it doesn't
+    /// check for deadlock exception.
+    /// </summary>
+    public void insert()
+    {
+        #OCCRetryCount
+
+        try
+        {
+            // Caller should make sure that the correct user is set.
+            // If called from the User options form, User ID will be set (by the form) to the user
+            // for which the set up is performed (it can be current user or Admin for some user).
+            // If called from the User printers form (maintained by Admin), User ID will also be set
+            // by the form to the currently selected user.
+            if (!this.UserId)
+            {
+                this.UserId = curUserId();
+            }
+
+            if (this.LineNum == 0)
+            {
+                this.LineNum = DocUserPrinter::maxLineNum(this.UserId) + 1;
+            }
+
+            super();
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                // set LineNum to 0 so it will be recalculated again
+                this.LineNum = 0;
+                retry;
+            }
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::DuplicateKeyException;
+            }
+            else
+            {
+                // set LineNum to 0 so it will be recalculated again
+                this.LineNum = 0;
+                retry;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfUserPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Display method that shows number of records (user printers) for the currrently selected user.
+    /// </summary>
+    /// <returns>A number of user printers for the currrently selected user</returns>
+    display NumberOf numberOfUserPrinters()
+    {
+        DocUserPrinter userPrinter;
+
+        select count(RecId) from userPrinter where userPrinter.UserId == this.UserId;
+
+        return int642int(userPrinter.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfNotAssignedPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Display method that shows number of printers not assigned for the currrently selected user.
+    /// </summary>
+    /// <returns>A number of printers not assigned for the currrently selected user</returns>
+    display NumberOf numberOfNotAssignedPrinters()
+    {
+        DocUserPrinter userPrinter;
+        SysCorpNetPrinters networkPrinter;
+
+        select count(RecId) from networkPrinter
+            notexists join userPrinter 
+                where userPrinter.PrinterName == networkPrinter.Printername
+                    && userPrinter.UserId == this.UserId;
+
+        return int642int(networkPrinter.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addForMissingPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add the records for the given User ID and for all the printers that aren't already
+    /// in the User printers table.
+    /// </summary>
+    /// <param name = "_userId">User ID for which the printers should be added</param>
+    /// <returns>Container [number of added records, RecId of the first added record, boolean success]</returns>
+    public static container addForMissingPrinters(UserId _userId)
+    {
+        DocUserPrinter userPrinter, testUserPrinter;
+        SysCorpNetPrinters networkPrinter;
+        RecId firstRecId;
+        int numInserted = 0;
+        boolean success = false;
+        int lineNum = real2int(DocUserPrinter::maxLineNum(_userId) + 1);
+
+        RecordSortedList recordSortedList = new RecordSortedList(tableNum(DocUserPrinter));
+        recordSortedList.sortOrder(fieldNum(DocUserPrinter, LineNum));
+        try
+        {
+            while select PrinterName from networkPrinter
+                notexists join testUserPrinter
+                    where testUserPrinter.PrinterName == networkPrinter.PrinterName
+                        && testUserPrinter.UserId == _userId
+            {
+                userPrinter.clear();
+                userPrinter.PrinterName = networkPrinter.PrinterName;
+                userPrinter.UserId = _userId;
+                userPrinter.LineNum = lineNum;
+
+                if (userPrinter.validateWrite())
+                {
+                    recordSortedList.ins(userPrinter);
+                    numInserted++;
+                    lineNum++;
+                }
+                
+                if (numInserted == 1)
+                {
+                    firstRecId = userPrinter.RecId;
+                }
+            }
+
+            // Insert all the prepared reocrds into the user printer table
+            recordSortedList.insertDatabase();
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorAddingAllPrintersForUser", _userId));
+        }
+
+        return [numInserted, firstRecId, success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addForPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add the records for the given User ID and for all the printers specified
+    /// in the input parameter. Skip allready assigned printers.
+    /// </summary>
+    /// <param name = "_userId">User ID for which the printers should be added</param>
+    /// <param name = "_printers">Set with PrinterName values of the printers which should be added</param>
+    /// <returns>Container [number of added records, RecId of the first added record, boolean success]</returns>
+    public static container addForPrinters(UserId _userId, Set _printers)
+    {
+        DocUserPrinter userPrinter, testUserPrinter;
+        RecId firstRecId;
+        int numInserted = 0;
+        boolean success = false;
+        int lineNum = real2int(DocUserPrinter::maxLineNum(_userId) + 1);
+
+        if (_printers == null)
+        {
+            return [0, 0, true];
+        }
+
+        RecordSortedList recordSortedList = new RecordSortedList(tableNum(DocUserPrinter));
+        recordSortedList.sortOrder(fieldNum(DocUserPrinter, LineNum));
+        try
+        {
+            SetEnumerator se = _printers.getEnumerator();
+            while (se.moveNext())
+            {
+                PrinterName printerName = se.current();
+                select firstonly RecId from testUserPrinter
+                    where testUserPrinter.PrinterName == printerName
+                        && testUserPrinter.UserId == _userId;
+                if (testUserPrinter.RecId == 0) // notexists join
+                {
+                    userPrinter.clear();
+                    userPrinter.PrinterName = printerName;
+                    userPrinter.UserId = _userId;
+                    userPrinter.LineNum = lineNum;
+
+                    if (userPrinter.validateWrite())
+                    {
+                        recordSortedList.ins(userPrinter);
+                        numInserted++;
+                        lineNum++;
+                    }
+                
+                    if (numInserted == 1)
+                    {
+                        firstRecId = userPrinter.RecId;
+                    }
+                }
+            }
+
+            // Insert all the prepared reocrds into the user printer table
+            recordSortedList.insertDatabase();
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorAddingSelectedPrintersForUser", _userId));
+        }
+
+        return [numInserted, firstRecId, success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeAllPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete all printers for a given user.
+    /// </summary>
+    /// <param name = "_userId">User ID of the user for which the printers should be removed</param>
+    /// <returns>Container [number of removed records, boolean success]</returns>
+    public static container removeAllPrinters(UserId _userId)
+    {
+        DocUserPrinter userPrinter;
+        boolean success = false;
+
+        try
+        {
+            delete_from userPrinter where userPrinter.UserId == _userId;
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorRemovingAllPrintersForUser", _userId));
+        }
+        
+        return [userPrinter.RowCount(), success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeForPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the specified printers for a given user.
+    /// </summary>
+    /// <param name = "_userId">User ID of the user for which the printers should be removed</param>
+    /// <param name = "_printers">Set of PrinterName values of the printers that should be removed</param>
+    /// <returns>Container [number of removed records, boolean success]</returns>
+    public static container removeForPrinters(UserId _userId, Set _printers)
+    {
+        DocUserPrinter userPrinter;
+        boolean success = false;
+
+        if (_printers == null)
+        {
+            return [0, true];
+        }
+
+        // Isn't it crazy that we must delete in the loop?!?! Hello, Microsoft!
+        int64 cnt = 0;
+        try
+        {
+            SetEnumerator se = _printers.getEnumerator();
+            ttsbegin;
+            while (se.moveNext())
+            {
+                delete_from userPrinter where userPrinter.UserId == _userId && userPrinter.PrinterName == se.current();
+                cnt += userPrinter.RowCount();
+            }
+            ttscommit;
+            
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorRemovingSelectedPrintersForUser", _userId));
+        }
+            
+        return [int642int(cnt), success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addForMissingUsers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add the records for the given Printer name and for all the users that aren't already
+    /// in the User printers table.
+    /// </summary>
+    /// <param name = "_printerName">Printer name for which the users should be added</param>
+    /// <returns>Container [number of added records, RecId of the first added user, boolean success]</returns>
+    public static container addForMissingUsers(PrinterName _printerName)
+    {
+        DocUserPrinter userPrinter, testUserPrinter;
+        UserInfo userInfo;
+        int numInserted = 0;
+        boolean success = false;
+
+        RecordSortedList recordSortedList = new RecordSortedList(tableNum(DocUserPrinter));
+        recordSortedList.sortOrder(fieldNum(DocUserPrinter, UserId));
+        try
+        {            
+            while select id from userInfo
+                where userInfo.enable == NoYes::Yes
+                    && userInfo.accountType != UserAccountType::ClaimsGroup
+                    && userInfo.isMicrosoftAccount == NoYes::No
+                notexists join testUserPrinter
+                    where testUserPrinter.PrinterName == _printerName
+                        && testUserPrinter.UserId == userInfo.id
+            {
+                userPrinter.clear();
+                userPrinter.PrinterName = _printerName;
+                userPrinter.UserId = userInfo.id;
+                
+                int lineNum = real2int(DocUserPrinter::maxLineNum(userInfo.id) + 1);
+                userPrinter.LineNum = lineNum;
+
+                if (userPrinter.validateWrite())
+                {
+                    recordSortedList.ins(userPrinter);
+                    numInserted++;
+                }
+            }
+
+            // Insert all the prepared reocrds into the user printer table
+            recordSortedList.insertDatabase();
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorAddingAllUsersForPrinter", _printerName));
+        }
+
+        return [numInserted, success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addForUsers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add the records for the given Printer name and for all the users specified
+    /// in the input parameter. Skip allready assigned users.
+    /// </summary>
+    /// <param name = "_printerName">Printer name for which the users should be added</param>
+    /// <param name = "_usersOrRoles">Set with UserId values of the users which should be added</param>
+    /// <param name = "_isUserRole">Boolean value, false if _usersOrRoles carries a set of
+    /// User IDs and true if _usersOrRoles carries a set of user roles</param>
+    /// <returns>Container [number of added records, RecId of the first added record, boolean success]</returns>
+    public static container addForUsers(PrinterName _printerName, Set _usersOrRoles, boolean _isUserRole)
+    {
+        DocUserPrinter userPrinter, testUserPrinter;
+        int64 numInserted = 0;
+        boolean success = false;
+
+        if (_usersOrRoles == null)
+        {
+            return [0, 0, true];
+        }
+        
+        try
+        {
+            SetEnumerator se = _usersOrRoles.getEnumerator();
+
+            if (_isUserRole)
+            {
+                // _usersOrRoles carries a set of user roles. For each role we take all the users
+                // assigned to this role and create entries in the User printer table for the
+                // user-printer combination
+                SecurityRole securityRole;
+                SecurityUserRole linkTable;
+                UserInfo userInfo;
+
+                ttsbegin;
+                while (se.moveNext())
+                {
+                    SecurityRoleName roleName = se.current();
+
+                    insert_recordset userPrinter (PrinterName, UserId)
+                        select _printerName, User from linkTable
+                            exists join securityRole 
+                                where securityRole.Name == roleName
+                                    && securityRole.RecId == linkTable.SecurityRole
+                            exists join userInfo
+                                where userInfo.id == linkTable.User
+                                    && userInfo.enable == NoYes::Yes
+                                    && userInfo.accountType != UserAccountType::ClaimsGroup
+                                    && userInfo.isMicrosoftAccount == NoYes::No
+                            notexists join testUserPrinter
+                                where testUserPrinter.PrinterName == _printerName
+                                    && testUserPrinter.UserId == linkTable.User;
+
+                    numInserted += userPrinter.RowCount();                                
+                }
+                ttscommit;
+            }
+            else
+            {
+                // _usersOrRoles carries a set of users. For each user create one entry in the 
+                // User printer table.
+                RecordSortedList recordSortedList = new RecordSortedList(tableNum(DocUserPrinter));
+                recordSortedList.sortOrder(fieldNum(DocUserPrinter, UserId));
+
+                while (se.moveNext())
+                {
+                    UserId userId = se.current();
+
+                    select firstonly RecId from testUserPrinter
+                        where testUserPrinter.UserId == userId
+                            && testUserPrinter.PrinterName == _printerName;
+                    if (testUserPrinter.RecId == 0) // notexists join
+                    {
+                        userPrinter.clear();
+                        userPrinter.PrinterName = _printerName;
+                        userPrinter.UserId = userId;
+
+                        int lineNum = real2int(DocUserPrinter::maxLineNum(userId) + 1);
+                        userPrinter.LineNum = lineNum;
+
+                        if (userPrinter.validateWrite())
+                        {
+                            recordSortedList.ins(userPrinter);
+                            numInserted++;
+                        }
+                    }
+                }
+
+                // Insert all the prepared reocrds into the user printer table
+                recordSortedList.insertDatabase();
+            }
+
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorAddingSelectedUsersForPrinter", _printerName));
+        }
+
+        return [int642int(numInserted), success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeAllUsers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete all users for a given printer.
+    /// </summary>
+    /// <param name = "_printerName">Printer name of the printer for which the users should be removed</param>
+    /// <returns>Container [number of removed records, boolean success]</returns>
+    public static container removeAllUsers(PrinterName _printerName)
+    {
+        DocUserPrinter userPrinter;
+        boolean success = false;
+
+        try
+        {
+            delete_from userPrinter where userPrinter.PrinterName == _printerName;
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorRemovingAllUsersForPrinter", _printerName));
+        }
+        
+        return [userPrinter.RowCount(), success];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeForUsers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the specified users for a given printer. 
+    /// </summary>
+    /// <param name = "_printerName">Printer name of the printer for which the users should be removed</param>
+    /// <param name = "_usersOrRoles">Set of UserId values of the users that should be removed</param>
+    /// <param name = "_isUserRole">Boolean value, false if _usersOrRoles carries a set of
+    /// User IDs and true if _usersOrRoles carries a set of user roles</param>
+    /// <returns>Container [number of removed records, boolean success]</returns>
+    public static container removeForUsers(PrinterName _printerName, Set _usersOrRoles, boolean _isUserRole)
+    {
+        DocUserPrinter userPrinter;
+        boolean success = false;
+
+        if (_usersOrRoles == null)
+        {
+            return [0, true];
+        }
+
+        int64 numDeleted = 0;
+        try
+        {
+            SetEnumerator se = _usersOrRoles.getEnumerator();
+
+            if (_isUserRole)
+            {
+                // _usersOrRoles carries a set of user roles. For each role we take all the users
+                // assigned to this role and remove the entries from the User printer table for the
+                // user-printer combination
+                SecurityRole securityRole;
+                SecurityUserRole linkTable;
+
+                ttsbegin;
+                while (se.moveNext())
+                {
+                    SecurityRoleName roleName = se.current();
+
+                    delete_from userPrinter where userPrinter.PrinterName == _printerName
+                        exists join linkTable where linkTable.User == userPrinter.UserId
+                        exists join securityRole where securityRole.Name == roleName
+                            && securityRole.RecId == linkTable.SecurityRole;
+
+                    numDeleted += userPrinter.RowCount();
+                }
+                ttscommit;
+            }
+            else
+            {
+                // _usersOrRoles carries a set of users. For each user remove the entry from the
+                // User printer table.
+                // Isn't it crazy that we must delete in the loop?!?!
+                ttsbegin;
+                while (se.moveNext())
+                {
+                    delete_from userPrinter where userPrinter.UserId == se.current() && userPrinter.PrinterName == _printerName;
+                    numDeleted += userPrinter.RowCount();
+                }
+                ttscommit;
+            }
+            
+            success = true;
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX4:ErrorRemovingSelectedUsersForPrinter", _printerName));
+        }
+            
+        return [int642int(numDeleted), success];
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+	<DeveloperDocumentation>@DocentricAX4:UserPrinterDD</DeveloperDocumentation>
+	<Label>@DocentricAX4:UserPrinter</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
+	<TitleField1>UserId</TitleField1>
+	<TitleField2>PrinterName</TitleField2>
+	<ReplacementKey>UserPrinterIdx</ReplacementKey>
+	<DeleteActions />
+	<FieldGroups>
+		<AxTableFieldGroup>
+			<Name>AutoReport</Name>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>UserId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>PrinterName</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>LineNum</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoLookup</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoIdentification</Name>
+			<AutoPopulate>Yes</AutoPopulate>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>UserId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>PrinterName</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoSummary</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoBrowse</Name>
+			<Fields />
+		</AxTableFieldGroup>
+	</FieldGroups>
+	<Fields>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>UserId</Name>
+			<ExtendedDataType>UserId</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>PrinterName</Name>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>PrinterName</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldReal">
+			<Name>LineNum</Name>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>LineNum</ExtendedDataType>
+		</AxTableField>
+	</Fields>
+	<FullTextIndexes />
+	<Indexes>
+		<AxTableIndex>
+			<Name>UserPrinterIdx</Name>
+			<AlternateKey>Yes</AlternateKey>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>UserId</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>PrinterName</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>UserLineNumIdx</Name>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>UserId</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>LineNum</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+	</Indexes>
+	<Mappings />
+	<Relations>
+		<AxTableRelation>
+			<Name>UserInfo</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<RelatedTable>UserInfo</RelatedTable>
+			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>UserId</Name>
+					<Field>UserId</Field>
+					<RelatedField>id</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+		</AxTableRelation>
+		<AxTableRelation>
+			<Name>SysCorpNetPrinters</Name>
+			<Cardinality>ZeroOne</Cardinality>
+			<RelatedTable>SysCorpNetPrinters</RelatedTable>
+			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>PrinterName</Name>
+					<Field>PrinterName</Field>
+					<RelatedField>PrinterName</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+		</AxTableRelation>
+	</Relations>
+	<StateMachines />
+</AxTable>

@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BankPaymAdviceVendControllerV2_DR</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Runtime.Remoting.Messaging;
+using System.Reflection;
+
+/// <summary>
+/// This is the fix for not loading print settings from SysLastValue when the report dialog is shown.
+/// Document counter (important when redirecting Screen to File) for PrintMgmtReportRun is also fixed.
+/// NOTE: This class compiles on D365FO 10.0.14 or above, because up to 10.0.13
+/// the BankPaymAdviceVendControllerV2 class is marked as final and it's not inheritable.
+/// </summary>
+class BankPaymAdviceVendControllerV2_DR extends BankPaymAdviceVendControllerV2 
+{
+    #define.printId('printId')
+
+    private int reportExecutionCounter = 0;
+    private boolean redirectScreenToFile = false;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setFieldValue_defaultParameters_DR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set the private field defaultParameters of the parent controller.
+    /// </summary>
+    /// <param name = "_defaultParameters">BankPaymAdviceDefaultParameters object</param>
+    internal void setFieldValue_defaultParameters_DR(BankPaymAdviceDefaultParameters _defaultParameters)
+    {
+        try
+        {
+            BindingFlags bindFlags = BindingFlags::Instance | BindingFlags::NonPublic | BindingFlags::Public | BindingFlags::IgnoreCase;
+            System.Type type = this.GetType();
+            FieldInfo fieldInfo = type.BaseType.GetField('defaultParameters', bindFlags);
+            fieldInfo.SetValue(this, _defaultParameters);
+        }
+        catch (Exception::CLRError)
+        {
+            exceptionTextFallThrough();
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>outputReports</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Overridden method of the parent class to fix behaviour for Document Counter.
+    /// </summary>
+    protected void outputReports()
+    {
+        var rdpContract = this.getReportContract().parmRdpContract(); /*BankPaymAdviceContract*/
+        str vendAccount = rdpContract.parmAccountNum();
+
+        // NOTE: Comparing to other multi-document output reports such as Customer account statement
+        // or Collection letter notes the PrintMgtmReportRun class is not use as usual.
+        // Namely, instead of incrementing the counter of reports open in Viewer, the PrintMgtmReportRun
+        // object is always instanced all over again for each of report execution and this way preventing
+        // redirection to File to happen. We will 'fix' this behaviour by invoking the method:
+        // printMgmtReportRun.screenCounter_DC(_counterValue) which sets this counter from outside.
+        printMgmtReportRun.screenCounter_DC(reportExecutionCounter);
+        printMgmtReportRun.parmCheckScreenOutput(true);
+
+        // Set the flag for redirection to File which we stored after the previous report execution.
+        printMgmtReportRun.parmRedirectScreenOutput_DC(redirectScreenToFile);
+
+        // Set documentKeyValue which affects the output filename.
+        str documentKeyValue = vendAccount + '-#' + System.String::Format('{0:000}', reportExecutionCounter + 1);
+        printMgmtReportRun.parmDocumentKeyValue_DC(documentKeyValue);
+
+        // Increase the counter.
+        reportExecutionCounter++;
+
+        super();
+
+        // Store the 'Redirection to File' flag.
+        redirectScreenToFile = printMgmtReportRun.parmRedirectScreenOutput_DC();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runPrintMgmt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Overridden method of the parent class to release CallContext named data slot.
+    /// </summary>
+    protected void runPrintMgmt()
+    {
+        // Set new unique ReportExecutionContext.
+        // Without this fix if LoadFromSysLastValue=true, all BankPaymAdviceVendTmp records gets the same ReportExecutionContext (from SysLastValue) and are all included in the report.
+        BankPaymAdviceContract contract = this.parmReportContract().parmRdpContract() as BankPaymAdviceContract;
+        SysGuidString reportExecutionContext = guid2Str(newGuid());
+
+        // call internal BankPaymAdviceContract.parmReportExecutionContext() method (since 10.0.27)
+        SysDictClass dictClass = new SysDictClass(classNum(BankPaymAdviceContract));
+        if (dictClass.hasObjectMethod(identifierStr(parmReportExecutionContext)))
+        {
+            dictClass.callObject(identifierStr(parmReportExecutionContext), contract, reportExecutionContext);
+        }
+
+        super();
+
+        CallContext::FreeNamedDataSlot(#printId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The new main() method to fix behaviour with the SysLastValue framework and show the last used values on the report dialog for a user.
+    /// </summary>
+    /// <param name = "_args">Args object containing the BankPaymAdviceDefaultParameters object in its parmObject() method</param>
+    public static void main(Args _args)
+    {
+        BankPaymAdviceVendControllerV2_DR controller = new BankPaymAdviceVendControllerV2_DR();
+        controller.parmReportName(controller.getReportName());
+        controller.parmArgs(_args);
+
+        boolean shouldShowDialog = true;
+        if (_args && _args.parmObject() is BankPaymAdviceDefaultParameters)
+        {
+            shouldShowDialog = false;
+            controller.setFieldValue_defaultParameters_DR(_args.parmObject());
+        }
+
+        // SysLastValue should not be used when the controller can run with or without a dialog since the last saved value will override the input from this execution.
+        controller.parmShowDialog(shouldShowDialog);
+
+        // If the report dialog is not shown, don't load from the SysLastValue neither.
+        controller.parmLoadFromSysLastValue(shouldShowDialog);
+
+        // NOTE: When print settings are not loaded from SysLastValue, they will not be saved to SysLastValue neither.
+
+        str printId = strLwr(DocGlobalHelper::guid2strWithoutBraces(newGuid()));
+        CallContext::SetData(#printId, printId);
+
+        controller.startOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getStoredPrintId_DR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Use this method from the Docentric custom DSP class (e.g. DocBankPaymAdviceVendV2DSP)
+    /// to get the current Print ID and use it as the Custom placeholder.
+    /// Note that Print ID connects all printed Bank Payment Advice documents for the single report run.
+    /// </summary>
+    /// <returns>Current Print ID</returns>
+    public static str getStoredPrintId_DR()
+    {
+        // Retrieve the printId value from the CallContext object.
+        str printId = CallContext::GetData(#printId);
+        return printId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

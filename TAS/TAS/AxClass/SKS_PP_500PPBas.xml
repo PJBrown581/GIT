@@ -1,0 +1,1135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PP_500PPBas</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_PP_500PPBas
+{
+    #SKS_Global
+
+    SKS_PP_Bank SKS_PP_Bank;
+    SKS_LB_Bank SKS_LB_Bank;
+
+
+    int gNbrGoodRecs;
+    str gdefaultfilepath;
+    str gdefaultfilename;
+    str gpcommuserprog;
+    SKS_PP_CommunicationsType gpcommtype;
+    SKS_PP_HeadTrailId gheadtrailid;
+    NoYes gppdelete;
+    str mErrorText;
+    SKS_EB_FileName mBFNewFileName;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>AProcess_PP</Name>
+				<Source><![CDATA[
+    void AProcess_PP(SKS_PP_FileNbr gPPFileNbr,
+                    SKS_PP_NextActionDisplay PPNextAction,
+                    boolean PrintReport,
+                    SKS_EB_CommProcess _SKS_EB_CommProcess,
+                    SKS_PP_Caller _SKS_PP_Caller,
+                    boolean _isInBatch)
+    {
+        ExecutePermission perm;
+        System.Text.StringBuilder sbReportName = new System.Text.StringBuilder();
+        System.Text.StringBuilder sbClassName = new System.Text.StringBuilder();
+        str ReportName, ClassName;
+        str locParamters;
+        ReportRun ppReport;
+        Args args = new Args();
+
+        Int MsgChkWrk=0;
+        str CheckPPMsg = '';
+        Str FormatID;
+        boolean KeepDelete;
+        boolean locSendSuccess = false;
+        boolean locCommSuccess = true;
+        str locPPFileOnDisk;
+        str locErrSKS_EB_Filename;
+        Str PPFileName;
+        Str SelAcct;
+        Str SelSub;
+        str locBFFileLocation = strMin();
+        str locBFFileName = strMin();
+        str locLogFilePathName;
+        str locErrFilePathName;
+        boolean loclogFileExists = false;
+        boolean locErrorFileExists = false;
+        System.String[] locBFLocationAndName;
+
+        SKS_PP_File locSKS_PP_File;
+        SKS_PP_File locUpdateableSKS_PP_File;   //select, use, and immediately discard.
+                                                //For BF the record is being updated elsewhere and you can't guarantee this file will stay current.
+        SKS_PP_50000Bas dd500;
+        SKS_PP_50001Bas locSKS_PP_50001Bas;
+        SKS_PP_NonUSBas ddNonUS;
+
+        SysDictClass obj;
+        Object classInstance;
+
+        SKS_EB_FileHub locErrSKS_EB_FileHub;
+        SKS_EB_FileHub locLogSKS_EB_FileHub;
+        SKS_BF_BankIntType locSKS_BF_BankIntType;
+        dd500 = new SKS_PP_50000Bas();
+        locSKS_PP_50001Bas = new SKS_PP_50001Bas(gPPFileNbr);
+        ddNonUS = new SKS_PP_NonUSBas();
+
+        select * from locSKS_PP_File where locSKS_PP_File.FileNbr == gPPFileNbr; //temp?
+        
+        PPFileName = locSKS_PP_File.FileName;
+        locPPFileOnDisk = locSKS_PP_File.FilePath + '\\' + PPFileName;
+        locErrSKS_EB_Filename = locSKS_PP_File.FilePath + '\\' + 'LOG' + '\\' + locSKS_PP_File.FileName + '.err';
+        // These values may have been set from previous passes
+        gNbrGoodRecs = locSKS_PP_File.Ret_GoodRecs;
+        SelAcct = locSKS_PP_File.Ret_WrkBankAccountId;
+        FormatID = locSKS_PP_File.FormatID;
+        KeepDelete = True; // default to give user option to Keep/Delete
+        locSKS_BF_BankIntType = locSKS_PP_File.SKS_BF_BankIntType;
+
+        //Print Report (only available once working table has been created) and exit
+        if (PPNextAction == SKS_PP_NextActionDisplay::PrintAudit)// (Print audit report only)
+        {
+            this.PrintAuditReport(gPPFileNbr);
+            return;
+        }
+
+        this.GetFileDefaults(locSKS_PP_File , _SKS_EB_CommProcess); //get file info from setup or bank record
+
+        //Create/Send, Create
+        if ((PPNextAction == SKS_PP_NextActionDisplay::CreateSendFile) || (PPNextAction == SKS_PP_NextActionDisplay::RetryComm))
+        {
+            //do not allow file to be recreated if this is a retryComm
+            if(PPNextAction != SKS_PP_NextActionDisplay::RetryComm)
+            {
+                // Cycle thru the PP screen grid, and verifies that the selected batches can be put into one file
+                CheckPPMsg = this.CheckUserSelectionPP(locSKS_PP_File );
+                if(CheckPPMsg != '') //errors were found in CheckUserSelectionPP
+                {
+                    info("@SKS205" + ' ' + CheckPPMsg); //Either multiple batches have been selected with differences and/or other problems exist.  Please review these and re-select the batches and/or correct the problems before processing.
+                    return;
+                }
+
+
+                this.BuildHeaderTrailer(FormatID, gPPFileNbr);
+                if((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::UponJrnlPosting) || ((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::FixedTime) && (_SKS_PP_Caller != SKS_PP_Caller::FixedTime)) || (_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::Manual))
+                {
+                    MsgChkWrk = SKS_PP_500PPBas::BuildWorkingTablePP(FormatID, locSKS_PP_File);
+                    if(MsgChkWrk > 0)
+                    {
+                        gNbrGoodRecs = MsgChkWrk;
+                    }
+                    else
+                    {
+                        gNbrGoodRecs = 0;
+                    }
+                    locSKS_PP_50001Bas.Update_SKS_PP_File_Ret_GoodRecs(gNbrGoodRecs);
+
+                }
+
+                if((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::UponJrnlPosting) || ((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::FixedTime) && (_SKS_PP_Caller != SKS_PP_Caller::OnPost)) || (_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::Manual))
+                {
+                    this.Kill(locErrSKS_EB_Filename, locSKS_PP_File.SKS_BF_BankIntType);
+                    if(gNbrGoodRecs > 0)
+                    {
+                        SelAcct = '';
+                        SelSub = '';
+                        if (gPPFileNbr != '' )
+                        {
+                            //Look into Working Table and get first Acct, Sub from Payments section
+                            ddNonUS.GetWrkAcctSub('P', gPPFileNbr, SelAcct, SelSub);
+                        }
+                    }
+                    else
+                    {
+                        info("@SYS4205"); //no records found
+                        return;
+                    }
+
+                    //Create Pos Pay File
+                    if (gNbrGoodRecs > 0)
+                    {
+                        //Check for a PP report
+                        sbReportName.Append('SKS_PP_');
+                        sbReportName.Append(FormatID);
+                        sbReportName.Replace('-', '_');
+                        ReportName = sbReportName.ToString();
+
+                        if (!this.ValidateReport(ReportName, FormatID))
+                        {
+                            //check for a PP class
+                            sbClassName.Append('SKS_PP_Format_');
+                            sbClassName.Append(FormatID);
+                            sbClassName.Replace('-', '_');
+                            ClassName = sbClassName.ToString();
+
+                            if (!this.ValidateClass(ClassName, FormatID))
+                            {
+                                //Cannot find the report or class
+                                return;
+                            }
+                            else
+                            {
+                                perm = new ExecutePermission();
+                                perm.assert();
+
+                                obj = new SysDictClass(className2Id(ClassName));
+                                classInstance = obj.makeObject(); // Instantiate class
+                                obj.callObject('setFileNbr', classInstance, gPPFileNbr); // Call method to set variable
+                                obj.callObject('run', classInstance); // Run
+                                mErrorText = obj.callObject('getErrorText', classInstance);
+                                mBFNewFileName = obj.callObject('getBFNewFileName', classInstance);
+
+                                obj = null;
+                                classInstance = null;
+                                CodeAccessPermission::revertAssert();
+                                if(mErrorText != '')
+                                {
+                                    //File Creation Failed
+                                    error(mErrorText);
+                                    return;
+                                }
+                                //BankFabric - assign file name from bank fabric
+                                if (mBFNewFileName)
+                                {
+                                    SKS_PP_500PPBas::setFileNameByFileNumber(mBFNewFileName, gPPFileNbr);
+                                    locPPFileOnDisk = locSKS_PP_File.FilePath + '\\' + mBFNewFileName;
+                                    locErrSKS_EB_Filename = locSKS_PP_File.FilePath + '\\' + 'LOG' + '\\' + mBFNewFileName + '.err';
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(_SKS_PP_Caller != SKS_PP_Caller::FixedTime)
+                            {
+                                args.parm(gPPFileNbr + ';' + locPPFileOnDisk);
+                                args.name(ReportName);
+                                ppReport = SrsReportRunController::reportRunClass(args);
+                                ppReport.printJobSettings().setTarget(PrintMedium::File);
+                                ppReport.printJobSettings().preferredTarget(PrintMedium::File);
+                                ppReport.printJobSettings().format(PrintFormat::ASCII);
+                                ppReport.printJobSettings().fileName(locPPFileOnDisk);
+                                ppReport.printJobSettings().warnIfFileExists(FALSE);
+                                ppReport.init();
+                                ppReport.run();
+                            }
+                            else//Reports cannot be run from the batch server.  Fixed time requires a class
+                            {
+                                error("@SKS2477");
+                                return;
+                            }
+                        }
+                        locSKS_PP_50001Bas.Update_SKS_PP_File_KeepDelete(false, SKS_PP_FileStatus::FileCreated);
+                    }
+                    else
+                    {
+                        this.Kill(locPPFileOnDisk, locSKS_PP_File.SKS_BF_BankIntType);
+                    }
+                }
+            }
+
+            // ' ----------------------------------
+            // ' FILE CREATED STAGE - FINISHED
+            // ' ----------------------------------
+
+            // ' ----------------------------------
+            // ' TRANSMITTED - STARTED
+            // ' ----------------------------------
+
+            // ' --------------------------------
+            // ' --------------------------------
+            // ' COMMUNICATIONS - Send the file
+            // ' --------------------------------
+            // ' --------------------------------
+            if(((locSKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal && _SKS_EB_CommProcess.CommType != SKS_PP_CommunicationsType::None) || (locSKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric && strLen(_SKS_EB_CommProcess.BankFabricCommunicationName) > 0)) &&
+                    ((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::UponJrnlPosting) ||
+                    ((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::FixedTime) && (_SKS_PP_Caller != SKS_PP_Caller::OnPost)) ||
+                    (_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::Manual) ||
+                    (PPNextAction == SKS_PP_NextActionDisplay::RetryComm)))
+            {
+                if(gNbrGoodRecs > 0)
+                {
+                    //get the paramters for the file send, and place them in a parameters string.
+                    locParamters = SKS_EB_Send::getParams(_SKS_EB_CommProcess,
+                                                                PPFileName,
+                                                                locSKS_PP_File.FilePath,
+                                                                locPPFileOnDisk);
+
+                    //Execute the acutal upload action
+                    if(locSKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric)
+                    {
+                        if(strContains(locPPFileOnDisk,@'/'))
+                        {
+                            locBFLocationAndName = System.Text.RegularExpressions.Regex::Split(locPPFileOnDisk,@'//');
+                        }
+                        else if(strContains(locPPFileOnDisk,@'\'))
+                        {
+                            locBFLocationAndName = System.Text.RegularExpressions.Regex::Split(locPPFileOnDisk,@'\\');
+                        }
+                        else
+                        {
+                            throw Global::error(strFmt("@SKS:SKGBankFabricCommFailure",_SKS_EB_CommProcess.CommID, locBFFileLocation, locBFFileName ));
+                        }
+                        
+                        locBFFileLocation = locBFLocationAndName.GetValue(0);
+                        locBFFileName = locBFLocationAndName.GetValue(1);
+                    }
+                    else
+                    {
+                        locBFFileLocation = strMin();
+                        locBFFileName = strMin();
+                    }
+                    
+
+                    locSendSuccess = SKS_EB_Send::Send(_SKS_EB_CommProcess,
+                                                        locParamters, gpcommuserprog,
+                                                        locPPFileOnDisk,
+                                                        _isInBatch,
+                                                        false,
+                                                        locBFFileName,
+                                                        locBFFileLocation);
+
+
+                    //Send was attempted.  Now checking for error file to determine success.
+                    SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(locSKS_PP_File.SKS_BF_BankIntType);
+                    fileHub.parmThrowErrorIfException(false);
+                    fileHub.runFileInquire(locErrSKS_EB_Filename);
+                    if(fileHub.attrFileExists() || !locSendSuccess)
+                    {
+                        locCommSuccess = false;
+                        //if the a previous run failed communicaiton, it is unnecessary to reset the DB record to CommFailed because it is already set.
+                        if(locSKS_PP_File.KeepDelete != SKS_PP_FileStatus::CommFailed)
+                            locSKS_PP_50001Bas.Update_SKS_PP_File_KeepDelete(false, SKS_PP_FileStatus::CommFailed);
+                    }
+                    //if  a previous run failed communication, but is has now succeeded,
+                    //this will clear the failed status.  This is necessary for items that are set in Communications to Never Mark Complete;
+                    //if the previous Communications isn't cleared, the record would continue to show Communications Failed even when successful.
+                    else if(locSKS_PP_File.KeepDelete == SKS_PP_FileStatus::CommFailed)//Clear the CommFailed status from previous runs
+                    {
+                        locSKS_PP_50001Bas.Update_SKS_PP_File_KeepDelete(false, SKS_PP_FileStatus::FileCreated);
+                    }
+                }
+            }
+            // COMMUNICATIONS COMPLETED
+            // Next: Check for log file. if it exists, not that in the table.
+            locUpdateableSKS_PP_File = null;
+            //You cannot use locSKS_PP_File with BankFabric; locSKS_PP_File was selected PRIOR to the filename being set.
+            select firstonly FileName, SKS_BF_BankIntType from locUpdateableSKS_PP_File where locUpdateableSKS_PP_File.FileNbr == gPPFileNbr;
+            locErrSKS_EB_FileHub = SKS_EB_FileHub::construct(locUpdateableSKS_PP_File.SKS_BF_BankIntType);
+            locLogSKS_EB_FileHub = SKS_EB_FileHub::construct(locUpdateableSKS_PP_File.SKS_BF_BankIntType);
+            locSKS_BF_BankIntType = locUpdateableSKS_PP_File.SKS_BF_BankIntType;
+            locErrFilePathName = locSKS_PP_File.FilePath + '\\Log\\' + locUpdateableSKS_PP_File.FileName + '.err';
+            locLogFilePathName = locSKS_PP_File.FilePath + '\\Log\\' + locUpdateableSKS_PP_File.FileName + '.log';
+            locUpdateableSKS_PP_File = null;
+            locLogSKS_EB_FileHub.runFileInquire(loclogFilePathName);
+            loclogFileExists = locLogSKS_EB_FileHub.attrFileExists();
+            locErrSKS_EB_FileHub.runFileInquire(locErrFilePathName);
+            locErrorFileExists = locErrSKS_EB_FileHub.attrFileExists();
+
+            //locSKS_PP_File.LogErrFilesChecked = NoYes::Yes;
+            //locSKS_PP_File.LogFileExist = loclogFileExists  ? NoYes::Yes : NoYes::No;
+            //locSKS_PP_File.ErrFileExist = locErrorFileExists ? NoYes::Yes : NoYes::No;
+            ttsbegin;
+            update_recordset locUpdateableSKS_PP_File
+                setting
+                    LogFileExist = loclogFileExists  ? NoYes::Yes : NoYes::No,
+                    ErrFileExist = locErrorFileExists ? NoYes::Yes : NoYes::No,
+                    LogErrFilesChecked = NoYes::Yes
+                where
+                    locUpdateableSKS_PP_File.FileNbr == gPPFileNbr;
+            ttscommit;
+        }
+        //end if PPNextAction from screen = "A" (Create and Send)
+
+
+
+
+        //' Complete/Keep Only
+        if((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::UponJrnlPosting)
+            || ((_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::FixedTime) && (_SKS_PP_Caller != SKS_PP_Caller::OnPost))
+            || (_SKS_EB_CommProcess.FileCreateType == SKS_EB_FileCreate::Manual))
+        {
+
+
+            if (PPNextAction == SKS_PP_NextActionDisplay::CompleteKeep)//kKEEPDELETE_NEXTACTION_KEEP Then
+            {
+                this.PP_Keep(gPPFileNbr, locPPFileOnDisk, SKS_PP_Bank.PPDelete, locSKS_BF_BankIntType);
+                KeepDelete = False;
+            }
+            //' Create/Send or Send
+            else if ((PPNextAction == SKS_PP_NextActionDisplay::CreateSendFile) ||
+                (PPNextAction == SKS_PP_NextActionDisplay::Send) ||
+                (PPNextAction == SKS_PP_NextActionDisplay::RetryComm))
+            {
+                // Communications was OK, now check number of records
+                if (KeepDelete == true)
+                {
+                    KeepDelete = (gNbrGoodRecs > 0);
+                }
+
+                // Keep/Delete processes
+                if (KeepDelete == true)
+                {
+                    this.KeepDeleteDialog(gPPFileNbr,
+                                            locPPFileOnDisk,
+                                            SKS_PP_Bank.PPDelete,
+                                            _SKS_EB_CommProcess,
+                                            locErrSKS_EB_Filename,
+                                            locCommSuccess,
+                                            locSKS_BF_BankIntType);
+                }
+            }
+        }
+
+        // 19947
+        if ((PrintReport) && (_SKS_PP_Caller == SKS_PP_Caller::CreateAndSendForm))//check box was checked so print report now
+        {
+            //Print Audit report from working table
+            this.PrintAuditReport(gPPFileNbr);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>BuildHeaderTrailer</Name>
+				<Source><![CDATA[
+    int BuildHeaderTrailer(str _FormatID, SKS_PP_FileNbr gPPFileNbr)
+    {
+
+        int RetVal = 0;
+        str HeaderCodes;
+        str TrailerCodes;
+        int IndexCnt = 0;
+        SKS_PP_FileDetail locSKS_PP_File;
+
+        str RecInfo;
+
+        SKS_PP_50000Bas dd500;
+        ;
+
+        dd500 = new SKS_PP_50000Bas();
+
+        // First Delete Header/Trailer records for the current file
+        delete_from locSKS_PP_File
+            where locSKS_PP_File.FileNbr == gPPFileNbr
+               && locSKS_PP_File.RecSection != SKS_PP_RecSection::Payments;
+
+        HeaderCodes = 'HIJK';
+        TrailerCodes = 'TUVX';
+
+        try
+        {
+            //  Header placed here as some formats require the Header
+            //  to have Total information
+            //  --------------------------------
+            //  Header
+            //  --------------------------------
+            ttsbegin;
+            for (IndexCnt = 1; IndexCnt <= strlen(HeaderCodes); IndexCnt += 1)
+            {
+                RecInfo = dd500.Build_Head_Trail(SKS_PP_HeaderTrailerFileType::SKS_PositivePay, SKS_PP_Bank.PPFormatId, gheadtrailid, SubStr(HeaderCodes,IndexCnt, 1));
+                if(RecInfo == '')
+                {
+                    break;
+                }
+                else
+                {
+                    dd500.InsertMiscRecord('1', 'P', 'H', RecInfo, IndexCnt, gPPFileNbr);
+                }
+            }
+            ttscommit;
+            // --------------------------------
+            // Trailer
+            // --------------------------------
+            // Build trailer record(s) from SKS_PP_HeaderTrailer
+            ttsbegin;
+            for (IndexCnt = 1; IndexCnt <= strlen(TrailerCodes); IndexCnt += 1)
+            {
+                RecInfo = dd500.Build_Head_Trail(SKS_PP_HeaderTrailerFileType::SKS_PositivePay, SKS_PP_Bank.PPFormatId, gheadtrailid, SubStr(TrailerCodes,IndexCnt, 1));
+                if(RecInfo == '')
+                {
+                    break;
+                }
+                else
+                {
+                    dd500.InsertMiscRecord('1', 'P', 'T', RecInfo, IndexCnt, gPPFileNbr);
+                }
+            }
+            ttscommit;
+
+        }
+        catch
+        {
+            //a problem...so return a non-zero value
+            RetVal = -1;
+        }
+
+        return RetVal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CheckUserSelectionPP</Name>
+				<Source><![CDATA[
+    //   '===============================================================================
+    //    ' Cycles thru the PP screen grid, and verifies that the selected batches can be put into one file
+    //    '
+    //    ' Parameters
+    //    '   GridNav             I   Which grid to navigate
+    //    '   SubstText           I/O Substitution text for the message
+    //    '   FormatID            0   FormatID for selected batches
+    //    '
+    //    ' Returns
+    //    '   ErrorMessage        O   Error message if we have one
+    //    '===============================================================================
+
+    str CheckUserSelectionPP(SKS_PP_File _SKS_PP_File)
+    {
+        str bankacct;
+        str SubstText = '';
+
+        str FormatID;
+        boolean MultiAcctAllowed = false;
+        str PosPayInfo;
+        str PosPayCurrInfo;
+        str CommInfo;
+        str AccountInfo;
+
+        SKS_PP_Setup SKS_PP_Setup;
+        BankChequeTable bankChequeTable;
+        SKS_PP_FileFormat SKS_PP_FileFormat;
+        boolean locBankChequeTableFound = false;
+        boolean locSKS_PP_BankFound = false;
+
+        select crossCompany DataAreaId, SKS_PP_FileNbr from bankChequeTable
+                group by bankChequeTable.DataAreaId, bankChequeTable.SKS_PP_FileNbr, bankChequeTable.AccountID
+                where bankChequeTable.SKS_PP_File_RecId == _SKS_PP_File.RecId;
+        while(bankChequeTable)
+        {
+            //setting it true every time, because the overhead to check it is the same, this it is faster overall to just set it.
+            locBankChequeTableFound = true;
+            bankacct = bankChequeTable.AccountID;
+            SKS_PP_Bank = null;
+            SKS_PP_FileFormat = null;
+            SKS_PP_Setup = null;
+            changeCompany(bankChequeTable.company())
+            {
+                SKS_PP_Bank = SKS_PP_Bank.SetAcctSub(bankacct);
+                select firstonly * from SKS_PP_Setup;
+                select firstonly * from SKS_PP_FileFormat where SKS_PP_FileFormat.FormatId == SKS_PP_Bank.PPFormatId;
+            }
+
+            if(SKS_PP_Bank)
+            {
+                //setting it true every time, because the overhead to check it is the same, this it is faster overall to just set it.
+                locSKS_PP_BankFound = true;
+
+                //set globals
+                if(SKS_PP_Bank.PPFromSetup == NoYes::Yes)//get from setup
+                {
+                    gdefaultfilepath = _SKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric ? SKS_PP_Setup.PPBankFabricLocation : SKS_PP_Setup.PPPath;
+                    gdefaultfilename = SKS_PP_Setup.PPFileName;
+                    gheadtrailid = SKS_PP_Setup.PPHeadTrailID;
+                    gppdelete = SKS_PP_Setup.PPDelete;
+                }
+                else //get from SKS_PP_Bank
+                {
+                    gdefaultfilepath = _SKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric ? SKS_PP_Bank.PPBankFabricLocation : SKS_PP_Bank.PPPath;
+                    gdefaultfilename = SKS_PP_Bank.PPFileName;
+                    gheadtrailid = SKS_PP_Bank.PPHeadTrailId;
+                    gppdelete = SKS_PP_Bank.PPDelete;
+                }
+
+                if(FormatID == '')
+                {
+                    FormatID = SKS_PP_Bank.PPFormatId;
+                    if(SKS_PP_FileFormat)
+                    {
+                        MultiAcctAllowed = SKS_PP_FileFormat.MultiAcctAllowed;
+                    }
+                }
+                else if(FormatID != SKS_PP_Bank.PPFormatId)
+                {
+                    //' Two or more selections have different Format IDs
+                    SubstText = SubstText + "@SKS112" + ', ';
+                }
+
+                if(PosPayInfo == '')
+                {
+                    PosPayInfo = enum2str(gheadtrailid) + enum2str(gppdelete);
+                    if(!SKS_PP_Setup.PPFileNameCanChange)
+                    {
+                        PosPayInfo = PosPayInfo + strupr(gdefaultfilename + gdefaultfilepath);
+                    }
+                }
+                else
+                {
+                    PosPayCurrInfo = enum2str(gheadtrailid) + enum2str(gppdelete);
+                    if(!SKS_PP_Setup.PPFileNameCanChange)
+                    {
+                        PosPayCurrInfo = PosPayCurrInfo + strupr(gdefaultfilename + gdefaultfilepath);
+                    }
+
+                    if(PosPayInfo != PosPayCurrInfo)
+                    {
+                        //Two or more selections have different File Info
+                        SubstText = SubstText + "@SKS714" + ', ';
+                    }
+                }
+
+                if(CommInfo == '')
+                {
+                    CommInfo = SKS_PP_Bank.PPOutCommID;
+                }
+                else if (CommInfo != SKS_PP_Bank.PPOutCommID)
+                {
+                    //Two or more selections have different Comm Info
+                    SubstText = SubstText + "@SKS194" + ', ';
+                }
+
+                if(AccountInfo == '')
+                {
+                    AccountInfo = SKS_PP_Bank.BankAccountId;
+                }
+                else
+                {
+                    if( AccountInfo != SKS_PP_Bank.BankAccountId && !MultiAcctAllowed)
+                    {
+                        SubstText = SubstText + "@SKS715" + ', ';
+                    }
+                }
+            }
+            next bankChequeTable;
+        }
+        if(!locBankChequeTableFound)
+        {
+            //There should always be a record found.
+            error(strFmt("@SKS3941",
+                _SKS_PP_File.company(),
+                _SKS_PP_File.FileNbr));
+            throw Exception::Error;
+        }
+        if(!locSKS_PP_BankFound)
+        {
+            //There should always be a record found.
+            error(strFmt("@SKS3942",
+                _SKS_PP_File.company(),
+                _SKS_PP_File.FileNbr));
+            throw Exception::Error;
+        }
+
+        if(strlen(SubstText) > 0)
+        {
+            //remove trailing comma and space and parens
+            SubstText = substr(SubstText, 0, strlen(SubstText) - 2);
+            SubstText = '(' + SubstText + ')';
+        }
+
+        return SubstText;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetEnum</Name>
+				<Source><![CDATA[
+    int GetEnum(identifierName enumName, str enumSymbol)
+    {
+        return new DictEnum(enumName2Id(enumName)).symbol2Value(enumSymbol);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetFileDefaults</Name>
+				<Source><![CDATA[
+    void GetFileDefaults(SKS_PP_File _SKS_PP_File, SKS_EB_CommProcess _SKS_EB_CommProcess)
+    {
+        str bankacct;
+        SKS_PP_Setup ChequesSKS_PP_Setup;
+        BankChequeTable bankChequeTable;
+        ;
+
+        select firstOnly crossCompany AccountID, DataAreaId, SKS_PP_FileNbr from bankChequeTable
+                where bankChequeTable.SKS_PP_File_RecId == _SKS_PP_File.RecId;
+        if(bankChequeTable)
+        {
+            bankacct = bankChequeTable.AccountID;
+            SKS_PP_Bank = null;
+            changeCompany(bankChequeTable.company())
+            {
+                SKS_PP_Bank = SKS_PP_Bank.SetAcctSub(bankacct);
+                select firstonly PPBankFabricLocation, PPPath, PPFileName, PPHeadTrailID, PPDelete from ChequesSKS_PP_Setup;
+            }
+
+            //set globals
+            if (SKS_PP_Bank.PPFromSetup == NoYes::Yes)  //get from setup
+            {
+                gdefaultfilepath = _SKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric ? ChequesSKS_PP_Setup.PPBankFabricLocation : ChequesSKS_PP_Setup.PPPath;
+                gdefaultfilename = ChequesSKS_PP_Setup.PPFileName;
+                gheadtrailid = ChequesSKS_PP_Setup.PPHeadTrailID;
+                gppdelete = ChequesSKS_PP_Setup.PPDelete;
+            }
+            else //get from SKS_PP_Bank
+            {
+                gdefaultfilepath = _SKS_PP_File.SKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric ? SKS_PP_Bank.PPBankFabricLocation : SKS_PP_Bank.PPPath;
+                gdefaultfilename = SKS_PP_Bank.PPFileName;
+                gheadtrailid = SKS_PP_Bank.PPHeadTrailId;
+                gppdelete = SKS_PP_Bank.PPDelete;
+            }
+            //non-conditional globals
+            gpcommuserprog = _SKS_EB_CommProcess.CommUserProg;
+            gpcommtype = _SKS_EB_CommProcess.CommType;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>IsRegistered</Name>
+				<Source><![CDATA[
+    // Validates registration key
+    // Returns -2 if selected file formats > license format number
+    // Returns -1 if unlocking key is invalid
+    // Returns 1 if unlocking key is valid
+    int IsRegistered(str EBModule)
+    {
+        SKS_PP_Setup SKS_PP_Setup;
+        int result;
+        str modules;
+        int nbrEFTLicFormats = 0;
+        ;
+
+        select firstonly * from SKS_PP_Setup;
+        if (strlen(strrtrim(strltrim(SKS_PP_Setup.RegUnlockKey))) == 0)
+        {
+            return -1;
+        }
+        else
+        {
+            modules = '';
+            if (SKS_PP_Setup.RegPP == NoYes::Yes)
+            {
+                modules = 'PP';
+            }
+            if (SKS_PP_Setup.RegBR == NoYes::Yes)
+            {
+                modules += 'AB';
+            }
+            if (SKS_PP_Setup.RegLB == NoYes::Yes)
+            {
+                modules += 'LB';
+            }
+            if (SKS_PP_Setup.RegAPEFT == NoYes::Yes)
+            {
+                modules += 'APEFT';
+            }
+            if (SKS_PP_Setup.RegAREFT == NoYes::Yes)
+            {
+                modules += 'AREFT';
+            }
+            if (SKS_PP_Setup.RegFX == NoYes::Yes)
+            {
+                modules += 'FX';
+            }
+            if(SKS_PP_Setup.RegInhouseBank == NoYes::Yes)
+            {
+                modules += 'IHB';
+            }
+            if(SKS_PP_Setup.RegMandateAutomation == NoYes::Yes)
+            {
+                modules += 'DDMA';
+            }
+            if(SKS_PP_Setup.RegPaymFactoryAutomation == NoYes::Yes)
+            {
+                modules += 'PFA';
+            }
+            if(SKS_PP_Setup.RegMCFAPDD == NoYes::Yes)
+            {
+                modules += 'MCFAPDD';
+            }
+            if(SKS_PP_Setup.RegCCReconciliationExtensions == NoYes::Yes)
+            {
+                modules += 'CCRE';
+            }
+            if(SKS_PP_Setup.RegSCF == NoYes::Yes) //FDD-14323- Supply chain finance
+            {
+                modules += 'SCF';
+            }
+            if(SKS_PP_Setup.RegBTB == NoYes::Yes)
+            {
+                modules += 'BTB';
+            }
+            if(SKS_PP_Setup.RegCNP == NoYes::Yes)
+            {
+                modules += 'CNP';
+            }
+            if(SKS_PP_Setup.RegPCard == NoYes::Yes)
+            {
+                modules += 'PCARD';
+            }
+            if (SKS_PP_Setup.RegAPEFT == NoYes::Yes || SKS_PP_Setup.RegAREFT == NoYes::Yes || SKS_PP_Setup.RegBTB == NoYes::Yes)
+            {
+                nbrEFTLicFormats = SKS_PP_Setup.EFTLicensedFormats;
+            }
+
+            result = SKS_EB_SysInfo::validateUnlockKey(strrtrim(strltrim(SKS_PP_Setup.RegUnlockKey)), modules, nbrEFTLicFormats, EBModule);
+
+            // call registration notification delegate
+            if(result == 1)
+            {
+                this.registrationNotification();
+            }
+
+            return result;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registrationNotification</Name>
+				<Source><![CDATA[
+    delegate void registrationNotification()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>KeepDeleteDialog</Name>
+				<Source><![CDATA[
+    void KeepDeleteDialog(SKS_PP_FileNbr FileNbr, str PPFileOnDisk, NoYes ePPDelete, SKS_EB_CommProcess _SKS_EB_CommProcess, str _errSKS_EB_FileName, boolean _CommSuccess, SKS_BF_BankIntType _SKS_BF_BankIntType)
+    {
+        SKS_PP_50001Bas dd501;
+        DialogButton diagBut;
+        ;
+
+        if(_SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::Prompt)
+        {
+            diagBut = Box::yesNo(
+                "@SKS196",
+                DialogButton::Yes, // Initial focus is on the No button.
+                "@SKS195");
+        }
+        else if(_SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::AlwaysMarkIfNoError)
+        {
+            //if Commtype is none, they it is completed.
+            if(_SKS_EB_CommProcess.CommType == SKS_PP_CommunicationsType::None)
+            {
+                diagBut = DialogButton::Yes;
+            }
+            //Check for existence of error file
+            else
+            {
+                if(!_CommSuccess)
+                {
+                    diagBut = DialogButton::No;
+                    error(strFmtLB(strFmt("@SKS2478", _ErrSKS_EB_Filename)));
+                }
+                else
+                {
+                    diagBut = DialogButton::Yes;
+                }
+            }
+        }
+        else if(_SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::NeverMarkComplete)
+        {
+            diagBut = DialogButton::No;
+        }
+
+
+        ttsbegin;
+        if (diagBut == DialogButton::Yes)
+        {
+            this.PP_Keep(FileNbr, PPFileOnDisk, ePPDelete, _SKS_BF_BankIntType);
+        }
+        else
+        {
+            dd501 = new SKS_PP_50001Bas(FileNbr);
+            dd501.Delete_Exit();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Kill</Name>
+				<Source><![CDATA[
+    void Kill(str PPFileOnDisk, SKS_BF_BankIntType _BFBankIntype = SKS_BF_BankIntType::FileHubLocal)
+    {
+        SKS_EB_FileHub locSKS_EB_FileHub = SKS_EB_FileHub::construct(_BFBankIntype);
+        locSKS_EB_FileHub.runFileInquire(PPFileOnDisk);
+        if(locSKS_EB_FileHub.attrFileExists())
+            locSKS_EB_FileHub.runFileDelete(PPFileOnDisk);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PP_Keep</Name>
+				<Source><![CDATA[
+    void PP_Keep(str FileNbr, str PPFileOnDisk, NoYes ePPDelete, SKS_BF_BankIntType _SKS_BF_BankIntType)
+    {
+        SKS_PP_50000Bas dd500;
+        SKS_PP_50001Bas dd501;
+        ;
+
+        dd501 = new SKS_PP_50001Bas(FileNbr);
+        dd501.Update_SKS_PP_File_KeepDelete(True, SKS_PP_FileStatus::Completed);
+
+        dd501.ArchiveFiles(SKS_PP_FileType::SKS_PositivePay,'', SKS_PP_Bank, SKS_LB_Bank, _SKS_BF_BankIntType);
+
+        dd500 = new SKS_PP_50000Bas();
+        dd500.PurgeBatches(SKS_PP_FileType::SKS_PositivePay);
+
+        // Delete the file from the hard disk
+        if (ePPDelete == NoYes::Yes)
+        {
+            this.Kill(PPFileOnDisk, _SKS_BF_BankIntType);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PrintAuditReport</Name>
+				<Source><![CDATA[
+    void PrintAuditReport(str _gPPFileNbr)
+    {
+        MenuFunction        mf;
+        Args                parms = new Args();
+        SKS_PP_FileDetail   fileDetail;
+        SKS_PP_FileNbr      fileNbr = _gPPFileNbr;
+
+        select firstonly fileDetail
+            where fileDetail.FileNbr == fileNbr;
+
+        parms.record(fileDetail);
+        mf = new MenuFunction(menuitemOutputStr(SKS_PP_AuditReport), MenuItemType::Output);
+        mf.run(parms);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateClass</Name>
+				<Source><![CDATA[
+    boolean ValidateClass(str className, str formatId)
+    {
+        TreeNode tnode2Enum;
+        ;
+
+        tnode2Enum = TreeNode::findNode('Classes');
+        tnode2Enum = tnode2Enum.AOTfindChild(className);
+
+        if (tnode2Enum == null)
+        {
+            error(strFmt("@SKS864", formatId));
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateReport</Name>
+				<Source><![CDATA[
+    boolean ValidateReport(str reportName, str formatId)
+    {
+        TreeNode tnode2Enum;
+        ;
+
+        tnode2Enum = TreeNode::findNode('Reports');
+        tnode2Enum = tnode2Enum.AOTfindChild(reportName);
+
+        if (tnode2Enum == null)
+        {
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecordPPCommon</Name>
+				<Source><![CDATA[
+    //   '===============================================================================
+    //    ' Cycles thru the screen grid, and with the selected batches, builds the PP working table
+    //    '
+    //    ' Parameters
+    //    '   FormatID            I   All selected batches, prenotes, test file - Format ID to use
+    //    '   FileRecCnt          I   Record Count
+    //    '
+    //    ' Returns
+    //    '   Success             O   0 Success
+    //    '                       O   -1 Failure
+    //    '===============================================================================
+
+    delegate void insertRecordPPCommon(
+        SKS_EB_RecId        _fileRecId,
+        str                 _clientComputerName,
+        str                 _formatId,
+        EventHandlerResult  _result)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecordPP</Name>
+				<Source><![CDATA[
+    private int insertRecordPP(SKS_EB_RecId _fileRecId, str _clientComputerName, str _formatId)
+    {
+        EventHandlerResult  result = new EventHandlerResult();
+        int                 retCnt;
+
+        str responseErrorText = SKS_PP_Sys::ValidateSKSCommonModel();
+        if (responseErrorText != '')
+        {
+            throw error(responseErrorText);
+        }
+
+        this.insertRecordPPCommon(_fileRecId, _clientComputerName, _formatId, result);
+
+        retCnt = result.result();
+
+        return retCnt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>BuildWorkingTablePP</Name>
+				<Source><![CDATA[
+    static client int BuildWorkingTablePP(str _FormatID, SKS_PP_File _SKS_PP_File)
+    {
+        int retVal = 0;
+        SKS_PP_FileDetail locSKS_PP_File;
+        int recCount;
+        xSession xS;
+
+        xS = new xSession(); // Get Session for Computer name
+
+        // First Delete payment records for the current file
+        delete_from locSKS_PP_File
+            where locSKS_PP_File.FileNbr == _SKS_PP_File.FileNbr
+               && locSKS_PP_File.RecSection == SKS_PP_RecSection::Payments;
+
+        try
+        {
+            ttsbegin;
+            SKS_PP_500PPBas sks_PPCommon = new SKS_PP_500PPBas();
+            recCount = sks_PPCommon.insertRecordPP(_SKS_PP_File.RecId, xS.clientComputerName(), _FormatID);
+
+            if (recCount == -1)
+            {
+                // Didn't pass registration.
+                error("@SKS245", '');
+                recCount = 0;
+            }
+
+            retVal += recCount;
+            ttscommit;
+        }
+        catch
+        {
+            //a problem...so return a non-zero value
+            retVal = -1;
+        }
+
+        return retVal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPosPayChecks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get checks from the BankChequeTable that are marked for this positive pay file
+    /// </summary>
+    /// <param name="_SKS_PP_File">
+    /// Positive pay file header
+    /// </param>
+    /// <returns>
+    /// Collection of BankChequeTable records
+    /// </returns>
+    /// <remarks>
+    /// Get checks from the BankChequeTable that are marked for this positive pay file
+    /// </remarks>
+
+    public static client server BankChequeTable getPosPayChecks(SKS_PP_File _SKS_PP_File)
+    {
+        BankChequeTable bankChequeTable;
+        ;
+
+        select crossCompany bankChequeTable where bankChequeTable.SKS_PP_File_RecId == _SKS_PP_File.RecId;
+
+        return bankChequeTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRemittanceCompanyName</Name>
+				<Source><![CDATA[
+    public static client server BankNegInstRecipientName getRemittanceCompanyName(bankChequeTable _bankChequeTable)
+    {
+        BankNegInstRecipientName    recipientName;
+        LogisticsPostalAddress      address;
+        LogisticsLocationEntity     location;
+        VendTable                   LocalVendTable;
+        ;
+
+        if (!_bankChequeTable.RemittanceAddress)
+        {
+            //Mirrors CustVendCheque::output
+            if (_bankChequeTable.RecipientType == BankChequeRecipientType::Vend)
+            {
+                LocalVendTable  = VendTable::find(_bankChequeTable.RecipientAccountNum);
+                location    = LogisticsLocationEntity::constructFromLocationRecId(VendTable::getDefaultRemittanceLocation(LocalVendTable.AccountNum));
+                recipientName = location.parmLocationDescription();
+            }
+            else if (_bankChequeTable.RecipientType == BankChequeRecipientType::Cust)
+            {
+                CustTable LocalCustTable = CustTable::findByCompany(_bankChequeTable.company(), _bankChequeTable.RecipientAccountNum);
+                recipientName = LocalCustTable.name();
+            }
+        }
+        else
+        {
+            address         = LogisticsPostalAddress::findRecId(_bankChequeTable.RemittanceAddress);
+            recipientName   = LogisticsLocation::locationNameFromRecId(address.Location);
+        }
+        return recipientName;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setFileNameByFileNumber</Name>
+				<Source><![CDATA[
+    public static void setFileNameByFileNumber(SKS_EB_FileName _SKS_EB_FileName, SKS_PP_FileNbr _SKS_PP_FileNbr)
+    {
+        SKS_PP_File locSKS_PP_File;
+        select forupdate firstonly locSKS_PP_File where locSKS_PP_File.FileNbr == _SKS_PP_FileNbr;
+        ttsbegin;
+        locSKS_PP_File.FileName = _SKS_EB_FileName;
+        locSKS_PP_File.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocStartupManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Docentric global startup manager.
+/// </summary>
+public class DocStartupManager
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ApplicationStartupEventManager_onFirstTimeUserInteractiveSessionCreated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Docentric AX global startup procedure.
+    /// This event occurs when the system is creating an interactive session for the first time for a user.
+    /// The event is raised once per user per AOS.
+    /// </summary>
+    [SubscribesTo(classStr(ApplicationStartupEventManager), staticDelegateStr(ApplicationStartupEventManager, onFirstTimeUserInteractiveSessionCreated))]
+    public static void ApplicationStartupEventManager_onFirstTimeUserInteractiveSessionCreated()
+    {
+        try
+        {
+            // Show upgrade messages when administrators log in.
+            DocUpgradeManager::showUpgradeLogs();
+        }
+        catch
+        {
+            Global::exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ApplicationStartupEventManager_onSessionCreated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Docentric AX session startup procedure.
+    /// Event that occurs when the session is created and ready for use.
+    /// The event is raised once per user session creation for any user.
+    /// </summary>
+    /// <param name="_isBatch">Whether the system is running a batch job.</param>
+    /// <param name="_isInteractive">Whether the session is interactive.</param>
+    [SubscribesTo(classStr(ApplicationStartupEventManager), staticDelegateStr(ApplicationStartupEventManager, onSessionCreated))]
+    public static void ApplicationStartupEventManager_onSessionCreated(boolean _isBatch, boolean _isInteractive)
+    {
+        // Note that if this code would run at system (not session) startup, some context object would not be initialized.
+
+        // Ignore sessions in partitions other than initial.
+        if (getCurrentPartition() != 'initial')
+        {
+            return;
+        }
+
+        // Run the following just once:
+        // - the upgrade procedure
+        // - scheduling of the DocLicenseExpirationNotifier batch job
+
+        SysGlobalObjectCache globalObjectCache = classFactory.globalObjectCache();
+        str         cacheScope = classStr(DocStartupManager);
+        container   cacheKey = ['AppStartup'];
+
+        if (!globalObjectCache.find(cacheScope, cacheKey))
+        {
+            // Skip sessions not yet ready to execute the upgrade (on versions before 10.0.10 environment ApplicationVersion was not filled for SysTest sessions)
+            if (isRunningSyncEngine() || (!DocDiagnosticsManager::d365Version()) || (!DocDiagnosticsManager::fullyQualifiedDomainName()))
+            {
+                return;
+            }
+            
+            if (!DocInstallation::find().RecId)     // invokes DocInstallation::ensureSingleRecord();
+            {
+                return;
+            }
+
+            if (!DocParameters::find().RecId)       // creates new record if it does not exist
+            {
+                return;
+            }
+
+            // Store the information that Docentric Upgrade Manager is (going to be) executed.
+            globalObjectCache.insert(cacheScope, cacheKey, [true]);
+
+            // Let's initialize the reporting engine, fonts, etc.
+            // This is only there to get faster first time experience for the user.
+            Docentric.AX.DocentricAX::Initialize();
+
+            // Check if the environment is ready.
+            DocGlobalHelper::assert(DocDiagnosticsManager::d365Version() != '');
+            DocGlobalHelper::assert(DocDiagnosticsManager::fullyQualifiedDomainName() != '');
+            DocGlobalHelper::assert(DocInstallation::find().RecId != 0);
+            
+            // Detect environment hostname change (e.g. the database has been copied from Production to UAT) and clear the database table fields
+            // such as passwords and connection strings, if reading their values fails. This might happen when the field values were encrypted
+            // using a certificate different than the certificate used for the current environment. In this case DocUpgradeManager would always fail,
+            // since one of the upgrade steps is migrating data for Additional email accounts and this one would fail.
+            DocStartupManager::detectEnvironmentChanged();
+
+            // Run the upgrade manager.
+            DocUpgradeManager::main(new Args());
+
+            // Enable/disable the license subscription expiration notifier background automation process depending on the license type
+            DocLicenseExpirationNotifierTypeRegistration::setEnabledByLicenseType();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>detectEnvironmentChanged</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Detect environment hostname change (database copy) and clear invalid data
+    /// </summary>
+    public static void detectEnvironmentChanged()
+    {
+        DocFullyQualifiedDomainName environmentHostname = DocDiagnosticsManager::fullyQualifiedDomainName();
+        DocInstallation             installation;
+        System.Exception            ex;
+
+        try
+        {
+            ttsBegin;
+                
+            select firstOnly pessimisticLock installation where installation.Key == 0;
+        
+            if (installation.RecId && (installation.EnvironmentHostname != environmentHostname))
+            {
+                if (installation.EnvironmentHostname)
+                {
+                    str msg = DocStartupManager::environmentChanged(installation.EnvironmentHostname, environmentHostname);
+
+                    DocUpgradeLog::log('', '', Exception::Info, msg);
+                }
+            
+                installation.EnvironmentHostname = environmentHostname;
+                installation.update();
+            }
+
+            ttsCommit;
+        }
+        catch (ex)  // catches X++ and .NET exceptions
+        {
+            DocUpgradeLog::log('', '', Exception::Error, 'Error occurred while clearing data after changed environment hostname.: ' + ex.ToString());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>environmentChanged</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns message for upgrade log.
+    /// </summary>
+    /// <param name = "_fromHostanme">Old hostname</param>
+    /// <param name = "_toHostname">New hostname</param>
+    /// <returns>Summary message</returns>
+    public static str environmentChanged(DocFullyQualifiedDomainName _fromHostanme, DocFullyQualifiedDomainName _toHostname)
+    {
+        str msg  = strFmt('Environment hostname changed from %1 to %2.', _fromHostanme, _toHostname);
+
+        // Suppress outgoing emails
+        DocParameters parameters = DocParameters::find(true);
+        parameters.SuppressOutgoingEmails = DocSuppressOutgoingEmails::YesWithDownload;
+        parameters.update();
+
+        // Disable Send emails flag for license expiry notification settings
+        DocLicenseParameters licenseParameters = DocLicenseParameters::find(true);
+        Set notificationSettingsSet = Set::create(licenseParameters.LicenseNotificationSettings);   // Set<DocLicenseNotificationSettings>
+
+        SetEnumerator notificationSettingsSetEnum = notificationSettingsSet.getEnumerator();
+        while (notificationSettingsSetEnum.moveNext())
+        {
+            DocLicenseNotificationSettings notificationSettingsCurrent = notificationSettingsSetEnum.current();
+            notificationSettingsCurrent.parmNotificationSendEmail(false);
+        }
+
+        licenseParameters.LicenseNotificationSettings = notificationSettingsSet.pack();
+        licenseParameters.update();
+       
+
+        // Clear invalid encrypted fields
+        str cleanupMsg = DocEncryptedFieldsCleanup::run();
+        if (cleanupMsg)
+        {
+            msg += ' \n' + cleanupMsg;
+        }
+
+        return msg;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

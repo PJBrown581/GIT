@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPInitEntityHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class PIPInitEntityHelper
+{
+    private static boolean initialized;
+    private static boolean isoCacheCleared;
+    private static boolean defaultsPopulated;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>resetEntities</Name>
+				<Source><![CDATA[
+    public static void resetEntities()
+    {
+        // Only run the first time
+        if (initialized)
+        {
+            return;
+        }
+
+        initialized = true;
+
+        // Delete the target mapping in bulk instead of one entity at a time; we'll regenerate all this below
+        ttsbegin;
+        DMFTargetXML                dmfTargetXML;
+        DMFTargetEntityHierarchy    dmfTargetEntityHierarchy;
+        DMFTargetXMLToEntityMap     dmfTargetXMLToEntityMap;
+
+        dmfTargetXML.skipDataMethods(true);
+        dmfTargetEntityHierarchy.skipDataMethods(true);
+        dmfTargetXMLToEntityMap.skipDataMethods(true);
+
+        // Rebuild data type mapping as older AX instances may not have the correct values
+        PIPInitEntityHelper::rebuildDataTypeMapping();        
+        
+        delete_from dmfTargetXML;
+        delete_from dmfTargetEntityHierarchy;
+        delete_from dmfTargetXMLToEntityMap;
+        ttscommit;
+
+        // Regenerate the target mapping for all existing entities
+        DMFEntity dmfEntity;
+        while select dmfEntity
+            where dmfEntity.EntityType == DMFEntityTypes::Entity
+                && dmfEntity.EntityTable != ''
+        {
+            if (!tableName2id(dmfEntity.EntityTable))
+            {
+                info(strFmt("@PIP5116", dmfEntity.EntityName));
+                continue;
+            }
+            DMFTargetXMLToEntityMap::generateMapping(dmfEntity, true);
+        }
+
+        // Ensure any new entities are loaded
+        DMFDataPopulation::createDefaultData(true, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateDefaultData</Name>
+				<Source><![CDATA[
+    public static void populateDefaultData()
+    {
+        if (defaultsPopulated)
+        {
+            return;
+        }
+        
+        defaultsPopulated = true;
+
+        DocuType::createDefaults();
+        PCOrderlineTypeSelectionCriteria::initializeData();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>OMLegalEntity_onPersistedEntity</Name>
+				<Source><![CDATA[
+    [DataEventHandler(tableStr(OMLegalEntity), DataEventType::PersistedEntity)]
+    public static void OMLegalEntity_onPersistedEntity(Common _sender, DataEventArgs _eventArgs)
+    {
+        LogisticsIProvider logisticsProvider = PIPInitEntityHelper::logisticsProvider();
+        if (!isoCacheCleared)
+        {
+            logisticsProvider.cleanupCountryRegionCodeCache();
+            isoCacheCleared = true;
+        }
+        
+        OMLegalEntity legalEntity = _sender as OMLegalEntity;
+        logisticsProvider.countryInfo(legalEntity.LegalEntityId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logisticsProvider</Name>
+				<Source><![CDATA[
+    private static LogisticsIProvider logisticsProvider()
+    {
+        LogisticsIProvider logisticsProvider = null;
+        SysPluginMetadataCollection metadataCollection = new SysPluginMetadataCollection();
+        metadataCollection.SetManagedValue('LogisticsProvider', 'LogisticsProvider');
+        logisticsProvider = SysPluginFactory::Instance('Dynamics.AX.Application', classStr(LogisticsIProvider), metadataCollection);
+        if(!logisticsProvider)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+        return logisticsProvider;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FSRebuildEntityTargetMapButton_OnClicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(DMFParameters, PIPRebuildEntityTargetMapButton), FormControlEventType::Clicked)]
+    public static void FSRebuildEntityTargetMapButton_OnClicked(FormControl sender, FormControlEventArgs e)
+    {
+        if (Box::confirm("@PIP5105"))
+        {
+            PIPInitEntityHelper::buildEntityTargetMapAsync();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FSRebuildEntityDataTypeMapButton_OnClicked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    [FormControlEventHandler(formControlStr(DMFParameters, PIPRebuildEntityDataTypeMapButton), FormControlEventType::Clicked)]
+    public static void FSRebuildEntityDataTypeMapButton_OnClicked(FormControl sender, FormControlEventArgs e)
+    {
+        if (Box::confirm("@PIP5109"))
+        {
+            PIPInitEntityHelper::rebuildDataTypeMapping();
+
+            info("@PIP5110");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildEntityTargetMapAsync</Name>
+				<Source><![CDATA[
+    private static void buildEntityTargetMapAsync()
+    {
+        System.Threading.CancellationTokenSource tokenSource = new System.Threading.CancellationTokenSource();
+        
+        runAsync(classNum(PIPInitEntityHelper),
+                    staticMethodStr(PIPInitEntityHelper, resetEntitiesAsync),
+                    conNull(),
+                    tokenSource.Token,
+                    classNum(DMFExportImportData),
+                    staticMethodStr(DMFExportImportData, processAsyncDataExecutionResult));
+        
+        Box::info(strFmt("@PIP5106"));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetEntitiesAsync</Name>
+				<Source><![CDATA[
+    public static container resetEntitiesAsync(container _params, System.Threading.CancellationToken _cancellationToken)
+    {
+        System.Exception ex;
+
+        try
+        {
+            PIPInitEntityHelper::resetEntities();
+        }
+        catch (ex)
+        {
+            throw error("@PIP5107");
+        }
+
+        return [strFmt("@PIP5108")];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rebuildDataTypeMapping</Name>
+				<Source><![CDATA[
+    private static void rebuildDataTypeMapping()
+    {
+        DMFDataTypeMapping dmfDataTypeMapping;
+        delete_from dmfDataTypeMapping;
+        DMFDataPopulation::createDataTypeMapping();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

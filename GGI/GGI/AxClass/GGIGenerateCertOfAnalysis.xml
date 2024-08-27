@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIGenerateCertOfAnalysis</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class GGIGenerateCertOfAnalysis
+{
+    SalesTable salesTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static GGIGenerateCertOfAnalysis construct(Args _args)
+    {
+        return new GGIGenerateCertOfAnalysis(_args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(Args _args)
+    {
+        salesTable = _args.record();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public void process()                                
+
+    {
+        SalesLine                       salesLine;
+        InventTable                     inventTable;
+        GGIInventTable                  ggiInventTable;
+        InventTestCertOfAnalysisTable   coaTable;
+        InventItemGroupItem             inventItemGroupItem;
+        InventItemGroup                 inventItemGroup;
+        InventTrans                     inventTrans;
+        InventTransOrigin               inventTransOrigin;
+        boolean                         created = false;
+
+        if (!salesTable)
+        {
+            throw error(strfmt("@GGI:MissingCallingRecordError"));
+        }
+        
+        if (salesTable.SalesStatus == SalesStatus::Canceled)
+        {
+            throw error(strfmt("@GGI:CofAErrorMsgCancelled"));
+        }
+
+        /*
+        if (salesTable.SalesStatus != SalesStatus::Invoiced
+            && salesTable.SalesStatus != SalesStatus::Delivered)
+        {
+            throw error("@GGI:OrderNotInvoicedError");
+        }
+        */
+        while select salesLine
+                Where salesLine.SalesId == salesTable.SalesId
+        {
+            select firstonly RecId from ggiInventTable
+                exists join inventTable
+                exists join inventItemGroupItem
+                exists join inventItemGroup
+                    where  ggiInventTable.InventTable == inventTable.RecId
+                        && InventTable.ItemId == salesLine.ItemId
+                        && ggiInventTable.GGIIncludeInCOA == false
+                        && inventItemGroupItem.ItemId == inventTable.ItemId
+                        && inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId
+                        && inventItemGroupItem.ItemGroupId == inventItemGroup.ItemGroupId
+                        && inventItemGroup.GGIIncludeInCOA == true;
+
+            if (ggiInventTable.RecId)
+            {
+                throw Error (strfmt("@GGI:COAItemValidation"));
+            }
+
+            select firstonly RecId from inventTrans
+                join inventTransOrigin
+                join inventTable
+                join ggiInventTable
+                    where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                        && inventTransOrigin.InventTransId == salesLine.InventTransId
+                        && inventTable.ItemId == salesLine.ItemId
+                        && ggiInventTable.InventTable == inventTable.RecId
+                        && ggiInventTable.GGIIncludeInCOA == NoYes::Yes
+                        && inventTrans.StatusIssue != StatusIssue::Picked
+                        && inventTrans.StatusIssue != StatusIssue::Sold
+                        && inventTrans.StatusIssue != StatusIssue::Deducted;
+
+            if (inventTrans.RecId)
+            {
+                throw Error ("@GGI:COAItemStatus");
+            }
+        }
+        select RecId
+                from coaTable
+                    where coaTable.SalesId == salesTable.SalesId;
+
+        if (coaTable.RecId)
+        {
+            throw Error (strfmt("@GGI:CertificateAlreadyExistsMessage"));
+        }
+
+        ttsbegin;
+
+        while
+            select salesLine
+                join inventTable
+                    where inventTable.ItemId == salesLine.ItemId
+                join ggiInventTable
+                    where ggiInventTable.InventTable == inventTable.RecId
+                        && ggiInventTable.GGIIncludeInCOA == NoYes::Yes
+                        && salesLine.SalesId == salesTable.SalesId
+
+        {
+            this.createCOAFromTransId(salesLine);
+            created = true;
+        }
+
+        ttscommit;
+
+        if (created)
+        {
+            Info(strfmt("@GGI:GenerationCompletedMessage"));
+        }
+        else
+        {
+            select salesLine
+                join inventTable
+                    where inventTable.ItemId == salesLine.ItemId
+                    && salesLine.SalesId == salesTable.SalesId
+                join ggiInventTable
+                    where  ggiInventTable.InventTable == inventTable.RecId
+                join inventItemGroupItem
+                join inventItemGroup
+                    where  ggiInventTable.InventTable == inventTable.RecId                         
+                        && inventItemGroupItem.ItemId == inventTable.ItemId
+                        && inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId
+                        && inventItemGroupItem.ItemGroupId == inventItemGroup.ItemGroupId
+                        && (inventItemGroup.GGIIncludeInCOA == false || ggiInventTable.GGIIncludeInCOA == false);                    
+                        
+            
+            if(SalesLine.RecId)
+            {
+                warning(strfmt("@GGI:COAItemValidation"));
+            }
+            else
+            {
+                warning(strfmt("@GGI:CofANoLinesWarning"));
+            }
+        }
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        GGIGenerateCertOfAnalysis certOfAnalysis = GGIGenerateCertOfAnalysis::construct(_args);
+
+        certOfAnalysis.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCOAFromTransId</Name>
+				<Source><![CDATA[
+    public void createCOAFromTransId(SalesLine _salesLine)
+    {
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        InventDim           inventDim, inventDimQuality;
+        InventBatchId       inventBatchId;
+        EcoResItemStyleName inventStyleid;
+        InventDim           inventDimCOA, inventDimLocal;
+        InventDim           inventDimTrans;
+        boolean             createCOA = true;
+
+        InventTestCertOfAnalysisTable   coaTable;
+        InventQualityOrderTable         qualityTable;
+
+        NumberSeq num;
+
+        ttsbegin;
+
+        num = NumberSeq::newGetNum(InventParameters::numRefCertificateOfAnalysisId()); // Parameters Table
+
+        while
+            select *
+                from inventTrans
+                join inventTransOrigin
+                join inventDim
+                    group by inventDim.InventBatchId
+                    where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                            /*&& (inventTrans.StatusIssue == StatusIssue::Picked
+                            || inventTrans.StatusIssue == StatusIssue::Sold
+                            || inventTrans.StatusIssue == StatusIssue::Deducted)*/
+                        && inventTransOrigin.InventTransId == _salesLine.InventTransId
+                        && inventDim.InventDimId == inventTrans.InventDimId
+        {
+            inventDimTrans = _salesLine.inventDim();
+
+            inventBatchId = inventDim.inventBatchId;
+            inventStyleid = inventDimTrans.InventStyleId;
+
+            select count(RecId)
+                from coaTable
+                exists join inventDimLocal
+                    where coaTable.InventDimId == inventDimLocal.InventDimId
+                        && inventDimLocal.inventBatchId == inventBatchId
+                        && coaTable.ItemId == _salesLine.ItemId
+                        && coaTable.SalesId == _salesLine.SalesId;
+        
+            if (coaTable.RecId > 0 )
+            {
+                createCOA = false;
+            }
+            if (createCOA)
+            {
+                select firstonly qualityTable
+                    order by qualityTable.CreatedDateTime desc
+                        where qualityTable.ItemId == _salesLine.ItemId
+                            && qualityTable.ReferenceType != InventTestReferenceType::PIPReturn
+                    join inventDimQuality
+                        where inventDimQuality.inventDimId == qualityTable.InventDimId
+                            && inventDimQuality.inventBatchId == inventBatchId;
+
+                if (qualityTable)
+                {
+                    inventDimCOA.clear();
+                    inventDimCOA.inventBatchId = inventBatchId;
+                    inventDimCOA.InventStyleId = inventStyleId;
+
+                    coaTable.clear();
+                    coaTable.initFromInventQualityOrderTable(qualityTable);
+                    coaTable.InventCertificateOfAnalysisId = num.num();
+                    coaTable.QualityOrderId = qualityTable.QualityOrderId;
+                    coaTable.ItemId = _salesLine.ItemId;
+                    coaTable.PIPCustAccount = salesTable.CustAccount;
+                    coaTable.InventDimId = InventDim::findOrCreate(inventDimCOA).inventDimId;
+                    coaTable.SalesId = _salesLine.SalesId;
+                    coaTable.insert();
+                    //mark the number
+                    num.used();
+                }
+                else
+                {
+                    throw Error (strFmt("@SYS114306"));
+                }
+            }            
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,684 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_JournalValidate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class SKS_EFT_JournalValidate
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>insertExceptionList</Name>
+				<Source><![CDATA[
+    //SKS_DD_ARPaymentValidation_20170123
+    public void insertExceptionList(CustVendAC         _custVendAC,
+                                    LedgerJournalId    _ledgerJournalId,
+                                    SKS_DD_ErrorWarning _errorWarning,
+                                    SKS_DD_PaymError    _paymError,
+                                    Voucher             _voucher,
+                                    RecId               _transRecId,
+                                    AmountCur           _invoiceAmount,
+                                    Boolean             _isDirectDebitException = false)
+    {
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList;
+        LedgerJournalTrans  ledgerJournalTransUpt;
+        SKS_DD_ExceptionStatus tranStatus;
+
+        ttsBegin;
+        custVendPaymExceptionList.CustVendAC = _custVendAC;
+        custVendPaymExceptionList.Error = _paymError;
+        custVendPaymExceptionList.JournalId = _ledgerJournalId;
+        custVendPaymExceptionList.Voucher = _voucher;
+        custVendPaymExceptionList.ErrorWarning = _errorWarning;
+        custVendPaymExceptionList.InvoiceAmount = _invoiceAmount;
+        custVendPaymExceptionList.TransId = _transRecId;
+        custVendPaymExceptionList.TransTableId = tableNum(LedgerJournalTrans);
+        custVendPaymExceptionList.IsDirectDebitException = _isDirectDebitException;
+        custVendPaymExceptionList.insert();
+        ttsCommit;
+
+        switch(_errorWarning)
+        {
+            case SKS_DD_ErrorWarning::Error:
+                tranStatus = SKS_DD_ExceptionStatus::Error;
+                break;
+            case SKS_DD_ErrorWarning::Warning:
+                tranStatus = SKS_DD_ExceptionStatus::Warning;
+                break;
+        }
+
+        ledgerJournalTransUpt.skipDataMethods(true);
+        ledgerJournalTransUpt.skipEvents(true);
+        update_recordset ledgerJournalTransUpt setting SKS_DD_ExceptionStatus = tranStatus
+                where ledgerJournalTransUpt.RecId == _transRecId &&
+                      ledgerJournalTransUpt.SKS_DD_ExceptionStatus != tranStatus &&
+                      ledgerJournalTransUpt.SKS_DD_ExceptionStatus != SKS_DD_ExceptionStatus::Error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSettledAmount</Name>
+				<Source><![CDATA[
+    public static boolean checkSettledAmount(
+        LedgerJournalTrans _ledgerJournalTrans,
+        SKS_EFT_Module _module,
+        boolean _enableLog = false)
+    {
+        SpecTransManager            specTransManager;
+        Amount                      specAmount;
+        Spectrans                   spectrans;
+        ExchangeRateHelper          exchangeRateHelper;
+        boolean                     ret = true;
+        Amount                      pmtAmount;
+    
+        pmtAmount = - _ledgerJournalTrans.amount();
+    
+        specTransManager = SpecTransManager::newFromSpec(_ledgerJournalTrans);
+        exchangeRateHelper = ExchangeRateHelper::newCurrency(Ledger::primaryLedger(CompanyInfo::findDataArea(_ledgerJournalTrans.Company).RecId), _ledgerJournalTrans.CurrencyCode);
+    
+        specAmount = SpecTransManager::getTotalSettleAmountForSpecReference(
+                        _ledgerJournalTrans.company(),
+                        _ledgerJournalTrans.TableId,
+                        _ledgerJournalTrans.RecId,
+                        _ledgerJournalTrans.CurrencyCode,
+                        _ledgerJournalTrans.Company,
+                        _ledgerJournalTrans.TransDate,
+                        exchangeRateHelper.prepareExchangeRateForStorage(_ledgerJournalTrans.crossrate()));
+    
+        if (specAmount != 0 && pmtAmount != 0 && specAmount != pmtAmount)
+        {
+            select count(Balance01) from spectrans where Spectrans.specrecid == _ledgerJournalTrans.Recid;
+    
+            if(spectrans.Balance01 > 1)
+            {
+                SKS_EFT_JournalValidate::errorLog("@SKS2166", _ledgerJournalTrans, _enableLog, specAmount);
+    
+                ret = false;
+            }
+            else if((specAmount < 0 && specAmount > pmtAmount) || (specAmount > 0 && specAmount < pmtAmount))
+            {
+                SKS_EFT_JournalValidate::errorLog("@SKS2167", _ledgerJournalTrans, _enableLog, specAmount);
+                ret = false;
+            }
+            else if((specAmount > 0 && pmtAmount < 0) || (specAmount < 0 && pmtAmount > 0))
+            {
+                SKS_EFT_JournalValidate::errorLog("@SKS2168", _ledgerJournalTrans, _enableLog, specAmount);
+                ret = false;
+            }
+            else
+            {
+                SKS_EFT_JournalValidate::updateSpecTrans(_ledgerJournalTrans, _module);
+    
+                SKS_EFT_JournalValidate::warningLog("@SKS2169", _ledgerJournalTrans, _enableLog,specAmount);
+            }
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorLog</Name>
+				<Source><![CDATA[
+    public static void errorLog(
+            str _errorMessage,
+            LedgerJournalTrans _ledgerJournalTrans,
+            boolean _enableLog,
+            InvoiceAmountMST   _invoiceAmount = 0)
+    {
+        str errorMsg,exceptionErrorMsg;
+        SKS_EFT_JournalValidate journalValidate = new SKS_EFT_JournalValidate(); //SKS_DD_ARPaymentValidation_20170123
+    
+        if(!_ledgerJournalTrans.SKS_EFT_IsPaymentUpload)
+        {
+            if(_ledgerJournalTrans.SKS_BTB_TransferMethod)
+            {
+                errorMsg =
+                    _errorMessage +
+                    ' ' +
+                    strFmt("@SKS:SKGBTBSentTransferInfo",
+                    _ledgerJournalTrans.Voucher, SKS_EFT_Common::getAccountNum(_ledgerJournalTrans.LedgerDimension), _ledgerJournalTrans.PaymMode, _ledgerJournalTrans.PaymSpec);
+            }
+            else
+            {
+                errorMsg = "@SKS984" +
+                        ' ' +
+                        _errorMessage +
+                        ' ' +
+                        strFmt("@SKS985",
+                        _ledgerJournalTrans.Voucher, SKS_EFT_Common::getAccountNum(_ledgerJournalTrans.LedgerDimension), _ledgerJournalTrans.PaymMode, _ledgerJournalTrans.PaymSpec, _ledgerJournalTrans.CustVendBankAccountId);
+            }
+        }
+        exceptionErrorMsg = _errorMessage;   //SKS: Change request 7180 & 7189
+
+        // SKS_DD_ARPaymentValidation_20170123 -->
+        if(_enableLog)
+        {
+            error(errorMsg);
+            journalValidate.insertExceptionList(SKS_EFT_Common::getAccountNum(_ledgerJournalTrans.LedgerDimension),_ledgerJournalTrans.JournalNum, SKS_DD_ErrorWarning::Error, exceptionErrorMsg, _ledgerJournalTrans.Voucher, _ledgerJournalTrans.RecId, _invoiceAmount);
+        }
+        else
+        {
+            journalValidate.insertExceptionList(SKS_EFT_Common::getAccountNum(_ledgerJournalTrans.LedgerDimension),_ledgerJournalTrans.JournalNum, SKS_DD_ErrorWarning::Error, exceptionErrorMsg, _ledgerJournalTrans.Voucher, _ledgerJournalTrans.RecId, _invoiceAmount);
+        }
+        // SKS_DD_ARPaymentValidation_20170123 <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSpecTrans</Name>
+				<Source><![CDATA[
+    private static void updateSpecTrans(LedgerJournalTrans _ledgerJournalTrans, SKS_EFT_Module _module)
+    {
+        SpecTrans specTrans;
+        VendTransOpen vendTransOpen;
+        CustTransOpen custTransOpen;
+        CustVendOpenTransManager manager;
+    
+        manager = CustVendOpenTransManager::construct(_ledgerJournalTrans);
+    
+        select firstOnly RefRecId from specTrans where SpecTrans.SpecRecId == _ledgerJournalTrans.RecId;
+    
+        if(_module == SKS_EFT_Module::AR || _module == SKS_EFT_Module::CNP)
+        {
+            select firstOnly crossCompany custTransOpen where custTransOpen.RecId == SpecTrans.RefRecId;
+    
+            // update settle amount and discount amount
+            manager.updateSettleAmountPaymCur(custTransOpen, -_ledgerJournalTrans.amount());
+        }
+        else
+        {
+            select firstOnly crossCompany vendTransOpen where vendTransOpen.RecId == SpecTrans.RefRecId;
+    
+            // update settle amount and discount amount
+            manager.updateSettleAmountPaymCur(vendTransOpen, -_ledgerJournalTrans.amount());
+        }
+    
+        // update all SpecTrans records with date used to calculate discount
+        manager.updateSpecTransWithSelectedDate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSet</Name>
+				<Source><![CDATA[
+        static boolean validateSet(LedgerJournalType _ledgerJournalType, LedgerJournalTable _ledgerJournalTable, boolean _enableLog = false)
+    {
+        boolean result = false;
+            SKS_EFT_Setup lSKS_EFT_Setup = SKS_EFT_Setup::find();
+    
+        if(_ledgerJournalType == LedgerJournalType::Payment)
+        {
+                result = SKS_EFT_APJournalValidate::validateSet(_ledgerJournalTable, _enableLog, false, false, lSKS_EFT_Setup.APFormatValidJournal, lSKS_EFT_Setup.APFormatValidMultiThread);
+        }
+        else if(_ledgerJournalType == LedgerJournalType::Daily && LedgerJournalName::find(_ledgerJournalTable.JournalName).SKS_BTB_BankTransferJournal)
+        {
+            SKS_EFT_BTBJournalValidate::validateSet(_ledgerJournalTable, _enableLog, false);
+        }
+        else if(_ledgerJournalType == LedgerJournalType::CustPayment)
+        {
+            if (SKS_Table_LedgerJournalTable::checkCustReimbursement(_ledgerJournalTable))
+            {
+                result = SKS_EFT_CNPJournalValidate::validateSet(_ledgerJournalTable, _enableLog,false);
+            }
+            else
+            {
+                result = SKS_EFT_ARJournalValidate::validateSet(_ledgerJournalTable, _enableLog,false, lSKS_EFT_Setup.DDFormatValidJournal,lSKS_EFT_Setup.DDFormatValidMultiThread);
+            }
+        }
+    
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateUnset</Name>
+				<Source><![CDATA[
+    static boolean validateUnset(LedgerJournalType _ledgerJournalType, LedgerJournalTable _ledgerJournalTable, boolean _enableLog = false)
+    {
+        boolean result = false;
+    
+        if(_ledgerJournalType == LedgerJournalType::Payment)
+        {
+            result = SKS_EFT_APJournalValidate::validateUnSet(_ledgerJournalTable, _enableLog, _enableLog); //7199
+        }
+        else if(_ledgerJournalType == LedgerJournalType::CustPayment)
+        {
+            if (SKS_Table_LedgerJournalTable::checkCustReimbursement(_ledgerJournalTable))
+            {
+                result = SKS_EFT_CNPJournalValidate::validateUnSet(_ledgerJournalTable, _enableLog, _enableLog); //7199
+            }
+            else
+            {
+                result = SKS_EFT_ARJournalValidate::validateUnSet(_ledgerJournalTable, _enableLog, _enableLog); //7199
+            }
+        }
+        else if(_ledgerJournalType == LedgerJournalType::Daily)
+        {
+            result = SKS_EFT_BTBJournalValidate::validateUnSet(_ledgerJournalTable, _enableLog, _enableLog); //7199
+        }
+    
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>warningLog</Name>
+				<Source><![CDATA[
+    public static void warningLog(
+        str _warningMessage,
+        LedgerJournalTrans _ledgerJournalTrans,
+        boolean _enableLog,
+        InvoiceAmountMST   _invoiceAmount = 0,
+        boolean _mappingNotFound = false)//SKS_FDD_10590
+    {
+        str warningMsg;
+        SKS_EFT_JournalValidate journalValidate = new SKS_EFT_JournalValidate(); //SKS_DD_ARPaymentValidation_20170123
+    
+        if(!_ledgerJournalTrans.SKS_EFT_IsPaymentUpload && !_mappingNotFound) //SKS_FDD_9785
+        {
+            warningMsg = "@SKS2032" +
+                            ' ' +
+                        _warningMessage +
+                        ' ' +
+                        strFmt("@SKS985",
+                        _ledgerJournalTrans.Voucher, SKS_EFT_Common::getAccountNum(_ledgerJournalTrans.LedgerDimension), _ledgerJournalTrans.PaymMode, _ledgerJournalTrans.PaymSpec, _ledgerJournalTrans.CustVendBankAccountId);
+        }
+        else
+        {
+            warningMsg = _warningMessage;
+        }
+    
+        // SKS_DD_ARPaymentValidation_20170123 -->
+        if(_enableLog)
+        {
+            warning(warningMsg);
+        }
+        else
+        {
+            journalValidate.insertExceptionList(SKS_EFT_Common::getAccountNum(_ledgerJournalTrans.LedgerDimension),_ledgerJournalTrans.JournalNum, SKS_DD_ErrorWarning::Warning, warningMsg, _ledgerJournalTrans.Voucher, _ledgerJournalTrans.RecId, _invoiceAmount);
+        }
+        // SKS_DD_ARPaymentValidation_20170123 <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DataFieldvalidation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public static boolean DataFieldvalidation(
+        anytype _fieldValue,
+        SKS_EFT_BankFormatValidation   _sks_EFT_BankFormatValidation, // SKS_FDD_10590
+        LedgerJournalTrans _ledgerJournalTrans,
+        boolean _enableLog = false)
+    {
+        SKS_EFT_BRValidationAltFieldMapping sks_EFT_BRValidationAltFieldMapping;// SKS_FDD_10590
+        SKS_EFT_DataValidationDetails       SKS_EFT_DataValidationDetails;
+        SKS_EFT_DataValidationRule          SKS_EFT_DataValidationRule;
+        boolean validdataAND = true;
+        boolean validdataOR = false;
+        boolean validdata = true;
+        str     caseCompareText;
+        str errorMsg;
+        str errorMessage;
+
+        while select SKS_EFT_DataValidationDetails
+            join SKS_EFT_DataValidationRule
+            where _sks_EFT_BankFormatValidation.dataRuleId == SKS_EFT_DataValidationDetails.DataRuleId &&
+            SKS_EFT_DataValidationDetails.DataRuleId == SKS_EFT_DataValidationRule.dataruleid
+        {
+            errorMessage = strFmt("@SKS:SKGInvalidData", SKS_EFT_DataValidationRule.DataRuleId, SKS_EFT_DataValidationRule.Description);
+            switch(SKS_EFT_DataValidationDetails.SKS_EB_ValidationFilter)
+            {
+                case SKS_EB_ValidationFilter::NotEqual:
+                    if(validdataAND)
+                    {
+                        if(SKS_EFT_DataValidationDetails.CaseSensitive)
+                        {
+                            if(_fieldValue == SKS_EFT_DataValidationDetails.value)
+                            {
+                                int pos = strScan(_fieldValue, SKS_EFT_DataValidationDetails.Value, 1, strLen(_fieldValue));
+                                caseCompareText = subStr(_fieldValue, pos, strLen(SKS_EFT_DataValidationDetails.Value));
+                                if(strCmp(caseCompareText, SKS_EFT_DataValidationDetails.Value) == 0)
+                                {
+                                    validdataAND = false;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(_fieldValue == SKS_EFT_DataValidationDetails.value)
+                            {
+                                validdataAND = false;
+                            }
+                        }
+                    }
+                    break;
+                case SKS_EB_ValidationFilter::DoesNotContain:
+                    if(validdataAND)
+                    {
+                        if(SKS_EFT_DataValidationDetails.CaseSensitive)
+                        {
+                            if(strContains(_fieldValue, SKS_EFT_DataValidationDetails.Value))
+                            {
+                                int pos = strScan(_fieldValue, SKS_EFT_DataValidationDetails.Value, 1, strLen(_fieldValue));
+                                caseCompareText = subStr(_fieldValue, pos, strLen(SKS_EFT_DataValidationDetails.Value));
+                                if(strCmp(caseCompareText, SKS_EFT_DataValidationDetails.Value) == 0)
+                                {
+                                    validdataAND = false;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(strContains(_fieldValue, SKS_EFT_DataValidationDetails.Value))
+                            {
+                                validdataAND = false;
+                            }
+                        }
+                    }
+                    break;
+                case SKS_EB_ValidationFilter::Contains:
+                    if(!validdataOR)
+                    {
+                        if(SKS_EFT_DataValidationDetails.CaseSensitive)
+                        {
+                            if(strContains(_fieldValue, SKS_EFT_DataValidationDetails.Value))
+                            {
+                                int pos = strScan(_fieldValue, SKS_EFT_DataValidationDetails.Value, 0, strLen(_fieldValue));
+                                caseCompareText = subStr(_fieldValue, pos, strLen(SKS_EFT_DataValidationDetails.Value));
+                                if(strCmp(caseCompareText, SKS_EFT_DataValidationDetails.Value) == 0)
+                                {
+                                    validdataOR = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            validdataOR = strContains(_fieldValue, SKS_EFT_DataValidationDetails.Value);
+                        }
+                    }
+                    break;
+                case SKS_EB_ValidationFilter::IsEqualTo:
+                    if(!validdataOR)
+                    {
+                        if(SKS_EFT_DataValidationDetails.CaseSensitive)
+                        {
+                            if(_fieldValue == SKS_EFT_DataValidationDetails.value)
+                            {
+                                int pos = strScan(_fieldValue, SKS_EFT_DataValidationDetails.Value, 0, strLen(SKS_EFT_DataValidationDetails.Value));
+                                caseCompareText = subStr(_fieldValue, pos, strLen(SKS_EFT_DataValidationDetails.Value));
+                                if(strCmp(caseCompareText, SKS_EFT_DataValidationDetails.Value) == 0)
+                                {
+                                    validdataOR = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(_fieldValue == SKS_EFT_DataValidationDetails.value)
+                            {
+                                validdataOR = true;
+                            }
+                        }
+                    }
+                    break;
+                case SKS_EB_ValidationFilter::BeginsWith:
+                    if(!validdataOR)
+                    {
+                        if(SKS_EFT_DataValidationDetails.CaseSensitive)
+                        {
+                            if(strStartsWith(_fieldValue, SKS_EFT_DataValidationDetails.Value))
+                            {
+                                int pos = strScan(_fieldValue, SKS_EFT_DataValidationDetails.Value, 0, strLen(SKS_EFT_DataValidationDetails.Value));
+                                caseCompareText = subStr(_fieldValue, pos, strLen(SKS_EFT_DataValidationDetails.Value));
+                                if(strCmp(caseCompareText, SKS_EFT_DataValidationDetails.Value) == 0)
+                                {
+                                    validdataOR = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            validdataOR = strStartsWith(_fieldValue, SKS_EFT_DataValidationDetails.Value);
+                        }
+                    }
+                    break;
+            }
+
+            if(SKS_EFT_DataValidationRule.sks_eb_andor == SKS_EB_AndOr::And)
+            {
+                validdata = validdataAND;
+            }
+            else
+            {
+                validdata = validdataOR;
+            }
+        }
+
+        select firstonly sks_EFT_BRValidationAltFieldMapping
+            where sks_EFT_BRValidationAltFieldMapping.SourceContext == _sks_EFT_BankFormatValidation.SourceContext &&
+            sks_EFT_BRValidationAltFieldMapping.SourceField == _sks_EFT_BankFormatValidation.SourceField;
+
+        //General validations
+        if (!validdata &&
+            !_sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            // SKS_FDD_10590 -->
+            if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id)+ strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation);
+            }
+            // SKS_FDD_10590 -->
+            else
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc);
+            }
+
+            // SKS_FDD_10590 <--
+            SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+            return false;
+
+        }
+        else if (!validdata &&
+                _sks_EFT_BankFormatValidation.ISOCountrySpec)
+        {
+            // SKS_FDD_10590 -->
+            if(sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation)
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, sks_EFT_BRValidationAltFieldMapping.MappingFieldLocation);
+            }
+            // SKS_FDD_10590 <--
+            else
+            {
+                errorMsg = "@SKS4381" +
+                        ' ' +
+                        errorMessage +
+                        ' ' + strFmt("@SKS:SKGFieldRuleId",_sks_EFT_BankFormatValidation.Id) + strFmt("@SKS:SKGFieldDesc",
+                        sks_EFT_BRValidationAltFieldMapping.MappingField, _sks_EFT_BankFormatValidation.SourceFieldLoc);
+            }
+
+
+            SKS_EFT_JournalValidate::errorLog(errorMsg,_ledgerJournalTrans,_enableLog,_ledgerJournalTrans.amount());
+
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runAfterAllValidated</Name>
+				<Source><![CDATA[
+    public static boolean runAfterAllValidated(container _params, LedgerJournalId _journalNum)
+    {
+        boolean valid = true;
+        List tasks = new List(Types::Class);
+        for(int i = 3; i < conLen(_params); i++)
+        {
+            tasks.addEnd(conPeek(_params, i+1));
+        }
+
+        boolean threadsRunning = true;
+        while (threadsRunning)
+        {
+            ListEnumerator enumerator = tasks.getEnumerator();
+
+            System.Threading.Tasks.Task currentTask;
+            boolean allCompleted = true;
+
+            while(enumerator.moveNext())
+            {
+                currentTask = enumerator.current();
+
+                if(currentTask.Status == System.Threading.Tasks.TaskStatus::RanToCompletion)
+                {
+                    allCompleted = true && allCompleted;
+                }
+                else
+                {
+                    allCompleted = false;
+                    break;
+                }
+            }
+            threadsRunning = !allCompleted;
+        }
+        // Check results if valid came in as true
+        // If exceptions occurred in the journal return false
+        // If journal was not supplied, don't need to return a value
+        if(SKS_EFT_JournalValidate::isJournalException(_journalNum))
+        {
+            valid = false;
+        }
+        return valid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isJournalException</Name>
+				<Source><![CDATA[
+    public static boolean isJournalException(LedgerJournalId _journalNum)
+    {
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList;
+        boolean ret = false;
+        if(_journalNum)
+        {
+            select firstonly RecId from custVendPaymExceptionList
+                    where custVendPaymExceptionList.JournalId == _journalNum
+                    && custVendPaymExceptionList.ErrorWarning == SKS_DD_ErrorWarning::Error;
+
+            if(custVendPaymExceptionList.RecId)
+            {
+                ret = true;
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeJournalException</Name>
+				<Source><![CDATA[
+    public static void removeJournalException(LedgerJournalId _journalNum)
+    {
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList_del;
+        LedgerJournalTrans ledgerJournalTransUpt;
+
+        ttsBegin;
+        custVendPaymExceptionList_del.skipDataMethods(true);
+        custVendPaymExceptionList_del.skipEvents(true);
+        custVendPaymExceptionList_del.skipDeleteActions(true);
+        delete_from custVendPaymExceptionList_del where custVendPaymExceptionList_del.JournalId == _journalNum;
+
+        // reset the exception status on the line level
+        ledgerJournalTransUpt.skipDataMethods(true);
+        ledgerJournalTransUpt.skipEvents(true);
+        update_recordSet ledgerJournalTransUpt setting
+            SKS_DD_ExceptionStatus = SKS_DD_ExceptionStatus::Blank
+            where ledgerJournalTransUpt.JournalNum == _journalNum;
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournalTableState</Name>
+				<Source><![CDATA[
+    public static void updateJournalTableState(LedgerJournalTable _ledgerJournalTableLoc)
+    {
+        SKS_DD_CustVendPaymExceptionList custVendPaymExceptionList;
+
+        select firstonly RecId from custVendPaymExceptionList
+                where custVendPaymExceptionList.JournalId == _ledgerJournalTableLoc.JournalNum &&
+                    custVendPaymExceptionList.ErrorWarning == SKS_DD_ErrorWarning::Error;
+
+        ttsBegin;
+        if (_ledgerJournalTableLoc.RecId != 0)
+        {
+            _ledgerJournalTableLoc.reread();
+            _ledgerJournalTableLoc.selectForUpdate(true);
+            if(custVendPaymExceptionList.RecId == 0)
+            {
+                _ledgerJournalTableLoc.SKS_EFT_JournalState  = SKS_EFT_JournalState::Ready;
+            }
+            else
+            {
+                _ledgerJournalTableLoc.SKS_EFT_JournalState  = SKS_EFT_JournalState::Errors;
+            }
+            _ledgerJournalTableLoc.doUpdate();
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateClass</Name>
+				<Source><![CDATA[
+    public static str ValidateClass(str className, str formatId)
+    {
+        TreeNode tnode2Enum;
+        ;
+
+        tnode2Enum = TreeNode::findNode('Classes');
+        tnode2Enum = tnode2Enum.AOTfindChild(className);
+
+        if (tnode2Enum == null)
+        {
+            return strFmt("@SKS1022", formatId);
+        }
+        return '';
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

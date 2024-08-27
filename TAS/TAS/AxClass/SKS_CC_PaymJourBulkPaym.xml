@@ -1,0 +1,470 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_PaymJourBulkPaym</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_PaymJourBulkPaym extends RunBaseBatch
+{
+    #OCCRetryCount
+    LedgerJournalTable      ledgerJournalTableCaller;
+    DialogField             dfJournalNum;
+    DialogField             dfNumberOfThreads;
+    LedgerJournalId         journalNum;
+    PositiveNumber          numberOfThreads;
+    Map                     recordsToProcessMap;
+    Counter                 journalLineCounter;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        journalNum,
+        numberOfThreads
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkJournalLineBeforeProcessing</Name>
+				<Source><![CDATA[
+    public static boolean checkJournalLineBeforeProcessing(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        boolean ret = true;
+        LedgerJournalTrans      ledgerJournalTrans;
+        AmountCur               markedForSettlementAmt;
+        str                     transTypeForMsg;
+
+        if (_ledgerJournalTrans.AmountCurDebit)
+        {
+            transTypeForMsg = "@SKS6506";
+        }
+        else
+        {
+            transTypeForMsg = "@SKS6507";
+        }
+
+        if (transTypeForMsg)
+        {
+            transTypeForMsg = strLwr(transTypeForMsg);
+        }
+        
+        if (!_ledgerJournalTrans.TransDate)
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCSpecifyDateOnJourLineErrMsg", _ledgerJournalTrans.Voucher, transTypeForMsg));
+        }
+
+        if (!_ledgerJournalTrans.amount())
+        {
+            ret = checkFailed(strFmt("@SKS6399", _ledgerJournalTrans.Voucher, transTypeForMsg));
+        }
+
+        if (!_ledgerJournalTrans.LedgerDimension)
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCSpecifyAccountOnJourLineErrMsg", _ledgerJournalTrans.Voucher, transTypeForMsg));
+        }
+
+        if (!_ledgerJournalTrans.OffsetLedgerDimension)
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCSpecifyOffsetAccountOnJourLineErrMsg", _ledgerJournalTrans.Voucher, transTypeForMsg));
+        }       
+
+        // Validate that the amount entered on the journal lines corresponds to invoices/credits selected for payment
+        markedForSettlementAmt = SpecTransManager::getTotalSettleAmountForSpecReference(_ledgerJournalTrans.Company,
+            _ledgerJournalTrans.TableId,
+            _ledgerJournalTrans.RecId,
+            _ledgerJournalTrans.CurrencyCode,
+            _ledgerJournalTrans.Company,
+            _ledgerJournalTrans.TransDate);
+
+        if (markedForSettlementAmt)
+        {
+            if (markedForSettlementAmt > 0 && !_ledgerJournalTrans.AmountCurCredit)
+            {
+                ret = checkFailed(strFmt("@SKS:SKGCCAmountMustBeCreditWhenSumOfMarkedIsPositive", _ledgerJournalTrans.Voucher));
+            }
+
+            if (markedForSettlementAmt < 0 && !_ledgerJournalTrans.AmountCurDebit)
+            {
+                ret = checkFailed(strFmt("@SKS:SKGCCAmountMustBeDebitWhenSumOfMarkedIsNegative", _ledgerJournalTrans.Voucher));
+            }            
+        }
+
+        if (_ledgerJournalTrans.AmountCurCredit && SKS_CC_PayLinkQueue::journalLineHasPendingPayLink(_ledgerJournalTrans))
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCJourLineMayNotBeCCProcDueToPendingPayLink",
+                        _ledgerJournalTrans.Voucher, _ledgerJournalTrans.JournalNum));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        DialogRunbase   dialog;
+
+        dialog = super();
+
+        journalNum = ledgerJournalTableCaller.JournalNum;
+        dfJournalNum = dialog.addFieldValue(extendedTypeStr(LedgerJournalId), journalNum);
+        dfJournalNum.allowEdit(false);
+        dfJournalNum.skip(true);
+
+        dfNumberOfThreads = dialog.addFieldValue(extendedTypeStr(PositiveNumber), numberOfThreads, "@SYS109551");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        boolean ret;
+
+        ret = super();
+
+        journalNum = dfJournalNum.value();
+        numberOfThreads = dfNumberOfThreads.value();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    public boolean validate(Object calledFrom = null)
+    {
+        boolean     ret = true;
+
+        if (numberOfThreads > 8)
+        {
+            ret = checkFailed("@SKS:SKGCCMaxNbrOfThreadsAllowedIsEight");
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLedgerJournalTable</Name>
+				<Source><![CDATA[
+    public LedgerJournalTable parmLedgerJournalTable(LedgerJournalTable _ledgerJournalTable = ledgerJournalTableCaller)
+    {
+        ledgerJournalTableCaller = _ledgerJournalTable;
+        return ledgerJournalTableCaller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecordList</Name>
+				<Source><![CDATA[
+    protected void processRecordList()
+    {
+        SKS_CC_PaymJourBulkPaymSubTask  paymJourBulkPaymSubTask;
+        BatchHeader                     batchHeader;
+        container                       rangesPerThreadCon;
+        container                       keyRangesCon;
+        container                       journalLineList, keysRangeList;        
+
+        if (this.isInBatch())
+        {
+            if (!numberOfThreads)
+            {
+                numberOfThreads = 4;
+            }
+
+            if (journalLineCounter <= numberOfThreads)
+            {
+                numberOfThreads = 1;
+            }
+        }
+        else
+        {
+            numberOfThreads = 1;
+        }
+
+        [rangesPerThreadCon, keyRangesCon] = this.setRangePerThread(journalLineCounter);
+
+        if (this.isInBatch())
+        {            
+            str batchThreadCaption;
+            int i;
+            for (i = 1; i <= numberOfThreads; i++)
+            {
+                if (!batchHeader)
+                {
+                    batchHeader = BatchHeader::construct(this.parmCurrentBatch().BatchJobId);
+                }
+
+                journalLineList = conPeek(rangesPerThreadCon, i);
+                if (!journalLineList)
+                {
+                    continue;
+                }
+                keysRangeList = conPeek(keyRangesCon, i);
+
+                int curTaskRangeFrom, curTaskRangeTo, curTaskNbrOfRecords;
+                curTaskRangeFrom = conPeek(keysRangeList, 1);
+                curTaskNbrOfRecords = conLen(keysRangeList);
+                curTaskRangeTo = conPeek(keysRangeList, curTaskNbrOfRecords);
+
+                batchThreadCaption = strFmt("@SKS:SKGCCPayLinkBatchThreadCaption", SKS_CC_PaymJourBulkPaymSubTask::description(), i, curTaskRangeFrom, curTaskRangeTo);
+                paymJourBulkPaymSubTask = SKS_CC_PaymJourBulkPaymSubTask::newSubTask(journalNum, journalLineList, batchThreadCaption, true);
+
+                batchHeader.addRuntimeTask(paymJourBulkPaymSubTask, this.parmCurrentBatch().RecId);
+            }
+
+            if (batchHeader)
+            {
+                batchHeader.save();
+            }
+        }
+        else
+        {
+            // when not in batch
+            journalLineList = conPeek(rangesPerThreadCon, 1);
+            SKS_CC_PaymJourBulkPaymSubTask::newSubTask(journalNum, journalLineList, '', false).run();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setRangePerThread</Name>
+				<Source><![CDATA[
+    private container setRangePerThread(int _nbrToProc)
+    {
+        container       recordsToProcCon, keysToProcCon;
+        container       curRecsCon, curKeysCon;
+        int             intDiv, lastUsedRange, i;
+        int             curKey;
+        int64           curValue;
+        MapEnumerator   me;
+
+        intDiv = _nbrToProc div numberOfThreads;
+
+        i = 1;
+        lastUsedRange = intDiv;
+        me = recordsToProcessMap.getEnumerator();
+        while (me.moveNext())
+        {
+            curKey = me.currentKey();
+            curValue = me.currentValue();
+            curRecsCon += curValue;
+            curKeysCon += curKey;
+
+            if (i < numberOfThreads && curKey == lastUsedRange)
+            {
+                lastUsedRange += intDiv;
+                recordsToProcCon = conIns(recordsToProcCon, i, curRecsCon);
+                keysToProcCon = conIns(keysToProcCon, i, curKeysCon);
+                curRecsCon = conNull();
+                curKeysCon = conNull();
+                i++;
+            }
+        }
+
+        if (curRecsCon && conLen(curRecsCon) != 0)
+        {
+            recordsToProcCon = conIns(recordsToProcCon, i, curRecsCon);
+            keysToProcCon = conIns(keysToProcCon, i, curKeysCon);
+        }
+
+        return [recordsToProcCon, keysToProcCon];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        LedgerJournalTrans      ledgerJournalTrans;
+        CustPaymModeTable       custPaymModeTable;
+        CustTable               custTable;
+        CreditCardCust          creditCardCust;
+        AmountCur               paymentAmount;
+
+        if (!ledgerJournalTableCaller)
+        {
+            ledgerJournalTableCaller = LedgerJournalTable::find(journalNum);
+            if (!ledgerJournalTableCaller)
+            {
+                throw error(strFmt("@SKS:SKGCCCustPaymJourNotFound", journalNum));
+            }
+        }
+
+        if (ledgerJournalTableCaller.Posted)
+        {
+            throw error(strFmt("@SKS:SKGCCUnableToProcBulkPaymJourIsPosted", ledgerJournalTableCaller.JournalNum));
+        }
+
+        recordsToProcessMap = new Map(Types::Integer, Types::Int64);
+        while select ledgerJournalTrans
+            where ledgerJournalTrans.JournalNum == ledgerJournalTableCaller.JournalNum
+            && ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::None
+        exists join custPaymModeTable
+            where custPaymModeTable.PaymMode == ledgerJournalTrans.PaymMode
+            && custPaymModeTable.PaymStatus == CustVendPaymStatus::Confirmed
+            && custPaymModeTable.PaymentType == CustPaymentType::CreditCard
+        {
+            paymentAmount = SKS_CC_CustPaymTable::getCreditCardAmountRemainFromSource(ledgerJournalTrans.TableId, ledgerJournalTrans.RecId);
+            if (!paymentAmount)
+            {
+                continue;
+            }
+
+            if (!SKS_CC_PaymJourBulkPaym::checkJournalLineBeforeProcessing(ledgerJournalTrans))
+            {
+                continue;
+            }
+
+            custTable = CustTable::find(ledgerJournalTrans.accountDisplay());
+            if (!custTable)
+            {
+                continue;
+            }
+
+            select creditCardCust
+                where creditCardCust.CustAccount == custTable.AccountNum
+                && creditCardCust.SKS_CC_DefaultCard == NoYes::Yes;
+
+            if (!creditCardCust)
+            {
+                select count(RecId) from creditCardCust
+                    where creditCardCust.CustAccount == custTable.AccountNum;
+                
+                if (creditCardCust.RecId == 1)
+                {
+                    select creditCardCust
+                        where creditCardCust.CustAccount == custTable.AccountNum;
+                }
+            }
+
+            if (!creditCardCust)
+            {
+                continue;
+            }
+
+            journalLineCounter++;
+            recordsToProcessMap.insert(journalLineCounter, ledgerJournalTrans.RecId);
+        }
+
+        if (!journalLineCounter || !recordsToProcessMap || recordsToProcessMap.empty())
+        {
+            return;
+        }
+
+        this.processRecordList();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_PaymJourBulkPaym construct()
+    {
+        return new SKS_CC_PaymJourBulkPaym();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS:SKGCCProcessAllCreditCards";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        SKS_CC_PaymJourBulkPaym     paymJourBulkPaym = SKS_CC_PaymJourBulkPaym::construct();
+        LedgerJournalTable          ledgerJournalTable;
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS6608");
+        }
+
+        if (!_args)
+        {
+            throw(error(Error::wrongUseOfFunction(funcName())));
+        }
+
+        if (_args.dataset() != tableNum(LedgerJournalTable))
+        {
+            throw error(Error::missingRecord(tableStr(LedgerJournalTable)));
+        }
+
+        if (!_args.record())
+        {
+            throw error(Error::missingRecord(tableStr(LedgerJournalTable)));
+        }
+
+        ledgerJournalTable = _args.record();
+        if (ledgerJournalTable.Posted)
+        {
+            throw error(strFmt("@SKS:SKGCCUnableToProcBulkPaymJourIsPosted", ledgerJournalTable.JournalNum));
+        }
+
+        paymJourBulkPaym.parmLedgerJournalTable(ledgerJournalTable);        
+
+        if (paymJourBulkPaym.prompt())
+        {
+            paymJourBulkPaym.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

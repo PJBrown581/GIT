@@ -1,0 +1,430 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LedgerJournalCheckPost_PostEvent</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_LedgerJournalCheckPost_PostEvent
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>LedgerJournalCheckPost_Post_run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// When posting the reversed journal bank account transaction should marked as cleared.
+    /// </summary>
+    /// <param name="args"></param>
+    // CR-9541
+    [PostHandlerFor(classStr(LedgerJournalCheckPost), methodStr(LedgerJournalCheckPost, run))]
+    public static void LedgerJournalCheckPost_Post_run(XppPrePostArgs args)
+    {
+        LedgerJournalCheckPost                      ledgerJournalCheckPost;
+        LedgerJournalTable                          ledgerJournalTable;
+        //11656 --v--
+        LedgerJournalName                           locLedgerJournalName;
+        LedgerJournalTrans                          locLedgerJournalTrans;
+        SKS_BR_BankTran                             locSKS_BR_BankTran;
+        SKS_PP_Setup                                locSKS_PP_Setup;
+        //11656 --^--
+        SKS_EFTAP_VendPmtSubmitLegerJournalTable    sks_EFTAP_VendPmtSubmitLegerJournalTable; // SKS_FDD_9536
+        ledgerJournalCheckPost =  args.getthis() as LedgerJournalCheckPost;
+
+        ledgerJournalTable = ledgerJournalCheckPost.parmLedgerJournalTable();
+        ledgerJournalTable.reread();
+
+
+        //11656 --v--
+        changecompany(ledgerJournalTable.company())
+        {
+            locSKS_PP_Setup = SKS_PP_Setup::find(false);
+            if(locSKS_PP_Setup.ModBR)
+            {
+                select VoucherAllocatedAtPosting from locLedgerJournalName where locLedgerJournalName.JournalName == ledgerJournalTable.JournalName;
+                if(locLedgerJournalName.VoucherAllocatedAtPosting)
+                {
+                    ttsbegin;
+                    //this join means we only update SKS_BR_BankTrans if:
+                    // we are creating GJ(if we didn't create GJ, there is no locLedgerJournalTrans)
+                    // and the GJ is part of the Journal being posted "locLedgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum"
+                    While select forupdate locSKS_BR_BankTran
+                    join locLedgerJournalTrans
+                    where locSKS_BR_BankTran.LedgerJournalRecId == locLedgerJournalTrans.RecId
+                        && locSKS_BR_BankTran.LedgerJournalRecId != 0
+                        && locLedgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+                    {
+                        locSKS_BR_BankTran.Voucher = locLedgerJournalTrans.Voucher;
+                        locSKS_BR_BankTran.update();
+                    }
+                    ttscommit;
+                }
+            }
+        }
+        //11656 --^--
+
+        if(ledgerJournalTable.Posted)
+        {
+            while select crosscompany * from sks_EFTAP_VendPmtSubmitLegerJournalTable
+                where sks_EFTAP_VendPmtSubmitLegerJournalTable.ReferenceJournalnum == ledgerJournalTable.JournalNum
+                    && sks_EFTAP_VendPmtSubmitLegerJournalTable.SKS_EFTAP_PaymentCompany == ledgerJournalTable.DataAreaId
+            {
+
+                if(sks_EFTAP_VendPmtSubmitLegerJournalTable && ledgerJournalTable.Posted)
+                {
+                    changecompany(sks_EFTAP_VendPmtSubmitLegerJournalTable.SKS_EFTAP_SubmitCompany)
+                    {
+                        SKS_EFTAP_VendPmtSubmitLegerJournalTable    vendPmtSubmitLegerJournalTableUpdate;
+
+                        vendPmtSubmitLegerJournalTableUpdate = sks_EFTAP_VendPmtSubmitLegerJournalTable;
+                        vendPmtSubmitLegerJournalTableUpdate.selectForUpdate(true);
+
+                        ttsbegin;
+                        vendPmtSubmitLegerJournalTableUpdate.Posted = NoYes::Yes;
+                        vendPmtSubmitLegerJournalTableUpdate.update();
+                        ttscommit;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LedgerJournalCheckPost_Post_validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate the in-house bank setup before doing posting of payment journal.
+    /// </summary>
+    /// <param name="args">It contains the <C>LedgerJournalCheckPost</C> class buffer.</param>
+    // SKS_FDD_9536
+    [PostHandlerFor(classStr(LedgerJournalCheckPost), methodStr(LedgerJournalCheckPost, validate))]
+    public static void LedgerJournalCheckPost_Post_validate(XppPrePostArgs args)
+    {
+        LedgerJournalCheckPost  ledgerJournalCheckPost;
+        LedgerJournalTable      ledgerJournalTable;
+        LedgerJournalTrans      ledgerJournalTrans;
+        LedgerJournalNameId     paymentCompanyJournalName;
+        LedgerJournalNameId     subCompanyJournalName;
+        int                     conCount = 0;
+        int                     errorCnt;
+        container               conInHouseJournalName;
+        SKS_EFTAP_CreateCustomerTradingJournal  sKS_EFTAP_CreateCustomerTradingJournal; // SKS_FDD_9602
+        // SKS_FDD_9664 -->
+        DataAreaId              customerCompany, vendorCompany;
+        LedgerJournalNameId     customerCompanyJournalName, vendorCompanyJournalName;
+        // SKS_FDD_9664 <--
+        boolean                 errorExist; // SKS_10238 CR
+
+        ledgerJournalCheckPost =  args.getthis() as LedgerJournalCheckPost;
+
+        ledgerJournalTable = ledgerJournalCheckPost.parmLedgerJournalTable();
+
+        if(SKS_PP_Setup::find().IHB_Active &&
+            (ledgerJournalTable.JournalType == LedgerJournalType::Payment ||
+            ledgerJournalTable.JournalType == LedgerJournalType::CustPayment ||
+             ledgerJournalTable.JournalType == LedgerJournalType::Daily) &&
+            !ledgerJournalTable.ledgerJournalName().SKS_IHB_PaymentRequestJournal &&
+            (!ledgerJournalTable.SKS_EFTAP_IsIHBJournal
+               || !ledgerJournalTable.SKS_EFTAR_IsIHBJournal)) // SKS_10238 CR
+        {
+            if(ledgerJournalTable.JournalType == LedgerJournalType::Payment) // SKS_10238 CR
+            {
+                while select Company, SKS_EFTAP_IHBBankAccount, Voucher, SKS_IHB_InterComp /*SKS_FDD_9602 */, LedgerDimension, AccountType /*SKS_FDD_9664*/, SKS_EFTAP_RevOrigRecId from ledgerJournalTrans
+                    where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+                {
+                    
+                    if(ledgerJournalTrans.Company != curExt() && SKS_PP_Setup::find().IHB_Active && !ledgerJournalTrans.SKS_EFTAP_IHBBankAccount && !ledgerJournalTrans.SKS_EFTAP_RevOrigRecId) //SKS_DevOps_20968
+                    {
+                        throw error("@SKS:SKGIHBBankMandatory");
+                    }
+
+                    if(ledgerJournalTrans.SKS_EFTAP_IHBBankAccount || ledgerJournalTrans.SKS_IHB_InterComp) // SKS_FDD_9602
+                    {
+                        // Check journal name is specified in payment and sub company TAS parameters.
+                        conCount++;
+                        if(conCount == 1)
+                        {
+                            paymentCompanyJournalName = SKS_EFTAP_PaymJourCreate::findInHouseBankJournal();
+                            if(!paymentCompanyJournalName)
+                            {
+                                conInHouseJournalName += [curExt()];
+                            }
+                        }
+                        changecompany(ledgerJournalTrans.Company)
+                        {
+                            subCompanyJournalName = SKS_EFTAP_PaymJourCreate::findInHouseBankJournal();
+                            // SKS_FDD_9664 -->
+                            if(ledgerJournalTrans.AccountType == LedgerJournalACType::Vend && ledgerJournalTrans.LedgerDimension)
+                            {
+                                customerCompany = SKS_LedgerJournalCheckPost_PostEvent::findCustomerDataAreaId(VendTable::findByLedgerDimension(ledgerJournalTrans.LedgerDimension));
+                            }
+                            // SKS_FDD_9664 <--
+                        }
+                        if(!subCompanyJournalName)
+                        {
+                            conInHouseJournalName += [ledgerJournalTrans.Company];
+                        }
+                        // SKS_FDD_9664 -->
+                        if(customerCompany)
+                        {
+                            changecompany(customerCompany)
+                            {
+                                customerCompanyJournalName = SKS_EFTAP_PaymJourCreate::findInHouseBankJournal();
+                            }
+                        }
+                        if(!customerCompanyJournalName && customerCompany)
+                        {
+                            conInHouseJournalName += [customerCompany];
+                        }
+                        // SKS_FDD_9664 <--
+                        // Validate the IHB bank account
+                        if(SKS_EFTAP_PaymJourCreate::validateInHouseBank(ledgerJournalTrans))
+                        {
+                            errorCnt++;
+                        }
+                    }
+                }
+                // SKS_10238 CR -->
+            }
+            else if (ledgerJournalTable.JournalType == LedgerJournalType::CustPayment || ledgerJournalTable.JournalType == LedgerJournalType::Daily)
+            {
+                while select Company, OffsetCompany, SKS_EFTAR_IHBBankAccount, SKS_EFTGL_IHBBankAccount, Voucher, SKS_IHB_InterComp, LedgerDimension, AccountType, SKS_EFTAR_RevOrigRecId from ledgerJournalTrans
+                    where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+                {
+                    conCount++;
+                    if(conCount == 1)
+                    {
+                        paymentCompanyJournalName = SKS_EFTAR_PaymJourCreate::findInHouseBankJournal();
+                        if(!paymentCompanyJournalName)
+                        {
+                            conInHouseJournalName += [curExt()];
+                        }
+                    }
+                    changecompany(ledgerJournalTrans.Company)
+                    {
+                        subCompanyJournalName = SKS_EFTAR_PaymJourCreate::findInHouseBankJournal();
+                        
+                        if(ledgerJournalTrans.AccountType == LedgerJournalACType::Cust && ledgerJournalTrans.LedgerDimension)
+                        {
+                            vendorCompany = SKS_LedgerJournalCheckPost_PostEvent::findVendorDataAreaId(CustTable::findByLedgerDimension(ledgerJournalTrans.LedgerDimension));
+                        }
+                        
+                    }
+                    if(!subCompanyJournalName)
+                    {
+                        conInHouseJournalName += [ledgerJournalTrans.Company];
+                    }
+                    
+                    if(vendorCompany)
+                    {
+                        changecompany(vendorCompany)
+                        {
+                            vendorCompanyJournalName = SKS_EFTAR_PaymJourCreate::findInHouseBankJournal();
+                        }
+                    }
+                    if(!vendorCompanyJournalName && vendorCompany)
+                    {
+                        conInHouseJournalName += [vendorCompany];
+                    }
+
+                    if(SKS_EFTAR_PaymJourCreate::validateInHouseBank(ledgerJournalTrans))
+                    {
+                        errorCnt++;
+                    }
+
+                    if(ledgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+                    {
+                        if(ledgerJournalTrans.Company != curExt() && SKS_PP_Setup::find().IHB_Active && !ledgerJournalTrans.SKS_EFTAR_IHBBankAccount && !ledgerJournalTrans.SKS_EFTAR_RevOrigRecId)
+                        {
+                            throw warning("@SKS:SKGIHBBankMandatory");
+                        }
+                    }
+
+                    if(ledgerJournalTable.JournalType == LedgerJournalType::Daily)
+                    {
+                        if((ledgerJournalTrans.Company != curExt() ||
+                            (ledgerJournalTrans.OffsetCompany && ledgerJournalTrans.Company != ledgerJournalTrans.OffsetCompany))
+                            && SKS_PP_Setup::find().IHB_Active && !ledgerJournalTrans.SKS_EFTGL_IHBBankAccount &&
+                            !ledgerJournalTrans.SKS_EFTAR_RevOrigRecId &&
+                            (ledgerJournalTrans.AccountType ==  LedgerJournalACType::Cust ||
+                            ledgerJournalTrans.AccountType ==  LedgerJournalACType::Ledger ||
+                            ledgerJournalTrans.AccountType ==  LedgerJournalACType::Bank   ||
+                            ledgerJournalTrans.AccountType ==  LedgerJournalACType::FixedAssets ||
+                            ledgerJournalTrans.AccountType ==  LedgerJournalACType::Vend))
+                        {
+                            throw warning("@SKS:SKGIHBBankMandatory");
+                        }
+                    }
+                }
+            }
+            else if (!ledgerJournalTable.SKS_EFTAsset_IsIHBAssetJournal && !ledgerJournalTable.SKS_EFTInv_IsIHBInvJournal)
+            {
+                errorExist = SKS_Ledgerjournalcheckpost_postevent::checkIntercoLedgerDimensionExist(ledgerJournalTable);
+                if(errorExist)
+                {
+                    errorCnt++;
+                }
+            }
+            // SKS_10238 CR <--
+            for(int i= 1;i<=conLen(conInHouseJournalName);i++)
+            {
+                error(strFmt("@SKS:SKGIHBJourNameEmptyValMsg",conPeek(conInHouseJournalName,i)));
+                errorCnt++;
+            }
+            if(errorCnt > 0)
+            {
+                throw error ("@SYS23002");
+            }
+        }
+
+        if(SKS_PP_Setup::find().IHB_Active &&
+            (ledgerJournalTable.JournalType == LedgerJournalType::Assets ||
+            ledgerJournalTable.JournalType == LedgerJournalType::VendInvoiceRegister))
+        {
+            while select Company, SKS_EFTInv_IHBBankAccount, SKS_EFTAsset_IHBBankAccount, Voucher, SKS_IHB_InterComp, LedgerDimension, AccountType from ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+            {
+                if(ledgerJournalTrans.SKS_EFTInv_IHBBankAccount || ledgerJournalTrans.SKS_EFTAsset_IHBBankAccount)
+                {
+                    if(SKS_EFTAP_PaymJourCreate::validateInHouseBank(ledgerJournalTrans))
+                    {
+                        errorCnt++;
+                    }
+                }
+            }
+
+            if(errorCnt > 0)
+            {
+                throw error ("@SYS23002");
+            }
+        }
+
+        // SKS_FDD_9602 -->
+        if(conCount > 0 && ledgerJournalCheckPost.parmPost() && !ledgerJournalCheckPost.parmSimulatePosting())
+        {
+            sKS_EFTAP_CreateCustomerTradingJournal =  new SKS_EFTAP_CreateCustomerTradingJournal();
+            sKS_EFTAP_CreateCustomerTradingJournal.setledgerJournalTable(ledgerJournalTable);
+            sKS_EFTAP_CreateCustomerTradingJournal.run();
+        }
+        // SKS_FDD_9602 <--
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findCustomerDataAreaId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the Customer company in vendor table.
+    /// </summary>
+    /// <param name = "_vendor">It contains <C>VendTable</C> buffer.</param>
+    /// <returns>Return customer company.</returns>
+    // SKS_FDD_9664
+    public static DataAreaId findCustomerDataAreaId(VendTable _vendor)
+    {
+        InterCompanyTradingPartner vendorPartner;
+        InterCompanyTradingPartner customerPartner;
+        InterCompanyTradingRelation tradingRelation;
+
+        select firstonly CustomerParty, CustomerDataAreaId from customerPartner
+            exists join tradingRelation
+                where customerPartner.RecId == tradingRelation.InterCompanyTradingCustomer
+                && tradingRelation.Active
+            exists join vendorPartner
+                where vendorPartner.RecId            == tradingRelation.InterCompanyTradingVendor
+                   && vendorPartner.VendorParty      == _vendor.Party
+                   && vendorPartner.VendorDataAreaId == _vendor.dataAreaId;
+
+        return customerPartner.CustomerDataAreaId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findVendorDataAreaId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the Vendor company in customer table.
+    /// </summary>
+    /// <param name = "_customer">It contains <C>CustTable</C> buffer.</param>
+    /// <returns>Return vendor company.</returns>
+    // SKS_FDD_9664
+    public static DataAreaId findVendorDataAreaId(CustTable _customer)
+    {
+        InterCompanyTradingPartner customerPartner;
+        InterCompanyTradingPartner vendorPartner;
+        InterCompanyTradingRelation tradingRelation;
+
+        select firstonly VendorParty, VendorDataAreaId from vendorPartner
+            exists join tradingRelation
+                where vendorPartner.RecId == tradingRelation.InterCompanyTradingCustomer
+                && tradingRelation.Active
+            exists join customerPartner
+                where customerPartner.RecId            == tradingRelation.InterCompanyTradingVendor
+                   && customerPartner.CustomerParty      == _customer.Party
+                   && customerPartner.CustomerDataAreaId == _customer.dataAreaId;
+
+        return vendorPartner.VendorDataAreaId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIntercoLedgerDimensionExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check Interco account details is specified or not.
+    /// </summary>
+    /// <param name = "_ledgerJourTable">It contains the <c>LedgerJournalTable</c> record.</param>
+    /// <returns>Return true.</returns>
+    // SKS_10238 CR
+    public static boolean checkIntercoLedgerDimensionExist(LedgerJournalTable _ledgerJourTable)
+    {
+        LedgerJournalTrans      ledgerJournalTransLoc;
+        SKS_PP_Bank             sKS_PP_Bank;
+        SKS_PP_Bank             sKS_PP_BankLoc;
+        boolean                 errorExist;
+
+        while select Company, LedgerDimension, AccountType, OffsetLedgerDimension, OffsetAccountType, OffsetCompany, SKS_IHB_IntercoLedgerDimension
+            from ledgerJournalTransLoc
+                where ledgerJournalTransLoc.JournalNum == _ledgerJourTable.JournalNum
+        {
+            if(ledgerJournalTransLoc.AccountType == LedgerJournalACType::Bank &&
+                ledgerJournalTransLoc.LedgerDimension)
+            {
+                sKS_PP_Bank = SKS_PP_Bank::findIHBBank(LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(ledgerJournalTransLoc.LedgerDimension), ledgerJournalTransLoc.Company);
+            }
+            if(ledgerJournalTransLoc.OffsetAccountType == LedgerJournalACType::Bank && // SKS_Bug_10358
+                ledgerJournalTransLoc.OffsetLedgerDimension)
+            {
+                sKS_PP_BankLoc = SKS_PP_Bank::findIHBBank(LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(ledgerJournalTransLoc.OffsetLedgerDimension), ledgerJournalTransLoc.OffsetCompany);
+            }
+            //Bug-12112 --->
+            if(sKS_PP_Bank && sKS_PP_BankLoc)
+            {
+                errorExist = true;
+                error("@SKS:SKGIHBAccOffsetAcc");
+                break;
+            }
+            // <--- Bug-12112
+            if((sKS_PP_Bank && !sKS_PP_BankLoc) ||
+                (!sKS_PP_Bank && sKS_PP_BankLoc) &&
+                !ledgerJournalTransLoc.SKS_IHB_IntercoLedgerDimension)
+            {
+                errorExist = true;
+                error("@SKS:SKGIHBIntercoAccountVal");
+                break;
+            }
+            sKS_PP_Bank = null;
+            sKS_PP_BankLoc = null;
+        }
+        return errorExist;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

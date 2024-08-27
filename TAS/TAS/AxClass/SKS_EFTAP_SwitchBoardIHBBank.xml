@@ -1,0 +1,444 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFTAP_SwitchBoardIHBBank</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EFTAP_SwitchBoardIHBBank
+{
+    LedgerJournalTable      ledgerJournalTable;
+    boolean                 isCallfromPaymReq;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    server static void main(Args args)
+    {
+        SKS_EFTAP_SwitchBoardIHBBank      sKS_EFTAP_SwitchBoardIHBBank = new SKS_EFTAP_SwitchBoardIHBBank();
+        sKS_EFTAP_SwitchBoardIHBBank.setledgerJournalTable(args.record() as LedgerJournalTable);
+        sKS_EFTAP_SwitchBoardIHBBank.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setledgerJournalTable</Name>
+				<Source><![CDATA[
+    void setledgerJournalTable(LedgerJournalTable _ledgerJournalTable)
+    {
+        ledgerJournalTable = _ledgerJournalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setIsCallfromPaymReq</Name>
+				<Source><![CDATA[
+    void setIsCallfromPaymReq(boolean _isCallfromPaymReq)
+    {
+        isCallfromPaymReq = _isCallfromPaymReq;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public  void run()
+    {
+        if (ledgerJournalTable.JournalType == LedgerJournalType::Payment && SKS_EFT_Setup::find().ModAPEFT)
+        {
+            this.updateJournalLinesFromSwitchBoard();
+        }
+        else if (ledgerJournalTable.JournalType == LedgerJournalType::CustPayment && SKS_EFT_Setup::find().ModAREFT)
+        {
+            this.updateCustPaymJournalLinesFromSwitchBoard();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournalLinesFromSwitchBoard</Name>
+				<Source><![CDATA[
+    public void updateJournalLinesFromSwitchBoard()
+    {
+        LedgerJournalTrans                      ledgerJournalTransUpdate;
+        CurrencyCode                            currencyCode;
+        // SKS_FDD_9602- Start
+        LedgerDimensionDefaultAccount       offsetLedgerDimension;
+        SKS_IHB_InterCompanySetup           sks_IHB_InterCompanySetup;
+        InterCompanyTradingPartner          interCompanyTradingPartner;
+        InterCompanyTradingRelation         interCompanyTradingRelation;
+        InterCompanyTradingPartner          interCompanyTradingPartnerCus;
+        LedgerDimensionDefaultAccount       ledgerDimensionIntercompanyGL;
+        // SKS_FDD_9602- End
+        while select forupdate
+            JournalNum,
+            OffsetAccountType,
+            Company,
+            CurrencyCode,
+            PaymMode,
+            DataAreaId,
+            TableId,
+            RecId,
+            PaymSpec,
+            OffsetLedgerDimension,
+            LedgerDimension,
+            AccountType,
+            BankAccountId,
+            SKS_EFTAP_IHBBankAccount,
+            Txt,
+            CustVendBankAccountId /*SKS_bug_10117*/,
+            SKS_EFTAP_IsAppliedSwitchboard/*SKS_bug_10146*/
+            from ledgerJournalTransUpdate
+              where ledgerJournalTransUpdate.JournalNum == ledgerJournalTable.JournalNum
+                 && ledgerJournalTransUpdate.SKS_EFTAP_IsAppliedSwitchboard == NoYes::No // 10146
+        {
+            ttsbegin;
+            VendTable vendTableLocal;
+            VendBankAccount vendBankAccount;
+            boolean isAPEFTPayMode = false;
+            VendTrans vendTransLocal;
+            SpecTrans specTransLocal;
+            SKS_EFTAP_SwitchboardExternalBank switchboardExternalBank;
+            SKS_EFTAP_SwitchboardInHouseBank switchboardInHouseBank;
+
+            if(ledgerJournalTransUpdate.LedgerDimension != 0 || ledgerJournalTransUpdate.OffsetLedgerDimension != 0) //10090
+            {
+                changecompany(ledgerJournalTransUpdate.Company)
+                {
+                    SKS_IHB_InterCompanySetup           sks_IHB_InterCompanySetupLoc; // SKS_Bug_10503
+                    if(ledgerJournalTransUpdate.AccountType == LedgerJournalACType::Vend)
+                    {
+                        vendTableLocal = VendTable::findByLedgerDimension(ledgerJournalTransUpdate.LedgerDimension);
+                    }
+                    else if(ledgerJournalTransUpdate.OffsetAccountType == LedgerJournalACType::Vend)
+                    {
+                        vendTableLocal = VendTable::findByLedgerDimension(ledgerJournalTransUpdate.OffsetLedgerDimension);
+                    }
+                    // SKS_Bug_10117 -->
+                    if(vendTableLocal && !ledgerJournalTransUpdate.CustVendBankAccountId)
+                    {
+                        vendBankAccount = VendBankAccount::find(vendTableLocal.AccountNum, vendTableLocal.BankAccount);
+                    }
+                    else
+                    {
+                        vendBankAccount = VendBankAccount::find(vendTableLocal.AccountNum, ledgerJournalTransUpdate.CustVendBankAccountId);
+                    }
+                    // SKS_Bug_10117 <--
+                    // SKS_FDD_9602- Start
+                    interCompanyTradingPartner  = InterCompanyTradingPartner::findVendor(vendTableLocal.Party, vendTableLocal.dataAreaid);
+                    interCompanyTradingRelation = InterCompanyTradingPartner.interCompanyTradingRelation();
+                    interCompanyTradingPartnerCus = InterCompanyTradingPartner::find(interCompanyTradingRelation.InterCompanyTradingCustomer);
+
+                    select firstonly Active, PaymentCompany, BankAccount from sks_IHB_InterCompanySetupLoc
+                        where sks_IHB_InterCompanySetupLoc.VendAccount == vendTableLocal.AccountNum; // SKS_Bug_10503
+                    sks_IHB_InterCompanySetup = sks_IHB_InterCompanySetupLoc; // SKS_Bug_10503
+                    // SKS_FDD_9602- End
+                }
+                // SKS_FDD_9602- Start
+                // checking the vendor whether  IHB intercompany is activated
+                if(sks_IHB_InterCompanySetup.Active && sks_IHB_InterCompanySetup.PaymentCompany == ledgerJournalTransUpdate.DataAreaId && interCompanyTradingRelation.ExcludeIHBNetting == NoYes::No)
+                {
+                    ttsbegin;
+                    ledgerJournalTransUpdate.OffsetAccountType = LedgerJournalACType::Bank;
+                    offsetLedgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(sks_IHB_InterCompanySetup.BankAccount, LedgerJournalACType::Bank);
+                    ledgerJournalTransUpdate.OffsetLedgerDimension = offsetLedgerDimension;
+                    if(SKS_PP_Setup::find().IHB_Active) // 10201
+                    {
+                        ledgerJournalTransUpdate.SKS_IHB_InterComp = NoYes::Yes;
+                        ledgerJournalTransUpdate.PaymMode = SKS_PP_Setup::find().IHB_InterCoMOP;
+                        if(ledgerJournalTransUpdate.Company != ledgerJournalTransUpdate.DataAreaId)
+                        {
+                            switchboardInHouseBank = SKS_EFTAP_SwitchboardInHouseBank::find(ledgerJournalTransUpdate.Company,ledgerJournalTransUpdate.CurrencyCode);
+                            ledgerJournalTransUpdate.SKS_EFTAP_IHBBankAccount = switchboardInHouseBank.InHouseBank;
+                        }
+
+                        //SKS_Bug_20588--->
+                        VendTable lVendTable;
+                        VendName vendName;
+
+                        changecompany(ledgerJournalTransUpdate.Company)
+                        {
+                            if(ledgerJournalTransUpdate.AccountType == LedgerJournalACType::Vend)
+                            {
+                                lVendTable = VendTable::findByLedgerDimension(ledgerJournalTransUpdate.LedgerDimension);
+                                vendName = DirPartyTable::getName(lVendTable.Party);
+                            }
+                        }
+
+                        specTransLocal = SpecTrans::findBySpec(ledgerJournalTransUpdate.DataAreaId,ledgerJournalTransUpdate.TableId,ledgerJournalTransUpdate.RecId);
+                        if(specTransLocal)
+                        {
+                            vendTransLocal = specTransLocal.vendTrans();
+                            if(vendTransLocal)
+                            {
+                                ledgerJournalTransUpdate.Txt = lVendTable.AccountNum + ', ' + vendName + ', ' + vendTransLocal.Invoice;
+                            }
+                        }
+                        //SKS_Bug_20588<---
+                    }
+
+                    ledgerJournalTransUpdate.update();
+                    ttscommit;
+                }
+                // Check whether the vendor-customer trading relationship established
+                else if(interCompanyTradingRelation.Active && interCompanyTradingPartnerCus.CustomerDataAreaId && interCompanyTradingPartnerCus.CustomerParty && SKS_PP_Setup::find().IHB_Active && interCompanyTradingRelation.ExcludeIHBNetting == NoYes::No)
+                {
+                    ttsbegin;
+                    ledgerDimensionIntercompanyGL = LedgerInterCompany::findCompanyPair(ledgerJournalTransUpdate.DataAreaId, vendTableLocal.DataAreaId).OriginatingCreditLedgerDimension;
+                    ledgerDimensionIntercompanyGL = LedgerDimensionFacade::serviceCreateLedgerDimension(ledgerDimensionIntercompanyGL,0);
+                    ledgerJournalTransUpdate.OffsetAccountType = LedgerJournalACType::Ledger;
+                    ledgerJournalTransUpdate.OffsetLedgerDimension = ledgerDimensionIntercompanyGL;
+                      ledgerJournalTransUpdate.SKS_IHB_InterComp = NoYes::Yes;
+                      ledgerJournalTransUpdate.PaymMode = SKS_PP_Setup::find().IHB_InterCoMOP;
+                      if(ledgerJournalTransUpdate.Company != ledgerJournalTransUpdate.DataAreaId)
+                      {
+                          switchboardInHouseBank = SKS_EFTAP_SwitchboardInHouseBank::find(ledgerJournalTransUpdate.Company,ledgerJournalTransUpdate.CurrencyCode);
+                          ledgerJournalTransUpdate.SKS_EFTAP_IHBBankAccount = switchboardInHouseBank.InHouseBank;
+                      }
+
+                      //SKS_Bug_20588--->
+                      VendTable lVendTable;
+                      VendName vendName;
+
+                      changecompany(ledgerJournalTransUpdate.Company)
+                      {
+                          if(ledgerJournalTransUpdate.AccountType == LedgerJournalACType::Vend)
+                          {
+                              lVendTable = VendTable::findByLedgerDimension(ledgerJournalTransUpdate.LedgerDimension);
+                              vendName = DirPartyTable::getName(lVendTable.Party);
+                          }
+                      }
+
+                      specTransLocal = SpecTrans::findBySpec(ledgerJournalTransUpdate.DataAreaId,ledgerJournalTransUpdate.TableId,ledgerJournalTransUpdate.RecId);
+                      if(specTransLocal)
+                      {
+                          vendTransLocal = specTransLocal.vendTrans();
+                          if(vendTransLocal)
+                          {
+                              ledgerJournalTransUpdate.Txt = lVendTable.AccountNum + ', ' + vendName + ', ' + vendTransLocal.Invoice;
+                          }
+                      }
+                      //SKS_Bug_20588<---
+
+                    ledgerJournalTransUpdate.update();
+                    ttscommit;
+                }
+                // SKS_FDD_9602- End
+                else
+                {
+                    // Find invoice MOP
+                    specTransLocal = SpecTrans::findBySpec(ledgerJournalTransUpdate.DataAreaId,ledgerJournalTransUpdate.TableId,ledgerJournalTransUpdate.RecId);
+                    if(specTransLocal)
+                    {
+                        vendTransLocal = specTransLocal.vendTrans();
+                        if(vendTransLocal)
+                        {
+                            switchboardExternalBank = SKS_EFTAP_SwitchboardExternalBank::findPaymentOutput(ledgerJournalTransUpdate.DataAreaId,vendTransLocal.PaymMode,vendTransLocal.PaymSpec,vendTransLocal.CurrencyCode, vendBankAccount.countryRegionId(), vendTransLocal);
+                        }
+                    }
+                    else
+                    {
+                        switchboardExternalBank = SKS_EFTAP_SwitchboardExternalBank::findPaymentOutput(ledgerJournalTransUpdate.DataAreaId,ledgerJournalTransUpdate.PaymMode,ledgerJournalTransUpdate.PaymSpec,ledgerJournalTransUpdate.CurrencyCode, vendBankAccount.countryRegionId()); // 10070
+                    }
+
+                    if(ledgerJournalTransUpdate.Company != ledgerJournalTransUpdate.DataAreaId)
+                    {
+                        if(vendTransLocal)
+                        {
+                            currencyCode = vendTransLocal.CurrencyCode;
+                        }
+                        else
+                        {
+                            currencyCode = ledgerJournalTransUpdate.CurrencyCode;
+                        }
+                        if(SKS_PP_Setup::find().IHB_Active) // 10201
+                        {
+                            switchboardInHouseBank = SKS_EFTAP_SwitchboardInHouseBank::find(ledgerJournalTransUpdate.Company,currencyCode); // 10070
+                            ledgerJournalTransUpdate.SKS_EFTAP_IHBBankAccount = switchboardInHouseBank.InHouseBank;
+                        }
+                    }
+
+                    if(switchboardExternalBank.PaymMode)
+                    {
+                        ledgerJournalTransUpdate.PaymMode = switchboardExternalBank.PaymMode;
+                        ledgerJournalTransUpdate.PaymSpec = '';
+                    }
+                    if(switchboardExternalBank.PaymSpec)
+                    {
+                        ledgerJournalTransUpdate.PaymSpec = switchboardExternalBank.PaymSpec;
+                    }
+                    //10227 -->
+                    VendPaymModeTable vendPaymModeTable = VendPaymModeTable::find(ledgerJournalTransUpdate.PaymMode);
+
+                    if(vendPaymModeTable.SKS_EFT_PaymMode)
+                    {
+                        isAPEFTPayMode = true;
+                    }
+                    //10227<--
+
+                    DimensionDynamicAccount ledgerDimensionBank = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(switchboardExternalBank.ExternalBankAccount, LedgerJournalACType::Bank);
+                    //10146 -->
+                    if(isAPEFTPayMode || ledgerDimensionBank)
+                    {
+                        ledgerJournalTransUpdate.OffsetAccountType = LedgerJournalACType::Bank;
+                    }
+
+                    if(ledgerDimensionBank)//10146<--
+                    {
+                        ledgerJournalTransUpdate.OffsetLedgerDimension = ledgerDimensionBank;
+                        ledgerJournalTransUpdate.OffsetDefaultDimension = SKS_EB_LedgerJournalEngine::initOffsetDefaultDimensionServer(ledgerJournalTransUpdate);
+                    }
+
+                    ledgerJournalTransUpdate.SKS_EFTAP_IsAppliedSwitchboard = NoYes::Yes; //10146
+                    ledgerJournalTransUpdate.update();
+
+                    if(isAPEFTPayMode)
+                    {
+                        // 10222 -->
+                        SKS_EFT_Setup local_SKS_EFT_Setup = SKS_EFT_Setup::find();
+                        SKS_EFT_FileFormatPaymSpec local_SKS_EFT_FileFormatPaymSpec;
+                        boolean setupEmail = false;
+
+                        select firstOnly FormatId, PaymSpec, EmailOff from local_SKS_EFT_FileFormatPaymSpec where
+                            local_SKS_EFT_FileFormatPaymSpec.FormatId == vendPaymModeTable.SKS_EFT_FormatId &&
+                            local_SKS_EFT_FileFormatPaymSpec.PaymSpec == ledgerJournalTransUpdate.PaymSpec && // SKS_Bug_10435
+                            local_SKS_EFT_FileFormatPaymSpec.EmailOff == NoYes::No;
+
+                        // If payment spec has e-mail On and setup has e-mail On
+                        if(local_SKS_EFT_FileFormatPaymSpec && local_SKS_EFT_Setup.ModAPEmail)
+                        {
+                            setupEmail = true;
+                        }
+                        SKS_EFT_VendorLoad::CreateVendorRecord(vendTableLocal, local_SKS_EFT_Setup, true, true, setupEmail,ledgerJournalTransUpdate.Company, true); // SKS_Bug_10435
+                        if(vendBankAccount.AccountID
+                            && VendPaymModeSpec::findSpec(ledgerJournalTransUpdate.PaymMode, ledgerJournalTransUpdate.PaymSpec))
+                        {
+                            SKS_EFT_VendorLoad::CreateVendorPaymRecord(vendTableLocal, local_SKS_EFT_Setup, ledgerJournalTransUpdate.PaymMode, ledgerJournalTransUpdate.PaymSpec,  vendBankAccount.AccountID,'',false,ledgerJournalTransUpdate.Company);
+                        }
+                        // 10222 <--
+                    }
+                }
+            }
+            ttscommit;
+        }
+        if (appl.ttsLevel() == 0) // run for payment proposal, not for payment factory
+        {
+            this.validateAP_EFT(ledgerJournalTable.JournalNum, isCallfromPaymReq);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateAP_EFT</Name>
+				<Source><![CDATA[
+    public void validateAP_EFT(LedgerJournalId _ledgerJournalId, boolean _isCallFromPaymReq)
+    {
+        SKS_DD_CustVendPaymExceptionList custVendPaymExceptionList;
+        LedgerJournalTable ledgerJournalTableLoc;
+
+        ledgerJournalTableLoc = LedgerJournalTable::find(_ledgerJournalId);
+        ledgerJournalTableLoc.reread();
+
+        if(ledgerJournalTableLoc)
+        {
+            SKS_EFT_Setup lSKS_EFT_Setup = SKS_EFT_Setup::find();
+            SKS_EFT_APJournalValidate::validateSet(ledgerJournalTableLoc,false, false, _isCallFromPaymReq, lSKS_EFT_Setup.APFormatValidProposal, lSKS_EFT_Setup.APFormatValidMultiThread);
+
+            select firstonly RecId from custVendPaymExceptionList
+                where custVendPaymExceptionList.JournalId == ledgerJournalTableLoc.JournalNum &&
+                custVendPaymExceptionList.ErrorWarning == SKS_DD_ErrorWarning::Error;
+
+            if(custVendPaymExceptionList.RecId == 0)
+            {
+                if (ledgerJournalTableLoc.SKS_EFT_JournalState == SKS_EFT_JournalState::Errors)
+                {
+                    ledgerJournalTableLoc.selectForUpdate(true);
+                    ledgerJournalTableLoc.SKS_EFT_JournalState = SKS_EFT_JournalState::Ready;
+                }
+            }
+            else
+            {
+                if (ledgerJournalTableLoc.SKS_EFT_JournalState == SKS_EFT_JournalState::Ready)
+                {
+                    ttsbegin;
+                    ledgerJournalTableLoc.selectForUpdate(true);
+                    ledgerJournalTableLoc.SKS_EFT_JournalState = SKS_EFT_JournalState::Errors;
+                    ledgerJournalTableLoc.doUpdate();
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCustPaymJournalLinesFromSwitchBoard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update customer journal lines IHB bank account based on currency and company from switch board.
+    /// </summary>
+    public void updateCustPaymJournalLinesFromSwitchBoard()
+    {
+        LedgerJournalTrans                      ledgerJournalTransUpdate;
+        CurrencyCode                            currencyCode;
+
+        LedgerDimensionDefaultAccount       offsetLedgerDimension;
+
+        while select forupdate
+            JournalNum,
+            OffsetAccountType,
+            Company,
+            CurrencyCode,
+            PaymMode,
+            DataAreaId,
+            TableId,
+            RecId,
+            PaymSpec,
+            OffsetLedgerDimension,
+            LedgerDimension,
+            AccountType,
+            BankAccountId,
+            SKS_EFTAR_IHBBankAccount,
+            CustVendBankAccountId,
+            SKS_EFTAR_IsAppliedSwitchboard
+        from ledgerJournalTransUpdate
+              where ledgerJournalTransUpdate.JournalNum == ledgerJournalTable.JournalNum
+                 && ledgerJournalTransUpdate.SKS_EFTAR_IsAppliedSwitchboard == NoYes::No
+        {
+            ttsbegin;
+
+            SKS_EFTAP_SwitchboardInHouseBank switchboardInHouseBank;
+
+            if(ledgerJournalTransUpdate.LedgerDimension != 0 || ledgerJournalTransUpdate.OffsetLedgerDimension != 0) //10090
+            {
+                ttsbegin;
+
+                if(SKS_PP_Setup::find().IHB_Active)
+                {
+                    if(ledgerJournalTransUpdate.Company != ledgerJournalTransUpdate.DataAreaId)
+                    {
+                        switchboardInHouseBank = SKS_EFTAP_SwitchboardInHouseBank::find(ledgerJournalTransUpdate.Company,ledgerJournalTransUpdate.CurrencyCode);
+                        ledgerJournalTransUpdate.SKS_EFTAR_IHBBankAccount = switchboardInHouseBank.InHouseBank;
+                    }
+                }
+
+                ledgerJournalTransUpdate.update();
+                ttscommit;
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

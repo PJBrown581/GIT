@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_AutoSettlement</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Batch class for auto-settlement.
+/// </summary>
+class SKS_LB_AutoSettlement extends RunBaseBatch 
+{
+    PositiveNumber numberOfThreads;
+    int fromCustAccount, toCustAccount;
+
+    Map custRecMap = new Map(Types::Integer, Types::Int64);
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        numberOfThreads
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmNumberOfThreads</Name>
+				<Source><![CDATA[
+    public PositiveNumber parmNumberOfThreads(PositiveNumber _numberOfThreads = numberOfThreads)
+    {
+        numberOfThreads = _numberOfThreads;
+        return numberOfThreads;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_LB_AutoSettlement construct()
+    {
+        return new SKS_LB_AutoSettlement();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Description
+    /// </summary>
+    /// <returns> returns description </returns>
+    public server static ClassDescription description()
+    {
+        return "@SKS:SKGAutoSettlement";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        CustTable custTable;
+
+        SKS_LB_AutoSettleResult SKS_LB_AutoSettleResult;
+
+        var recCount =0;
+        int i =0;
+        const int MinimumCustomerBundleSize = 20;
+        
+        CustTransOpen custTransOpenDebit, custTransOpenCredit;
+        SKS_LB_AutoSettlementSetup autoSettlementSetup, autoSettlementSetup_curComp;
+
+        delete_from SKS_LB_AutoSettleResult;
+
+        select firstonly autoSettlementSetup_curComp;
+
+        while select crosscompany RecId, BatchJobId from autoSettlementSetup
+            where autoSettlementSetup.BatchJobId == autoSettlementSetup_curComp.BatchJobId &&
+                  autoSettlementSetup.AutoSettlementActive == NoYes::Yes
+        {
+            changecompany(autoSettlementSetup.DataAreaId)
+            {
+                custTable = null;
+                custTransOpenCredit = null;
+                custTransOpenDebit = null;
+
+                while select AccountNum, Party, RecId from custTable
+                    where custTable.SKS_LB_AutoSettlement ==  NoYes::Yes
+                {
+                    // Payment/credit
+                    select firstonly RecId from custTransOpenCredit
+                        where custTransOpenCredit.AccountNum == custTable.AccountNum
+                            && custTransOpenCredit.AmountCur < 0;
+
+                    if (custTransOpenCredit)
+                    {
+                        // Invoice/debit
+                        select firstonly RecId from custTransOpenDebit
+                            where custTransOpenDebit.AccountNum == custTable.AccountNum
+                                && custTransOpenDebit.AmountCur > 0;
+                    }
+
+                    if (!custTransOpenDebit || !custTransOpenCredit)
+                    {
+                        SKS_LB_AutoSettlementProcess::createAutoSettlementResultRecord(custTable);
+                        continue;
+                    }
+                    else
+                    {
+                        i++;
+                        custRecMap.insert(i, custTable.RecId);
+                    }
+                }
+            }
+        }
+
+        if (this.isInBatch())
+        {
+            var batchHeader = BatchHeader::getCurrentBatchHeader();
+
+            if (batchHeader == null)
+            {
+                batchHeader = BatchHeader::construct();
+            }
+
+            int lastCustomer;
+            int numberOfBatches = this.parmNumberOfThreads() == 0 ? 4 : this.parmNumberOfThreads();
+            int totalCount      = custRecMap.elements();
+            int bundleSize      = real2int(roundUp((totalCount / numberOfBatches), 1.0));
+
+            bundleSize          = bundleSize < MinimumCustomerBundleSize ? MinimumCustomerBundleSize : bundleSize;
+            int j =0;
+
+            while (j < totalCount)
+            {
+                recCount++;
+                j++;
+
+                if (recCount == 1)
+                {
+                    fromCustAccount = j;
+                }
+                else if (recCount >= bundleSize)
+                {
+                    toCustAccount = j;
+
+                    this.createSubJobs(batchHeader);
+
+                    recCount = 0;
+                }
+                lastCustomer = j;
+            }
+
+            if (recCount > 0)
+            {
+                toCustAccount = lastCustomer;
+                this.createSubJobs(batchHeader);
+            }
+
+            batchHeader.save();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSubJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the sub jobs for batch processing.
+    /// </summary>
+    /// <param name = "_batchHeader">batch header </param>
+    public void createSubJobs(BatchHeader _batchHeader)
+    {
+        var autoSettlementProcess = SKS_LB_AutoSettlementProcess::construct(fromCustAccount, toCustAccount, custRecMap.pack());
+
+        batchInfo = autoSettlementProcess.batchInfo();
+        batchInfo.parmCaption(strFmt('%1 : %2', fromCustAccount, toCustAccount));
+
+        _batchHeader.addRuntimeTask(autoSettlementProcess, this.parmCurrentBatch().RecId);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

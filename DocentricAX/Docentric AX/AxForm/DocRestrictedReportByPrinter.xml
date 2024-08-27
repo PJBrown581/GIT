@@ -1,0 +1,1985 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>DocRestrictedReportByPrinter</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+[Form]
+public class DocRestrictedReportByPrinter extends FormRun
+{
+    QueryBuildDataSource qbdsFilter;
+    boolean shouldPositionToCallerRestriction = false;
+    PrinterName callerPrinterName;
+    str callerFormName;
+
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkCaller</Name>
+				<Source><![CDATA[
+    private void checkCaller()
+    {
+        callerFormName = '';
+        if (element.args() && element.args().caller() && (element.args().caller() is FormRun))
+        {
+            FormRun callerForm = element.args().caller();
+            callerFormName = callerForm.name();
+        }
+
+        if (element.args() && element.args().record())
+        {
+            if (element.args().record() is DocRestrictedPrinter)
+            {
+                // We came through jumpRef from the flat restriction form.
+                // By default, this form would be filtered to the printer from the caller record, 
+                // but we don't want that. 
+                // Instead, we only want to be positioned to the corresponding printer record. 
+                // We will do that during the first execution of the linkActive() method of the printers datasource.
+                DocRestrictedPrinterInfo_ds.query().dataSourceTable(tableNum(DocRestrictedPrinterInfo)).clearDynalinks();
+                DocRestrictedPrinterInfo_ds.query().dataSourceTable(tableNum(SysCorpNetPrinters)).clearDynalinks();
+
+                DocRestrictedPrinter callerRestriction = element.args().record() as DocRestrictedPrinter;
+                callerPrinterName = callerRestriction.PrinterName;
+                shouldPositionToCallerRestriction = true;
+
+                NavigationList.visible(true);
+            }
+            else if (element.args().record() is DocRestrictedPrintersView)
+            {
+                // We came through jumpRef from Restricted printers by report form.
+                // We want to be positioned on the corresponding printer record.
+                DocRestrictedPrintersView callerView = element.args().record() as DocRestrictedPrintersView;
+                callerPrinterName = callerView.PrinterName;
+                shouldPositionToCallerRestriction = true;
+
+                NavigationList.visible(true);
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initForm</Name>
+				<Source><![CDATA[
+    private void initForm()
+    {
+        #SysSystemDefinedButtons
+
+        // Hide the Attach button.
+        FormCommandButtonControl button = this.control(this.controlId(#SystemDefinedAttachButton)) as FormCommandButtonControl;
+        if (button)
+        {
+            button.visible(false);
+        }
+
+        // Add company id to the form caption
+        this.design().caption(strFmt('%1 - %2', "@DocentricAX3:RestrictedReportsByPrinter", curExt()));
+        
+        // Restriction info  
+        RestrictionInfo.colorScheme(FormColorScheme::RGB);
+        if (DocPrinterManager::getRestrictPrintersMode() == DocRestrictPrinters::None)
+        {
+            RestrictionInfo.text("@DocentricAX3:RestrictionIsOff");
+            RestrictionInfo.helpText("@DocentricAX3:RestrictionIsOffHelp");
+            RestrictionInfo.backgroundColor(0xFFF4CE);   // yellow color from infolog warning
+        }
+        else
+        {
+            RestrictionInfo.text("@DocentricAX3:RestrictionIsOn");
+            RestrictionInfo.helpText("@DocentricAX3:RestrictionIsOnHelp");
+            RestrictionInfo.backgroundColor(0xE5FFE5);   // light green color
+        }         
+
+        // Make sure that all helper tables are correctly initialized.
+        DocPrinterManager::initializeRestrictedPrintersTables();
+        DocRestrictedPrinterInfo_ds.research();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setControls</Name>
+				<Source><![CDATA[
+    public void setControls()
+    {
+        // Allow bulk operations only in grid view
+        boolean isGridView = GridPanel.isActivePage();
+        Actions.visible(isGridView);
+
+        // Show/hide report combo.        
+        ReportId.visible(FilterCombo.selection() == DocRestrictPrinterOrReportFilter::RestrictedFor
+                            || FilterCombo.selection() == DocRestrictPrinterOrReportFilter::AllowedFor);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    public void init()
+    {
+        super();
+
+        this.checkCaller();
+
+        this.initForm();
+
+        element.setControls();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="">
+			<DataSource>
+				<Name>DocRestrictedPrinterInfo</Name>
+				<Methods>
+					<Method>
+						<Name>parentTitleFields</Name>
+						<Source><![CDATA[
+        public TitleFields parentTitleFields(Common _record)
+        {
+            TitleFields ret;
+    
+            // Don't show parent title fields
+            //ret = super(_record);
+    
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        public void executeQuery()
+        {
+            // If we are in a grid view,
+            // and we selected some kind of filtering
+            if (GridPanel.isActivePage() && (FilterCombo.selection() != DocRestrictPrinterOrReportFilter::All))
+            {
+                // The following combinations are valid:
+                //  - with/without any restriction
+                //  - with/without restriction for a given report, then ReportId must be provided
+                if (FilterCombo.selection() == DocRestrictPrinterOrReportFilter::WithAnyRestriction
+                    || FilterCombo.selection() == DocRestrictPrinterOrReportFilter::WithoutAnyRestriction
+                    || ReportId.text() != '')
+                {
+                    qbdsFilter.clearRanges();
+
+                    if (FilterCombo.selection() == DocRestrictPrinterOrReportFilter::RestrictedFor
+                        || FilterCombo.selection() == DocRestrictPrinterOrReportFilter::AllowedFor)
+                    {
+                        // We are looking specifically for restriction for given report.
+                        qbdsFilter.addRange(fieldNum(DocRestrictedPrinter, ReportId)).value(queryValue(ReportId.text()));
+                    }
+                    
+                    // Temporarily enable the helper Restricted printer datasource,
+                    // until super() executes the query, then we will disable it.
+                    qbdsFilter.enabled(true);
+                
+                    switch (FilterCombo.selection())
+                    {
+                        case DocRestrictPrinterOrReportFilter::RestrictedFor:
+                        case DocRestrictPrinterOrReportFilter::WithAnyRestriction:
+                            qbdsFilter.joinMode(JoinMode::ExistsJoin);
+                            break;
+
+                        case DocRestrictPrinterOrReportFilter::AllowedFor:
+                        case DocRestrictPrinterOrReportFilter::WithoutAnyRestriction:
+                            qbdsFilter.joinMode(JoinMode::NoExistsJoin);
+                            break;
+
+                        default:
+                        // do nothing
+                    }
+                }
+            }
+            
+            // Execute the query (i.e. run super()) and then disable the helper Restricted printer
+            // datasource until the next time we need it.
+            super();
+
+            // Get the number of records in the query resultset 
+            // and add it to the form caption           
+            element.design().caption(strFmt('%1 - %2 (printers count: %3)', 
+                                    "@DocentricAX3:RestrictedReportsByPrinter", curExt(),
+                                    SysQuery::countLoops(this.queryRun())));
+            
+            qbdsFilter.enabled(false);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>linkActive</Name>
+						<Source><![CDATA[
+        public void linkActive()
+        {
+            super();
+
+            if (shouldPositionToCallerRestriction)
+            {
+                shouldPositionToCallerRestriction = false;
+
+                DocRestrictedPrinterInfo localPrinterInfo = DocRestrictedPrinterInfo::findByPrinterName(callerPrinterName);
+                this.positionToRecord(localPrinterInfo);
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields />
+			</DataSource>
+			<DataSource>
+				<Name>SysCorpNetPrinters</Name>
+				<Methods>
+					<Method>
+						<Name>init</Name>
+						<Source><![CDATA[
+        public void init()
+        {
+            super();
+            
+            QueryBuildDataSource qbds = this.query().dataSourceTable(tableNum(SysCorpNetPrinters));
+            
+            // On cloud environments make sure that we show only the printers which are enabled in DRA.
+            DocPrinterManager::filterPrintersWithApp(qbds);
+
+            // Link a helper Restricted printer datasource, but keep it disabled.
+            // We will enable it only temporarily in executeQuery() for the root datasource (DocRestrictedPrinterInfo),
+            // when we need to filter restricted or not restricted printers.
+            qbdsFilter = qbds.addDataSource(tableNum(DocRestrictedPrinter));
+            qbdsFilter.relations(true);
+            qbdsFilter.enabled(false);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>parentTitleFields</Name>
+						<Source><![CDATA[
+        public TitleFields parentTitleFields(Common _record)
+        {
+            TitleFields ret;
+        
+            // Prevent core from setting the title field based on the caller
+            //ret = super(_record);
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+        
+            ret = super();
+            
+            DetailsTabPage.caption(strFmt('%1 %2 (%3)', "@DocentricAX3:RestrictReportsFor", SysCorpNetPrinters.PrinterName, curExt()));
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>PrinterName</DataField>
+						<Methods>
+							<Method>
+								<Name>jumpRef</Name>
+								<Source><![CDATA[
+            public void jumpRef()
+            {
+                // When printer is clicked, open the Network printers form
+                // and get positioned to the exactly same record as this one.
+                Args args = new Args();
+                args.caller(element);
+            
+                SysCorpNetPrinters targetPrinter;
+                select firstonly targetPrinter where targetPrinter.PrinterName == SysCorpNetPrinters.PrinterName;
+                args.lookupRecord(targetPrinter);
+                
+                new MenuFunction(menuItemDisplayStr(SysCorpNetPrinters), MenuItemType::Display).run(args);
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+			<DataSource>
+				<Name>AllowedReports</Name>
+				<Methods>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        public void executeQuery()
+        {
+            QueryBuildDataSource qbds = this.query().dataSourceTable(tableNum(DocRestrictedPrintersView));
+            qbds.clearRange(fieldNum(DocRestrictedPrintersView, PrinterName));
+            qbds.addRange(fieldNum(DocRestrictedPrintersView, PrinterName)).value(queryValue(SysCorpNetPrinters.PrinterName));
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>init</Name>
+						<Source><![CDATA[
+        public void init()
+        {
+            super();
+            
+            QueryBuildDataSource qbds = this.query().dataSourceTable(tableNum(DocRestrictedPrintersView));
+
+            qbds.clearRanges();
+            qbds.addRange(fieldNum(DocRestrictedPrintersView, IsRestricted)).value(queryValue(NoYes::No));
+            qbds.addOrderByField(fieldNum(DocRestrictedPrintersView, ReportId));
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>getIsExclusive</Name>
+						<Source><![CDATA[
+        private boolean getIsExclusive(DocRestrictedPrintersView _view)
+        {
+            boolean isExclusive = false;
+
+            // Return the information if the current combination Report-printer is exclusive.
+            // It is true if:
+            // 1. Current report has the 'Restrict for new printers' flag ON, and
+            // 2. All other printers are restricted for this report
+            if (DocReportTable::findReportId(_view.ReportId).RestrictForNewPrinters)
+            {
+                // 1st condition met (this report has the flag ON).
+                // Check the 2nd condition.
+                DocRestrictedPrintersView testView;
+                select count(RecId) from testView
+                    where testView.PrinterName != _view.PrinterName
+                        && testView.PrinterName != DocConstant::RestrictedPrinterNewPrinters
+                        && testView.ReportId == _view.ReportId
+                        && testView.IsRestricted == NoYes::No
+                        && testView.DataAreaId == _view.DataAreaId;
+                if (testView.RecId == 0)
+                {
+                    isExclusive = true;
+                }
+            }
+
+            return isExclusive;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>isExclusive</Name>
+						<Source><![CDATA[
+        display boolean isExclusive(DocRestrictedPrintersView _view)
+        {
+            return this.getIsExclusive(_view);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>exclusivityIndicator</Name>
+						<Source><![CDATA[
+        public display container exclusivityIndicator(DocRestrictedPrintersView _view)
+        {
+            str symbol = '';
+            LabelId label;
+
+            if (this.getIsExclusive(_view))
+            {
+                symbol = ImageReferenceSymbol::Lock;
+                label = "@DocentricAX4:RestrictedForOtherPrinters";
+            }
+
+            return ImageReference::constructForSymbol(symbol, label).pack();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+        
+            ret = super();
+
+            RestrictAllowedReportForOtherPrinters.enabled(AllowedReports.ReportId != DocConstant::RestrictedPrinterUnregisteredReports
+                                                                && AllowedReports.ReportId != DocConstant::RestrictedPrinterNewReports);
+        
+            AllowAllowedReportForOtherPrinters.enabled(AllowedReports.ReportId != DocConstant::RestrictedPrinterUnregisteredReports
+                                                                && AllowedReports.ReportId != DocConstant::RestrictedPrinterNewReports);
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>ReportId</DataField>
+						<Methods>
+							<Method>
+								<Name>jumpRef</Name>
+								<Source><![CDATA[
+            public void jumpRef()
+            {
+                // jumpRef should work only for non-token values
+                if (AllowedReports.ReportId != DocConstant::RestrictedPrinterUnregisteredReports
+                    && AllowedReports.ReportId != DocConstant::RestrictedPrinterNewReports)
+                {
+                    // When ReportId is clicked, open the Restricted printer by report form
+                    // and get positioned to the same report as on the current record.
+                    Args args = new Args();
+                    args.caller(element);
+                    args.record(AllowedReports);
+                    args.formViewOption(FormViewOption::Details);
+                
+                    new MenuFunction(menuItemDisplayStr(DocRestrictedPrinterByReport), MenuItemType::Display).run(args);
+                }
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+			<DataSource>
+				<Name>RestrictedReports</Name>
+				<Methods>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        public void executeQuery()
+        {
+            QueryBuildDataSource qbds = this.query().dataSourceTable(tableNum(DocRestrictedPrintersView));
+            qbds.clearRange(fieldNum(DocRestrictedPrintersView, PrinterName));
+            qbds.addRange(fieldNum(DocRestrictedPrintersView, PrinterName)).value(queryValue(SysCorpNetPrinters.PrinterName));
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>init</Name>
+						<Source><![CDATA[
+        public void init()
+        {
+            super();
+            
+            QueryBuildDataSource qbds = this.query().dataSourceTable(tableNum(DocRestrictedPrintersView));
+
+            qbds.clearRanges();
+            qbds.addRange(fieldNum(DocRestrictedPrintersView, IsRestricted)).value(queryValue(NoYes::Yes));
+            qbds.addOrderByField(fieldNum(DocRestrictedPrintersView, ReportId));
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+        
+            ret = super();
+
+            RestrictRestrictedReportForOtherPrinters.enabled(RestrictedReports.ReportId != DocConstant::RestrictedPrinterUnregisteredReports
+                                                                && RestrictedReports.ReportId != DocConstant::RestrictedPrinterNewReports);
+        
+            AllowRestrictedReportForOtherPrinters.enabled(RestrictedReports.ReportId != DocConstant::RestrictedPrinterUnregisteredReports
+                                                                && RestrictedReports.ReportId != DocConstant::RestrictedPrinterNewReports);
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>ReportId</DataField>
+						<Methods>
+							<Method>
+								<Name>jumpRef</Name>
+								<Source><![CDATA[
+            public void jumpRef()
+            {
+                // jumpRef should work only for non-token values
+                if (RestrictedReports.ReportId != DocConstant::RestrictedPrinterUnregisteredReports
+                    && RestrictedReports.ReportId != DocConstant::RestrictedPrinterNewReports)
+                {
+                    // When ReportId is clicked, open the Restricted printer by report form
+                    // and get positioned to the same report as on the current record.
+                    Args args = new Args();
+                    args.caller(element);
+                    args.record(RestrictedReports);
+                    args.formViewOption(FormViewOption::Details);
+
+                    new MenuFunction(menuItemDisplayStr(DocRestrictedPrinterByReport), MenuItemType::Display).run(args);
+                }
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+		</DataSources>
+		<DataControls xmlns="">
+			<Control>
+				<Name>DocReportTable</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            // Work-around to avoid getting the "parent" in the report setup title.
+            Args args = new Args();
+            args.caller(element);
+
+            new MenuFunction(menuItemDisplayStr(DocReportTable), MenuItemType::Display).run(args);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>DetailsPanel</Name>
+				<Type>TabPage</Type>
+				<Methods>
+					<Method>
+						<Name>pageActivated</Name>
+						<Source><![CDATA[
+        public void pageActivated()
+        {
+            element.setControls();
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>RestrictButton</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            super();
+
+            DocRestrictedPrinter restrictedPrinter;
+
+            MultiSelectionHelper helper = MultiSelectionHelper::construct();
+            helper.parmDatasource(AllowedReports_ds);
+
+            DocRestrictedPrintersView allowed = helper.getFirst();
+
+            try
+            {
+                RecordInsertList recordInsertList = new RecordInsertList(tableNum(DocRestrictedPrinter));
+
+                while (allowed.RecId != 0)
+                {
+                    if (allowed.ReportId == DocConstant::RestrictedPrinterUnregisteredReports)
+                    {
+                        DocRestrictedPrinterInfo.RestrictForUnregisteredReports = NoYes::Yes;
+                        DocRestrictedPrinterInfo.update();
+                    }
+                    else if (allowed.ReportId == DocConstant::RestrictedPrinterNewReports)
+                    {
+                        DocRestrictedPrinterInfo.RestrictForNewReports = NoYes::Yes;
+                        DocRestrictedPrinterInfo.update();
+                    }
+                    else
+                    {
+                        restrictedPrinter.initValue();
+                        restrictedPrinter.PrinterName = SysCorpNetPrinters.PrinterName;
+                        restrictedPrinter.ReportId = allowed.ReportId;
+
+                        if (restrictedPrinter.validateWrite())
+                        {
+                            recordInsertList.add(restrictedPrinter);
+                        }
+                    }
+
+                    allowed = helper.getNext();
+                }
+
+                recordInsertList.insertDatabase();
+
+                // Refresh datasources
+                DocRestrictedPrinterInfo_ds.reread();
+                DocRestrictedPrinterInfo_ds.refresh();
+
+                AllowedReports_ds.research();
+                RestrictedReports_ds.research();
+            }
+            catch
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX3:ErrorRestrictingReportsForPrinter", SysCorpNetPrinters.PrinterName));
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>AllowButton</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            super();
+
+            DocRestrictedPrinter restrictedPrinter;
+
+            MultiSelectionHelper helper = MultiSelectionHelper::construct();
+            helper.parmDatasource(RestrictedReports_ds);
+
+            DocRestrictedPrintersView allowed = helper.getFirst();
+
+            try
+            {
+                ttsbegin;
+
+                while (allowed.RecId != 0)
+                {                    
+                    if (allowed.ReportId == DocConstant::RestrictedPrinterUnregisteredReports)
+                    {
+                        DocRestrictedPrinterInfo.RestrictForUnregisteredReports = NoYes::No;
+                        DocRestrictedPrinterInfo.update();
+                    }
+                    else if (allowed.ReportId == DocConstant::RestrictedPrinterNewReports)
+                    {
+                        DocRestrictedPrinterInfo.RestrictForNewReports = NoYes::No;
+                        DocRestrictedPrinterInfo.update();
+                    }
+                    else
+                    {
+                        delete_from restrictedPrinter
+                            where restrictedPrinter.PrinterName == SysCorpNetPrinters.PrinterName
+                                && restrictedPrinter.ReportId == allowed.ReportId;
+                    }
+
+                    allowed = helper.getNext();
+                }
+
+                ttscommit;
+
+                // Refresh datasources
+                DocRestrictedPrinterInfo_ds.reread();
+                DocRestrictedPrinterInfo_ds.refresh();
+
+                AllowedReports_ds.research();
+                RestrictedReports_ds.research();
+            }
+            catch
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX3:ErrorAllowingReportsForPrinter", SysCorpNetPrinters.PrinterName));
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>GridPanel</Name>
+				<Type>TabPage</Type>
+				<Methods>
+					<Method>
+						<Name>pageActivated</Name>
+						<Source><![CDATA[
+        public void pageActivated()
+        {
+            element.setControls();
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>FilterCombo</Name>
+				<Type>ComboBox</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+    
+            ret = super();
+
+            ReportId.visible(FilterCombo.selection() == DocRestrictPrinterOrReportFilter::RestrictedFor
+                            || FilterCombo.selection() == DocRestrictPrinterOrReportFilter::AllowedFor);
+
+            // Apply the selected filter
+            DocRestrictedPrinterInfo_ds.executeQuery();
+    
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>ReportId</Name>
+				<Type>String</Type>
+				<Methods>
+					<Method>
+						<Name>lookup</Name>
+						<Source><![CDATA[
+        public void lookup()
+        {
+            SysTableLookup          sysTableLookup;
+            Query                   query;
+            QueryBuildDataSource    qbds;
+
+            query = new Query();
+
+            qbds = query.addDataSource(tableNum(DocReportTable));
+            qbds.addOrderByField(fieldNum(DocReportTable, ReportId));
+
+            sysTableLookup = SysTableLookup::newParameters(tableNum(DocReportTable), this);
+            sysTableLookup.addLookupfield(fieldNum(DocReportTable, ReportId));
+
+            sysTableLookup.parmQuery(query);
+            sysTableLookup.performFormLookup();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>validate</Name>
+						<Source><![CDATA[
+        public boolean validate()
+        {
+            boolean ret;
+        
+            ret = super();
+
+            str selectedReportId = ReportId.text();
+            if (!DocReportTable::findReportId(selectedReportId))
+            {
+                ret = ret && checkFailed(strFmt("@DocentricAX3:InvalidReportId", selectedReportId));
+            }
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+        
+            ret = super();
+            
+            // Apply the selected filter
+            DocRestrictedPrinterInfo_ds.executeQuery();
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>jumpRef</Name>
+						<Source><![CDATA[
+        public void jumpRef()
+        {
+            Args args = new Args();
+            args.caller(element);
+
+            FormRun formRun = new MenuFunction(menuItemDisplayStr(DocReportTable), MenuItemType::Display).create(args);
+            formRun.run();
+            formRun.dataSource(1).positionToRecord(DocReportTable::findReportId(this.text()));
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources>
+		<AxFormDataSource xmlns="">
+			<Name>DocRestrictedPrinterInfo</Name>
+			<Table>DocRestrictedPrinterInfo</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>DataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictForNewReports</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictForUnregisteredReports</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<AllowCreate>No</AllowCreate>
+			<AllowDelete>No</AllowDelete>
+			<AllowEdit>No</AllowEdit>
+			<Index>PrinterNameIdx</Index>
+			<InsertAtEnd>No</InsertAtEnd>
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+		<AxFormDataSource xmlns="">
+			<Name>SysCorpNetPrinters</Name>
+			<Table>SysCorpNetPrinters</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>Active</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Description</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterPath</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<JoinSource>DocRestrictedPrinterInfo</JoinSource>
+			<LinkType>InnerJoin</LinkType>
+			<AllowCreate>No</AllowCreate>
+			<AllowDelete>No</AllowDelete>
+			<AllowEdit>No</AllowEdit>
+			<InsertAtEnd>No</InsertAtEnd>
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+		<AxFormDataSource xmlns="">
+			<Name>AllowedReports</Name>
+			<Table>DocRestrictedPrintersView</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>DataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IsRestricted</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterActive</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterDataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterDescription</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterPath</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportDescription</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportGroupId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictedPrinterDataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictedPrinterPrinterName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictedPrinterReportId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<JoinSource>SysCorpNetPrinters</JoinSource>
+			<AllowCreate>No</AllowCreate>
+			<AllowDelete>No</AllowDelete>
+			<AllowEdit>No</AllowEdit>
+			<InsertAtEnd>No</InsertAtEnd>
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+		<AxFormDataSource xmlns="">
+			<Name>RestrictedReports</Name>
+			<Table>DocRestrictedPrintersView</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>DataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IsRestricted</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterActive</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterDataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterDescription</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PrinterPath</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportDescription</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportGroupId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictedPrinterDataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictedPrinterPrinterName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RestrictedPrinterReportId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<JoinSource>SysCorpNetPrinters</JoinSource>
+			<AllowCreate>No</AllowCreate>
+			<AllowDelete>No</AllowDelete>
+			<AllowEdit>No</AllowEdit>
+			<InsertAtEnd>No</InsertAtEnd>
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+	</DataSources>
+	<Design>
+		<Caption xmlns="">@DocentricAX3:RestrictedReportsByPrinter</Caption>
+		<DataSource xmlns="">DocRestrictedPrinterInfo</DataSource>
+		<Pattern xmlns="">DetailsMaster</Pattern>
+		<PatternVersion xmlns="">1.4</PatternVersion>
+		<SetCompany xmlns="">No</SetCompany>
+		<ShowDeleteButton xmlns="">No</ShowDeleteButton>
+		<ShowNewButton xmlns="">No</ShowNewButton>
+		<Style xmlns="">DetailsFormMaster</Style>
+		<ViewEditMode xmlns="">View</ViewEditMode>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormActionPaneControl">
+				<Name>MainActionPane</Name>
+				<Type>ActionPane</Type>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormButtonGroupControl">
+						<Name>ViewButtonGroup</Name>
+						<Type>ButtonGroup</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormMenuFunctionButtonControl">
+								<Name>DocRestrictedPrinterByReport</Name>
+								<HelpText>@DocentricAX3:SetupByReportHelp</HelpText>
+								<Type>MenuFunctionButton</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<FormViewOption>Grid</FormViewOption>
+								<MenuItemName>DocRestrictedPrinterByReport</MenuItemName>
+								<MultiSelect>Yes</MultiSelect>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormMenuFunctionButtonControl">
+								<Name>DocRestrictedPrinterFlat</Name>
+								<HelpText>@DocentricAX3:RestrictedPrinterViewAllHelp</HelpText>
+								<Type>MenuFunctionButton</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<MenuItemName>DocRestrictedPrinterFlat</MenuItemName>
+								<MultiSelect>Yes</MultiSelect>
+								<NormalImage>ViewAll</NormalImage>
+							</AxFormControl>
+						</Controls>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormActionPaneTabControl">
+						<Name>ToolsActionPaneTab</Name>
+						<Type>ActionPaneTab</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonGroupControl">
+								<Name>Actions</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<Type>ButtonGroup</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>AllowAllReports</Name>
+										<HelpText>@DocentricAX3:AllowAllReportsHelp</HelpText>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+										<MenuItemName>DocRestrictOrAllowAllReports</MenuItemName>
+										<MenuItemType>Action</MenuItemType>
+										<MultiSelect>Yes</MultiSelect>
+										<NeedsRecord>Yes</NeedsRecord>
+										<Parameters>Allow</Parameters>
+										<Text>@DocentricAX3:AllowAllReports</Text>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>RestrictAllReports</Name>
+										<HelpText>@DocentricAX3:RestrictAllReportsHelp</HelpText>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+										<MenuItemName>DocRestrictOrAllowAllReports</MenuItemName>
+										<MenuItemType>Action</MenuItemType>
+										<MultiSelect>Yes</MultiSelect>
+										<NeedsRecord>Yes</NeedsRecord>
+										<Parameters>Restrict</Parameters>
+										<Text>@DocentricAX3:RestrictAllReports</Text>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuButtonControl">
+										<Name>SetRestrictionOptions</Name>
+										<HelpText>@DocentricAX3:SetRestrictionOptionsHelp</HelpText>
+										<Type>MenuButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormMenuFunctionButtonControl">
+												<Name>SetRestrictForUnregisteredReports</Name>
+												<Type>MenuFunctionButton</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<DataSource>DocRestrictedPrinterInfo</DataSource>
+												<MenuItemName>DocRestrictionFlagsSetOrClear</MenuItemName>
+												<MenuItemType>Action</MenuItemType>
+												<MultiSelect>Yes</MultiSelect>
+												<NeedsRecord>Yes</NeedsRecord>
+												<Parameters>SetForUnregistered</Parameters>
+												<Text>@DocentricAX3:ForUnregisteredReports</Text>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormMenuFunctionButtonControl">
+												<Name>SetRestrictForNewReports</Name>
+												<Type>MenuFunctionButton</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<DataSource>DocRestrictedPrinterInfo</DataSource>
+												<MenuItemName>DocRestrictionFlagsSetOrClear</MenuItemName>
+												<MenuItemType>Action</MenuItemType>
+												<MultiSelect>Yes</MultiSelect>
+												<NeedsRecord>Yes</NeedsRecord>
+												<Parameters>SetForNew</Parameters>
+												<Text>@DocentricAX3:ForNewReports</Text>
+											</AxFormControl>
+										</Controls>
+										<MultiSelect>Yes</MultiSelect>
+										<NeedsRecord>Yes</NeedsRecord>
+										<Text>@DocentricAX3:SetRestrictionOptions</Text>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuButtonControl">
+										<Name>ClearRestrictionOptions</Name>
+										<HelpText>@DocentricAX3:ClearRestrictionOptionsHelp</HelpText>
+										<Type>MenuButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormMenuFunctionButtonControl">
+												<Name>ClearRestrictForUnregisteredReports</Name>
+												<Type>MenuFunctionButton</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<DataSource>DocRestrictedPrinterInfo</DataSource>
+												<MenuItemName>DocRestrictionFlagsSetOrClear</MenuItemName>
+												<MenuItemType>Action</MenuItemType>
+												<MultiSelect>Yes</MultiSelect>
+												<NeedsRecord>Yes</NeedsRecord>
+												<Parameters>ClearForUnregistered</Parameters>
+												<Text>@DocentricAX3:ForUnregisteredReports</Text>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormMenuFunctionButtonControl">
+												<Name>ClearRestrictForNewReports</Name>
+												<Type>MenuFunctionButton</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<DataSource>DocRestrictedPrinterInfo</DataSource>
+												<MenuItemName>DocRestrictionFlagsSetOrClear</MenuItemName>
+												<MenuItemType>Action</MenuItemType>
+												<MultiSelect>Yes</MultiSelect>
+												<NeedsRecord>Yes</NeedsRecord>
+												<Parameters>ClearForNew</Parameters>
+												<Text>@DocentricAX3:ForNewReports</Text>
+											</AxFormControl>
+										</Controls>
+										<MultiSelect>Yes</MultiSelect>
+										<Text>@DocentricAX3:ClearRestrictionOptions</Text>
+									</AxFormControl>
+								</Controls>
+								<Caption>@SYS9342</Caption>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonGroupControl">
+								<Name>Links</Name>
+								<Type>ButtonGroup</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>SysCorpNetPrinters</Name>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<MenuItemName>SysCorpNetPrinters</MenuItemName>
+										<MultiSelect>Yes</MultiSelect>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>DocReportTable</Name>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<FormViewOption>Grid</FormViewOption>
+										<MenuItemName>DocReportTable</MenuItemName>
+										<MultiSelect>Yes</MultiSelect>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormMenuFunctionButtonControl">
+										<Name>DocUserPrinterByPrinter</Name>
+										<Type>MenuFunctionButton</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<MenuItemName>DocUserPrinterByPrinter</MenuItemName>
+										<MultiSelect>Yes</MultiSelect>
+										<Text>@DocentricAX4:UserPrintersByPrinter</Text>
+									</AxFormControl>
+								</Controls>
+								<Caption>@SYS72248</Caption>
+							</AxFormControl>
+						</Controls>
+						<Caption>@DocentricAX:Tools</Caption>
+					</AxFormControl>
+				</Controls>
+				<DataSource>DocRestrictedPrinterInfo</DataSource>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>NavigationList</Name>
+				<AutoDeclaration>Yes</AutoDeclaration>
+				<HeightMode>SizeToAvailable</HeightMode>
+				<Type>Group</Type>
+				<Visible>No</Visible>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl>
+						<Name>NavigationListQuickFilter</Name>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension>
+							<Name>QuickFilterControl</Name>
+							<ExtensionComponents />
+							<ExtensionProperties>
+								<AxFormControlExtensionProperty>
+									<Name>targetControlName</Name>
+									<Type>String</Type>
+									<Value>LeftPrintersGrid</Value>
+								</AxFormControlExtensionProperty>
+								<AxFormControlExtensionProperty>
+									<Name>placeholderText</Name>
+									<Type>String</Type>
+								</AxFormControlExtensionProperty>
+								<AxFormControlExtensionProperty>
+									<Name>defaultColumnName</Name>
+									<Type>String</Type>
+								</AxFormControlExtensionProperty>
+							</ExtensionProperties>
+						</FormControlExtension>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormGridControl">
+						<Name>LeftPrintersGrid</Name>
+						<AllowEdit>No</AllowEdit>
+						<Type>Grid</Type>
+						<WidthMode>SizeToContent</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>SysCorpNetPrinters_PrinterName</Name>
+								<Type>String</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<DataField>PrinterName</DataField>
+								<DataSource>SysCorpNetPrinters</DataSource>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>Navigation_PrinterInfo</Name>
+								<Type>String</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<DataMethod>displayPrinterInfo</DataMethod>
+								<DataSource>DocRestrictedPrinterInfo</DataSource>
+							</AxFormControl>
+						</Controls>
+						<DataSource>SysCorpNetPrinters</DataSource>
+						<MultiSelect>No</MultiSelect>
+						<ShowRowLabels>No</ShowRowLabels>
+						<Style>List</Style>
+					</AxFormControl>
+				</Controls>
+				<FrameType>None</FrameType>
+				<Style>SidePanel</Style>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormTabControl">
+				<Name>MainTab</Name>
+				<Type>Tab</Type>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>DetailsPanel</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>DetailsHeaderGroup</Name>
+								<Type>Group</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>PrinterName</Name>
+										<Skip>Yes</Skip>
+										<Type>String</Type>
+										<WidthMode>SizeToAvailable</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>PrinterName</DataField>
+										<DataSource>SysCorpNetPrinters</DataSource>
+										<ShowLabel>No</ShowLabel>
+										<Style>TitleField</Style>
+									</AxFormControl>
+								</Controls>
+								<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+								<FrameType>None</FrameType>
+								<Style>DetailTitleContainer</Style>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormTabControl">
+								<Name>DetailsTab</Name>
+								<Type>Tab</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormTabPageControl">
+										<Name>DetailsTabPage</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Pattern>Custom</Pattern>
+										<Type>TabPage</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormGroupControl">
+												<Name>RestrictionInfoGroup</Name>
+												<AutoDeclaration>Yes</AutoDeclaration>
+												<Type>Group</Type>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormGroupControl">
+														<Name>RestrictionInfoActionableField</Name>
+														<Type>Group</Type>
+														<WidthMode>SizeToAvailable</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<Controls>
+															<AxFormControl xmlns=""
+																i:type="AxFormStringControl">
+																<Name>RestrictionInfo</Name>
+																<AllowEdit>No</AllowEdit>
+																<AutoDeclaration>Yes</AutoDeclaration>
+																<Type>String</Type>
+																<WidthMode>SizeToAvailable</WidthMode>
+																<FormControlExtension
+																	i:nil="true" />
+																<ShowLabel>No</ShowLabel>
+																<ViewEditMode>View</ViewEditMode>
+															</AxFormControl>
+															<AxFormControl xmlns=""
+																i:type="AxFormMenuFunctionButtonControl">
+																<Name>EditRestriction</Name>
+																<ElementPosition>1802825776</ElementPosition>
+																<ExtendedStyle>button_inlineImageOnly</ExtendedStyle>
+																<FilterExpression>%1</FilterExpression>
+																<HeightMode>Auto</HeightMode>
+																<HelpText>@DocentricAX3:GoToRestrictionOptionsHelp</HelpText>
+																<Type>MenuFunctionButton</Type>
+																<VerticalSpacing>-1</VerticalSpacing>
+																<WidthMode>Auto</WidthMode>
+																<FormControlExtension
+																	i:nil="true" />
+																<ButtonDisplay>TextWithImageLeft</ButtonDisplay>
+																<MenuItemName>DocParameters</MenuItemName>
+																<NormalImage>Go</NormalImage>
+																<Parameters>RestrictPrinters</Parameters>
+																<Style>Link</Style>
+																<Text>@DocentricAX3:GoToRestrictionOptions</Text>
+															</AxFormControl>
+														</Controls>
+														<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+														<FrameType>None</FrameType>
+													</AxFormControl>
+												</Controls>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormGroupControl">
+												<Name>DummyVerticalSpacingGroup</Name>
+												<Type>Group</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormStaticTextControl">
+														<Name>DummyStaticText</Name>
+														<Type>StaticText</Type>
+														<WidthMode>SizeToAvailable</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<Text></Text>
+													</AxFormControl>
+												</Controls>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormGroupControl">
+												<Name>DetailsGroup</Name>
+												<HeightMode>SizeToAvailable</HeightMode>
+												<Type>Group</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormGroupControl">
+														<Name>DetailsListPanel</Name>
+														<ExtendedStyle>listPanel</ExtendedStyle>
+														<HeightMode>SizeToAvailable</HeightMode>
+														<Type>Group</Type>
+														<FormControlExtension
+															i:nil="true" />
+														<Controls>
+															<AxFormControl xmlns=""
+																i:type="AxFormGroupControl">
+																<Name>AllowedReportsGroup</Name>
+																<ExtendedStyle>listPanel_availPanel</ExtendedStyle>
+																<HeightMode>SizeToAvailable</HeightMode>
+																<Type>Group</Type>
+																<FormControlExtension
+																	i:nil="true" />
+																<Controls>
+																	<AxFormControl xmlns=""
+																		i:type="AxFormActionPaneControl">
+																		<Name>AllowedReportsActionPane</Name>
+																		<Type>ActionPane</Type>
+																		<FormControlExtension
+																			i:nil="true" />
+																		<Controls>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormButtonGroupControl">
+																				<Name>RestrictionsActionsButtonGroup</Name>
+																				<Type>ButtonGroup</Type>
+																				<WidthMode>SizeToAvailable</WidthMode>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<Controls>
+																					<AxFormControl xmlns=""
+																						i:type="AxFormMenuFunctionButtonControl">
+																						<Name>RestrictAllowedReportForOtherPrinters</Name>
+																						<AutoDeclaration>Yes</AutoDeclaration>
+																						<HelpText>@DocentricAX3:RestrictReportForOtherPrintersHelp</HelpText>
+																						<Type>MenuFunctionButton</Type>
+																						<FormControlExtension
+																							i:nil="true" />
+																						<DataSource>AllowedReports</DataSource>
+																						<MenuItemName>DocRestrictReportForOtherPrinters</MenuItemName>
+																						<MenuItemType>Action</MenuItemType>
+																						<MultiSelect>No</MultiSelect>
+																						<NeedsRecord>Yes</NeedsRecord>
+																						<NormalImage>Lock</NormalImage>
+																						<Parameters>Restrict</Parameters>
+																						<Text>@DocentricAX3:RestrictReportForOtherPrinters</Text>
+																					</AxFormControl>
+																					<AxFormControl xmlns=""
+																						i:type="AxFormMenuFunctionButtonControl">
+																						<Name>AllowAllowedReportForOtherPrinters</Name>
+																						<AutoDeclaration>Yes</AutoDeclaration>
+																						<HelpText>@DocentricAX4:AllowForOtherPrintersHelp</HelpText>
+																						<Type>MenuFunctionButton</Type>
+																						<FormControlExtension
+																							i:nil="true" />
+																						<DataSource>AllowedReports</DataSource>
+																						<MenuItemName>DocRestrictReportForOtherPrinters</MenuItemName>
+																						<MenuItemType>Action</MenuItemType>
+																						<MultiSelect>No</MultiSelect>
+																						<NeedsRecord>Yes</NeedsRecord>
+																						<NormalImage>Unlock</NormalImage>
+																						<Parameters>Allow</Parameters>
+																						<Text>@DocentricAX4:AllowForOtherPrinters</Text>
+																					</AxFormControl>
+																				</Controls>
+																				<DataSource>AllowedReports</DataSource>
+																			</AxFormControl>
+																		</Controls>
+																		<DataSource>AllowedReports</DataSource>
+																		<Style>Strip</Style>
+																	</AxFormControl>
+																	<AxFormControl xmlns=""
+																		i:type="AxFormGridControl">
+																		<Name>AllowedReportsGrid</Name>
+																		<AutoDeclaration>Yes</AutoDeclaration>
+																		<Type>Grid</Type>
+																		<FormControlExtension
+																			i:nil="true" />
+																		<Controls>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormStringControl">
+																				<Name>AllowedReports_ReportId</Name>
+																				<Type>String</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataField>ReportId</DataField>
+																				<DataSource>AllowedReports</DataSource>
+																			</AxFormControl>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormImageControl">
+																				<Name>ExclusivityIndicator</Name>
+																				<ExtendedStyle>image_gridIcon</ExtendedStyle>
+																				<Type>Image</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataMethod>exclusivityIndicator</DataMethod>
+																				<DataSource>AllowedReports</DataSource>
+																				<ShowLabel>No</ShowLabel>
+																			</AxFormControl>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormStringControl">
+																				<Name>AllowedReports_ReportGroupId</Name>
+																				<Type>String</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataField>ReportGroupId</DataField>
+																				<DataSource>AllowedReports</DataSource>
+																			</AxFormControl>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormStringControl">
+																				<Name>AllowedReports_ReportDescription</Name>
+																				<Type>String</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataField>ReportDescription</DataField>
+																				<DataSource>AllowedReports</DataSource>
+																				<DisplayHeight>1</DisplayHeight>
+																				<DisplayHeightMode>Fixed</DisplayHeightMode>
+																			</AxFormControl>
+																		</Controls>
+																		<DataSource>AllowedReports</DataSource>
+																	</AxFormControl>
+																</Controls>
+																<Caption>@DocentricAX3:AllowedReports</Caption>
+																<ViewEditMode>View</ViewEditMode>
+															</AxFormControl>
+															<AxFormControl xmlns=""
+																i:type="AxFormGroupControl">
+																<Name>ReportActionsGroup</Name>
+																<ExtendedStyle>listPanel_buttonPanel</ExtendedStyle>
+																<HeightMode>SizeToAvailable</HeightMode>
+																<Type>Group</Type>
+																<FormControlExtension
+																	i:nil="true" />
+																<Controls>
+																	<AxFormControl xmlns=""
+																		i:type="AxFormGroupControl">
+																		<Name>RestrictButtonGroup</Name>
+																		<Type>Group</Type>
+																		<FormControlExtension
+																			i:nil="true" />
+																		<Controls>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormButtonControl">
+																				<Name>RestrictButton</Name>
+																				<AutoDeclaration>Yes</AutoDeclaration>
+																				<NeededPermission>Update</NeededPermission>
+																				<Type>Button</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<ButtonDisplay>ImageOnly</ButtonDisplay>
+																				<MultiSelect>Yes</MultiSelect>
+																				<NeedsRecord>Yes</NeedsRecord>
+																				<NormalImage>MoveRight</NormalImage>
+																				<SaveRecord>No</SaveRecord>
+																				<Text>@DocentricAX3:Restrict</Text>
+																			</AxFormControl>
+																		</Controls>
+																		<DataSource>AllowedReports</DataSource>
+																	</AxFormControl>
+																	<AxFormControl xmlns=""
+																		i:type="AxFormGroupControl">
+																		<Name>AllowButtonGroup</Name>
+																		<Type>Group</Type>
+																		<FormControlExtension
+																			i:nil="true" />
+																		<Controls>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormButtonControl">
+																				<Name>AllowButton</Name>
+																				<AutoDeclaration>Yes</AutoDeclaration>
+																				<NeededPermission>Update</NeededPermission>
+																				<Type>Button</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<ButtonDisplay>ImageOnly</ButtonDisplay>
+																				<MultiSelect>Yes</MultiSelect>
+																				<NeedsRecord>Yes</NeedsRecord>
+																				<NormalImage>MoveLeft</NormalImage>
+																				<SaveRecord>No</SaveRecord>
+																				<Text>@DocentricAX3:Allow</Text>
+																			</AxFormControl>
+																		</Controls>
+																		<DataSource>RestrictedReports</DataSource>
+																	</AxFormControl>
+																</Controls>
+																<FrameType>None</FrameType>
+															</AxFormControl>
+															<AxFormControl xmlns=""
+																i:type="AxFormGroupControl">
+																<Name>RestrictedReportsGroup</Name>
+																<ExtendedStyle>listPanel_selPanel</ExtendedStyle>
+																<HeightMode>SizeToAvailable</HeightMode>
+																<Type>Group</Type>
+																<FormControlExtension
+																	i:nil="true" />
+																<Controls>
+																	<AxFormControl xmlns=""
+																		i:type="AxFormActionPaneControl">
+																		<Name>RestrictedReportsActionPane</Name>
+																		<Type>ActionPane</Type>
+																		<FormControlExtension
+																			i:nil="true" />
+																		<Controls>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormButtonGroupControl">
+																				<Name>RestrictionsActionsButtonGroupCopy1</Name>
+																				<Type>ButtonGroup</Type>
+																				<WidthMode>SizeToAvailable</WidthMode>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<Controls>
+																					<AxFormControl xmlns=""
+																						i:type="AxFormMenuFunctionButtonControl">
+																						<Name>RestrictRestrictedReportForOtherPrinters</Name>
+																						<AutoDeclaration>Yes</AutoDeclaration>
+																						<HelpText>@DocentricAX3:RestrictReportForOtherPrintersHelp</HelpText>
+																						<Type>MenuFunctionButton</Type>
+																						<FormControlExtension
+																							i:nil="true" />
+																						<DataSource>RestrictedReports</DataSource>
+																						<MenuItemName>DocRestrictReportForOtherPrinters</MenuItemName>
+																						<MenuItemType>Action</MenuItemType>
+																						<MultiSelect>No</MultiSelect>
+																						<NeedsRecord>Yes</NeedsRecord>
+																						<NormalImage>Lock</NormalImage>
+																						<Parameters>Restrict</Parameters>
+																						<Text>@DocentricAX3:RestrictReportForOtherPrinters</Text>
+																					</AxFormControl>
+																					<AxFormControl xmlns=""
+																						i:type="AxFormMenuFunctionButtonControl">
+																						<Name>AllowRestrictedReportForOtherPrinters</Name>
+																						<AutoDeclaration>Yes</AutoDeclaration>
+																						<HelpText>@DocentricAX4:AllowForOtherPrintersHelp</HelpText>
+																						<Type>MenuFunctionButton</Type>
+																						<FormControlExtension
+																							i:nil="true" />
+																						<DataSource>RestrictedReports</DataSource>
+																						<MenuItemName>DocRestrictReportForOtherPrinters</MenuItemName>
+																						<MenuItemType>Action</MenuItemType>
+																						<MultiSelect>No</MultiSelect>
+																						<NeedsRecord>Yes</NeedsRecord>
+																						<NormalImage>Unlock</NormalImage>
+																						<Parameters>Allow</Parameters>
+																						<Text>@DocentricAX4:AllowForOtherPrinters</Text>
+																					</AxFormControl>
+																				</Controls>
+																				<DataSource>RestrictedReports</DataSource>
+																			</AxFormControl>
+																		</Controls>
+																		<DataSource>RestrictedReports</DataSource>
+																		<Style>Strip</Style>
+																	</AxFormControl>
+																	<AxFormControl xmlns=""
+																		i:type="AxFormGridControl">
+																		<Name>RestrictedReportsGrid</Name>
+																		<AutoDeclaration>Yes</AutoDeclaration>
+																		<Type>Grid</Type>
+																		<FormControlExtension
+																			i:nil="true" />
+																		<Controls>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormStringControl">
+																				<Name>RestrictedReports_ReportId</Name>
+																				<Type>String</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataField>ReportId</DataField>
+																				<DataSource>RestrictedReports</DataSource>
+																			</AxFormControl>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormStringControl">
+																				<Name>RestrictedReports_ReportGroupId</Name>
+																				<Type>String</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataField>ReportGroupId</DataField>
+																				<DataSource>RestrictedReports</DataSource>
+																			</AxFormControl>
+																			<AxFormControl xmlns=""
+																				i:type="AxFormStringControl">
+																				<Name>RestrictedReports_ReportDescription</Name>
+																				<Type>String</Type>
+																				<FormControlExtension
+																					i:nil="true" />
+																				<DataField>ReportDescription</DataField>
+																				<DataSource>RestrictedReports</DataSource>
+																				<DisplayHeight>1</DisplayHeight>
+																				<DisplayHeightMode>Fixed</DisplayHeightMode>
+																			</AxFormControl>
+																		</Controls>
+																		<DataSource>RestrictedReports</DataSource>
+																	</AxFormControl>
+																</Controls>
+																<Caption>@DocentricAX3:RestrictedReports</Caption>
+																<ViewEditMode>View</ViewEditMode>
+															</AxFormControl>
+														</Controls>
+														<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+														<FrameType>None</FrameType>
+													</AxFormControl>
+												</Controls>
+											</AxFormControl>
+										</Controls>
+										<Caption>@DocentricAX3:RestrictReportsFor</Caption>
+										<FastTabExpanded>Always</FastTabExpanded>
+										<Style>DetailsFormDetails</Style>
+									</AxFormControl>
+								</Controls>
+								<Style>FastTabs</Style>
+							</AxFormControl>
+						</Controls>
+						<FastTabExpanded>Always</FastTabExpanded>
+						<PanelStyle>Details</PanelStyle>
+						<Style>DetailsFormDetails</Style>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>GridPanel</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>CustomFilterGroup</Name>
+								<Pattern>CustomAndQuickFilters</Pattern>
+								<PatternVersion>1.1</PatternVersion>
+								<Type>Group</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl>
+										<Name>QuickFilterControl</Name>
+										<FormControlExtension>
+											<Name>QuickFilterControl</Name>
+											<ExtensionComponents />
+											<ExtensionProperties>
+												<AxFormControlExtensionProperty>
+													<Name>targetControlName</Name>
+													<Type>String</Type>
+													<Value>PrintersGrid</Value>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>placeholderText</Name>
+													<Type>String</Type>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>defaultColumnName</Name>
+													<Type>String</Type>
+													<Value>PrintersGrid_PrinterName</Value>
+												</AxFormControlExtensionProperty>
+											</ExtensionProperties>
+										</FormControlExtension>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>FilterCombo</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<EnumType>DocRestrictPrinterOrReportFilter</EnumType>
+										<Label>@DocentricAX3:ShowPrinters</Label>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>ReportId</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<ExtendedDataType>DocReportId</ExtendedDataType>
+										<LookupButton>Always</LookupButton>
+									</AxFormControl>
+								</Controls>
+								<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+								<FrameType>None</FrameType>
+								<Style>CustomFilter</Style>
+								<ViewEditMode>Edit</ViewEditMode>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGridControl">
+								<Name>PrintersGrid</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<Type>Grid</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>PrinterInfo_PrinterName</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>PrinterName</DataField>
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SysCorpNetPrinters_PrinterPath</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>PrinterPath</DataField>
+										<DataSource>SysCorpNetPrinters</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SysCorpNetPrinters_Description</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>Description</DataField>
+										<DataSource>SysCorpNetPrinters</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>SysCorpNetPrinters_Active1</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>Active</DataField>
+										<DataSource>SysCorpNetPrinters</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>PrinterInfo_RestrictForUnregisteredReports</Name>
+										<Type>CheckBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>RestrictForUnregisteredReports</DataField>
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>PrinterInfo_RestrictForNewReports</Name>
+										<Type>CheckBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>RestrictForNewReports</DataField>
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormInt64Control">
+										<Name>PrinterInfo_NumberOfRestrictedReports</Name>
+										<Type>Int64</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataMethod>getNumberOfRestrictedReports</DataMethod>
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+										<Label>@DocentricAX3:NoOfRestrictedReports</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormInt64Control">
+										<Name>PrinterInfo_NumberOfAllowedReports</Name>
+										<Type>Int64</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataMethod>getNumberOfAllowedReports</DataMethod>
+										<DataSource>DocRestrictedPrinterInfo</DataSource>
+										<Label>@DocentricAX3:NoOfAllowedReports</Label>
+									</AxFormControl>
+								</Controls>
+								<DataSource>DocRestrictedPrinterInfo</DataSource>
+								<DefaultAction>MainGridDefaultAction</DefaultAction>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormCommandButtonControl">
+								<Name>MainGridDefaultAction</Name>
+								<Type>CommandButton</Type>
+								<Visible>No</Visible>
+								<FormControlExtension
+									i:nil="true" />
+								<Command>DetailsView</Command>
+							</AxFormControl>
+						</Controls>
+						<PanelStyle>Grid</PanelStyle>
+						<Style>DetailsFormGrid</Style>
+					</AxFormControl>
+				</Controls>
+				<ArrangeMethod>Vertical</ArrangeMethod>
+				<ShowTabs>No</ShowTabs>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

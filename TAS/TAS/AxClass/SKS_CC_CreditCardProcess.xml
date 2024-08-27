@@ -1,0 +1,3163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CreditCardProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Retail=Microsoft.Dynamics.Retail;
+using RetailConst=Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants;
+class SKS_CC_CreditCardProcess extends CreditCardProviderProcess
+{
+    SKS_CC_CustPaymTable    sKS_CC_CustPaymTable;
+    LedgerJournalTrans      sKS_CC_ledgerJournalTrans;
+    RecId                   sKS_CC_CustPaymTableRecId;
+    boolean                 isCalledFromSKS_CC;
+    boolean                 isVoidCapture;
+    boolean                 isPaymJourCVCSuccess;
+
+    CustConfirmDocNum       sKS_CC_CustConfirmJourDocNum;
+    SMAServiceOrderTable    sKS_CC_SMAServiceOrderTable;
+    ProjInvoiceJour         sKS_CC_ProjInvoiceJour;
+
+    public const str TaxTypeIdentifier = 'AlternateTax';
+    public const str TaxDescription = 'Total Tax';
+
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_CreditCardProcess construct(CreditCardOperation _operation, Common _record)
+    {
+        SKS_CC_CreditCardProcess process = new SKS_CC_CreditCardProcess();
+
+        process.parmOperation(_operation);
+
+        process.init(_record);
+
+        return process;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    protected void init(Common _record)
+    {        
+        //SKS-Code below comes from CreditCardProcess - Start
+        switch (_record.TableId)
+        {
+            case tableNum(SalesTable):
+                salesTable = _record;
+                creditCardTrans = CreditCardAuthTrans::findValidPreApproval(salesTable.SalesId);
+
+                //SKS-Begin
+                if (creditCardTrans.SKS_CC_CustPaymTable)
+                {
+                    sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findByRecID(creditCardTrans.SKS_CC_CustPaymTable);
+                }
+                //SKS-End
+                break;
+            case tableNum(CreditCardAuthTrans):
+                creditCardTrans = _record;
+
+                if (creditCardTrans.SalesId)
+                {
+                    salesTable = SalesTable::find(creditCardTrans.SalesId);
+                }
+
+                if (creditCardTrans.MCRPaymRecId)
+                {
+                    mcrCustPaymTable = mcrCustPaymTable::findByRecID(creditCardTrans.MCRPaymRecId);
+                }                
+                
+                //SKS-Begin
+                if (creditCardTrans.SKS_CC_CustPaymTable)
+                {
+                    sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findByRecID(creditCardTrans.SKS_CC_CustPaymTable);
+                    this.parmIsCalledFromSKS_CC(true);
+                }
+                //SKS-End
+                break;            
+            case tableNum(MCRCustPaymTable):
+                mcrCustPaymTable = _record;
+                creditCardTrans = CreditCardAuthTrans::mcrfindValidPreApproval(mcrCustPaymTable.RecId);
+                // Sales table is required to submit the authorization so set the sales table.
+                switch (mcrCustPaymTable.RefTableId)
+                {
+                    case tableNum(salesTable):
+                        salesTable = salesTable::findRecId(mcrCustPaymTable.RefRecId);
+                        break;
+                    case tableNum(CustInvoiceTable):
+                        custInvoiceTable = CustInvoiceTable::findRecId(mcrCustPaymTable.RefRecId);
+                        break;
+                    case tableNum(ledgerJournalTrans):
+                        ledgerJournalTrans = ledgerJournalTrans::findRecId(mcrCustPaymTable.RefRecId, false);
+                        break;
+                    case tableNum(custPaymSchedLine):
+                        CustPaymSchedLine = custPaymSchedLine::mcrFindByRecID(mcrCustPaymTable.RefRecId, false);
+                        break;
+                }
+                break;
+            //SKS-Begin
+            case tableNum(SKS_CC_CustPaymTable):
+                sKS_CC_CustPaymTable = _record;
+                this.parmIsCalledFromSKS_CC(true);
+
+                creditCardTrans = CreditCardAuthTrans::sKS_CC_FindValidPreApproval(sKS_CC_CustPaymTable.RecId);
+
+                switch (sKS_CC_CustPaymTable.RefTableId)
+                {
+                    case tableNum(salesTable):
+                        salesTable = salesTable::findRecId(sKS_CC_CustPaymTable.RefRecId);
+                        break;
+                    case tableNum(ledgerJournalTrans):
+                        sKS_CC_ledgerJournalTrans = ledgerJournalTrans::findRecId(sKS_CC_CustPaymTable.RefRecId, false);
+                        break;
+                    case tableNum(SMAServiceOrderTable):
+                        sKS_CC_SMAServiceOrderTable = SMAServiceOrderTable::sKS_CC_FindRecId(sKS_CC_CustPaymTable.RefRecId);
+                        break;
+                }
+                break; 
+            //SKS-End
+        }
+
+        // If credit card is for an order determine if order completion is enabled for it's channel
+        // otherwise use the channel for the current user.
+        if (salesTable)
+        {
+            mcrEnableOrderCompletion = RetailMCRChannelTable::mcrEnableOrderCompletion(salesTable);
+        }
+        else
+        {
+            mcrEnableOrderCompletion = RetailMCRChannelTable::mcrEnableOrderCompletionFindByUser();
+        }
+        //SKS-Code from CreditCardProcess - End
+
+        //SKS-Begin
+        //SKS-Code below comes from CreditCardProviderProcess - Start
+        // CCA: If salesTable record is passed then reread record to ensure that it has latest changes.
+        if (salesTable.RecId && this.parmOperation() != CreditCardOperation::Void)
+        {
+            salesTable.reread();
+        }
+        //SKS-End
+
+        if (salesTable.CreditCardCustRefId)
+        {
+            creditCardCust = CreditCardCust::find(salesTable.CreditCardCustRefId);
+        }
+        //SKS-Begin
+        else if (SKS_CC_CustPaymTable)
+        {
+            creditCardCust = creditCardCust::find(SKS_CC_CustPaymTable.CreditCardCustRefId);
+        }
+        //SKS-End
+        else if (mcrCustPaymTable)
+        {
+            creditCardCust = creditCardCust::find(mcrCustPaymTable.PaymInfoRecId);
+        }
+
+        if (!creditCardCust && !creditCardTrans)
+        {
+            //SKS-Begin
+            //CCA: Provide a better error message.
+            //throw error(Error::wrongUseOfFunction(funcName()));
+            // The credit card number must be specfied
+            throw error("@SYS116746");
+            //SKS-End
+        }
+
+        if (creditCardTrans && creditCardTrans.CreditCardProcessors)
+        {
+            this.initProcessor(creditCardTrans.CreditCardProcessors);
+        }
+        else
+        {
+            this.initProcessor(creditCardCust.CreditCardProcessors);
+        }
+
+        if (creditCardTrans && creditCardTrans.CreditCardTypeName)
+        {
+            this.initCardType(creditCardTrans.CreditCardTypeName);
+        }
+        else
+        {
+            this.initCardType(creditCardCust.CreditCardTypeName);
+        }
+
+        if (creditCardTrans && creditCardTrans.CreditCardNumber)
+        {
+            creditCardNumber = creditCardTrans.CreditCardNumber;
+        }
+        else
+        {
+            if (!(salesTable.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTable)) ||
+                salesTable.CreditCardCustRefId)
+            {
+                creditCardNumber = CreditCardCust::find(salesTable.CreditCardCustRefId).CardNumber;
+            }
+            else
+            {
+                creditCardNumber = CreditCardCust::find(mcrCustPaymTable.PaymInfoRecId).CardNumber;
+            }
+        }
+
+        if (!creditCardNumber && creditCardCust.CardNumber)
+        {
+            creditCardNumber = creditCardCust.CardNumber;
+        }
+
+        if (!creditCardCust && creditCardTrans.UniqueCardId)
+        {
+            creditCardCust = creditCardCust::findByUniqueCardId(creditCardTrans.UniqueCardId);
+            if (!creditCardNumber)
+            {
+                creditCardNumber = creditCardCust.CardNumber;
+            }
+        } 
+
+        companyInfo = CompanyInfo::find();
+        creditCardPreAuthorization = CustParameters::find().CreditCardPreAuthorization;
+        processSucceed = true;
+        //SKS-Code from CreditCardProviderProcess - End
+
+        if (accountSetup && accountSetup.DisallowZeroAmount != NoYes::Yes)
+        {
+            accountSetup.DisallowZeroAmount = NoYes::Yes;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_ProjInvoiceJour</Name>
+				<Source><![CDATA[
+    public ProjInvoiceJour parmSKS_CC_ProjInvoiceJour(ProjInvoiceJour _sKS_CC_ProjInvoiceJour = sKS_CC_ProjInvoiceJour)
+    {
+        sKS_CC_ProjInvoiceJour = _sKS_CC_ProjInvoiceJour;
+        return sKS_CC_ProjInvoiceJour;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_SMAServiceOrderTable</Name>
+				<Source><![CDATA[
+    public SMAServiceOrderTable parmSKS_CC_SMAServiceOrderTable(SMAServiceOrderTable _sKS_CC_SMAServiceOrderTable = sKS_CC_SMAServiceOrderTable)
+    {
+        sKS_CC_SMAServiceOrderTable = _sKS_CC_SMAServiceOrderTable;
+        return sKS_CC_SMAServiceOrderTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsCalledFromSKS_CC</Name>
+				<Source><![CDATA[
+    boolean parmIsCalledFromSKS_CC(boolean _isCalledFromSKS_CC = isCalledFromSKS_CC)
+    {
+        isCalledFromSKS_CC = _isCalledFromSKS_CC;
+        return isCalledFromSKS_CC;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_CustPaymTable</Name>
+				<Source><![CDATA[
+    protected SKS_CC_CustPaymTable parmSKS_CC_CustPaymTable(SKS_CC_CustPaymTable _sKS_CC_CustPaymTable = sKS_CC_CustPaymTable)
+    {
+        sKS_CC_CustPaymTable = _sKS_CC_CustPaymTable;
+        return sKS_CC_CustPaymTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_CustPaymTableRecId</Name>
+				<Source><![CDATA[
+    public RecId parmSKS_CC_CustPaymTableRecId(RecId _sKS_CC_CustPaymTableRecId = sKS_CC_CustPaymTableRecId)
+    {
+        sKS_CC_CustPaymTableRecId = _sKS_CC_CustPaymTableRecId;
+        return sKS_CC_CustPaymTableRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_IsVoidCapture</Name>
+				<Source><![CDATA[
+    boolean parmSKS_CC_IsVoidCapture(boolean _isVoidCapture = isVoidCapture)
+    {
+        isVoidCapture = _isVoidCapture;
+        return isVoidCapture;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_LedgerJournalTrans</Name>
+				<Source><![CDATA[
+    public ledgerJournalTrans parmSKS_CC_LedgerJournalTrans(LedgerJournalTrans _sKS_CC_ledgerJournalTrans = sKS_CC_ledgerJournalTrans)
+    {
+        sKS_CC_ledgerJournalTrans = _sKS_CC_ledgerJournalTrans;
+        return sKS_CC_ledgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetRefundAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets the amount to refund to the credit card.
+    /// </summary>
+    /// <param name="_amountToRefund">
+    ///    The amount to refund to the credit card.
+    /// </param>
+    private void sKS_CC_SetRefundAmount(AmountCur _amountToRefund)
+    {
+        totalAmountCur  = _amountToRefund;
+        currencyCode    = sKS_CC_CustPaymTable.CreditCardCurrency;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_updateLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the ledger journal line table.
+    /// </summary>
+    /// <returns>
+    ///    true if the journal line table is updated successfully; otherwise, false.
+    /// </returns>
+    public boolean sKS_CC_updateLedgerJournalTrans()
+    {
+        return CreditCard::sKS_CC_updateLedgerJournalTrans(sKS_CC_ledgerJournalTrans.RecId, providerResult, this.processSucceed());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetCurrencyCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the currency code from the transaction
+    /// </summary>
+    /// <returns>
+    /// <c>CurrencyCode</c> based on the transaction that is passed in.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Method requires a transaction table; throw error if one is not available.
+    /// </exception>
+    protected CurrencyCode sKS_CC_GetCurrencyCode()
+    {
+        anytype currencyCodeLocal;
+
+        if (SalesTable)
+        {
+            currencyCodeLocal = salesTable.CurrencyCode;
+        }
+        else if (sKS_CC_ledgerJournalTrans)
+        {
+            currencyCodeLocal = sKS_CC_ledgerJournalTrans.CurrencyCode;
+        }
+        else if (sKS_CC_CustPaymTable)
+        {
+            currencyCodeLocal = sKS_CC_CustPaymTable.CreditCardCurrency;
+        } 
+        else if (creditCardTrans)
+        {
+            currencyCodeLocal = creditCardTrans.CurrencyCode;
+        }
+        else
+        {
+            throw error("@SYS89176");
+        }
+        return currencyCodeLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetInvoiceAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the invoice account related to the transaction.
+    /// </summary>
+    /// <returns>
+    /// <c>CustAccount</c> based on the transaction that is passed in.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Method requires a transaction table; throw error if one is not available.
+    /// </exception>
+    protected CustAccount sKS_CC_GetInvoiceAccount()
+    {
+        CustAccount invoiceAccount;
+
+        if (SalesTable)
+        {
+            invoiceAccount = salesTable.InvoiceAccount;
+        }
+        else if (sKS_CC_ledgerJournalTrans)
+        {
+            invoiceAccount = sKS_CC_ledgerJournalTrans.accountDisplay();
+        }
+        else if (sKS_CC_CustPaymTable)
+        {
+            invoiceAccount = sKS_CC_CustPaymTable.CustAccount;
+        }
+        else
+        {
+            throw error("@SYS89176");
+        }
+        return invoiceAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetTransactionId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the transaction ID.
+    /// </summary>
+    /// <returns>
+    /// <c>SalesId</c>, <c>JournalNum</c> based on the transaction that is passed in.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Method requires a transaction table; throw error if one is not available.
+    /// </exception>
+    protected Num sKS_CC_GetTransactionId()
+    {
+        Num     transactionId;
+
+        if (SalesTable)
+        {
+            transactionId = salesTable.SalesId;
+        }
+        else if (sKS_CC_ledgerJournalTrans)
+        {
+            transactionId = sKS_CC_ledgerJournalTrans.JournalNum;
+        }
+        else if (sKS_CC_SMAServiceOrderTable)
+        {
+            transactionId = sKS_CC_SMAServiceOrderTable.ServiceOrderId;
+        }
+        else if (sKS_CC_ProjInvoiceJour)
+        {
+            transactionId = sKS_CC_ProjInvoiceJour.ProposalId;
+        }
+        else if (sKS_CC_CustPaymTable)
+        {
+            transactionId = sKS_CC_CustPaymTable.RefOriginId;
+        } 
+        else
+        {
+            throw error("@SYS89176");
+        }
+        return transactionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkFreight</Name>
+				<Source><![CDATA[
+    AmountCur checkFreight(AmountCur _amt = 0)
+    {
+        AmountCur freight = 0;
+
+        if (salesTable)
+        {
+            if (DlvTerm::find(salesTable.DlvTerm).SKS_CC_AddFreightToCCAuth == NoYes::Yes)
+            {
+                freight = salesTable.projectedFreightCharge(_amt);
+            }
+        }
+
+        return freight;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidCurrencyCodeForCreditCard</Name>
+				<Source><![CDATA[
+    public boolean isValidCurrencyCodeForCreditCard()
+    {
+        CreditCardProcessors processors;
+        CreditCardTypeSetup  cardSetup;
+        boolean ret;
+        
+        //SKS-Begin
+        processors = CreditCardProcessors::find(this.parmCreditCardProcessor());
+        if (this.parmIsCalledFromSKS_CC())
+        {
+            if (salesTable.CreditCardCustRefId)
+            {
+                cardSetup = CreditCardTypeSetup::find(processors, CreditCardCust::find(salesTable.CreditCardCustRefId).CreditCardTypeName);
+            }
+            else if (sKS_CC_CustPaymTable)
+            {
+                cardSetup = CreditCardTypeSetup::find(processors, CreditCardCust::find(sKS_CC_CustPaymTable.CreditCardCustRefId).CreditCardTypeName);
+                currencyCode = sKS_CC_CustPaymTable.CreditCardCurrency;
+            }
+            else if (creditCardTrans)
+            {
+                cardSetup = CreditCardTypeSetup::find(processors, creditCardTrans.CreditCardTypeName);
+                currencyCode = creditCardTrans.CurrencyCode;
+            }
+        }
+        else
+        {
+            if (MCROrderParameters::isCallCenterEnabledAndInUse())
+            {
+                if (salesTable.CreditCardCustRefId)
+                {
+                    cardSetup = CreditCardTypeSetup::find(processors, CreditCardCust::find(salesTable.CreditCardCustRefId).CreditCardTypeName);
+                }
+                else if (mcrCustPaymTable)
+                {
+                    cardSetup = CreditCardTypeSetup::find(processors, CreditCardCust::find(mcrCustPaymTable.PaymInfoRecId).CreditCardTypeName);
+                    currencyCode = mcrCustPaymTable.CurrencyCode;
+                }
+                else if (creditCardTrans)
+                {
+                    cardSetup = CreditCardTypeSetup::find(processors, creditCardTrans.CreditCardTypeName);
+                    currencyCode = creditCardTrans.CurrencyCode;
+                }
+            }
+            else
+            {
+                if (salesTable.CreditCardCustRefId)
+                {
+                    cardSetup = CreditCardTypeSetup::find(processors, CreditCardCust::find(salesTable.CreditCardCustRefId).CreditCardTypeName);
+                }
+                else if (creditCardTrans)
+                {
+                    cardSetup = CreditCardTypeSetup::find(processors, creditCardTrans.CreditCardTypeName);
+                    currencyCode = creditCardTrans.CurrencyCode;
+                }
+            }
+        }
+
+        ret = CreditCardTypeCurrency::exist(cardSetup, currencyCode);
+        //SKS-End
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the sales table.
+    /// </summary>
+    /// <returns>
+    ///    true if the sales table is updated successfully; otherwise, false.
+    /// </returns>
+    public boolean updateSalesTable()
+    {
+        boolean ret = true;
+
+        //SKS-Begin
+        if (!this.parmSKS_CC_IsVoidCapture())
+        {
+            if (salesTable)
+            {
+                ret = super();
+            }
+        }
+        //SKS-End
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetMarkedAmount</Name>
+				<Source><![CDATA[
+    public static AmountCur sKS_CC_GetMarkedAmount(salesTable _salesTable)
+    {
+        AmountCur   retAmount;
+
+        retAmount = SpecTransManager::getTotalSettleAmountForSpecReference(
+            _salesTable.company(),
+            _salesTable.TableId,
+            _salesTable.RecId,
+            _salesTable.CurrencyCode,
+            _salesTable.Company(),
+            DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+
+        return -retAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoCapture</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Captures the amount of the passed in record.
+    /// </summary>
+    /// <param name="_record">
+    /// <c>sKS_CC_CustPaymTable</c> or <c>CreditCardAuthTrans</c> record to be captured.
+    /// </param>
+    /// <param name="_salesInvoiceId">
+    /// Invoice ID of the related <c>CustInvoiceJour</c> record; optional.
+    /// </param>
+    /// <param name="_custInvoiceJour">
+    /// Invoice record generated during the invoicing process; optional.
+    /// </param>
+    /// <param name="_amount">
+    ///     The positive amount to post.
+    /// </param>
+    /// <returns>
+    /// true if capture was successful; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// <c>SalesInvoiceId</c> and <c>CustInvoiceJour</c> are both passed in
+    /// to improve usability of method.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// Require record for processing; throw error if not proivded.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Related table of payment must be <c>CustInvoiceTable</c>,<c>LedgerJournalTrans</c>, or <c>SalesTable</c>;
+    /// throw error if not the case.
+    /// </exception>
+    public static boolean sKS_CC_DoCapture(Common  _record,
+                                       SalesInvoiceId  _salesInvoiceId = '',
+                                       CustInvoiceJour _custInvoiceJour = null,
+                                       Amount _amount = 0)
+    {
+        SKS_CC_CreditCardProcess process;
+        CreditCardAuthTrans     authTrans;
+        SKS_CC_CustPaymTable    sKS_CC_CustPaymTable;
+        CreditCardOperation     ccOperation = CreditCardOperation::AuthorizeAndCapture;
+        str                     strTimeStamp;
+        utcDateTime             curDateTime;
+
+        if (_record)
+        {
+            if (_amount < 0)
+            {
+                ccOperation = CreditCardOperation::Refund;
+            }
+            process = SKS_CC_CreditCardProcess::construct(ccOperation, _record);
+
+            if (_record.TableId == tableNum(CreditCardAuthTrans))
+            {
+                authTrans = _record;
+                sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findByRecID(authTrans.SKS_CC_CustPaymTable);
+            }
+            else if (_record.TableId == tableNum(SKS_CC_CustPaymTable))
+            {
+                sKS_CC_CustPaymTable = _record;
+            }
+
+            if (sKS_CC_CustPaymTable)
+            {
+                process.setAmountFromSales(_amount, sKS_CC_CustPaymTable.CreditCardCurrency);
+                switch (sKS_CC_CustPaymTable.RefTableId)
+                {
+                    case tableNum(SalesTable):
+                        process.parmSalesInvoiceId(_salesInvoiceId);
+                        process.parmCustInvoiceJour(_custInvoiceJour);
+                        break;
+                    case tableNum(ledgerJournalTrans):
+                        LedgerJournalTrans ledgerJournalTransLocSKS = ledgerJournalTrans::findRecId(sKS_CC_CustPaymTable.RefRecId, false);
+                        process.parmSKS_CC_LedgerJournalTrans(ledgerJournalTransLocSKS);
+
+                        curDateTime = DateTimeUtil::getSystemDateTime();
+                        strTimeStamp = strFmt('%1%2%3',
+                            DateTimeUtil::hour(curDateTime),
+                            DateTimeUtil::minute(curDateTime),
+                            DateTimeUtil::second(curDateTime));
+
+                        if (ledgerJournalTransLocSKS.MarkedInvoiceRecId && ledgerJournalTransLocSKS.MarkedInvoice)
+                        {
+                            process.parmSalesInvoiceId(strFmt('%1_%2', ledgerJournalTransLocSKS.MarkedInvoice, strTimeStamp));
+                        }
+                        else
+                        {
+                            process.parmSalesInvoiceId(strFmt('%1_%2', ledgerJournalTransLocSKS.Voucher, strTimeStamp));
+                        }
+
+                        // CCA: Set currency code on invoice object without record so that it can be used correctly to determine PurchaseLevel type
+                        _custInvoiceJour.CurrencyCode = sKS_CC_CustPaymTable.CreditCardCurrency;
+                        process.parmCustInvoiceJour(_custInvoiceJour);
+                        break;
+                    default:
+                        throw error(strFmt("@SKS6483", int642str(sKS_CC_CustPaymTable.RefTableId), tableId2Name(sKS_CC_CustPaymTable.RefTableId)));
+                }
+                process.parmSKS_CC_CustPaymTableRecId(sKS_CC_CustPaymTable.RecId);
+            }
+        }
+        else
+        {
+            throw error("@SKS6484");
+        }
+
+        authTrans = process.parmCreditCardAuthTrans();
+
+        if(authTrans)
+        {
+            // if authorization is already done, chech if the amount is sufficient
+            if(authTrans.ApprovalAmountCur >= process.parmTotalAmountCur())
+            {
+                // authorization is sufficient, just need to capture
+                process.parmOperation(CreditCardOperation::CaptureAfterAuthorize);
+            }
+            else
+            {
+                // authorization is insufficient, void the authorization and then authorize and capture.
+                info("@SYS116938");
+                if(!SKS_CC_CreditCardProcess::sKS_CC_doVoidAuth(authTrans, false))
+                {
+                    return false;
+                }
+            }
+        }
+        return process.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoPreAuth</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Authorizes the amount on the passed in record.
+    /// </summary>
+    /// <param name="_record">
+    /// <c>SKS_CC_CustPaymTable</c> or <c>CreditCardAuthTrans</c> record to be authorized.
+    /// </param>
+    /// <param name="_presentExtraMsg">
+    /// Determines whether or not messages are displayed.
+    /// </param>
+    /// <returns>
+    /// true if authorization was successful; otherwise, false.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Passed in common must be either a <c>MCRCustPaymTable</c> or <c>CreditCardAuthTrans</c>,
+    /// throw error if not.
+    /// </exception>
+    public static boolean sKS_CC_DoPreAuth(Common _record,
+        boolean _presentExtraMsg = true
+        //SKS-Begin
+        , str _sKS_CC_CustConfirmJourDocNum = ''
+        //SKS-End
+        )
+    {
+        SKS_CC_CreditCardProcess process;
+        CreditCardAuthTrans     authTrans;
+        SKS_CC_CustPaymTable    sKS_CC_CustPaymTable;
+        CreditCardAuthTrans     creditCardAuthTrans;
+        SMAServiceOrderTable    serviceOrderTableLocal;
+
+        //SKS-Begin
+        SalesTotals salesTotals;
+        SalesTable salesTable;
+        AmountCur markedAmount, invoiceAmount, authAmount;
+        //SKS-End
+
+        // do nothing if no pre-authorize required
+        if(!CustParameters::find().CreditCardPreAuthorization)
+        {
+            return true;
+        }
+
+        if (_record)
+        {
+            process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Authorize, _record);
+            if (_record.TableId == tableNum(SKS_CC_CustPaymTable))
+            {
+                sKS_CC_CustPaymTable = _record;
+                process.setAmountFromSales(sKS_CC_CustPaymTable.getUnpostedAmount(), sKS_CC_CustPaymTable.CreditCardCurrency);
+
+                if (sKS_CC_CustPaymTable.RefTableId == tableNum(SMAServiceOrderTable))
+                {
+                    select serviceOrderTableLocal
+                        where serviceOrderTableLocal.RecId == sKS_CC_CustPaymTable.RefRecId;
+
+                    if (serviceOrderTableLocal)
+                    {
+                        process.parmSKS_CC_SMAServiceOrderTable(serviceOrderTableLocal);
+                    }
+                }
+            }
+            else if (_record.TableId == tableNum(CreditCardAuthTrans))
+            {
+                creditCardAuthTrans = _record;
+                process.setAmountFromSales(creditCardAuthTrans.ApprovalAmountCur,creditCardAuthTrans.CurrencyCode);
+            }
+            else if (_record.TableId == tableNum(SalesTable))
+            {
+                salesTable = _record;
+                if (!salesTable.sKS_CC_IsCreditCardPaymMode())
+                {
+                    throw error(strFmt("@SKS6488", salesTable.SalesId, salesTable.Payment, salesTable.PaymMode,
+                           enum2str(CustPaymentType::CreditCard), enum2str(CustVendPaymStatus::None)));
+                }
+                
+                salesTotals = SalesTotals_Sales::construct(salesTable, SalesUpdate::All);
+
+                //SKS-Begin
+                //Skip pre-authorizations if amount to authorize is zero to avoid error during processing
+                invoiceAmount = salesTotals.totalAmount();
+                markedAmount = SKS_CC_CreditCardProcess::sKS_CC_GetMarkedAmount(salesTable);
+                authAmount = invoiceAmount - markedAmount;
+
+                if ((abs(authAmount) > abs(invoiceAmount)) || !authAmount)
+                {
+                    return true;
+                }
+
+                if ((invoiceAmount >= 0 && authAmount < 0) ||
+                    (invoiceAmount <= 0 && authAmount > 0))
+                {
+                    return true;
+                }
+
+                if (SKS_PP_Setup::isCreditCardPayLinkEnabled() &&
+                    SKS_CC_PayLinkQueue::salesOrderHasPendingPayLink(salesTable))
+                {
+                    throw error(strFmt("@SKS:SKGCCProcessNotAllowedForSOSincePayLinkExist", salesTable.SalesId));
+                }
+
+                // Change authorization amount to exclude any marked for settlement records
+                process.setAmountFromSales(authAmount, salesTotals.currencyCode());
+                //SKS-End
+            }
+            else
+            {                
+                throw error (error::wrongUseOfFunction(funcName()));                
+            }
+        }
+        else
+        {
+            throw error (error::wrongUseOfFunction(funcName()));
+        }
+
+        process.parmGetCardVerificationValue(_presentExtraMsg);
+
+        // do nothing if pre-authorization is already done, and amount is sufficient
+        authTrans = process.parmCreditCardAuthTrans();
+        if(authTrans)
+        {
+            PositiveNumber captureToAuthAmtDiffPct = CreditCardAccountSetup::findActive().SKS_CC_CaptureAmtOverAuthAmtPct;
+            Amount authAmtWithPctDiffAllowance;
+
+            if (captureToAuthAmtDiffPct)
+            {
+                authAmtWithPctDiffAllowance = CurrencyExchangeHelper::amount(authTrans.ApprovalAmountCur * ((100 + captureToAuthAmtDiffPct) / 100), authTrans.CurrencyCode);
+            }
+
+            // if authorization is already done, chech if the amount is sufficient
+            // or within the capture to auth amount difference allowance %
+            if (authTrans.ApprovalAmountCur >= process.parmTotalAmountCur() ||
+                authAmtWithPctDiffAllowance >= process.parmTotalAmountCur())
+            {            
+                if(_presentExtraMsg)
+                {
+                    info("@SYS122586");
+                }
+                return true;
+            }
+            else
+            {
+                // void the existing pre-authorization if amount is insufficient
+                if(!SKS_CC_CreditCardProcess::sKS_CC_doVoidAuth(authTrans, false))
+                {
+                    return false;
+                }                
+            }
+        }
+
+        //SKS-Begin
+        process.parmSKS_CC_CustConfirmJourDocNum(_sKS_CC_CustConfirmJourDocNum);
+        //SKS-End
+
+        return process.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoRefund</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Refunds the amount on the passed in <c>_sKS_CC_CustPaymTable</c> record.
+    /// </summary>
+    /// <param name="_sKS_CC_CustPaymTable">
+    /// Credit card payment record to be refunded.
+    /// </param>
+    /// <returns>
+    /// true if refund was successful; otherwise, false.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// <c>SKS_CC_CustPaymTable</c> record required for processing, throw error if not provided.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// <c>CreditCardAuthTrans</c> record required for refund, throw error if not found.
+    /// </exception>
+    public static boolean sKS_CC_DoRefund(SKS_CC_CustPaymTable _sKS_CC_CustPaymTable)
+    {
+        CreditCardAuthTrans creditCardAuthTrans;
+        SKS_CC_CreditCardProcess process;
+        str                 strTimeStamp;
+        utcDateTime         curDateTime;
+        CustInvoiceJour     custInvoiceJour;
+
+        if (!_sKS_CC_CustPaymTable)
+        {
+            throw error (error::wrongUseOfFunction(funcName()));
+        }
+
+        if (SKS_PP_Setup::find().CCAllowRefundNoOrigTrans == NoYes::No && !_sKS_CC_CustPaymTable.OrigAuthorizationForRefund)
+        {
+            throw error("@SKS6485");
+        }
+
+        if (_sKS_CC_CustPaymTable.OrigAuthorizationForRefund)
+        {
+            creditCardAuthTrans = CreditCardAuthTrans::sKS_CC_FindRefundCharge(_sKS_CC_CustPaymTable.OrigAuthorizationForRefund, true);
+            if (!creditCardAuthTrans)
+            {
+                throw error(strFmt("@SKS6486", _sKS_CC_CustPaymTable.OrigAuthorizationForRefund));
+            }
+        }
+
+        if (creditCardAuthTrans)
+        {
+            process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Refund,creditCardAuthTrans);
+        }
+        else
+        {
+            process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Refund,_sKS_CC_CustPaymTable);
+        }
+
+        process.parmSKS_CC_CustPaymTable(_sKS_CC_CustPaymTable);
+        process.parmSKS_CC_CustPaymTableRecId(_sKS_CC_CustPaymTable.RecId);
+        process.parmIsCalledFromSKS_CC(true);
+        process.sKS_CC_SetRefundAmount(-_sKS_CC_CustPaymTable.CreditCardTransAmountCur);
+
+        if (_sKS_CC_CustPaymTable.RefTableId == tableNum(LedgerJournalTrans))
+        {
+            process.parmSKS_CC_LedgerJournalTrans(LedgerJournalTrans::findRecId(_sKS_CC_CustPaymTable.RefRecId, false));
+            curDateTime = DateTimeUtil::getSystemDateTime();
+            strTimeStamp = strFmt('%1%2%3',
+                DateTimeUtil::hour(curDateTime),
+                DateTimeUtil::minute(curDateTime),
+                DateTimeUtil::second(curDateTime));
+
+            process.parmSalesInvoiceId(strFmt('%1_%2', process.parmSKS_CC_LedgerJournalTrans().Voucher, strTimeStamp));
+
+            // CCA: Set currency code on invoice object without record so that it can be used correctly to determine PurchaseLevel type
+            custInvoiceJour.CurrencyCode = _sKS_CC_CustPaymTable.CreditCardCurrency;
+            process.parmCustInvoiceJour(custInvoiceJour);
+        }
+
+        if (creditCardAuthTrans.SalesInvoiceId)
+        {
+            process.parmSalesInvoiceId(creditCardAuthTrans.SalesInvoiceId);
+        }
+
+        return process.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoVoidCapture</Name>
+				<Source><![CDATA[
+    public static boolean sKS_CC_DoVoidCapture(CreditCardAuthTrans _creditCardAuthTrans2Void, boolean _showSuccessMessage = true, str _successDescriptionOverride = '')
+    {
+        SKS_CC_CreditCardProcess process;
+
+        process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Void, _creditCardAuthTrans2Void);
+
+        process.sKS_CC_SetAmountFromAuthTrans(_creditCardAuthTrans2Void);
+        process.parmSKS_CC_IsVoidCapture(true);
+
+        return process.process(_showSuccessMessage, _successDescriptionOverride);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetAmountFromAuthTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the amount to be processed on the credit card from a pre-authorization.
+    /// </summary>
+    /// <param name="_authTrans">
+    /// A <c>CreditCardAuthTrans</c> record.
+    /// </param>
+    private void sKS_CC_SetAmountFromAuthTrans(CreditCardAuthTrans _authTrans)
+    {
+        totalAmountCur = _authTrans.ApprovalAmountCur;
+        currencyCode = _authTrans.CurrencyCode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public boolean process(boolean _showSuccessMessage = true, str _successDescriptionOverride = '')
+    {
+        boolean ret = true;
+        
+        if (this.parmIsCalledFromSKS_CC())
+        {
+            if (!sKS_CC_ProjInvoiceJour)
+            {
+                _showSuccessMessage = false;
+            }            
+        }
+       
+        ret = super(_showSuccessMessage, _successDescriptionOverride);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardProcess_Post_setAmountFromSales</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to set charge amount
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProcess), methodStr(CreditCardProcess, setAmountFromSales))]
+    public static void CreditCardProcess_Post_setAmountFromSales(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProcess ccProcess = _ppArgs.getThis();
+        SalesTable salesTable = ccProcess.parmSalesTable();
+        CreditCardOperation operation = ccProcess.parmOperation();
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::Yes && salesTable)
+        {
+            if (salesTable.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTable))
+            {
+                return;
+            }
+
+            if (!salesTable.sKS_CC_IsCreditCardPaymMode())
+            {
+                throw error(strFmt("@SKS6488", salesTable.SalesId, salesTable.Payment, salesTable.PaymMode,
+                            enum2str(CustPaymentType::CreditCard), enum2str(CustVendPaymStatus::None)));
+            }
+            
+            AmountCur markedAmount, invoiceAmount, authAmount;
+            SalesTotals salesTotals = SalesTotals_Sales::construct(salesTable, SalesUpdate::All);  
+            
+            //Skip pre-authorizations if amount to authorize is zero to avoid error during processing
+            if (operation == CreditCardOperation::Authorize)
+            {
+                invoiceAmount = salesTotals.totalAmount();
+                markedAmount = SKS_CC_CreditCardProcess::sKS_CC_GetMarkedAmount(salesTable);
+                authAmount = invoiceAmount - markedAmount;
+
+                if ((abs(authAmount) > abs(invoiceAmount)) || !authAmount)
+                {
+                    ccProcess.parmTotalAmountCur(0);
+                }
+                else                
+                {
+                    // Change authorization amount to exclude any marked for settlement records
+                    ccProcess.parmTotalAmountCur(authAmount);
+                }
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardProcess_Post_construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to redirect object to a custom TAS object to allow extensions
+    /// </summary>
+    /// <param name="args"></param>
+    [PostHandlerFor(classStr(CreditCardProcess), staticMethodStr(CreditCardProcess, construct))]
+    public static void CreditCardProcess_Post_construct(XppPrePostArgs _ppArgs)
+    {
+        CreditCardProcess process = _ppArgs.getReturnValue();
+
+        if (SKS_PP_Setup::find().ModCC == NoYes::Yes)
+        {
+            CreditCardOperation operation = _ppArgs.getArg(identifierStr(_operation));
+            Common record = _ppArgs.getArg(identifierStr(_record));
+          
+            process = SKS_CC_CreditCardProcess::construct(operation, record);
+        }
+
+        _ppArgs.setReturnValue(process);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForCardVerificationValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if CVV is needed.
+    /// </summary>
+    /// <returns>
+    /// true if CVV is needed.
+    /// </returns>
+    protected boolean checkForCardVerificationValue()
+    {
+        var checkCvc = false;
+        CreditCardCVC cardVerificationCheck;
+
+        // Credit card verification check is only done when preauthorization is enabled.
+        if (creditCardPreAuthorization && this.parmGetCardVerificationValue())
+        {
+            if (this.parmSKS_CC_CustPaymTable())
+            {
+                cardVerificationCheck = CustTable::find(this.parmSKS_CC_CustPaymTable().CustAccount).CreditCardCVC;
+            }
+            else
+            {
+                cardVerificationCheck = CustTable::find(salesTable.InvoiceAccount).CreditCardCVC;
+            }            
+
+            if (cardVerificationCheck == CreditCardCVC::Yes)
+            {
+                checkCvc = true;
+            }
+            else if (cardVerificationCheck == CreditCardCVC::None)
+            {
+                checkCvc = accountSetup.CardVerificationCheck;
+            }
+        }
+
+        return checkCvc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createProcessResponse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a process response.
+    /// </summary>
+    /// <param name="_successDescriptionOverride">
+    /// Transaction description on success.
+    /// </param>
+    /// <returns>
+    /// true if the process executes successfully; otherwise false.
+    /// </returns>
+    boolean createProcessResponse(str _successDescriptionOverride = '')
+    {
+        CreditCardApprovalRejectReason description;
+
+        if (this.processSucceed())
+        {
+            if (salesTable)
+            {
+                description = strLen(_successDescriptionOverride) ? _successDescriptionOverride : strFmt("@SYS327114", salesTable.SalesId);
+            }
+            //SKS-Begin
+            else if (SKS_CC_CustPaymTable)
+            {
+                if (sKS_CC_ledgerJournalTrans)
+                {
+                    description = strLen(_successDescriptionOverride) ? _successDescriptionOverride : strFmt("@SKS6490",
+                                         sKS_CC_ledgerJournalTrans.JournalNum, sKS_CC_ledgerJournalTrans.LineNum, sKS_CC_ledgerJournalTrans.Voucher);
+                }
+                else
+                {
+                    description = strLen(_successDescriptionOverride) ? _successDescriptionOverride : "@SKS6491";
+                }
+            }
+            //SKS-End
+            else if (RetailMCRChannelTable::findForCurrentUser().MCREnableOrderCompletion)
+            {
+                if (custInvoiceTable)
+                {
+                    description = strLen(_successDescriptionOverride) ? _successDescriptionOverride : strFmt("@MCR40436", custInvoiceTable.InvoiceId);
+                }
+                else if (ledgerJournalTrans)
+                {
+                    description = strLen(_successDescriptionOverride) ? _successDescriptionOverride : strFmt("@MCR40415", ledgerJournalTrans.JournalNum, ledgerJournalTrans.LineNum);
+                }
+            }
+            else
+            {
+                //SKS-Begin
+                description = strLen(_successDescriptionOverride) ? _successDescriptionOverride : "@SKS6491";
+                //SKS-End
+            }
+        }
+        else
+        {
+            description = this.failedDescription();
+        }
+
+        switch (this.parmOperation())
+        {
+            case CreditCardOperation::Authorize:
+                CreditCard::sKS_CC_RecordAuthorization(providerResult,
+                                     salesTable,
+                                     this.parmCreditCardProcessor(),
+                                     this.processSucceed(),
+                                     description,
+                                     cardTokenRequest,
+                                     true,
+                                     mcrCustPaymTable,
+                                     SKS_CC_CustPaymTable,
+                                     sKS_CC_CustConfirmJourDocNum);
+                break;
+            case CreditCardOperation::CaptureAfterAuthorize:
+                CreditCard::sKS_CC_recordCapture(providerResult,
+                                     salesTable,
+                                     this.parmSalesInvoiceId(),
+                                     this.parmCreditCardProcessor(),
+                                     false,
+                                     this.processSucceed(),
+                                     description,
+                                     cardTokenRequest,
+                                     true,
+                                     mcrCustPaymTable,
+                                     SKS_CC_CustPaymTable);
+                break;
+            case CreditCardOperation::AuthorizeAndCapture:
+                CreditCard::sKS_CC_recordCapture(providerResult,
+                                     salesTable,
+                                     this.parmSalesInvoiceId(),
+                                     this.parmCreditCardProcessor(),
+                                     true,
+                                     this.processSucceed(),
+                                     description,
+                                     cardTokenRequest,
+                                     true,
+                                     mcrCustPaymTable,
+                                     SKS_CC_CustPaymTable);
+                break;
+            case CreditCardOperation::Refund:
+                CreditCard::sKS_CC_recordRefund(providerResult,
+                                     salesTable,
+                                     this.parmCreditCardProcessor(),
+                                     this.processSucceed(),
+                                     description,
+                                     cardTokenRequest,
+                                     true,
+                                     mcrCustPaymTable,
+                                     SKS_CC_CustPaymTable,
+                                     this.parmSalesInvoiceId());
+                break;
+            case CreditCardOperation::Void:
+                CreditCard::sKS_CC_RecordVoid(providerResult,
+                                    salesTable,
+                                    this.parmCreditCardProcessor(),
+                                    this.processSucceed(),
+                                    description,
+                                    cardTokenRequest,
+                                    true,
+                                    mcrCustPaymTable,
+                                    true, 
+                                    creditCardTrans);
+                break;
+            default:
+                throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAuthRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the properties needed for an authorization request.
+    /// </summary>
+    /// <returns>
+    /// The properties needed.
+    /// </returns>
+    protected CreditCardPaymentProperties getAuthRequest()
+    {
+        var properties = this.getCardToken(creditCardTrans, true);
+        var transNamespace = RetailConst.GenericNamespace::get_TransactionData();
+
+        properties = this.sKS_CC_SetTransactionalData(transNamespace, properties);
+
+        if (this.parmCardVerificationValue())
+        {
+            properties.add(CreditCardPaymentProperty::newValue(RetailConst.GenericNamespace::get_PaymentCard(), RetailConst.PaymentCardProperties::get_CardVerificationValue(), this.parmCardVerificationValue()));
+        }
+
+        this.sKS_CC_SetPurchaseLevelTypeAndDetails(properties);
+
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_Amount(), this.parmTotalAmountCur()));
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCaptureRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the properties needed for a capture request.
+    /// </summary>
+    /// <param name="_properties">
+    /// Properties from an authorization result to use in the request.
+    /// </param>
+    /// <returns>
+    /// The properties needed.
+    /// </returns>
+    protected CreditCardPaymentProperties getCaptureRequest(CreditCardPaymentProperties _properties)
+    {
+        var properties = CreditCardPaymentProperties::fromProperties(_properties.toArray());
+        var transNamespace = RetailConst.GenericNamespace::get_TransactionData();
+
+        properties = this.sKS_CC_SetTransactionalData(transNamespace, properties);
+
+        this.sKS_CC_SetPurchaseLevelTypeAndDetails(properties);
+
+        //SKS-Begin
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_CardNumber(), creditCardNumber));
+        //SKS-End
+
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_Amount(), this.parmTotalAmountCur()));
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRefundRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the properties needed for an refund request.
+    /// </summary>
+    /// <returns>
+    /// The properties needed.
+    /// </returns>
+    protected CreditCardPaymentProperties getRefundRequest()
+    {
+        var properties = this.getCardToken(creditCardTrans, false);
+        var transNamespace = RetailConst.GenericNamespace::get_TransactionData();
+
+        properties = this.sKS_CC_SetTransactionalData(transNamespace, properties);
+
+        this.sKS_CC_SetPurchaseLevelTypeAndDetails(properties);
+
+        //SKS-Begin
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_CardNumber(), creditCardNumber));
+        //SKS-End
+
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_Amount(), this.parmTotalAmountCur()));
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getVoidRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the propeties needed for a void request.
+    /// </summary>
+    /// <returns>
+    /// The properties needed.
+    /// </returns>
+    protected CreditCardPaymentProperties getVoidRequest()
+    {
+        var properties = this.getCardToken(creditCardTrans, false);
+        var transNamespace = RetailConst.GenericNamespace::get_TransactionData();
+
+        properties = this.sKS_CC_SetTransactionalData(transNamespace, properties);
+
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_CardNumber(), creditCardNumber));
+
+        //SKS-Begin
+        if (this.parmSKS_CC_IsVoidCapture())
+        {
+            if (this.parmTotalAmountCur() < 0)
+            {
+                properties.add(CreditCardPaymentProperty::newValue(transNamespace, 'VoidType', 'VoidRefund'));
+            }
+            else
+            {
+                properties.add(CreditCardPaymentProperty::newValue(transNamespace, 'VoidType', 'VoidCapture'));
+            }
+        }
+        else
+        {
+            properties.add(CreditCardPaymentProperty::newValue(transNamespace, 'VoidType', 'VoidAuth'));
+        }
+        //SKS-End
+
+        this.sKS_CC_SetPurchaseLevelTypeAndDetails(properties);        
+
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, RetailConst.TransactionDataProperties::get_Amount(), this.parmTotalAmountCur()));
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetTransactionalData</Name>
+				<Source><![CDATA[
+    private CreditCardPaymentProperties sKS_CC_SetTransactionalData(str _transNamespace, CreditCardPaymentProperties _properties)
+    {
+        CustAccount invoiceAccount;
+        CurrencyCode currencyCodeLocal;
+        Num transactionId;        
+
+        if (salesTable)
+        {
+            invoiceAccount = salesTable.InvoiceAccount;
+            currencyCodeLocal = salesTable.CurrencyCode;
+            transactionId = salesTable.SalesId;
+        }
+        //SKS-Begin
+        else if (SKS_CC_CustPaymTable && !this.parmSKS_CC_IsVoidCapture())
+        {
+            // set the variables based on transaction to add to the properties
+            invoiceAccount      = this.sKS_CC_GetInvoiceAccount();
+            currencyCodeLocal   = this.sKS_CC_GetCurrencyCode();
+            transactionId       = this.sKS_CC_GetTransactionId();
+        }
+        //SKS-End
+        else if (RetailMCRChannelTable::findForCurrentUser().MCREnableOrderCompletion)
+        {
+            // set the variables based on transaction to add to the properties
+            invoiceAccount = this.mcrGetInvoiceAccount();
+            currencyCodeLocal = this.mcrGetCurrencyCode();
+            transactionId = this.mcrGetTransactionId();
+        }
+
+        if (this.parmOperation() == CreditCardOperation::Authorize)
+        {
+            this.setSalesTotals();
+        }
+
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_CurrencyCode(), CreditCardProviderProcess::getIsoCurrency(currencyCodeLocal)));
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_Description(), xInfo::productName()));
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_ExternalCustomerId(), invoiceAccount));
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_ExternalInvoiceNumber(), transactionId));
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_ExternalReferenceId(), CreditCardPaymentProperty::clrString2Str(System.Guid::NewGuid().ToString())));
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_IsTestMode(), accountSetup.IsTest));
+        _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, RetailConst.TransactionDataProperties::get_SupportCardTokenization(), #isSupportCardTokenizationYes));
+        
+        //SKS-Begin
+        const str constAuthCodeParm = 'AuthCodeParm';
+        str authCodeParmValue;
+
+        SKS_PP_Setup sKS_PP_SetupLocal = SKS_PP_Setup::find();
+        if (sKS_PP_SetupLocal.ModCC)
+        {
+            authCodeParmValue = 'PFTransId';
+            if (sKS_PP_SetupLocal.CCAuthCodeValue == SKS_CC_AuthCodeValue::OriginationId)
+            {
+                authCodeParmValue = 'OriginationId';                
+            }
+
+            _properties.add(CreditCardPaymentProperty::newValue(_transNamespace, constAuthCodeParm, authCodeParmValue));
+        }
+        //SKS-End
+
+        return _properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetPurchaseLevelTypeAndDetails</Name>
+				<Source><![CDATA[
+    private void sKS_CC_SetPurchaseLevelTypeAndDetails(CreditCardPaymentProperties _properties)
+    {
+        //SKS-Begin
+        // Use currency code that was set from the caller, if available; otherwise,
+        // use it from the custInvoiceJour record.
+        CurrencyCode currencyCodeSKS;
+        if (currencyCode)
+        {
+            currencyCodeSKS = currencyCode;
+        }
+        else if (custInvoiceJour.CurrencyCode)
+        {
+            currencyCodeSKS = custInvoiceJour.CurrencyCode;
+        }
+        else if (salesTable.CurrencyCode)
+        {
+            currencyCodeSKS = salesTable.CurrencyCode;
+        }
+
+        Retail.PaymentSDK.Portable.PurchaseLevel purchaseLevel =
+            CreditCardProviderProcess::getPurchaseLevel(creditCardTypeSetup, currencyCodeSKS);
+
+        if (purchaseLevel == Retail.PaymentSDK.Portable.PurchaseLevel::Level2)
+        {
+            _properties.add(this.sKS_CC_SetLevel2Data());
+        }
+        else if (purchaseLevel == Retail.PaymentSDK.Portable.PurchaseLevel::Level3)
+        {
+            _properties.add(this.sKS_CC_SetLevel2Data());
+            _properties.add(this.sKS_CC_SetLevel3Data());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetLevel2Data</Name>
+				<Source><![CDATA[
+    private CreditCardPaymentProperty sKS_CC_SetLevel2Data()
+    {
+        CreditCardPaymentProperties properties = CreditCardPaymentProperties::construct();
+
+        void addLevel2Property(str _name, anytype _value)
+        {
+            this.sks_CC_AddPaymentProperty(RetailConst.GenericNamespace::get_L2Data(), properties, _name, _value);
+        }
+
+        void addHeaderTaxDetail(CreditCardPaymentProperty _taxDetail)
+        {
+            CreditCardPaymentProperties taxDetails = CreditCardPaymentProperties::construct();
+
+            taxDetails.add(_taxDetail);
+
+            addLevel2Property(RetailConst.L2DataProperties::get_TaxDetails(), taxDetails);
+        }
+
+        CustTable custTable = CustTable::find(salesTable.InvoiceAccount);
+        
+        if (SKS_PP_Setup::find().ModCC == NoYes::Yes)
+        {
+            const str constL2Data_OrderDateStrSKS = 'L2Data_OrderDateStr';
+
+            const str constL2Data_PaymentGatewayName = 'L2Data_PaymentGatewayName';
+            addLevel2Property(constL2Data_PaymentGatewayName, accountSetup.SKS_CC_PaymentGatewayName);
+
+            if (salesTable)
+            {
+                if (accountSetup.SKS_CC_PaymentGatewayName == 'NMI')
+                {
+                    str strSalesDateCreatedDateSKS = date2Str(DateTimeUtil::date(salesTable.CreatedDateTime), 321,
+                        DateDay::Digits2, DateSeparator::None,
+                        DateMonth::Digits2, DateSeparator::None,
+                        DateYear::Digits2);
+
+                    addLevel2Property(constL2Data_OrderDateStrSKS, strSalesDateCreatedDateSKS);
+                }
+            
+                addLevel2Property(RetailConst.L2DataProperties::get_OrderDateTime(), salesTable.CreatedDateTime);
+                addLevel2Property(RetailConst.L2DataProperties::get_OrderNumber(), salesTable.SalesId);                
+            }
+            else
+            {
+                LedgerJournalTrans ledgerJournalTransLoc_SKS = this.parmSKS_CC_LedgerJournalTrans();
+                if (ledgerJournalTransLoc_SKS)
+                {
+                    if (accountSetup.SKS_CC_PaymentGatewayName == 'NMI')
+                    {
+                        str strJournalLineDateSKS = date2Str(ledgerJournalTransLoc_SKS.TransDate, 321,
+                            DateDay::Digits2, DateSeparator::None,
+                            DateMonth::Digits2, DateSeparator::None,
+                            DateYear::Digits2);
+
+                        addLevel2Property(constL2Data_OrderDateStrSKS, strJournalLineDateSKS);
+                    }
+
+                    addLevel2Property(RetailConst.L2DataProperties::get_OrderDateTime(), ledgerJournalTransLoc_SKS.TransDate);
+                    addLevel2Property(RetailConst.L2DataProperties::get_OrderNumber(), ledgerJournalTransLoc_SKS.Voucher);
+                }
+            }
+
+            str strDateTimeStamp;
+            str customerPOtruncated;
+
+            // Payment gateway specific functionality has been hard-coded below  
+            // When processing from payment journal the 'Invoice' field already contains a timestamp so don't add again.
+            if (accountSetup.SKS_CC_PaymentGatewayName == 'Moneris' && !this.parmSKS_CC_LedgerJournalTrans())
+            {
+                strDateTimeStamp = DateTimeUtil::toStr(DateTimeUtil::utcNow());
+                strDateTimeStamp = strRem(strDateTimeStamp, '-T:/');
+                addLevel2Property(RetailConst.L2DataProperties::get_InvoiceNumber(), strFmt('%1_%2', this.parmSalesInvoiceId(), strDateTimeStamp));                
+            }
+            else
+            {
+                addLevel2Property(RetailConst.L2DataProperties::get_InvoiceNumber(), this.parmSalesInvoiceId());                
+            }
+
+            if (accountSetup.SKS_CC_PaymentGatewayName == 'CyberSource')
+            {
+                if (creditCardCust.CreditCardTypeName == 'Amex')
+                {
+                    if (strLen(salesTable.CustomerRef) > 17)
+                    {
+                        customerPOtruncated = subStr(salesTable.CustomerRef, 1, 17);
+                    }
+                    else
+                    {
+                        customerPOtruncated = salesTable.CustomerRef;
+                    }
+                }
+                else
+                {
+                    if (strLen(salesTable.CustomerRef) > 25)
+                    {
+                        customerPOtruncated = subStr(salesTable.CustomerRef, 1, 25);
+                    }
+                    else
+                    {
+                        customerPOtruncated = salesTable.CustomerRef;
+                    }
+
+                }
+                addLevel2Property(RetailConst.L2DataProperties::get_OrderDescription(), customerPOtruncated);                
+            }
+            else
+            {
+                addLevel2Property(RetailConst.L2DataProperties::get_OrderDescription(), salesTable.CustomerRef);
+            }
+        }
+        else
+        {
+            addLevel2Property(RetailConst.L2DataProperties::get_OrderDateTime(), salesTable.CreatedDateTime);
+            addLevel2Property(RetailConst.L2DataProperties::get_OrderNumber(), salesTable.SalesId);
+            addLevel2Property(RetailConst.L2DataProperties::get_InvoiceNumber(), this.parmSalesInvoiceId());
+            addLevel2Property(RetailConst.L2DataProperties::get_OrderDescription(), salesTable.CustomerRef);            
+        }
+        
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantContact(), HcmWorker::worker2Name(custTable.MainContactWorker));
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantTaxId(), companyInfo.CoRegNum);
+        if (custInvoiceJour)
+        {
+            addLevel2Property(RetailConst.L2DataProperties::get_InvoiceDateTime(), custInvoiceJour.InvoiceDate);
+            addLevel2Property(RetailConst.L2DataProperties::get_PurchaserId(), custInvoiceJour.InvoiceAccount);
+        }
+        else
+        {
+            addLevel2Property(RetailConst.L2DataProperties::get_PurchaserId(), salesTable.InvoiceAccount);
+        }
+
+        LogisticsPostalAddress logisticsPostalAddress;
+        if (custInvoiceJour.DeliveryPostalAddress)
+        {
+            logisticsPostalAddress = LogisticsPostalAddress::findRecId(custInvoiceJour.DeliveryPostalAddress);
+        }
+        else if (salesTable.DeliveryPostalAddress)
+        {
+            logisticsPostalAddress = LogisticsPostalAddress::findRecId(salesTable.DeliveryPostalAddress);
+        }
+
+        addLevel2Property(RetailConst.L2DataProperties::get_PurchaserTaxId(), custTable.getPrimaryRegistrationNumber(TaxRegistrationTypesList::TAXID, custInvoiceJour.InvoiceDate));
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipToCity(), logisticsPostalAddress.City);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipToCounty(), logisticsPostalAddress.County);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipToState_ProvinceCode(), logisticsPostalAddress.State);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipToPostalCode(), logisticsPostalAddress.ZipCode);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipToCountryCode(), logisticsPostalAddress.CountryRegionId);
+
+        // Ship From: Use Warehouse address else use Company address
+        InventLocation inventLocation = InventLocation::find(custInvoiceJour.InventLocationId);
+        if (InventParameters::find().ShipCarrierReturnTo == ShipCarrierReturnTo::Warehouse && inventLocation)
+        {
+            logisticsPostalAddress = LogisticsPostalAddress::findRecId(inventLocation.RecId);
+        }
+        else
+        {
+            logisticsPostalAddress = companyInfo.postalAddress();
+        }
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipFromCity(), logisticsPostalAddress.City);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipFromCounty(), logisticsPostalAddress.County);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipFromState_ProvinceCode(), logisticsPostalAddress.State);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipFromCountryCode(), logisticsPostalAddress.CountryRegionId);
+        addLevel2Property(RetailConst.L2DataProperties::get_ShipFromPostalCode(), logisticsPostalAddress.ZipCode);
+
+        addLevel2Property(RetailConst.L2DataProperties::get_DiscountAmount(), custInvoiceJour.EndDisc);
+        //SKS-Begin
+        // Code below has been changed to fix an issue with standard AX during RMAs and refunds.
+        // Tax amount should always be zero or a positive number.
+        addLevel2Property(RetailConst.L2DataProperties::get_TotalTaxAmount(), abs(custInvoiceJour.SumTax));
+        //SKS-End
+        addLevel2Property(RetailConst.L2DataProperties::get_IsTaxable(), custInvoiceJour.SumTax != 0 ? #isTaxableYes : #isTaxableNo);
+
+        if (custInvoiceJour.InvoiceAmount != 0)
+        {
+            addLevel2Property(RetailConst.L2DataProperties::get_TotalTaxRate(), 100.0 * custInvoiceJour.SumTax / custInvoiceJour.InvoiceAmount);
+        }
+
+        logisticsPostalAddress = companyInfo.postalAddress();
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantName(), companyInfo.Name);
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantStreet(), logisticsPostalAddress.Street);
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantCity(), logisticsPostalAddress.City);
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantCounty(), logisticsPostalAddress.County);
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantState(), logisticsPostalAddress.State);
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantCountryCode(), logisticsPostalAddress.CountryRegionId);
+        addLevel2Property(RetailConst.L2DataProperties::get_MerchantZip(), logisticsPostalAddress.ZipCode);
+
+        addLevel2Property(RetailConst.L2DataProperties::get_RequesterName(), CreditCardCust::find(salesTable.CreditCardCustRefId).Name);
+        addLevel2Property(RetailConst.L2DataProperties::get_TotalAmount(), this.parmTotalAmountCur());
+        addLevel2Property(RetailConst.L2DataProperties::get_PurchaseCardType(), #PurchaseCardTypeUnknown);
+
+        // Add tax details (just one)
+        addHeaderTaxDetail(this.createTaxDetail(TaxTypeIdentifier, TaxDescription, custInvoiceJour.InvoiceAmount == 0 ? 0.0 : this.sKS_CC_CalcTaxRate(custInvoiceJour.SumTax, custInvoiceJour.InvoiceAmount), custInvoiceJour.SumTax, 1));
+
+        // Add miscellaneous Charges, Freight and Handling are included in miscellaneous charges
+        addLevel2Property(RetailConst.L2DataProperties::get_MiscellaneousCharges(), this.sKS_CC_GetMiscCharges(custInvoiceJour));
+
+        return CreditCardPaymentProperty::newValue(RetailConst.GenericNamespace::get_PurchaseLevelData(), RetailConst.PurchaseLevelDataProperties::get_L2Data(), properties);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetLevel3Data</Name>
+				<Source><![CDATA[
+    private CreditCardPaymentProperty sKS_CC_SetLevel3Data()
+    {
+        void addLevel3Property(CreditCardPaymentProperties _properties, str _name, anytype _value)
+        {
+            this.sKS_CC_AddPaymentProperty(RetailConst.GenericNamespace::get_L3Data(), _properties, _name, _value);
+        }
+
+        void addShippingLineInfo(CreditCardPaymentProperties _properties, CustInvoiceTrans _invoiceTrans)
+        {
+            WHSSubmittedDateTime pickupDateTime;
+            str trackingNumbers;
+
+            MarkupTrans markupTrans;
+            TMSFreightBillMarkupTrans freightBillMarkupTrans;
+            TMSFreightBillDetail freightBillDetail;
+            TMSInvoiceLine invoiceLine;
+            TMSFBInvMatch invMatch;
+
+            while select ShipUTCDateTime from freightBillDetail
+                order by freightBillDetail.ShipUTCDateTime
+                outer join RecId from invMatch
+                    where invMatch.FreightBillDetailRecId == freightBillDetail.RecId
+                    outer join ShipCarrierTrackingNum from invoiceLine
+                        where invoiceLine.RecId == invMatch.InvoiceLineRecId
+                exists join freightBillMarkupTrans
+                    where freightBillMarkupTrans.MarkupTransTableId == tableNum(markupTrans)
+                        && freightBillMarkupTrans.FreightBillDetailTableId == tableNum(TMSFreightBillDetail)
+                        && freightBillMarkupTrans.FreightBillDetailRecId == freightBillDetail.RecId
+                exists join markupTrans
+                    where markupTrans.TransTableId == _invoiceTrans.TableId
+                        && markupTrans.TransRecId == _invoiceTrans.RecId
+                        && markupTrans.RecId == freightBillMarkupTrans.MarkupTransRecId
+            {
+                pickupDateTime = pickupDateTime ? pickupDateTime : freightBillDetail.ShipUTCDateTime;
+
+                if (invoiceLine && invoiceLine.ShipCarrierTrackingNum)
+                {
+                    trackingNumbers += (trackingNumbers ? ';' : '') + invoiceLine.ShipCarrierTrackingNum;
+                }
+            }
+
+            if (pickupDateTime)
+            {
+                addLevel3Property(_properties, RetailConst.L3DataProperties::get_PickupDateTime(), pickupDateTime);
+            }
+
+            if (trackingNumbers)
+            {
+                addLevel3Property(_properties, RetailConst.L3DataProperties::get_CarrierShipmentNumber(), trackingNumbers);
+            }
+        }
+
+        CreditCardPaymentProperty addLevel3DataByLine(CustInvoiceTrans _invoiceTrans, int _lineNum)
+        {
+            // BP deviation documented
+            CreditCardPaymentProperties properties = CreditCardPaymentProperties::construct();
+
+            if (SKS_PP_Setup::find().ModCC == NoYes::Yes)
+            {
+                CustTable custTableSKS = CustTable::find(_invoiceTrans.invoiceAccount());
+                addLevel3Property(properties, 'gross_net_indicator', custTableSKS.InclTax == NoYes::Yes ? 'Y' : 'N');
+            }
+
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_CommodityCode(), int642Str( _invoiceTrans.IntrastatCommodity));
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_ProductCode(), _invoiceTrans.ItemId);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_SequenceNumber(), _invoiceTrans.ItemId);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_ProductName(), _invoiceTrans.Name);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_ProductSKU(), _invoiceTrans.ExternalItemId);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_Descriptor(), _invoiceTrans.Name);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_UnitOfMeasure(), _invoiceTrans.SalesUnit);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_UnitPrice(), this.sKS_CC_FmtNum(_invoiceTrans.SalesPrice));
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_Discount(), this.sKS_CC_FmtNum(_invoiceTrans.LineDisc));
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_DiscountRate(), this.sKS_CC_FmtNum(_invoiceTrans.LinePercent));
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_Quantity(), this.sKS_CC_FmtNum(_invoiceTrans.Qty));
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_NetTotal(), this.sKS_CC_FmtNum(_invoiceTrans.LineAmount));
+            //SKS-Begin
+            // Code below has been changed to fix an issue with standard AX during RMAs and refunds.
+            // Tax amount should always be zero or a positive number.
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_TaxAmount(), this.sKS_CC_FmtNum(abs(_invoiceTrans.TaxAmount)));
+            //SKS-End
+
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_MerchantCatalogNumber(), _invoiceTrans.ItemId);
+
+            // Ship From: Use Warehouse address else use Company address
+            LogisticsPostalAddress logisticsPostalAddress;
+            InventLocation inventLocation = InventLocation::find(_invoiceTrans.inventDim().InventLocationId);
+            if (InventParameters::find().ShipCarrierReturnTo == ShipCarrierReturnTo::Warehouse && inventLocation)
+            {
+                logisticsPostalAddress = LogisticsPostalAddress::findRecId(inventLocation.RecId);
+            }
+            else
+            {
+                logisticsPostalAddress = companyInfo.postalAddress();
+            }
+
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_PickupCity(), logisticsPostalAddress.City);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_PickupState(), logisticsPostalAddress.State);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_PickupZip(), logisticsPostalAddress.ZipCode);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_PickupCountry(), logisticsPostalAddress.CountryRegionId);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_PickupCounty(), logisticsPostalAddress.County);
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_PickupAddress(), logisticsPostalAddress.Street);
+
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_CostCenter(),
+                    DimensionAttributeValueSetStorage::find(_invoiceTrans.DefaultDimension).getDisplayValueByDimensionAttribute(CustParameters::find().CreditCardCostCenterDimensionAttribute));
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_MerchantTaxID(), companyInfo.CoRegNum);
+
+            addShippingLineInfo(properties, _invoiceTrans);
+
+            CreditCardPaymentProperties taxDetails = CreditCardPaymentProperties::construct();
+            //taxLineNum = 0;
+
+            this.sKS_CC_AddTaxDetailsForRecord(taxDetails, _invoiceTrans);
+
+            var lineMarkupProperties = this.sKS_CC_GetMiscCharges(_invoiceTrans, taxDetails);
+
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_TaxDetails(), taxDetails);
+
+            // Add Miscellaneous Charges, freight and handling are included
+            addLevel3Property(properties, RetailConst.L3DataProperties::get_MiscellaneousCharges(), lineMarkupProperties);
+
+            return CreditCardPaymentProperty::newValue(RetailConst.GenericNamespace::get_PurchaseLevelData(), this.NameAndSeq(RetailConst.PurchaseLevelDataProperties::get_L3DataItems(), _lineNum), properties);
+        }
+
+        CreditCardPaymentProperties lines = CreditCardPaymentProperties::construct();
+        CustInvoiceTrans invoiceTrans;
+
+        int lineNum = 0;
+
+        while select invoiceTrans
+            order by
+                invoiceTrans.LineNum, invoiceTrans.RecId
+            where
+                invoiceTrans.SalesId == custInvoiceJour.SalesId &&
+                invoiceTrans.InvoiceId == custInvoiceJour.InvoiceId &&
+                invoiceTrans.InvoiceDate == custInvoiceJour.InvoiceDate &&
+                invoiceTrans.NumberSequenceGroup == custInvoiceJour.NumberSequenceGroup
+        {
+            lineNum++;
+            lines.add(addLevel3DataByLine(invoiceTrans, lineNum));
+        }
+
+        return CreditCardPaymentProperty::newValue(RetailConst.GenericNamespace::get_PurchaseLevelData(), RetailConst.PurchaseLevelDataProperties::get_L3Data(), lines);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sks_CC_AddPaymentProperty</Name>
+				<Source><![CDATA[
+    private void sks_CC_AddPaymentProperty(System.String _dataLevel, CreditCardPaymentProperties _properties, str _name, anytype _value)
+    {
+        if (_value)
+        {
+            _properties.add(CreditCardPaymentProperty::newValue(_dataLevel, _name, _value));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetMiscCharge</Name>
+				<Source><![CDATA[
+    private CreditCardPaymentProperty sKS_CC_GetMiscCharge(MarkupTrans _markupTrans)
+    {
+        CreditCardPaymentProperties miscChargeProperties = CreditCardPaymentProperties::construct();
+        miscChargeProperties.add(CreditCardPaymentProperty::newValue(RetailConst.GenericNamespace::get_MiscellaneousCharge(), RetailConst.MiscellaneousChargeProperties::get_ChargeType(), _markupTrans.Txt));
+        miscChargeProperties.add(CreditCardPaymentProperty::newValue(RetailConst.GenericNamespace::get_MiscellaneousCharge(), RetailConst.MiscellaneousChargeProperties::get_ChargeAmount(), _markupTrans.getCalculatedAmountRepresentable()));
+
+        CreditCardPaymentProperty miscCharge = CreditCardPaymentProperty::newName(RetailConst.GenericNamespace::get_MiscellaneousCharge(), RetailConst.MiscellaneousChargeProperties::get_MiscellaneousCharge());
+        miscCharge.parmPropertyListValue(miscChargeProperties);
+
+        return miscCharge;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetMiscCharges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns a payment properties object that contains all markup charges associated with a invoice journal.
+    /// If _taxDetails is passed it also updates the _taxDetails paymentProperties with the tax information for the markup charges.
+    /// </summary>
+    /// <param name="_source">
+    /// Invoice journal to get the charges from.
+    /// </param>
+    /// <param name="_taxDetails">
+    /// CreditCardPaymentProperties for the tax details.
+    /// Defaults to Null.
+    /// </param>
+    /// <returns>
+    /// The total amount of charges.
+    /// </returns>
+    private CreditCardPaymentProperties sKS_CC_GetMiscCharges(Common _common, CreditCardPaymentProperties _taxDetails = null)
+    {
+        CreditCardPaymentProperties miscCharges = CreditCardPaymentProperties::construct();
+
+        MarkupTrans markupTrans;
+        int miscChargeCount = 0;
+
+        while select * from markupTrans
+                where markupTrans.TransTableId == _common.TableId
+                    && markupTrans.TransRecId == _common.RecId
+        {
+            if (markupTrans.CalculatedAmount != 0)
+            {
+                miscChargeCount++;
+
+                CreditCardPaymentProperty miscCharge = this.sKS_CC_GetMiscCharge(markupTrans);
+                miscCharge.parmName(this.NameAndSeq(miscCharge.parmName(), miscChargeCount));
+
+                miscCharges.add(miscCharge);
+
+                if (!prmIsDefault(_taxDetails))
+                {
+                    this.sKS_CC_AddTaxDetailsForRecord(_taxDetails, markupTrans);
+                }
+            }
+        }
+
+        return miscCharges;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_AddTaxDetailsForRecord</Name>
+				<Source><![CDATA[
+    private void sKS_CC_AddTaxDetailsForRecord(CreditCardPaymentProperties _taxDetails, Common _common)
+    {
+        TaxTrans taxTrans;
+
+        while select * from taxTrans
+            where taxTrans.SourceTableId == _common.TableId
+                && taxTrans.SourceRecId == _common.RecId
+        {
+            //taxLineNum++;
+            //SKS-Begin
+            // Code below has been changed to fix an issue with standard AX during RMAs and refunds.
+            // Tax amount should always be zero or a positive number.
+            _taxDetails.add(this.createTaxDetail(TaxTypeIdentifier, taxTrans.taxName(), taxTrans.TaxValue, abs(taxTrans.SourceRegulateAmountCur), _taxDetails.count()));
+            //SKS-End
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_FmtDate</Name>
+				<Source><![CDATA[
+    private str sKS_CC_FmtDate(date _date)
+    {
+        return date2str(_date, 321, DateDay::Digits2, DateSeparator::Hyphen, DateMonth::Digits2, DateSeparator::Hyphen, DateYear::Digits4, DateFlags::None);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_FmtDateTime</Name>
+				<Source><![CDATA[
+    private str sKS_CC_FmtDateTime(utcdatetime _datetime)
+    {
+        return DateTimeUtil::toStr(_datetime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_FmtNum</Name>
+				<Source><![CDATA[
+    private str sKS_CC_FmtNum(real _num, int _decimalPlaces = 2)
+    {
+        return num2str(_num, 0, _decimalPlaces, 1, 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_CalcTaxRate</Name>
+				<Source><![CDATA[
+    private TaxValue sKS_CC_CalcTaxRate(TaxAmountCur _tax, AmountCur _amountWithTax)
+    {
+        return _amountWithTax <= _tax ? 0 : (100.0 * _tax / (_amountWithTax - _tax));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCardToken</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Return the appropriate payment card properties.
+    /// </summary>
+    /// <param name="_creditCardAuthTrans">
+    /// A <c>CreditCardAuthTrans</c> table record.
+    /// </param>
+    /// <param name="_useCard">
+    /// Forces use of the card token from the <c>CreditCardCust</c> table.
+    /// </param>
+    /// <returns>
+    /// The credit card properties.
+    /// </returns>
+    protected CreditCardPaymentProperties getCardToken(CreditCardAuthTrans _creditCardAuthTrans, boolean _useCard)
+    {
+        str cardToken;
+
+        if (!creditCardNumber && _creditCardAuthTrans.CreditCardNumber)
+        {
+            creditCardNumber = _creditCardAuthTrans.CreditCardNumber;
+        }
+
+        // Always use the last card token from credit card history table if available
+        if (_creditCardAuthTrans && _creditCardAuthTrans.CardTokenResult && !_useCard)
+        {
+            cardToken = _creditCardAuthTrans.CardTokenResult;
+        }
+        else
+        {   
+            //SKS-Begin
+            if (salesTable.CreditCardCustRefId && !SKS_CC_CustPaymTable && !mcrCustPaymTable)
+            {
+                cardToken = CreditCardCust::find(salesTable.CreditCardCustRefId).CardToken;
+            }
+            else if (SKS_CC_CustPaymTable)
+            {
+                cardToken = creditCardCust::find(SKS_CC_CustPaymTable.CreditCardCustRefId).CardToken;
+            }          
+            //SKS-End
+            // If MCRCustPaymTable exists the sales table CreditCardCustRefId will not be filled
+            else if (mcrCustPaymTable)
+            {
+                cardToken = creditCardCust::find(mcrCustPaymTable.PaymInfoRecId).CardToken;
+            }            
+        }
+
+        var properties = CreditCardPaymentProperties::fromXmlString(cardToken);
+
+        var property = properties.find(RetailConst.GenericNamespace::get_PaymentCard(), RetailConst.PaymentCardProperties::get_Last4Digits());
+        if (property && property.parmStringValue())
+        {
+            creditCardNumber = property.parmStringValue();
+        }
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCardVerificationValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Obtains the CVV value from the user.
+    /// </summary>
+    /// <returns>
+    /// true if the user entered a CVV value.
+    /// </returns>
+    /// <remarks>
+    /// The CVV value is available from parmCardVerificationValue.
+    /// </remarks>
+    protected boolean getCardVerificationValue()
+    {
+        var cvvEntered = true;
+
+        //SKS-Begin
+        boolean sKSIsPaymJourCapture;
+
+        if (this.parmSKS_CC_CustPaymTableRecId() && this.parmOperation() == CreditCardOperation::AuthorizeAndCapture)
+        {
+            if (this.parmSKS_CC_LedgerJournalTrans())
+            {
+                sKSIsPaymJourCapture = true;
+                this.parmGetCardVerificationValue(true);
+            }
+        }
+
+        if((this.parmOperation() == CreditCardOperation::Authorize || sKSIsPaymJourCapture)
+            && this.checkForCardVerificationValue())
+        //SKS-End
+        {
+            var cvvEntry = new CreditCardCVVEntry(accountSetup);
+
+            cvvEntry.parmSalesTable(salesTable);
+
+            //SKS-Begin
+            if (!creditCardNumber && sKSIsPaymJourCapture)
+            {
+                if (!creditCardCust)
+                {
+                    creditCardCust = CreditCardCust::find(this.parmSKS_CC_CustPaymTable().CreditCardCustRefId);
+                }
+
+                creditCardNumber = creditCardCust.CardNumber;
+            }
+            //SKS-End
+
+            cvvEntry.parmCreditCardNumber(creditCardNumber);
+
+            if (cvvEntry.prompt())
+            {
+                this.parmCardVerificationValue(cvvEntry.getCVV());
+            }
+            else
+            {
+                cvvEntered = false;
+            }
+        }
+
+        return cvvEntered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs the actual credit card operation.
+    /// </summary>
+    /// <returns>
+    /// true on success.
+    /// </returns>
+    public boolean submit()
+    {
+        void processAuthorize()
+        {
+            CreditCardPaymentProperties properties = this.getAuthRequest();
+            Retail.PaymentSDK.Portable.IPaymentProcessor processor = this.sKS_CC_GetProcessor(this.sKS_CC_HandleRequest(properties));
+
+            this.handleAuthResponse(processor.Authorize(this.sKS_CC_CreateRequest(properties), null));
+        }
+
+        void processCapture(CreditCardPaymentProperties _properties, CreditCardAuthorization _authorization)
+        {
+            CreditCardPaymentProperties properties = this.getCaptureRequest(_properties);
+            Retail.PaymentSDK.Portable.IPaymentProcessor processor = this.sKS_CC_GetProcessor(this.sKS_CC_HandleRequest(properties));
+
+            this.handleCaptureResponse(processor.Capture(this.sKS_CC_CreateRequest(properties)), _authorization);
+        }
+
+        void processRefund()
+        {
+            CreditCardPaymentProperties properties;
+            Retail.PaymentSDK.Portable.IPaymentProcessor processor;
+
+            //SKS-Begin
+            if(!sKS_CC_CustPaymTable && !creditCardTrans)
+            //SKS-End
+            {
+                processSucceed = false;
+                responseMessage = "@SYS327119";
+            }
+            //SKS-Begin
+            else if(!sKS_CC_CustPaymTable && !CreditCard::sameCard(salesTable, creditCardTrans))
+            //SKS-End
+            {
+                processSucceed = false;
+                responseMessage = "@SYS327136"; // Credit card refunds can be processed only for the same card as the original sales order.
+                displayedMessage = responseMessage;
+            }
+            else
+            {
+                properties = this.getRefundRequest();
+                processor = this.sKS_CC_GetProcessor(this.sKS_CC_HandleRequest(properties));
+
+                this.handleRefundResponse(processor.Refund(this.sKS_CC_CreateRequest(properties), null));
+            }            
+        }
+
+        void processVoid()
+        {
+            CreditCardPaymentProperties properties = this.getVoidRequest();
+            Retail.PaymentSDK.Portable.IPaymentProcessor processor = this.sKS_CC_GetProcessor(this.sKS_CC_HandleRequest(properties));
+
+            this.handleVoidResponse(processor.Void(this.sKS_CC_CreateRequest(properties)));
+        }
+
+        //SKS-Begin
+        if(this.parmOperation() != CreditCardOperation::Refund && this.parmTotalAmountCur() < 0 && !this.parmSKS_CC_IsVoidCapture())
+        //SKS-End        
+        {
+            processSucceed = false;
+            responseMessage = "@SYS327120";
+            return true;
+        }
+
+        InteropPermission perm = new InteropPermission(InteropKind::ClrInterop);
+        perm.assert();
+
+        try
+        {
+            switch (this.parmOperation())
+            {
+                case CreditCardOperation::Authorize:
+                    processAuthorize();
+                    break;
+                case CreditCardOperation::CaptureAfterAuthorize:
+                    processCapture(this.getCardToken(creditCardTrans, false), creditCardTrans.Authorization);
+                    break;
+                case CreditCardOperation::Refund:
+                    processRefund();
+                    break;
+                case CreditCardOperation::Void:
+                    processVoid();
+                    break;
+                case CreditCardOperation::AuthorizeAndCapture:
+                    processAuthorize();
+
+                    //SKS-Begin
+                    if (this.parmSKS_CC_CustPaymTableRecId() && this.parmSKS_CC_LedgerJournalTrans() &&
+                        cardVerificationValue && providerResult.parmCvcResult() == CreditCardMSCVCResultCode::Success)
+                    {
+                        isPaymJourCVCSuccess = true;
+                    }
+                    //SKS-End
+
+                    if (processSucceed)
+                    {
+                        processCapture(providerResult.parmProperties(), providerResult.parmAuthorization());
+                    }
+                    break;
+                default:
+                    processSucceed = false;
+                    responseMessage = strFmt("@SYS122465", this.parmOperation()); // "Current version doesn't handle credit card '%1'."
+                    break;
+            }
+        }
+        catch(Exception::CLRError)
+        {
+            processSucceed = false;
+            responseMessage = this.getClrExceptionMessage();
+            if (responseMessage)
+            {
+                displayedMessage = "@SYS116968" + '\n' + responseMessage;
+            }
+            else
+            {
+                displayedMessage = "@SYS116968";
+            }
+        }
+        catch
+        {
+            processSucceed = false;
+            displayedMessage = "@SYS34720";
+            if (!responseMessage)
+            {
+                responseMessage = displayedMessage;
+            }
+        }
+
+        CodeAccessPermission::revertAssert();
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_GetProcessor</Name>
+				<Source><![CDATA[
+    private Retail.PaymentSDK.Portable.IPaymentProcessor sKS_CC_GetProcessor(CreditCardConnectorName _connectorName)
+    {
+        InteropPermission perm = new InteropPermission(InteropKind::ClrInterop);
+
+        perm.assert();
+
+        Retail.PaymentSDK.Portable.IPaymentProcessor processor;
+
+        try
+        {
+            processor = new CreditCardPaymentProcessorFactory().getProcessor(_connectorName);
+        }
+        catch(Exception::CLRError)
+        {
+            processSucceed = false;
+            responseMessage = this.getClrExceptionMessage();
+            displayedMessage = "@SYS116968";
+        }
+        catch
+        {
+            processSucceed = false;
+            displayedMessage = "@SYS116968";
+            if (!responseMessage)
+            {
+                responseMessage = displayedMessage;
+            }
+        }
+
+        CodeAccessPermission::revertAssert();
+
+        return processor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_HandleRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Setup the standard properties needed to request a credit card operation.
+    /// </summary>
+    /// <param name="_requestProperties">
+    /// The request properties.
+    /// </param>
+    /// <returns>
+    /// A connector name.
+    /// </returns>
+    private CreditCardConnectorName sKS_CC_HandleRequest(CreditCardPaymentProperties _requestProperties)
+    {
+        cardTokenRequest = _requestProperties.toXmlString();
+
+        return CreditCard::addMerchantAccountProperties(_requestProperties);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_CreateRequest</Name>
+				<Source><![CDATA[
+    private Retail.PaymentSDK.Portable.Request sKS_CC_CreateRequest(CreditCardPaymentProperties _properties)
+    {
+        var request = new Retail.PaymentSDK.Portable.Request();
+
+        request.set_Locale(currentUserLanguage());
+        request.set_Properties(_properties.toArray());
+
+        return request;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCvc</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ensure the CVV value was correct.
+    /// </summary>
+    /// <returns>
+    /// true if successful.
+    /// </returns>
+    protected boolean validateCvc()
+    {
+        //SKS-Begin
+        if(!processSucceed ||
+           (this.parmOperation() != CreditCardOperation::Authorize &&
+            (this.parmSKS_CC_CustPaymTableRecId() && this.parmOperation() != CreditCardOperation::AuthorizeAndCapture)) ||
+           !this.checkForCardVerificationValue())
+        //SKS-End        
+        {
+            return true;
+        }
+
+        CreditCardMSCVCResultCode cvcResult = providerResult.parmCvcResult();
+        //SKS-Begin
+        if(cvcResult == CreditCardMSCVCResultCode::Success || isPaymJourCVCSuccess)
+        //SKS-End        
+        {
+            return true;
+        }
+
+        // If CVV is blank and blank is allow, consider it success
+        if (strLen(strRTrim(this.parmCardVerificationValue())) == 0 && accountSetup.CardVerificationCheckAllowBlank)
+        {
+            return true;
+        }
+
+        //SKS-Begin
+        processSucceed = false;
+        //SKS-End
+
+        str description = strFmt("@SYS327113", new DictEnum(enumNum(CreditCardMSCVCResultCode)).value2Label(cvcResult));
+
+        //SKS-Begin
+        CreditCardAuthTrans authTrans;
+        //SKS-Begin
+        if (this.parmSKS_CC_CustPaymTableRecId() || this.parmSKS_CC_CustPaymTable())
+        {
+            if (this.parmSKS_CC_CustPaymTable().RefTableId == tableNum(ledgerJournalTrans))
+            {
+                authTrans = CreditCardAuthTrans::sKS_CC_FindValidCaptureOrRefundApproval(this.parmSKS_CC_CustPaymTableRecId());
+
+                if (authTrans)
+                {
+                    // The immediate capture was processed successfully but CVV failed.
+                    SKS_CC_CreditCardProcess::sKS_CC_DoVoidCapture(authTrans, false, description);
+                }
+            }
+            else if (this.parmSKS_CC_CustPaymTable().RefTableId == tableNum(SMAServiceOrderTable))
+            {
+                authTrans = CreditCardAuthTrans::sKS_CC_FindValidPreApproval(this.parmSKS_CC_CustPaymTable().RecId);
+
+                if (authTrans)
+                {
+                    // The preauth was processed successfully but CVV failed.
+                    SKS_CC_CreditCardProcess::sKS_CC_doVoidAuth(authTrans, false, description);
+                }
+            }
+        }
+        else
+        {
+            authTrans = CreditCardAuthTrans::findValidPreApproval(salesTable.SalesId);
+
+            // The preauth was processed successfully but CVV failed.
+            SKS_CC_CreditCardProcess::sKS_CC_doVoidAuth(authTrans, false, description);
+        }
+        //SKS-End
+
+        responseMessage = "@SYS327138";
+        displayedMessage = description;
+
+        // Update the description with the CVC details
+        this.sKS_CC_UpdateFailedDescription(authTrans.RecId, description);
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_UpdateFailedDescription</Name>
+				<Source><![CDATA[
+    private void sKS_CC_UpdateFailedDescription(RefRecId _creditCardAuthTransRecId, str _additionalDescription)
+    {
+        if (_additionalDescription)
+        {
+            ttsbegin;
+
+            CreditCardAuthTrans ccAuthTransUpdate = CreditCardAuthTrans::find(_creditCardAuthTransRecId, true);
+            ccAuthTransUpdate.Description += ' ' + _additionalDescription;
+            ccAuthTransUpdate.update();
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSKS_CC_CustConfirmJourDocNum</Name>
+				<Source><![CDATA[
+    public CustConfirmDocNum parmSKS_CC_CustConfirmJourDocNum(CustConfirmDocNum _sKS_CC_CustConfirmJourDocNum = sKS_CC_CustConfirmJourDocNum)
+    {
+        sKS_CC_CustConfirmJourDocNum = _sKS_CC_CustConfirmJourDocNum;
+        return sKS_CC_CustConfirmJourDocNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForAddressVerification</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if AVS is needed.
+    /// </summary>
+    /// <returns>
+    /// true if AVS is needed.
+    /// </returns>
+    protected boolean checkForAddressVerification()
+    {
+        var checkAVS = false;
+
+        // Address verification check is only done when preauthorization is enabled.
+        if (creditCardPreAuthorization)
+        {
+            var addressVerification = CustTable::find(salesTable.InvoiceAccount).CreditCardAddressVerification;
+
+            if (addressVerification == CreditCardAddressVerification::Yes)
+            {
+                checkAVS = true;
+            }
+            else if (addressVerification == CreditCardAddressVerification::None)
+            {
+                checkAVS = accountSetup.AddressVerification;
+            }
+        }
+
+        return checkAVS;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isVoidNeeded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if void of authorization is needed, either when AVS result is not returned or when sufficient level wasn't reached.
+    /// </summary>
+    /// <param name = "_addressVerificationResult">Address verification result.</param>
+    /// <returns>The boolean value indicating if void of authorization is needed.</returns>
+    protected boolean isVoidNeeded(CreditCardAddressVerificationResult _addressVerificationResult)
+    {
+        boolean voidPreAuth = false;
+
+        CustTable custTable = CustTable::find(salesTable.InvoiceAccount);
+
+        if (_addressVerificationResult == CreditCardAddressVerificationResult::Returned)
+        {
+            CreditCardMSAVSDetailCode avsLevelNeeded = this.getAVSLevelNeeded(custTable, accountSetup);
+
+            CreditCardMSAVSDetailCode avsDetailValue = providerResult.parmAvsDetail();
+
+            voidPreAuth = avsDetailValue < avsLevelNeeded;
+        }
+        else
+        {
+            if (custTable.CreditCardAddressVerification == CreditCardAddressVerification::Yes)
+            {
+                voidPreAuth = custTable.CreditCardAddressVerificationVoid;
+            }
+            else
+            {
+                voidPreAuth = accountSetup.AddressVerificationVoidUnknown;
+            }
+        }
+
+        return voidPreAuth;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoCaptureFromProjInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Captures the amount of the passed in record.
+    /// </summary>
+    /// <param name="_record">
+    /// <c>sKS_CC_CustPaymTable</c> or <c>CreditCardAuthTrans</c> record to be captured.
+    /// </param>
+    /// <param name="_projInvoiceId">
+    /// Project invoice ID of the related <c>ProjInvoiceJour</c> record
+    /// </param>
+    /// <param name="_projInvoiceJour">
+    /// Project invoice record generated during the invoicing process
+    /// </param>
+    /// <param name="_amount">
+    ///     The positive amount to post.
+    /// </param>
+    /// <returns>
+    /// true if capture was successful; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// <c>_projInvoiceId</c> and <c>_projInvoiceJour</c> are both passed in
+    /// to improve usability of method.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// Require record for processing; throw error if not proivded.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Related table of payment must be <c>ProjProsalJour</c> or <c>SMAServiceOrderTable</c>;
+    /// throw error if not the case.
+    /// </exception>
+    
+    public static boolean sKS_CC_DoCaptureFromProjInvoice(Common  _record,
+    ProjInvoiceId _projInvoiceId,
+    ProjInvoiceJour _projInvoiceJour,
+    Amount _amount)
+    {
+        SKS_CC_CreditCardProcess    process;
+        CreditCardAuthTrans         authTrans;
+        SKS_CC_CustPaymTable        sKS_CC_CustPaymTable;
+        ProjProposalJour            projProposalJour;
+        CreditCardOperation         ccOperation = CreditCardOperation::AuthorizeAndCapture;
+
+        if (!_record)
+        {
+            throw error("@SKS6484");
+        }
+
+        process = SKS_CC_CreditCardProcess::construct(ccOperation, _record);
+
+        if (_record.TableId == tableNum(CreditCardAuthTrans))
+        {
+            authTrans = _record;
+            sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findByRecID(authTrans.SKS_CC_CustPaymTable);
+        }
+        else if (_record.TableId == tableNum(SKS_CC_CustPaymTable))
+        {
+            sKS_CC_CustPaymTable = _record;
+        }
+
+        if (!sKS_CC_CustPaymTable)
+        {
+            throw error(strFmt("@SKS6720", _projInvoiceJour.ProposalId));
+        }
+
+        process.parmSKS_CC_CustPaymTableRecId(sKS_CC_CustPaymTable.RecId);
+        process.parmSKS_CC_CustPaymTable(sKS_CC_CustPaymTable);
+        process.parmSKS_CC_ProjInvoiceJour(_projInvoiceJour);
+        process.setAmountFromSales(_amount, sKS_CC_CustPaymTable.CreditCardCurrency);
+        switch (sKS_CC_CustPaymTable.RefTableId)
+        {
+            case tableNum(ProjProposalJour):
+                if (!_projInvoiceJour.ProposalId)
+                {
+                    projProposalJour = ProjProposalJour::findRecid(sKS_CC_CustPaymTable.RefRecId);
+
+                }
+                else
+                {
+                    projProposalJour = ProjProposalJour::find(_projInvoiceJour.ProposalId);
+                }
+                break;
+            case tableNum(SMAServiceOrderTable):
+                projProposalJour = ProjProposalJour::find(_projInvoiceJour.ProposalId);
+                break;
+            default:
+                throw error(strFmt("@SKS6483", int642str(sKS_CC_CustPaymTable.RefTableId), tableId2Name(sKS_CC_CustPaymTable.RefTableId)));
+        }
+
+        process.parmSalesInvoiceId(_projInvoiceJour.ProjInvoiceId);
+
+        authTrans = process.parmCreditCardAuthTrans();
+
+        if(authTrans)
+        {
+            process.parmOperation(CreditCardOperation::AuthorizeAndCapture);
+
+            PositiveNumber captureToAuthAmtDiffPct = CreditCardAccountSetup::findActive().SKS_CC_CaptureAmtOverAuthAmtPct;
+            Amount authAmtWithPctDiffAllowance;
+
+            if (captureToAuthAmtDiffPct)
+            {
+                authAmtWithPctDiffAllowance = CurrencyExchangeHelper::amount(authTrans.ApprovalAmountCur * ((100 + captureToAuthAmtDiffPct) / 100), authTrans.CurrencyCode);
+            }
+
+            // if authorization is already done, chech if the amount is sufficient
+            // or within the capture to auth amount difference allowance %
+            if (authTrans.ApprovalAmountCur >= process.parmTotalAmountCur() ||
+                authAmtWithPctDiffAllowance >= process.parmTotalAmountCur())
+            {            
+                // authorization is sufficient, just need to capture
+                process.parmOperation(CreditCardOperation::CaptureAfterAuthorize);
+            }
+            else
+            {
+                // authorization is insufficient, void the authorization and then authorize and capture.
+                info("@SKS6719");
+                if(!SKS_CC_CreditCardProcess::sKS_CC_doVoidAuth(authTrans, false))
+                {
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            process.parmOperation(CreditCardOperation::AuthorizeAndCapture);
+        }
+
+        return process.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoRefundFromProjInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Refunds the amount of the passed in record.
+    /// </summary>
+    /// <param name="_sKS_CC_CustPaymTable">
+    /// <c>sKS_CC_CustPaymTable</c> record to be refunded.
+    /// </param>
+    /// <param name="_projInvoiceId">
+    /// Project invoice ID of the related <c>ProjInvoiceJour</c> record
+    /// </param>
+    /// <param name="_projInvoiceJour">
+    /// Project credit note invoice record generated during the invoicing process
+    /// </param>
+    /// <param name="_amount">
+    ///     The negative amount to post.
+    /// </param>
+    /// <returns>
+    /// true if refund was successful; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// <c>_projInvoiceId</c> and <c>_projInvoiceJour</c> are both passed in
+    /// to improve usability of method.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// Require record for processing; throw error if not proivded.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Related table of payment must be <c>ProjProsalJour</c>;
+    /// throw error if not the case.
+    /// </exception>    
+    public static boolean sKS_CC_DoRefundFromProjInvoice(SKS_CC_CustPaymTable _sKS_CC_CustPaymTable,
+        ProjInvoiceId _projInvoiceId,
+        ProjInvoiceJour _projInvoiceJour,
+        Amount _amount)
+    {
+        SKS_CC_CreditCardProcess    process;
+        CreditCardAuthTrans         authTrans;
+        ProjProposalJour            projProposalJour;        
+
+        if (!_sKS_CC_CustPaymTable)
+        {
+            throw error(strFmt("@SKS6731", _projInvoiceJour.ProposalId));
+        }
+
+        if (SKS_PP_Setup::find().CCAllowRefundNoOrigTrans == NoYes::No && !_sKS_CC_CustPaymTable.OrigAuthorizationForRefund)
+        {
+            throw error("@SKS6485");
+        }
+
+        if (_sKS_CC_CustPaymTable.OrigAuthorizationForRefund)
+        {
+            authTrans = CreditCardAuthTrans::sKS_CC_FindRefundCharge(_sKS_CC_CustPaymTable.OrigAuthorizationForRefund, true);
+            if (!authTrans)
+            {
+                throw error(strFmt("@SKS6486", _sKS_CC_CustPaymTable.OrigAuthorizationForRefund));
+            }
+        }
+
+        if (authTrans)
+        {
+            process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Refund, authTrans);
+        }
+        else
+        {
+            process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Refund, _sKS_CC_CustPaymTable);
+        }
+
+        process.parmSKS_CC_CustPaymTable(_sKS_CC_CustPaymTable);
+        process.parmSKS_CC_CustPaymTableRecId(_sKS_CC_CustPaymTable.RecId);
+        process.parmSKS_CC_ProjInvoiceJour(_projInvoiceJour);
+        process.parmIsCalledFromSKS_CC(true);
+        process.sKS_CC_SetRefundAmount(-_amount);
+
+        switch (_sKS_CC_CustPaymTable.RefTableId)
+        {
+            case tableNum(ProjProposalJour):
+                if (!_projInvoiceJour.ProposalId)
+                {
+                    projProposalJour = ProjProposalJour::findRecid(_sKS_CC_CustPaymTable.RefRecId);
+
+                }
+                else
+                {
+                    projProposalJour = ProjProposalJour::find(_projInvoiceJour.ProposalId);
+                }
+                break;
+            default:
+                throw error(strFmt("@SKS6732", int642str(_sKS_CC_CustPaymTable.RefTableId), tableId2Name(_sKS_CC_CustPaymTable.RefTableId)));
+        }
+
+        process.parmSalesInvoiceId(_projInvoiceJour.ProjInvoiceId);
+
+        return process.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>presentResponse</Name>
+				<Source><![CDATA[
+    public void presentResponse(boolean _showSuccessMessage = true)
+    {
+        if (this.processSucceed())
+        {
+            if (_showSuccessMessage)
+            {
+                if (salesTable.CreditCardCustRefId)
+                {
+                    info(strFmt("@SYS327114", salesTable.SalesId));
+                }
+                //SKS-Begin
+                else
+                {
+                    if (sKS_CC_ProjInvoiceJour)
+                    {
+                        info(strFmt("@SKS6725", sKS_CC_ProjInvoiceJour.ProjInvoiceId));
+                    }
+                }
+                //SKS-End
+            }
+        }
+        else
+        {
+            error(strFmt("@SYS116935", this.failedReason()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_doVoidAuth</Name>
+				<Source><![CDATA[
+    public static boolean sKS_CC_doVoidAuth(CreditCardAuthTrans _creditCardAuthTrans2Void, boolean _showSuccessMessage = true, str _successDescriptionOverride = '')
+    {        
+        SKS_CC_CreditCardProcess process;
+
+        process = SKS_CC_CreditCardProcess::construct(CreditCardOperation::Void, _creditCardAuthTrans2Void);
+
+        process.sKS_CC_SetAmountFromAuthTrans(_creditCardAuthTrans2Void);
+
+        return process.process(_showSuccessMessage, _successDescriptionOverride);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_DoCaptureFromSalesOrder</Name>
+				<Source><![CDATA[
+    public static boolean sKS_CC_DoCaptureFromSalesOrder(SalesTable _salesTable, SalesInvoiceId _salesInvoiceId, CustInvoiceJour _custInvoiceJour)
+    {
+        // Compiler/Security problem, see bug AX6:232082
+        CreditCardProcess process;
+        CreditCardAuthTrans authTrans;
+
+        process = CreditCardProcess::construct(CreditCardOperation::AuthorizeAndCapture, _salesTable);
+
+        process.setAmountFromSales(_custInvoiceJour.remainAmountToBePaid(), _salesTable.CurrencyCode);
+        process.parmSalesInvoiceId(_salesInvoiceId);
+        process.parmCustInvoiceJour(_custInvoiceJour);
+
+        authTrans = process.parmCreditCardAuthTrans();
+
+        if(authTrans)
+        {            
+            PositiveNumber captureToAuthAmtDiffPct = CreditCardAccountSetup::findActive().SKS_CC_CaptureAmtOverAuthAmtPct;
+            Amount authAmtWithPctDiffAllowance;
+
+            if (captureToAuthAmtDiffPct)
+            {
+                authAmtWithPctDiffAllowance = CurrencyExchangeHelper::amount(authTrans.ApprovalAmountCur * ((100 + captureToAuthAmtDiffPct) / 100), authTrans.CurrencyCode);
+            }
+
+            // if authorization is already done, chech if the amount is sufficient
+            // or within the capture to auth amount difference allowance %
+            if (authTrans.ApprovalAmountCur >= process.parmTotalAmountCur() ||
+                authAmtWithPctDiffAllowance >= process.parmTotalAmountCur())
+            {
+                // authorization is sufficient, just need to capture
+                process.parmOperation(CreditCardOperation::CaptureAfterAuthorize);
+            }
+            else
+            {
+                // authorization is insufficient, void the authorization and then authorize and capture.
+                info("@SKS6719");
+                if (!CreditCardProcess::doVoidAuth(authTrans, false))
+                {
+                    return false;
+                }
+            }
+        }
+        return process.process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardProcess_Pre_main</Name>
+				<Source><![CDATA[
+    [PreHandlerFor(classStr(CreditCardProcess), staticMethodStr(CreditCardProcess, main))]
+    public static void CreditCardProcess_Pre_main(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        SalesTable salesTable;
+        Args argsCaller = _ppArgs.getArg(identifierStr(_args));
+        switch (argsCaller.parmEnum())
+        {
+            case CreditCardOperation::Authorize:
+                if (argsCaller.record().TableId == tableNum(salesTable)) 
+                {
+                    salesTable = argsCaller.record();
+                    if (salesTable.ProjId)
+                    {
+                        throw warning(strFmt("@SYS127403", salesTable.SalesType));
+                    }
+
+                    if (!SKS_CC_CreditCardProcess::SKS_CC_CheckPreAuthAmountForOverPct(salesTable))
+                    {
+                        throw info("@SKS6744");
+                    }                    
+                }
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_CheckPreAuthAmountForOverPct</Name>
+				<Source><![CDATA[
+    public static boolean SKS_CC_CheckPreAuthAmountForOverPct(SalesTable _salesTable)
+    {
+        CreditCardAuthTrans authTrans;
+        SalesTotals salesTotals;       
+        AmountCur markedAmount, invoiceAmount, authAmount;        
+
+        // do nothing if no pre-authorize required
+        if (!CustParameters::find().CreditCardPreAuthorization)
+        {
+            return true;
+        }
+
+        salesTotals = SalesTotals_Sales::construct(_salesTable, SalesUpdate::All);
+        AmountCur salesTotalAmount = salesTotals.totalAmount();
+
+        // If sales total amount is negative it is a credit note and we don't authorize
+        if (salesTotalAmount < 0)
+        {
+            return true;
+        }
+        
+        invoiceAmount = salesTotals.totalAmount();
+        markedAmount = SKS_CC_CreditCardProcess::sKS_CC_GetMarkedAmount(_salesTable);
+        authAmount = invoiceAmount - markedAmount;
+
+        if ((abs(authAmount) > abs(invoiceAmount)) || !authAmount)
+        {
+            return true;
+        }
+
+        authTrans = CreditCardAuthTrans::findValidPreApproval(_salesTable.SalesId);
+        if (authTrans)
+        {
+            PositiveNumber captureToAuthAmtDiffPct = CreditCardAccountSetup::findActive().SKS_CC_CaptureAmtOverAuthAmtPct;
+            Amount authAmtWithPctDiffAllowance;
+
+            if (captureToAuthAmtDiffPct)
+            {
+                authAmtWithPctDiffAllowance = CurrencyExchangeHelper::amount(authTrans.ApprovalAmountCur * ((100 + captureToAuthAmtDiffPct) / 100), authTrans.CurrencyCode);
+            }
+
+            // if authorization is already done, chech if the amount is sufficient
+            // or within the capture to auth amount difference allowance %
+            if (authTrans.ApprovalAmountCur < authAmount &&
+                authAmtWithPctDiffAllowance >= authAmount)
+            {
+                if (Box::okCancel("@SKS6742", DialogButton::Cancel, "@SKS6743") == DialogButton::Cancel)
+                {
+                    return false;
+                }            
+            }        
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MCRCustPaymTable_Post_processIfAuthStale</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Post handler to ensure that <c>MCRCustPaymTable</c> record
+    ///     is updated to status <b>Authorized</b> when CC payment is
+    ///     successfully processed from <c>processIfAuthStale</c> method.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(tableStr(MCRCustPaymTable), tableStaticMethodStr(MCRCustPaymTable, processIfAuthStale))]
+    public static void MCRCustPaymTable_Post_processIfAuthStale(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        if (!CustParameters::find().CreditCardPreAuthorization)
+        {
+            return;
+        }
+
+        boolean retValue = _ppArgs.getReturnValue();
+        if (!retValue)
+        {
+            return;
+        }
+
+        RefRecId callerSalesTableRecId= _ppArgs.getArg(identifierStr(_salesTableRecId));
+        if (!callerSalesTableRecId)
+        {
+            return;
+        }
+
+        MCRCustPaymTable mcrCustPaymTable;
+        while select mcrCustPaymTable
+            where mcrCustPaymTable.RefRecId == callerSalesTableRecId
+               && mcrCustPaymTable.RefTableId == tableNum(SalesTable)
+               && mcrCustPaymTable.CustPaymType == MCRCustPaymType::CreditCard
+               && mcrCustPaymTable.Status == MCRCustPaymStatus::NotSubmitted
+        {
+            CreditCardAuthTrans creditCardAuthTrans = CreditCardAuthTrans::mcrFindValidPreApproval(mcrCustPaymTable.RecId);
+
+            if (creditCardAuthTrans)
+            {
+                mcrCustPaymTable.selectForUpdate(true);
+                ttsbegin;
+                mcrCustPaymTable.Status= MCRCustPaymStatus::Authorized;
+                mcrCustPaymTable.update();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardProcess_Post_mcrDoVoidPreAuth</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Post handler to ensure that <c>SalesTable</c> record is updated
+    ///     to status <b>Open order</b> and mcrOrderStopped set to 'Yes'
+    ///     when CC payment is successfully voided from <c>mcrDoVoidPreAut</c> method.
+    ///     This is added to fix an issue when voiding payments from 'Customer service' form.
+    ///     It works properly when voiding from 'Sales Order' form.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProcess), staticMethodStr(CreditCardProcess, mcrDoVoidPreAuth))]
+    public static void CreditCardProcess_Post_mcrDoVoidPreAuth(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        boolean retValue = _ppArgs.getReturnValue();
+        if (!retValue)
+        {
+            return;
+        }
+
+        Args callerArgs = _ppArgs.getArg(identifierStr(_args));
+        if (!callerArgs || callerArgs.callerName() != formStr(MCRCustPaymTable))
+        {
+            return;
+        }
+
+        Common callerRecord = _ppArgs.getArg(identifierStr(_record));
+        if (callerRecord.TableId == tableNum(mcrCustPaymTable))
+        {
+            MCRCustPaymTable mcrCustPaymTable = mcrCustPaymTable::findByRecID(callerRecord.RecId);
+            if (mcrCustPaymTable && mcrCustPaymTable.RefTableId == tableNum(SalesTable)
+                && mcrCustPaymTable.Status == MCRCustPaymStatus::NotSubmitted)
+            {
+                SalesTable salesTableSKS = mcrCustPaymTable.salesTable();
+                if (salesTableSKS.MCROrderStopped == NoYes::No)
+                {
+                    salesTableSKS.selectForUpdate(true);
+                    salesTableSKS.mcrOpenSalesOrder();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardProcess_Post_mcrDoPreAuth</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Post handler to ensure that <c>MCRCustPaymTable</c> record
+    ///     is updated to status <b>Authorized</b> when CC authorization is
+    ///     successfully processed from <c>mcrDoPreAuth</c> method when
+    ///     the authorization is created after a partial invoice is posted.
+    /// </summary>
+    /// <param name="_ppArgs"></param>
+    [PostHandlerFor(classStr(CreditCardProcess), staticMethodStr(CreditCardProcess, mcrDoPreAuth))]
+    public static void CreditCardProcess_Post_mcrDoPreAuth(XppPrePostArgs _ppArgs)
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            return;
+        }
+
+        if (!CustParameters::find().CreditCardPreAuthorization)
+        {
+            return;
+        }
+
+        boolean retValue = _ppArgs.getReturnValue();        
+
+        Common callerRecord = _ppArgs.getArg(identifierStr(_record));
+        if (!callerRecord)
+        {
+            return;
+        }
+
+        if (callerRecord.TableId == tableNum(mcrCustPaymTable))
+        {
+            MCRCustPaymTable mcrCustPaymTable = mcrCustPaymTable::findByRecID(callerRecord.RecId);
+            if (mcrCustPaymTable)
+            {
+                if (!retValue)
+                {
+                    if (mcrCustPaymTable.RefTableId == tableNum(SalesTable) &&
+                        mcrCustPaymTable.RefRecId)
+                    {
+                        SalesTable salesTableSKSUpd = SalesTable::findRecId(mcrCustPaymTable.RefRecId, true);
+                        if (salesTableSKSUpd &&
+                            salesTableSKSUpd.MCROrderStopped == NoYes::No &&
+                            salesTableSKSUpd.SalesStatus != SalesStatus::Invoiced &&
+                            salesTableSKSUpd.SalesStatus != SalesStatus::Canceled)
+                        {                            
+                            salesTableSKSUpd.mcrOpenSalesOrder();
+                        }
+                    }
+                }
+                else
+                {
+                    if (mcrCustPaymTable.Status == MCRCustPaymStatus::Paid)
+                    {
+                        CreditCardAuthTrans creditCardAuthTrans = CreditCardAuthTrans::mcrFindValidPreApproval(mcrCustPaymTable.RecId);
+
+                        if (creditCardAuthTrans)
+                        {
+                            mcrCustPaymTable.selectForUpdate(true);
+                            ttsbegin;
+                            mcrCustPaymTable.Status= MCRCustPaymStatus::Authorized;
+                            mcrCustPaymTable.update();
+                            ttscommit;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

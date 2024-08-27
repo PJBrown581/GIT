@@ -1,0 +1,1167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGISF_SalesOrderService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class GGISF_SalesOrderService extends SysOperationServiceBase
+{ 
+    GGISF_ResponseContract                  responseBase = new GGISF_ResponseContract();     
+    GGISF_ResponseContract_InfoMessages     message = new GGISF_ResponseContract_InfoMessages();
+
+    GGISF_SalesOrderLinesContract           salesOrderLineContract;
+    ListEnumerator                          salesLineListEnumerator;
+    
+
+    List messages = new List(Types::Class);
+    ListIterator messagesIterator;
+    SysInfologEnumerator sysInfologEnumerator;
+    Set             set = new Set(Types::String);
+    SetEnumerator   setEnumerator;
+
+    SalesTable                          salesTable;
+    SalesLine                           salesLine;
+    SalesId                             salesId;
+    CustTable                           custTable;
+
+    LogisticsLocation                   location;
+    LogisticsLocationEntity             locationEntity;
+    LogisticsLocationExt                locationExt;
+
+    int startLine;//used to count infolog lines
+   
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setLocation</Name>
+				<Source><![CDATA[
+    private boolean setLocation(LogisticsLocationId _locationId)
+    {
+        location = LogisticsLocation::findByLocationId(_locationId);
+        locationExt = LogisticsLocationExt::find(location.RecId,true);
+        locationEntity = LogisticsLocationEntity::constructFromLocationRecId(location.RecId);
+
+        if (locationEntity.getPostalAddress().RecId == 0)
+        {      
+            infolog.addException(strFmt("@GGISF:GGISF_ShiptoLocationError",_locationId),"");
+            message.parmMessage(infolog.text());
+            message.parmSeverityLevel(MessageSeverity::Error);
+            messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+
+            return false;
+        }
+        else
+        {
+            DirPartyPostalAddressView   dirPartyPostalAddressView;
+            LogisticsLocation logisticsLocation;
+    
+            select RecId
+                        from dirPartyPostalAddressView
+                        join logisticsLocation
+                        where dirPartyPostalAddressView.party == custtable.party &&
+                              logisticsLocation.RecId == dirPartyPostalAddressView.location &&
+                              logisticsLocation.locationId == location.LocationId;
+    
+            if (!dirPartyPostalAddressView.RecId)
+            {
+                infolog.addException(strFmt("@GGISF:GGISF_ShiptoLocationError",_locationId),"");
+                message.parmMessage(infolog.text());
+                message.parmSeverityLevel(MessageSeverity::Error);
+                messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+
+                return false;
+                
+            }
+
+            if (salesTable.DeliveryPostalAddress != locationEntity.getPostalAddress().RecId)
+            {
+                salesTable.setLocation(location.recId,true);
+
+                if (locationExt.TaxGroup != "")
+                {
+                    salesTable.TaxGroup = locationExt.TaxGroup;
+                }
+            }
+        }
+        return true;//successfully set address
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPermit</Name>
+				<Source><![CDATA[
+    private boolean setPermit(TTBPermitId _permitId)
+    {         
+        TTBPermitAddress ttbPermitAddress;
+        TTBPermitTable   ttbPermitTable;
+        select firstonly ttbPermitAddress join ttbPermitTable where ((ttbPermitAddress.permitTable == ttbPermitTable.RecId)
+                        && (ttbPermitAddress.LogisticsPostalAddress == locationEntity.getPostalAddress().RecId)
+                        && (ttbPermitTable.permitId == _permitId));
+                                                  
+        if (!ttbPermitAddress)
+        {     
+            infolog.addException(strFmt("@GGISF:GGISF_TTBPermitError",_permitId),"");
+            message.parmMessage(infolog.text());
+            message.parmSeverityLevel(MessageSeverity::Error);
+            messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+            responseBase.parmStatus(GGISF_ResponseStatus::Failed);
+            responseBase.parmMessagesList(messages);
+            return false;
+        }
+        if (salesTable.ttbPermitTable != TTBPermitTable::findPermitId(_permitId).RecId)
+        {
+            salesTable.ttbPermitTable = TTBPermitTable::findPermitId(_permitId).RecId;
+            
+            // BUG_17449 TTB approval serial number not populating on SF api calls - SR-138946 <PJB 08/16/2023>
+            // Add standard TTB functionality to populate appropriate fields when changing permit on order
+            salesTable.TTBHeaderTable::validatePermit();
+            salesTable.TTBHeaderTable::modifiedField(fieldNum(TTBHeaderTable, PermitTable));
+            // end BUG_17449
+            //salesTable.update();       //update later.  this replicates later functionality
+        }  
+        return true;//set permit to salesTable                
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLines</Name>
+				<Source><![CDATA[
+    private boolean createLines()
+    {          
+        int countItems;
+        startLine = infolog.line();        
+
+        while(salesLineListEnumerator.moveNext())
+        {
+            salesOrderLineContract = salesLineListEnumerator.current();
+            if(salesOrderLineContract)
+            {
+                salesLine.clear();                         
+                salesLine.ItemId = salesOrderLineContract.parmItemNumber();
+                salesLine.QtyOrdered = salesOrderLineContract.parmOrderedSalesQty();
+                salesLine.SalesQty = salesOrderLineContract.parmOrderedSalesQty();
+                salesLine.initFromSalesTable(salesTable);
+                salesLine.initFromInventTable(salesLine.inventTable(),true,salesTable.MatchingAgreement,true);
+                    
+                if(salesLine.validateWrite())
+                {
+                    salesLine.createLine(true, true, true, true, true, true,false,false,false,true,true);
+                }
+                else
+                {
+                    responseBase.parmStatus(GGISF_ResponseStatus::Failed); 
+                }
+                if (infolog.line() > startLine)
+                {
+                    this.addMessage(salesLine.ItemId);
+                }
+            }
+        }  
+        messagesIterator = new ListIterator(messages);
+        responseBase.parmMessagesList(messages);
+        while (messagesIterator.more())
+        {
+            message = messagesIterator.value();
+            if(message.parmSeverityLevel() == MessageSeverity::Error)
+            {
+                return false;
+            }
+            messagesIterator.next();
+        }
+
+        return true;//No errors creating lines
+            
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanMessages</Name>
+				<Source><![CDATA[
+    private void cleanMessages()
+    {
+        messagesIterator = new ListIterator(messages);
+        messages = new List(Types::Class);
+        while (messagesIterator.more())
+        {
+            message = messagesIterator.value();
+            if (!set.in(message.parmMessage()))
+            {
+                set.add(message.parmMessage());
+                messages.addEnd(message);
+            }
+            messagesIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addMessage</Name>
+				<Source><![CDATA[
+    private void addMessage(ItemId _itemId = "")
+    {        
+        sysInfologEnumerator = SysInfologEnumerator::newData(infolog.cut());
+        while (sysInfologEnumerator.moveNext())
+        {
+            message.parmMessage(_itemId + ": " + sysInfologEnumerator.currentMessage());
+                            
+            if(sysInfologEnumerator.currentException() == Exception::Info)
+            {
+                message.parmSeverityLevel(MessageSeverity::Informational);
+            }
+            if(sysInfologEnumerator.currentException() == Exception::Warning)
+            {
+                message.parmSeverityLevel(MessageSeverity::Warning);
+            }
+            if(sysInfologEnumerator.currentException() == Exception::Error)
+            {
+                message.parmSeverityLevel(MessageSeverity::Error);
+            }
+            messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+        }         
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyTax</Name>
+				<Source><![CDATA[
+    private void applyTax()
+    {        
+        AVA_TaxEngine    ava_TaxEngine = new AVA_TaxEngine();
+        if (AVA_TaxEngine::isAvaTaxConfigurationEnabled() &&  !Ava_Configuration::find().DisableTaxCalculation)
+        {
+            ava_TaxEngine.GetTax(salesTable,
+                    DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+                                 false,
+                                 null,
+                                 AVA_DocumentType::SalesOrder,
+                                 '',
+                                 salesTable.SalesType == SalesType::ReturnItem ? AVA_ConnSource::ReturnOrder : AVA_ConnSource::SalesOrder );
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSO</Name>
+				<Source><![CDATA[
+    public GGISF_ResponseContract_SalesOrder initSO(GGISF_SalesOrderHeaderContract  _contract)
+    {  
+        GGISF_ResponseContract_SalesOrder       responseSo = new GGISF_ResponseContract_SalesOrder();
+        str                                     result;
+        
+        NumberSeq                               numberSeq;
+        salesLineListEnumerator                 = _contract.parmSalesOrderLinesList().getEnumerator();        
+        MCRHoldCodeTrans                        mcrHoldCodeTrans;
+        
+        List ttbPermits = new List(Types::Class);
+        SalesAgreementHeaderEntity salesAgreementHeaderEntity; 
+            
+        try
+        {
+            ttsbegin;
+            
+            if (salesTable::find(_contract.parmSalesOrderId()))
+            {                
+                salesTable = salesTable::find(_contract.parmSalesOrderId(),true);
+                custTable = salesTable.custTable_CustAccount();   
+
+                if(!this.setLocation(_contract.parmShipToIdentifier()))
+                {
+                    this.cleanMessages();
+                    responseBase.parmMessagesList(messages);
+                    return responseBase;
+                }                 
+
+                GGI_ExciseTaxRates taxRates;
+                SalesLine exciseLine;
+                select firstonly exciseLine
+                where exciseLine.SalesId == salesTable.salesId
+                join taxRates
+                where exciseLine.SalesCategory == taxRates.salesCategory;
+
+                if (exciseLine.RecId != 0)
+                {
+                    exciseLine.selectForUpdate(true);
+                    if (exciseLine.validateDelete(true))
+                    {
+                        exciseLine.delete();
+                    }
+                }
+
+                //This update is necessary here for TTB Tax Calculation reset
+                //We will reset Permit after removing lines preupdate
+                salesTable.ttbPermitTable = 0;
+                salesTable.update();  
+
+                var deleteSalesLines = SalesTableDeleteLines::newFromSalesTable(salesTable);
+                deleteSalesLines.run();
+                boolean isSalesLineDeleted = deleteSalesLines.anySalesLinesDeleted();
+
+                if (_contract.parmTTBPermitNumber() != "")
+                {
+                    if(!this.setPermit(_contract.parmTTBPermitNumber()))
+                    {
+                        this.cleanMessages();
+                        responseBase.parmMessagesList(messages);
+                        return responseBase;
+                    }
+                }
+                else
+                {
+                    if (salesTable.ttbPermitTable)
+                    {
+                        salesTable.ttbPermitTable = 0;                         
+                    }
+                    // BUG_17449 TTB approval serial number not populating on SF api calls - SR-138946 <PJB 08/16/2023>
+                    // Add standard TTB functionality to populate appropriate fields when changing permit on order
+                    salesTable.TTBHeaderTable::validatePermit();
+                    salesTable.TTBHeaderTable::modifiedField(fieldNum(TTBHeaderTable, PermitTable));
+                    // end BUG_17449
+                }
+            
+                if (_contract.parmShippingSiteId() != "")
+                {
+                    salesTable.InventSiteId = _contract.parmShippingSiteId();                      
+                }
+                
+                if (_contract.parmShippingWarehouseId() != "")
+                {
+                    salesTable.InventLocationId = _contract.parmShippingWarehouseId();
+                }
+
+                salesTable.update();
+
+                MarkupTrans markupTrans, markupTransBilled;
+                MarkupTable markupTable = MarkupTable::find(MarkupModuleType::Cust, "AccFreight");
+                select forupdate markupTrans where markupTrans.TransTableId == salesTable.TableId
+                && markupTrans.TransRecId == salesTable.RecId && markupTrans.MarkupCode == markupTable.MarkupCode;
+                if(markupTrans.Recid)
+                {
+                    markupTrans.Value = 0;
+                    markupTrans.update();
+                }
+
+                MarkupTable  markupTableBilled = MarkupTable::find(MarkupModuleType::Cust, "FRTBilled");
+                select forupdate markupTransBilled where markupTransBilled.TransTableId == salesTable.TableId
+                && markupTransBilled.TransRecId == salesTable.RecId && markupTransBilled.MarkupCode == markupTableBilled.MarkupCode;
+                if(markupTransBilled.Recid)
+                {
+                    markupTransBilled.Value = 0;
+                    markupTransBilled.update();
+                } 
+               
+                this.applyTax();
+                
+            }
+            else //this is a new SO
+            {            
+                numberSeq = NumberSeq::newGetNum(GGISF_NumberSeqApplicationModule::numRefGGISF_OrderId());
+                salesId = numberSeq.num();
+                salesTable.SalesId = salesId;
+                salesTable.initValue(SalesType::Sales);
+                salesTable.CustAccount =_contract.parmCustAccount();
+                salesTable.initFromCustTable();
+                salesTable.initInvoiceAccount();   
+             
+                salesTable.CurrencyCode = _contract.parmCurrency();
+                salesTable.InventSiteId = _contract.parmShippingSiteId();
+                salesTable.InventLocationId = _contract.parmShippingWarehouseId();
+           
+                custTable = salesTable.custTable_CustAccount();
+                if (!custTable)
+                {
+                    responseBase.parmStatus(GGISF_ResponseStatus::Failed);
+
+                    infolog.addException(strFmt("@GGISF:GGISF_CustomerAccountError",_contract.parmCustAccount(),salesTable.company()),"");
+                    message.parmMessage(infolog.text());
+                    message.parmSeverityLevel(MessageSeverity::Error);
+                    messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+               
+                    this.cleanMessages();
+                    responseBase.parmMessagesList(messages);
+                    return responseBase;
+                }
+                else
+                {
+                    if ((custTable.Blocked != CustVendorBlocked::Never)&&(custTable.Blocked != CustVendorBlocked::No))
+                    {
+                        responseBase.parmStatus(GGISF_ResponseStatus::Failed);
+
+                        infolog.addException(strFmt("@GGISF:GGISF_CustomerBlockedError",_contract.parmCustAccount(),salesTable.company(),custTable.Blocked),"");
+                        message.parmMessage(infolog.text());
+                        message.parmSeverityLevel(MessageSeverity::Error);
+                        messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+               
+                        this.cleanMessages();
+                        responseBase.parmMessagesList(messages);
+                        return responseBase;
+                    }
+                }
+                 
+                if(!this.setLocation(_contract.parmShipToIdentifier()))
+                {
+                    this.cleanMessages();
+                    responseBase.parmMessagesList(messages);
+                    return responseBase;
+                }
+
+                if (_contract.parmTTBPermitNumber() != "")
+                {
+                    if(!this.setPermit(_contract.parmTTBPermitNumber()))
+                    {
+                        this.cleanMessages();
+                        responseBase.parmMessagesList(messages);
+                        return responseBase;
+                    }
+                } 
+
+                //CR_12031_SalesForce_AttachSalesAgreement
+                select count(RecId) from salesAgreementHeaderEntity
+                    where salesAgreementHeaderEntity.AgreementCustomerAccountNumber == custTable.AccountNum
+                    && salesAgreementHeaderEntity.DeliveryAddressLocationId == _contract.parmShipToIdentifier()
+                    && salesAgreementHeaderEntity.AgreementStatus == AgreementState::Effective;
+                if(salesAgreementHeaderEntity.RecId == 1)
+                {
+                    select firstonly salesAgreementHeaderEntity
+                    where salesAgreementHeaderEntity.AgreementCustomerAccountNumber == custTable.AccountNum
+                    && salesAgreementHeaderEntity.DeliveryAddressLocationId == _contract.parmShipToIdentifier();
+                    if(salesAgreementHeaderEntity.RecId)
+                    {
+                        salesTable.initFromSalesAgreementHeader(SalesAgreementHeader::findAgreementId(salesAgreementHeaderEntity.SalesAgreementId));
+                    }
+                }
+                else if(salesAgreementHeaderEntity.RecId > 1)
+                {
+                    infolog.add(Exception::Warning, "There are multiple Price Agreements associated to customer address.");
+                    message.parmMessage("There are multiple Price Agreements associated to customer address.");
+                    message.parmSeverityLevel(MessageSeverity::Warning);
+                    messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+                }
+                //end CR_12031_SalesForce_AttachSalesAgreement
+
+                if(salesTable.validateWrite())
+                {
+                    salesTable.insert();
+                    //CR_9602_SF_HoldCode
+                    //Create the order on hold so it is not included in planning before it is reviewed
+                    ttsbegin;
+                    mcrHoldCodeTrans.initValue();
+                    mcrHoldCodeTrans.InventRefId = salesTable.SalesId;
+                    mcrHoldCodeTrans.MCRHoldCode = 'OE_WEBSTR';
+                    mcrHoldCodeTrans.insert();
+                    ttscommit;
+                }
+                else
+                {
+                    responseBase.parmStatus(GGISF_ResponseStatus::Failed);
+               
+                    if (infolog.line() > startLine)
+                    {
+                        message.parmMessage(infolog.text());
+                        message.parmSeverityLevel(MessageSeverity::Error);
+                        messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+                   
+                    } 
+                    this.cleanMessages();
+                    responseBase.parmMessagesList(messages);
+                    return responseBase;
+                }
+            }
+
+            if(!this.createLines())
+            {
+                this.cleanMessages();
+                responseBase.parmMessagesList(messages);
+                return responseBase;
+            }
+            message = new GGISF_ResponseContract_InfoMessages();
+            this.applyTax();
+
+            ttscommit;             
+
+            responseSo.parmStatus(GGISF_ResponseStatus::Success);             
+            responseSo.parmErpOrderNumber(salesId);            
+            responseSo.parmSalesTaxGroup(locationExt.TaxGroup);
+            //response.parmTTBPermitNumber("Waiting on Dev to associate TTBPermit with customer addresses");
+            if(SalesTable::exist(salesId))
+            {             
+                responseSo.parmOrderStatus(enum2Str(SalesTable::find(salesId).SalesStatus));
+                message.parmMessage(strfmt("@GGISF:GGISF_InitSOCreateSuccessMsg", salesId));
+            }
+            if (salesTable::exist(_contract.parmSalesOrderId()))
+            {
+                responseSo.parmOrderStatus(enum2Str(SalesTable::find(_contract.parmSalesOrderId()).SalesStatus));
+                message.parmMessage(strfmt("@GGISF:GGISF_InitSOUpdateSuccessMsg", _contract.parmSalesOrderId()));
+            }
+            message.parmSeverityLevel(MessageSeverity::Informational);
+            messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));              
+
+            TTBPermitAddress ttbPermitAddress;
+            while select ttbPermitAddress where ttbPermitAddress.LogisticsPostalAddress == locationEntity.getPostalAddress().RecId
+            {
+                GGISF_ResponseContract_TTBPermits ttbPermit = new GGISF_ResponseContract_TTBPermits();
+                ttbPermit.parmTTBPermitNumber(TTBPermitTable::find(ttbPermitAddress.PermitTable).permitId);
+                ttbPermits.addEnd(ttbPermit);
+            }
+            responseSo.parmTTBPermitsList(ttbPermits);
+            this.cleanMessages();
+            responseSo.parmMessagesList(messages);
+            return responseSo;
+        }
+        catch(Exception::CLRError)
+        {
+            messages = new List(Types::Class);
+            responseSo.parmStatus(GGISF_ResponseStatus::Failed);
+            
+            if (infolog.line() > startLine)
+            {
+                this.addMessage();                   
+            }
+
+        }
+        catch(Exception::Error)
+        {
+            responseSo.parmStatus(GGISF_ResponseStatus::Failed);
+                
+            if (infolog.line() > startLine)
+            {
+                if (infolog.line() > startLine)
+                {
+                    this.addMessage();
+                }
+            }
+           
+        }
+        this.cleanMessages();
+        responseSo.parmMessagesList(messages);
+        return responseSo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getShipping</Name>
+				<Source><![CDATA[
+    public GGISF_ResponseContract_Shipping getShipping(GGISF_SalesOrderHeaderContract  _contract)
+    {
+        ttsbegin;
+        GGIIntegrationsURouteSalesTableAccessorials accessorialTable = GGIIntegrationsURouteSalesTableAccessorials::find(_contract.parmSalesOrderId(),true);
+        ListEnumerator  accessorialsEnumenator = _contract.parmSalesOrderAccessorialsList().getEnumerator();
+        while (accessorialsEnumenator.moveNext())
+        {
+            GGISF_SalesOrderAccessorialsContract accessorial = accessorialsEnumenator.current();
+            switch  (accessorial.parmAccessorialType())
+            {
+                case "Liftgate":
+                    {
+                        accessorialTable.Liftgate = true;
+                        accessorialTable.Update();
+                        break;
+                    }
+                case "InsideDelivery":
+                    {
+                        accessorialTable.InsideDelivery = true;
+                        accessorialTable.Update();
+                        break;
+                    }
+                case "DestinationAppointment":
+                    {
+                        accessorialTable.DestinationAppointment = true;
+                        accessorialTable.Update();
+                        break;
+                    }
+                case "LimitedAccess":
+                    {
+                        accessorialTable.LimtedAccess = true;
+                        accessorialTable.Update();
+                        break;
+                    }
+            }
+
+        }
+        ttscommit;
+
+        GGISF_ResponseContract_Shipping response = new GGISF_ResponseContract_Shipping();          
+
+        GGIIntegrationsURouteBase uRoute = new GGIIntegrationsURouteBase();
+        //uRoute.processGetURouteBaseRate(salesTable::find(_contract.parmSalesOrderId()),_contract.parmAccFreightMultiplier());
+
+        MarkupTrans markupTrans, markupTransBilled;
+        salesTable = salesTable::find(_contract.parmSalesOrderId());
+        real AccFreight = uRoute.processGetURouteBaseRate(salesTable,1,"SF");
+           
+        MarkupTable markupTable = MarkupTable::find(MarkupModuleType::Cust, "AccFreight");
+        select forupdate markupTrans where markupTrans.TransTableId == salesTable.TableId
+                && markupTrans.TransRecId == salesTable.RecId && markupTrans.MarkupCode == markupTable.MarkupCode;
+        if(markupTrans.Recid)
+        {
+            markupTrans.Value = AccFreight;
+            markupTrans.update();
+        }
+
+        MarkupTable  markupTableBilled = MarkupTable::find(MarkupModuleType::Cust, "FRTBilled");
+        select forupdate markupTransBilled where markupTransBilled.TransTableId == salesTable.TableId
+                && markupTransBilled.TransRecId == salesTable.RecId && markupTransBilled.MarkupCode == markupTableBilled.MarkupCode;
+        if(markupTransBilled.Recid)
+        {
+            markupTransBilled.Value = AccFreight * _contract.parmAccFreightMultiplier();
+            markupTransBilled.update();
+        }
+
+        response.parmErpOrderNumber(salesTable.salesId);
+        response.parmOrderStatus(enum2Str(salesTable.SalesStatus));
+
+        location = LogisticsLocation::find(salesTable.deliveryLocation());
+        locationExt = LogisticsLocationExt::find(location.RecId,true);
+
+        this.applyTax();
+        
+        response.parmSalesTaxGroup(locationExt.TaxGroup);
+
+        message.parmMessage("@GGISF:GGISF_GetShippingSuccessMsg");
+        message.parmSeverityLevel(MessageSeverity::Informational);
+        messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+        //response.parmMethodCode("UPSA");
+        response.parmStatus(GGISF_ResponseStatus::Success);
+        //response.parmMethodName("UPS 2 Day Air");
+        response.parmMethodCost(AccFreight);
+        response.parmfrtBilled(AccFreight * _contract.parmAccFreightMultiplier());
+        response.parmCurrency("USD");
+        response.parmMessagesList(messages);
+        return response;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaxes</Name>
+				<Source><![CDATA[
+    public GGISF_ResponseContract_Taxes getTaxes(GGISF_SalesOrderHeaderContract  _contract)
+    {
+        GGISF_ResponseContract_Taxes response = new GGISF_ResponseContract_Taxes();
+       
+        message.parmMessage("@GGISF:GGISF_GetTaxesSuccessMsg");
+        message.parmSeverityLevel(MessageSeverity::Informational);
+        messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+        
+        response.parmStatus(GGISF_ResponseStatus::Success);
+
+        salesTable = SalesTable::find(_contract.parmSalesOrderId());       
+
+        this.applyTax(); 
+       
+        SalesTotals     salesTotals;
+        salesTotals = SalesTotals::construct(salesTable,SalesUpdate::All);
+        salesTotals.calc();
+        response.parmSalesTax(abs(salesTotals.tax().totalTaxAmount()));
+        
+        SalesLine   exciseLine;
+        GGI_ExciseTaxRates taxRates;
+        select firstonly exciseLine
+            where exciseLine.SalesId == _contract.parmSalesOrderId()
+            join taxRates
+            where exciseLine.SalesCategory == taxRates.salesCategory;
+        if (exciseLine)
+        {
+            response.parmExciseTax(exciseLine.LineAmount);
+        }
+        
+        response.parmTotalTax( response.parmSalesTax()+ response.parmExciseTax());
+        response.parmCurrency("USD");
+        response.parmErpOrderNumber(salesTable.salesId);
+        response.parmOrderStatus(enum2Str(salesTable.SalesStatus));
+
+        location = LogisticsLocation::find(salesTable.deliveryLocation());
+        locationExt = LogisticsLocationExt::find(location.RecId,true);
+ 
+        response.parmSalesTaxGroup(locationExt.TaxGroup);
+
+        response.parmMessagesList(messages);
+        return response;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrices</Name>
+				<Source><![CDATA[
+    public GGISF_PricingResponseEnvelope getPrices(GGISF_PricingHeaderContract  _contract)
+    {  
+        int counter = 0;
+        GGISF_PricingResponseEnvelope response = new  GGISF_PricingResponseEnvelope();
+        GGISF_PricingResponseContract agreement = new GGISF_PricingResponseContract();
+        List pricing = new List(Types::Class);
+        List tiers = new List(Types::Class);
+        GGISF_PricingResponseContract_Tiers tier = new GGISF_PricingResponseContract_Tiers();
+        SalesAgreementHeaderEntity salesAgreementHeaderEntity;
+        SalesAgreementLineEntity salesAgreementLineEntity;
+        SalesAgreementId salesAgreementId;
+        PriceDiscTable priceDiscTable;        
+        boolean itemExists = false; 
+       
+        void localFuncPrices()
+        {            
+            if(agreement.parmSalesAgreementId() != salesAgreementLineEntity.SalesAgreementId || agreement.parmItemId() != salesAgreementLineEntity.ItemNumber || (agreement.parmEffectiveDate() != salesAgreementLineEntity.EffectiveDate && agreement.parmExpirationDate() != salesAgreementLineEntity.ExpirationDate))
+            {
+                if(agreement.parmSalesAgreementId() != "")
+                {
+                    counter++;
+                    if(agreement.parmPrice() == 0)
+                    {
+                        agreement = this.setpricing(agreement);
+                    }
+                    agreement.parmPricingTiers(tiers);
+                    pricing.addEnd(agreement);
+                    tiers = new List(Types::Class);
+                }
+                    
+                agreement = this.setAgreement(salesAgreementLineEntity);
+            }
+            if(salesAgreementLineEntity.MinimumReleaseAmount == 0 ||  salesAgreementLineEntity.MinimumReleaseAmount == salesAgreementLineEntity.price)
+            {
+                agreement.parmPrice(salesAgreementLineEntity.price);
+            }
+            else
+            {
+                tier = new GGISF_PricingResponseContract_Tiers();
+                tier.parmPrice(salesAgreementLineEntity.price);
+                tier.parmQuantity(salesAgreementLineEntity.MinimumReleaseAmount/salesAgreementLineEntity.price);
+                tiers.addEnd(tier);
+            }
+        }
+
+        if(_contract.parmItemId() != '')
+        {
+            itemExists = true;
+        }
+        
+        if(itemExists)
+        {
+            while select salesAgreementLineEntity order by salesAgreementLineEntity.SalesAgreementId,salesAgreementLineEntity.ItemNumber,salesAgreementLineEntity.EffectiveDate,salesAgreementLineEntity.ExpirationDate
+            where salesAgreementLineEntity.ItemNumber == _contract.parmItemId()       
+            {  
+                localFuncPrices();
+            }                   
+        } 
+        else
+        {
+            while select salesAgreementLineEntity order by salesAgreementLineEntity.ItemNumber,salesAgreementLineEntity.SalesAgreementId,salesAgreementLineEntity.EffectiveDate,salesAgreementLineEntity.ExpirationDate
+            {
+                localFuncPrices();
+            }
+        }
+        if(counter > 0)
+        {
+            agreement = this.setpricing(agreement);
+            agreement.parmPricingTiers(tiers);
+            pricing.addEnd(agreement);
+            response.parmPricing(pricing);
+        }
+        return response;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrice</Name>
+				<Source><![CDATA[
+    private GGISF_PricingResponseEnvelope getPrice(GGISF_PricingResponseContract  agreement, SalesAgreementLineEntity salesAgreementLineEntity)
+    {
+        SalesAgreementHeaderEntity salesAgreementHeaderEntity;
+        GGISF_PricingResponseEnvelope response = new  GGISF_PricingResponseEnvelope();
+        List pricing = new List(Types::Class);
+        List tiers = new List(Types::Class);
+        GGISF_PricingResponseContract_Tiers tier; 
+       
+        if(agreement.parmSalesAgreementId() != salesAgreementLineEntity.SalesAgreementId || agreement.parmItemId() != salesAgreementLineEntity.ItemNumber || (agreement.parmEffectiveDate() != salesAgreementLineEntity.EffectiveDate && agreement.parmExpirationDate() != salesAgreementLineEntity.ExpirationDate))
+        {
+            if(agreement.parmSalesAgreementId() != "")
+            {
+                //counter++;
+                if(agreement.parmPrice() == 0)
+                {
+                    agreement = this.setpricing(agreement);
+                    pricing.addEnd(agreement);
+                    tiers = new List(Types::Class);
+                }
+            }
+            agreement = this.setAgreement(salesAgreementLineEntity);
+        }
+        if(salesAgreementLineEntity.MinimumReleaseAmount == 0 ||  salesAgreementLineEntity.MinimumReleaseAmount == salesAgreementLineEntity.price)
+        {
+            agreement.parmPrice(salesAgreementLineEntity.price);
+        }
+        else
+        {
+            tier = new GGISF_PricingResponseContract_Tiers();
+            tier.parmPrice(salesAgreementLineEntity.price);
+            tier.parmQuantity(salesAgreementLineEntity.MinimumReleaseAmount/salesAgreementLineEntity.price);
+            tiers.addEnd(tier);
+        }  
+        response.parmPricing(pricing);
+        return response;       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrices2</Name>
+				<Source><![CDATA[
+    public GGISF_PricingResponseEnvelope getPrices2(GGISF_PricingHeaderContract  _contract)
+    {
+        int counter = 0;
+        GGISF_PricingResponseEnvelope response = new  GGISF_PricingResponseEnvelope();
+        GGISF_PricingResponseContract agreement = new GGISF_PricingResponseContract();
+        List pricing = new List(Types::Class);
+        List tiers = new List(Types::Class);
+        GGISF_PricingResponseContract_Tiers tier = new GGISF_PricingResponseContract_Tiers();
+        SalesAgreementHeaderEntity salesAgreementHeaderEntity;
+        SalesAgreementLineEntity salesAgreementLineEntity;
+        SalesAgreementId salesAgreementId;
+        PriceDiscTable priceDiscTable;
+        boolean itemExists = false;
+
+        if(_contract.parmItemId() != '')
+        {
+            itemExists = true;
+        }
+
+        if(itemExists)
+        {
+            while select salesAgreementLineEntity order by salesAgreementLineEntity.SalesAgreementId,salesAgreementLineEntity.ItemNumber,salesAgreementLineEntity.EffectiveDate,salesAgreementLineEntity.ExpirationDate
+            where salesAgreementLineEntity.ItemNumber == _contract.parmItemId()
+            {
+                if(agreement.parmSalesAgreementId() != salesAgreementLineEntity.SalesAgreementId || agreement.parmItemId() != salesAgreementLineEntity.ItemNumber || (agreement.parmEffectiveDate() != salesAgreementLineEntity.EffectiveDate && agreement.parmExpirationDate() != salesAgreementLineEntity.ExpirationDate))
+                {
+                    if(agreement.parmSalesAgreementId() != "")
+                    {
+                        counter++;
+                        if(agreement.parmPrice() == 0)
+                        {
+                            if(agreement.parmEffectiveDate() <= today() && agreement.parmExpirationDate() >= today())
+                            {
+                                select firstonly priceDiscTable where priceDiscTable.ItemRelation == agreement.parmItemId() && today() >= priceDiscTable.FromDate && today() <= priceDiscTable.ToDate && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                            }
+                            else
+                            {
+                                select firstonly priceDiscTable where priceDiscTable.ItemRelation == agreement.parmItemId() && priceDiscTable.FromDate >= agreement.parmEffectiveDate() && priceDiscTable.FromDate <= agreement.parmExpirationDate() && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                            }
+                            agreement.parmPrice(priceDiscTable.price());
+                            if(agreement.parmPrice() == 0)
+                            {
+                                select firstonly priceDiscTable where priceDiscTable.ItemRelation == agreement.parmItemId() && today() >= priceDiscTable.FromDate && today() <= priceDiscTable.ToDate && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                                agreement.parmPrice(priceDiscTable.price());
+                            }
+                            if(agreement.parmPrice() == 0)
+                            {
+                                select firstonly priceDiscTable order by priceDiscTable.FromDate asc where priceDiscTable.ItemRelation == agreement.parmItemId() && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                                agreement.parmPrice(priceDiscTable.price());
+                            }
+                            
+                            //agreement.parmEffectiveDateTA(priceDiscTable.FromDate);
+                            //agreement.parmExpirationDateTA(priceDiscTable.ToDate);
+                            agreement.parmPrice(priceDiscTable.Amount);
+                        }
+                        agreement.parmPricingTiers(tiers);
+                        pricing.addEnd(agreement);
+                        select firstonly salesAgreementHeaderEntity where salesAgreementHeaderEntity.SalesAgreementId == salesAgreementLineEntity.SalesAgreementId;
+                        tiers = new List(Types::Class);
+                        agreement = new GGISF_PricingResponseContract();
+                        agreement.parmSalesAgreementId(salesAgreementLineEntity.SalesAgreementId);
+                        agreement.parmEffectiveDate(salesAgreementLineEntity.EffectiveDate);
+                        agreement.parmExpirationDate(salesAgreementLineEntity.ExpirationDate);
+                        agreement.parmLocationId(salesAgreementHeaderEntity.DeliveryAddressLocationId);
+                        agreement.parmItemId(salesAgreementLineEntity.ItemNumber);
+                        agreement.parmCustomerId(salesAgreementLineEntity.AgreementCustomerAccountNumber);
+                        
+                    }
+                    else
+                    {
+                        select firstonly salesAgreementHeaderEntity where salesAgreementHeaderEntity.SalesAgreementId == salesAgreementLineEntity.SalesAgreementId;
+                    
+                        agreement = new GGISF_PricingResponseContract();
+                        agreement.parmSalesAgreementId(salesAgreementLineEntity.SalesAgreementId);
+                        agreement.parmEffectiveDate(salesAgreementLineEntity.EffectiveDate);
+                        agreement.parmExpirationDate(salesAgreementLineEntity.ExpirationDate);
+                        agreement.parmLocationId(salesAgreementHeaderEntity.DeliveryAddressLocationId);
+                        agreement.parmItemId(salesAgreementLineEntity.ItemNumber);
+                        agreement.parmCustomerId(salesAgreementLineEntity.AgreementCustomerAccountNumber);
+                        
+                    }
+                }
+                if(salesAgreementLineEntity.MinimumReleaseAmount == 0 ||  salesAgreementLineEntity.MinimumReleaseAmount == salesAgreementLineEntity.price)
+                {
+                    agreement.parmPrice(salesAgreementLineEntity.price);
+                }
+                else
+                {
+                    tier = new GGISF_PricingResponseContract_Tiers();
+                    tier.parmPrice(salesAgreementLineEntity.price);
+                    tier.parmQuantity(salesAgreementLineEntity.MinimumReleaseAmount/salesAgreementLineEntity.price);
+                    tiers.addEnd(tier);
+                }
+            }
+            response.parmPricing(pricing);
+            return response;
+        }
+        else
+        {
+            while select salesAgreementLineEntity order by salesAgreementLineEntity.ItemNumber,salesAgreementLineEntity.SalesAgreementId,salesAgreementLineEntity.EffectiveDate,salesAgreementLineEntity.ExpirationDate
+            {
+                if(agreement.parmSalesAgreementId() != salesAgreementLineEntity.SalesAgreementId || agreement.parmItemId() != salesAgreementLineEntity.ItemNumber || (agreement.parmEffectiveDate() != salesAgreementLineEntity.EffectiveDate && agreement.parmExpirationDate() != salesAgreementLineEntity.ExpirationDate))
+                {
+                    if(agreement.parmSalesAgreementId() != "")
+                    {
+                        counter++;
+                        if(agreement.parmPrice() == 0)
+                        {
+                            if(agreement.parmEffectiveDate() <= today() && agreement.parmExpirationDate() >= today())
+                            {
+                                select firstonly priceDiscTable where priceDiscTable.ItemRelation == agreement.parmItemId() && today() >= priceDiscTable.FromDate && today() <= priceDiscTable.ToDate && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                            }
+                            else
+                            {
+                                select firstonly priceDiscTable where priceDiscTable.ItemRelation == agreement.parmItemId() && priceDiscTable.FromDate >= agreement.parmEffectiveDate() && priceDiscTable.FromDate <= agreement.parmExpirationDate() && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                            }
+                            agreement.parmPrice(priceDiscTable.price());
+                            if(agreement.parmPrice() == 0)
+                            {
+                                select firstonly priceDiscTable where priceDiscTable.ItemRelation == agreement.parmItemId() && today() >= priceDiscTable.FromDate && today() <= priceDiscTable.ToDate && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                                agreement.parmPrice(priceDiscTable.price());
+                            }
+                            if(agreement.parmPrice() == 0)
+                            {
+                                select firstonly priceDiscTable order by priceDiscTable.FromDate asc where priceDiscTable.ItemRelation == agreement.parmItemId() && priceDiscTable.AccountRelation == CustTable::find(agreement.parmCustomerId()).PriceGroup;
+                                agreement.parmPrice(priceDiscTable.price());
+                            }
+                            
+                            //agreement.parmEffectiveDateTA(priceDiscTable.FromDate);
+                            //agreement.parmExpirationDateTA(priceDiscTable.ToDate);
+                            agreement.parmPrice(priceDiscTable.Amount);
+                        }
+                        agreement.parmPricingTiers(tiers);
+                        pricing.addEnd(agreement);
+                        select firstonly salesAgreementHeaderEntity where salesAgreementHeaderEntity.SalesAgreementId == salesAgreementLineEntity.SalesAgreementId;
+                        tiers = new List(Types::Class);
+                        agreement = new GGISF_PricingResponseContract();
+                        agreement.parmSalesAgreementId(salesAgreementLineEntity.SalesAgreementId);
+                        agreement.parmEffectiveDate(salesAgreementLineEntity.EffectiveDate);
+                        agreement.parmExpirationDate(salesAgreementLineEntity.ExpirationDate);
+                        agreement.parmLocationId(salesAgreementHeaderEntity.DeliveryAddressLocationId);
+                        agreement.parmItemId(salesAgreementLineEntity.ItemNumber);
+                        agreement.parmCustomerId(salesAgreementLineEntity.AgreementCustomerAccountNumber);
+                        
+                    }
+                    else
+                    {
+                        select firstonly salesAgreementHeaderEntity where salesAgreementHeaderEntity.SalesAgreementId == salesAgreementLineEntity.SalesAgreementId;
+                    
+                        agreement = new GGISF_PricingResponseContract();
+                        agreement.parmSalesAgreementId(salesAgreementLineEntity.SalesAgreementId);
+                        agreement.parmEffectiveDate(salesAgreementLineEntity.EffectiveDate);
+                        agreement.parmExpirationDate(salesAgreementLineEntity.ExpirationDate);
+                        agreement.parmLocationId(salesAgreementHeaderEntity.DeliveryAddressLocationId);
+                        agreement.parmItemId(salesAgreementLineEntity.ItemNumber);
+                        agreement.parmCustomerId(salesAgreementLineEntity.AgreementCustomerAccountNumber);
+                        
+                    }
+                }
+                if(salesAgreementLineEntity.MinimumReleaseAmount == 0 ||  salesAgreementLineEntity.MinimumReleaseAmount == salesAgreementLineEntity.price)
+                {
+                    agreement.parmPrice(salesAgreementLineEntity.price);
+                }
+                else
+                {
+                    tier = new GGISF_PricingResponseContract_Tiers();
+                    tier.parmPrice(salesAgreementLineEntity.price);
+                    tier.parmQuantity(salesAgreementLineEntity.MinimumReleaseAmount/salesAgreementLineEntity.price);
+                    tiers.addEnd(tier);
+                }
+            }
+            response.parmPricing(pricing);
+            return response;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setAgreement</Name>
+				<Source><![CDATA[
+    private GGISF_PricingResponseContract setAgreement(SalesAgreementLineEntity _salesAgreementLineEntity)
+    {
+        SalesAgreementHeaderEntity salesAgreementHeaderEntity;
+        GGISF_PricingResponseContract agreement;          
+
+        select firstonly salesAgreementHeaderEntity where salesAgreementHeaderEntity.SalesAgreementId == _salesAgreementLineEntity.SalesAgreementId;
+        
+        agreement = new GGISF_PricingResponseContract();
+        agreement.parmSalesAgreementId(_salesAgreementLineEntity.SalesAgreementId);
+        agreement.parmEffectiveDate(_salesAgreementLineEntity.EffectiveDate);
+        agreement.parmExpirationDate(_salesAgreementLineEntity.ExpirationDate);
+        agreement.parmLocationId(salesAgreementHeaderEntity.DeliveryAddressLocationId);
+        agreement.parmItemId(_salesAgreementLineEntity.ItemNumber);
+        agreement.parmCustomerId(_salesAgreementLineEntity.AgreementCustomerAccountNumber);   
+                
+        return agreement;
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPricing</Name>
+				<Source><![CDATA[
+    private GGISF_PricingResponseContract setPricing(GGISF_PricingResponseContract _agreement)
+    {         
+        PriceDiscTable priceDiscTable;
+        
+        if(_agreement.parmPrice() == 0)
+        {
+            if(_agreement.parmEffectiveDate() <= today() && _agreement.parmExpirationDate() >= today())
+            {
+                select firstonly priceDiscTable where priceDiscTable.ItemRelation == _agreement.parmItemId() && today() >= priceDiscTable.FromDate && today() <= priceDiscTable.ToDate && priceDiscTable.AccountRelation == CustTable::find(_agreement.parmCustomerId()).PriceGroup;
+            }
+            else
+            {
+                select firstonly priceDiscTable where priceDiscTable.ItemRelation == _agreement.parmItemId() && priceDiscTable.FromDate >= _agreement.parmEffectiveDate() && priceDiscTable.FromDate <= _agreement.parmExpirationDate() && priceDiscTable.AccountRelation == CustTable::find(_agreement.parmCustomerId()).PriceGroup;
+            }
+            _agreement.parmPrice(priceDiscTable.price());
+            if(_agreement.parmPrice() == 0)
+            {
+                select firstonly priceDiscTable where priceDiscTable.ItemRelation == _agreement.parmItemId() && today() >= priceDiscTable.FromDate && today() <= priceDiscTable.ToDate && priceDiscTable.AccountRelation == CustTable::find(_agreement.parmCustomerId()).PriceGroup;
+                _agreement.parmPrice(priceDiscTable.price());
+            }
+            if(_agreement.parmPrice() == 0)
+            {
+                select firstonly priceDiscTable order by priceDiscTable.FromDate asc where priceDiscTable.ItemRelation == _agreement.parmItemId() && priceDiscTable.AccountRelation == CustTable::find(_agreement.parmCustomerId()).PriceGroup;
+                _agreement.parmPrice(priceDiscTable.price());
+            }
+                            
+            _agreement.parmPrice(priceDiscTable.Amount);
+           
+        }
+        return _agreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>commitSO</Name>
+				<Source><![CDATA[
+    public GGISF_ResponseContract commitSO(GGISF_SalesOrderPaymentContract  _contract)
+    {
+        GGISF_ResponseContract response = new GGISF_ResponseContract(); 
+        startLine = infolog.line();
+
+        try
+        {
+            salesTable = SalesTable::find(_contract.parmSalesOrderId(),true);
+            SalesTableType salesTableType = salesTable.type();
+            salesTableType.updateDocumentStatus(DocumentStatus::Confirmation);
+
+            message.parmMessage("@GGISF:GGISF_CommitSOSuccessMsg");
+            message.parmSeverityLevel(MessageSeverity::Informational);
+            messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+            response.parmOrderStatus("In process");
+            response.parmStatus(GGISF_ResponseStatus::Success);
+            response.parmErpOrderNumber("WEBSF_000001");
+        }
+        catch(Exception::Error)
+        {
+            response.parmStatus(GGISF_ResponseStatus::Failed);
+                
+            if (infolog.line() > startLine)
+            {
+                message.parmMessage(infolog.text());
+                message.parmSeverityLevel(MessageSeverity::Error);
+                messages.addEnd(GGISF_ResponseContract_InfoMessages::construct(message));
+                   
+            }
+        }
+        response.parmMessagesList(messages);
+        return response;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNewOrModifiedOrders</Name>
+				<Source><![CDATA[
+    public GGISF_SalesOrderHeaderResponseContract getNewOrModifiedOrders(GGISF_SalesOrderNewOrModified  _contract)
+    {
+        GGISF_SalesOrderHeaderResponseContract salesOrderResponse = new GGISF_SalesOrderHeaderResponseContract();
+        GGISF_SalesOrderHeaderContract  salesOrder = new GGISF_SalesOrderHeaderContract();  
+        GGISF_SalesOrderLinesContract   salesOrderLine = new GGISF_SalesOrderLinesContract();
+        List orders = new List(Types::Class);
+        List lines = new List(Types::Class);
+        
+        SalesLine salesLine2;
+
+        Set orderIds = new Set(Types::String);
+        
+        while select salesTable where salesTable.ModifiedDateTime > _contract.parmSalesModifiedDate()
+        {
+            //clean up the lines array
+            lines = new List(Types::Class);
+            
+            //clean up the order 
+            salesOrder = new GGISF_SalesOrderHeaderContract();
+            salesOrder.parmCustAccount(salesTable.CustAccount);
+            salesOrder.parmEstimatedOrderTotal(SalesTotals::construct(salesTable).totalAmount());
+            salesOrder.parmSalesOrderId(salesTable.SalesId);
+            while select salesLine where salesLine.SalesId == salesTable.SalesId
+            {
+                salesOrderLine = new GGISF_SalesOrderLinesContract();
+                salesOrderLine.parmItemNumber(salesLine.ItemId);
+                salesOrderLine.parmOrderedSalesQty(salesLine.QtyOrdered);
+                lines.addEnd(salesOrderLine);
+            }
+            salesOrder.parmSalesOrderLinesList(lines);
+            orders.addEnd(salesOrder);
+            orderIds.add(salesTable.SalesId);
+        }
+        
+        while select salesLine2 where salesLine2.ModifiedDateTime == _contract.parmSalesModifiedDate()
+        {
+            if(!orderIds.in(salesLine2.SalesId))
+            {
+                while select salesTable where salesTable.SalesId == salesLine.SalesId
+                {
+                    //clean up the lines array
+                    lines = new List(Types::Class);
+            
+                    //clean up the order
+                    salesOrder = new GGISF_SalesOrderHeaderContract();
+                    salesOrder.parmCustAccount(salesTable.CustAccount);
+                    salesOrder.parmEstimatedOrderTotal(SalesTotals::construct(salesTable).totalAmount());
+                    salesOrder.parmSalesOrderId(salesTable.SalesId);
+                    while select salesLine where salesLine.SalesId == salesTable.SalesId
+                    {
+                        salesOrderLine = new GGISF_SalesOrderLinesContract();
+                        salesOrderLine.parmItemNumber(salesLine.ItemId);
+                        salesOrderLine.parmOrderedSalesQty(salesLine.QtyOrdered);
+                        lines.addEnd(salesOrderLine);
+                    }
+                    salesOrder.parmSalesOrderLinesList(lines);
+                    orders.addEnd(salesOrder);
+                    orderIds.add(salesTable.SalesId);
+                }
+                
+            }
+        }
+        salesOrderResponse.parmSalesOrderList(orders);
+        return salesOrderResponse;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

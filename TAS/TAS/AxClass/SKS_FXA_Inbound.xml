@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_FXA_Inbound</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_FXA_Inbound extends SKS_EB_Batch
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Necessary to allow the processing of every Communications ID(inner loop) in every company(outer loop)")]
+    public void run()
+    {
+        Batch bat;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+        SKS_EFT_Bank locSKS_EFT_Bank;
+        SKS_FXA_InboundTradeFile  locSKS_FXA_InboundTradeFile;
+        SKS_FXA_InboundSCFile locSKS_FXA_InboundSCFile;
+        SKS_EB_FileHub locSKS_EB_FileHub;
+        RefRecId locRefRecID;
+        str loclabelOutputForBatchLog; //Batch log will show the literal label, if you don't put it to str frist.
+        list ListOfConfirmationFilesToProcess, ListOfSettlementFilesToProcess;
+        ListEnumerator locConfirmationFilesToProcessEnum, locSettlementFilesToProcessEnum;
+        str locTarget;
+        //<Issue21103: BankFabric storage process>
+        SKS_BF_BankIntType bankIntType = SKS_EB_FileStorage::getBankIntType(SKS_EB_Module::FXAll);
+        str inboundTradeAckFilePath, inboundSettlementConfFilePath, inbFileName, inbSettlementFileName;
+        //</Issue21103>
+
+        bat = this.parmCurrentBatch();
+        locRefRecID = bat.RecId;
+    
+        while select crossCompany  CommID from locSKS_EB_CommProcess where locSKS_EB_CommProcess.BatchJobId == locRefRecID
+        {
+    
+            locSKS_EFT_Bank = null;
+    
+    
+            while Select crossCompany BankAccountId,
+                                        dataAreaId,
+                                        FXAInboundTradeAckFilePath,
+                                        FXAInboundSettlementConfFilePath,
+                                        FXABankFabricInboundTradeAckFileLoc, //Issue21103: BankFabric storage process
+                                        FXABankFabricInboundSettlementConfFileLoc, //Issue21103: BankFabric storage process
+                                        FXAEnabled
+                                        from locSKS_EFT_Bank
+                order by locSKS_EFT_Bank.dataAreaId,
+                            locSKS_EFT_Bank.FXAInboundTradeAckFilePath,
+                            locSKS_EFT_Bank.FXAInboundSettlementConfFilePath
+                where locSKS_EFT_Bank.FXAEnabled
+                && ((bankIntType == SKS_BF_BankIntType::FileHubLocal
+                        && locSKS_EFT_Bank.FXAInboundTradeAckFilePath != ''
+                        && locSKS_EFT_Bank.FXAInboundSettlementConfFilePath != '')
+                    || (bankIntType == SKS_BF_BankIntType::BankFabric //Issue21103: BankFabric storage process
+                        && locSKS_EFT_Bank.FXABankFabricInboundTradeAckFileLoc != ''
+                        && locSKS_EFT_Bank.FXABankFabricInboundSettlementConfFileLoc != ''))
+                && locSKS_EFT_Bank.FXAInboundCommID == locSKS_EB_CommProcess.CommID
+            {
+                changeCompany(locSKS_EFT_Bank.company())
+                {
+                    //<Issue21103: BankFabric storage process>
+                    if(bankIntType == SKS_BF_BankIntType::FileHubLocal)
+                    {
+                        inboundTradeAckFilePath = locSKS_EFT_Bank.FXAInboundTradeAckFilePath;
+                        inboundSettlementConfFilePath = locSKS_EFT_Bank.FXAInboundSettlementConfFilePath;
+                    }
+                    else
+                    {
+                        inboundTradeAckFilePath = locSKS_EFT_Bank.FXABankFabricInboundTradeAckFileLoc;
+                        inboundSettlementConfFilePath = locSKS_EFT_Bank.FXABankFabricInboundSettlementConfFileLoc;
+                    }
+                    //</Issue21103>
+
+                    //Process all Confirmation Files, if the path exists
+                    locSKS_EB_FileHub = SKS_EB_FileHub::construct(bankIntType);
+                    if(!locSKS_EB_FileHub.runDirectoryExists(inboundTradeAckFilePath))
+                    {
+                        warning(strFmt("@SKS3669",
+                        inboundTradeAckFilePath, locSKS_EFT_Bank.company(), locSKS_EFT_Bank.BankAccountId));
+                    }
+                    else//SKS001
+                    {
+                        ListOfConfirmationFilesToProcess = locSKS_EB_FileHub.runDirectoryGetFiles(inboundTradeAckFilePath);
+                        if(ListOfConfirmationFilesToProcess)
+                        {
+    
+                            if(!locConfirmationFilesToProcessEnum && ListOfConfirmationFilesToProcess.elements() > 0)
+                            {
+                                locConfirmationFilesToProcessEnum = ListOfConfirmationFilesToProcess.getEnumerator();
+                                while(locConfirmationFilesToProcessEnum.moveNext())
+                                {
+                                    //<Issue21103: BankFabric storage process>
+                                    if(bankIntType == SKS_BF_BankIntType::FileHubLocal)
+                                    {
+                                        inbFileName = locConfirmationFilesToProcessEnum.current();
+                                    }
+                                    else
+                                    {
+                                        inbFileName = System.IO.Path::Combine(inboundTradeAckFilePath, locConfirmationFilesToProcessEnum.current());
+                                    }
+                                    //</Issue21103>
+
+                                    locSKS_FXA_InboundTradeFile = new SKS_FXA_InboundTradeFile();
+
+                                    if(SKS_FXA_InboundTradeFile::ifTradeFile(inbFileName, true, bankIntType))
+                                    {
+                                        loclabelOutputForBatchLog = strfmt("@SKS3211", locConfirmationFilesToProcessEnum.current());
+                                        info(loclabelOutputForBatchLog);
+                                        Try
+                                        {
+                                            locSKS_EB_FileHub.setFileName(inbFileName);
+                                            locSKS_EB_FileHub.runFileInquire();
+
+                                            locSKS_EB_FileHub.setFileName(inbFileName); //Issue21103: BankFabric storage process
+                                            locSKS_FXA_InboundTradeFile.ImportFile(locSKS_EB_FileHub);
+
+                                            if(locSKS_FXA_InboundTradeFile.getErrorMessage() == 'UNMATCHED')
+                                            {
+                                                Try
+                                                {
+
+                                                    //Move file to Unmatched
+                                                    if(!locSKS_EB_FileHub.runDirectoryExists(System.IO.Path::Combine(
+                                                                        System.IO.Path::GetDirectoryName(inbFileName),
+                                                                        'Unmatched')))
+                                                    {
+                                                        locSKS_EB_FileHub.runDirectoryCreate(
+                                                                    System.IO.Path::Combine(
+                                                                        System.IO.Path::GetDirectoryName(inbFileName),
+                                                                        'Unmatched'));
+                                                    }
+                                                    locSKS_EB_FileHub.runFileMoveTo(System.IO.Path::Combine(
+                                                                        System.IO.Path::GetDirectoryName(inbFileName),
+                                                                        'Unmatched', System.IO.Path::GetFileName(inbFileName)));
+    
+                                                }
+                                                catch(Exception::Error)
+                                                {
+                                                    error(strFmt("@SKS3680",
+                                                        locConfirmationFilesToProcessEnum.current(),
+                                                        System.IO.Path::GetDirectoryName(inbFileName),
+                                                                        'Errors'));
+                                                }//catch (Exception::Error)
+                                            }
+                                            Try
+                                            {
+                                                //Move file to Archvie
+                                                if(!locSKS_EB_FileHub.runDirectoryExists(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                            'Archive')))
+                                                {
+                                                    locSKS_EB_FileHub.runDirectoryCreate(
+                                                                System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                    'Archive'));
+                                                }
+                                                locSKS_EB_FileHub.runFileMoveTo(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                    'Archive', System.IO.Path::GetFileName(inbFileName)));
+                                            }
+                                            catch(Exception::Error)
+                                            {
+                                                error(strFmt("@SKS3680",
+                                                    locConfirmationFilesToProcessEnum.current(),
+                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                    'Archive'));
+                                            }
+                                                //catch (Exception::Error)
+                                        }
+                                        catch (Exception::Error)//Begin Catch 115
+                                        {
+                                            Try//Begin Try 128
+                                            {
+                                                //Move file to Errors
+                                                if(!locSKS_EB_FileHub.runDirectoryExists(System.IO.Path::Combine(
+                                                                System.IO.Path::GetDirectoryName(inbFileName),
+                                                                'Errors')))
+                                                {
+                                                    locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                    'Errors'));
+                                                }
+                                                locSKS_EB_FileHub.runFileMoveTo(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                    'Errors', System.IO.Path::GetFileName(inbFileName)));
+    
+                                            }//End Try 128
+                                            catch(Exception::Error)//Begin Catch 151
+                                            {
+                                                error(strFmt("@SKS3680",
+                                                    locConfirmationFilesToProcessEnum.current(),
+                                                    System.IO.Path::GetDirectoryName(inbFileName),
+                                                                    'Errors'));
+                                            }//catch (Exception::Error) //END CATCH 151
+                                            throw Exception::Error;
+                                        }//catch (Exception::Error)// End Catch 115
+                                    }//if(SKS_FXA_InboundFile::ifTradeFile(locConfirmationFilesToProcessEnum.current(), true))
+                                }//while(locFilesToProcessEnum.moveNext())
+                                ListOfConfirmationFilesToProcess = null;
+                            }//if(!locConfirmationFilesToProcessEnum && ListOfConfirmationFilesToProcess.elements() > 0)
+                            locConfirmationFilesToProcessEnum = null;
+                        }//if(ListOfConfirmationFilesToProcess)
+    
+                    }//else//SKS001
+                    //Process all Settlement Center Files, if the path exists
+                    
+                    if(!locSKS_EB_FileHub.runDirectoryExists(inboundSettlementConfFilePath))
+                    {
+                        warning(strFmt("@SKS3691",
+                        inboundSettlementConfFilePath, locSKS_EFT_Bank.company(), locSKS_EFT_Bank.BankAccountId));
+                    }
+                    else//SKS002
+                    {
+                        ListOfSettlementFilesToProcess = locSKS_EB_FileHub.runDirectoryGetFiles(inboundSettlementConfFilePath);
+                        if(ListOfSettlementFilesToProcess)
+                        {
+                            if(!locSettlementFilesToProcessEnum && ListOfSettlementFilesToProcess.elements() > 0)
+                            {
+                                locSettlementFilesToProcessEnum = ListOfSettlementFilesToProcess.getEnumerator();
+                                while(locSettlementFilesToProcessEnum.moveNext())
+                                {
+                                    //<Issue21103: BankFabric storage process>
+                                    if(bankIntType == SKS_BF_BankIntType::FileHubLocal)
+                                    {
+                                        inbSettlementFileName = locSettlementFilesToProcessEnum.current();
+                                    }
+                                    else
+                                    {
+                                        inbSettlementFileName = System.IO.Path::Combine(inboundSettlementConfFilePath, locSettlementFilesToProcessEnum.current());
+                                    }
+                                    //</Issue21103>
+
+                                    locSKS_FXA_InboundSCFile = new SKS_FXA_InboundSCFile();
+                                    if(SKS_FXA_InboundSCFile::isSCFile(inbSettlementFileName, true, bankIntType))
+                                    {
+                                        loclabelOutputForBatchLog = strfmt("@SKS3211", inbSettlementFileName);
+                                        info(loclabelOutputForBatchLog);
+                                        locSKS_EB_FileHub = SKS_EB_FIleHub::construct(bankIntType);
+                                        locSKS_EB_FileHub.setFileName(inbSettlementFileName);
+                                        locSKS_EB_FileHub.runFileInquire();//Issue21103: BankFabric storage process
+                                        Try//Begin try 179
+                                        {
+                                            locSKS_EB_FileHub.setFileName(inbSettlementFileName);//Issue21103: BankFabric storage process
+                                            locSKS_FXA_InboundSCFile.ImportFile(locSKS_EB_FileHub);
+                                            if(locSKS_FXA_InboundSCFile.getErrorMessage() == 'UNMATCHED')//Begin IF 182
+                                            {
+                                                Try//Begin Try 184
+                                                {
+                                                    //Move file to Errors
+                                                    if(!locSKS_EB_FileHub.runDirectoryExists(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                'Unmatched')))
+                                                    {
+                                                        locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(
+                                                                System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                'Unmatched'));
+                                                    }
+                                                    locTarget = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                                'Unmatched', System.IO.Path::GetFileName(inbSettlementFileName));
+                                                    locSKS_EB_FileHub.runFileMoveTo(locTarget);
+    
+                                                }//End Try 184
+                                                catch(Exception::Error) //Begin Catch 201
+                                                {
+                                                    error(strFmt("@SKS3680",inbSettlementFileName,
+                                                                            System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                'Errors'));
+                                                }//catch (Exception::Error) //End Catch 201
+                                            }//End if 182
+                                            Try//Begin Try 209
+                                            {
+                                                //Move file to Archvie
+                                                if(!locSKS_EB_FileHub.runDirectoryExists(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                                                    'Archive')))
+                                                {
+                                                    locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                    'Archive'));
+                                                }
+                                                locTarget = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                    'Archive', System.IO.Path::GetFileName(inbSettlementFileName));
+                                            	locSKS_EB_FileHub.runFileMoveTo(locTarget);
+                                            }// END TRY 209
+                                            catch(Exception::Error)//Begin Catch 224
+                                            {
+                                                error(strFmt("@SKS3680",inbSettlementFileName,locTarget));
+                                            }//End Catch 224
+                                        }//End Try 179
+                                        catch (Exception::Error)//Begin Catch 232
+                                        {
+                                            Try//begin try 234
+                                            {
+                                                //Move file to Errors
+                                                if(!locSKS_EB_FileHub.runDirectoryExists(System.IO.Path::Combine(
+                                                                System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                'Errors')))
+                                                {
+                                                    locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(
+                                                                    System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                    'Errors'));
+                                                }
+                                                locTarget = System.IO.Path::Combine(
+                                                                                        System.IO.Path::GetDirectoryName(inbSettlementFileName),
+                                                                                        'Errors',
+                                                                                        System.IO.Path::GetFileName(inbSettlementFileName)
+                                                );
+                                                locSKS_EB_FileHub.runFileMoveTo(locTarget);
+                                                }//End try 234
+                                            catch(Exception::Error)//Begin catch 253
+                                            {
+                                                error(strFmt("@SKS3680",locSKS_EB_FileHub.fileName(),locTarget));
+
+                                            }//catch (Exception::Error) //End Catch 253
+                                            throw Exception::Error;
+                                        }//catch (Exception::Error) //End catch 232
+                                    }//if(SKS_FXA_InboundFile::ifTradeFile(locConfirmationFilesToProcessEnum.current(), true))
+                                }//while(locFilesToProcessEnum.moveNext())
+                                ListOfSettlementFilesToProcess = null;
+                            }//if(!locConfirmationFilesToProcessEnum && ListOfConfirmationFilesToProcess.elements() > 0)
+                            locSettlementFilesToProcessEnum = null;
+    
+                        }//if(ListOfSettlementFilesToProcess)
+                    }//else//SKS002
+    
+                }//changeCompany(locSKS_EFT_Bank.company())        }//while Select crossCompany BankAccountId,
+            } // while Select crossCompany BankAccountId,
+        }// while select crossCompany  CommID from locSKS_EB_CommProcess where locSKS_EB_CommProcess.BatchJobId == locRefRecID
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static client server ClassDescription description()
+    {
+        return "@SKS3608";
+    
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

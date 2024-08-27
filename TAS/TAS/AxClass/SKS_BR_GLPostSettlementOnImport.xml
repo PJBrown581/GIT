@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_GLPostSettlementOnImport</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_BR_GLPostSettlementOnImport
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postSettlementOnImport</Name>
+				<Source><![CDATA[
+    public static void postSettlementOnImport(SKS_BR_BankHeaderRecId _SKS_BR_BankHeaderRecId)
+    {
+        System.Threading.Tasks.Task postingTask;
+        List tasks = new List(Types::Class);
+        SKS_BR_BankTran     locSKS_BR_BankTran;
+        SKS_BR_BankTran     lSKS_BR_BankTran;
+
+        select firstonly crossCompany count(RecId) from lSKS_BR_BankTran where
+            lSKS_BR_BankTran.BankHeaderRecId == _SKS_BR_BankHeaderRecId &&
+            lSKS_BR_BankTran.GLMatchOrCreate    == SKS_BR_GLMatchOrCreate::CustomerSettlement &&
+            lSKS_BR_BankTran.SettlementImportAutoPost == NoYes::Yes &&
+            lSKS_BR_BankTran.IsSettlementCombinedJournal == NoYes::Yes;
+
+        if(lSKS_BR_BankTran.RecId > 0)
+        {
+            SKS_BR_GLProcessing_transactionform locSKS_BR_GLProcessing = new SKS_BR_GLProcessing_transactionform();
+
+            locSKS_BR_GLProcessing.PostCustGL(_SKS_BR_BankHeaderRecId);
+        }
+
+        while select crossCompany * from locSKS_BR_BankTran
+                where locSKS_BR_BankTran.BankHeaderRecId == _SKS_BR_BankHeaderRecId &&
+                      locSKS_BR_BankTran.GLMatchOrCreate    == SKS_BR_GLMatchOrCreate::CustomerSettlement &&
+                      locSKS_BR_BankTran.SettlementImportAutoPost == NoYes::Yes &&
+                      locSKS_BR_BankTran.IsSettlementCombinedJournal == NoYes::No &&
+                      locSKS_BR_BankTran.CustCompany != locSKS_BR_BankTran.DataAreaId
+        {
+
+            container params = [locSKS_BR_BankTran.Recid, locSKS_BR_BankTran.ImportedStatementDate, locSKS_BR_BankTran.ImportedStatementNum, locSKS_BR_BankTran.AccountID, locSKS_BR_BankTran.company()];
+            SKS_BR_GLPostSettlementOnImport::postTran(params);
+        }
+
+        while select crossCompany * from locSKS_BR_BankTran
+                where locSKS_BR_BankTran.BankHeaderRecId == _SKS_BR_BankHeaderRecId &&
+                      locSKS_BR_BankTran.GLMatchOrCreate    == SKS_BR_GLMatchOrCreate::CustomerSettlement &&
+                      locSKS_BR_BankTran.SettlementImportAutoPost == NoYes::Yes &&
+                      locSKS_BR_BankTran.IsSettlementCombinedJournal == NoYes::No &&
+                      locSKS_BR_BankTran.CustCompany == locSKS_BR_BankTran.DataAreaId
+        {
+            postingTask = Global::runAsync(
+                classNum(SKS_BR_GLPostSettlementOnImport),
+                staticMethodStr(SKS_BR_GLPostSettlementOnImport, postTran),
+                [locSKS_BR_BankTran.Recid, locSKS_BR_BankTran.ImportedStatementDate, locSKS_BR_BankTran.ImportedStatementNum, locSKS_BR_BankTran.AccountID, locSKS_BR_BankTran.company()],
+                System.Threading.CancellationToken::None);
+
+            tasks.addEnd(postingTask);
+        }
+
+        SKS_BR_GLPostSettlementOnImport::runAfterAllPosted(tasks.pack());
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postTran</Name>
+				<Source><![CDATA[
+    public static container postTran(container _params)
+    {
+        System.Exception ex;
+
+        changecompany(conPeek(_params, 5))
+        {
+            int64 sksBankTranRecId = conPeek(_params, 1);
+            SKS_BR_BankTran sksBankTran;
+            select firstonly forupdate * from sksBankTran where sksBankTran.RecId == sksBankTranRecId;
+
+            // Make sure transaction has not been matched and it's still marked as in use
+            if(sksBankTran.Matched == NoYes::Yes || sksBankTran.InUse == NoYes::No)
+            {
+                return conNull();
+            }
+
+            // Verify amounts
+            BankAccountTrans accountTrans;
+            SKS_LB_JournalARApplic journalARApplic;
+
+            select sum(AmountCur) from accountTrans
+                where accountTrans.SKS_BR_ManualReconciliationID == sksBankTran.ManualReconciliationID
+                && accountTrans.SKS_BR_ManualReconciliationID != emptyGuid();
+
+            select sum(TransactionAmount) from journalARApplic
+                where journalARApplic.SKS_BR_BankTran == sksBankTran.RecId;
+
+            if(sksBankTran.TranAmount - (accountTrans.AmountCur + journalARApplic.TransactionAmount) != 0)
+            {
+                return conNull();
+            }
+
+            if(sksBankTran.ManualReconciliationID == emptyGuid())
+            {
+                sksBankTran.ManualReconciliationID = newGuid();
+            }
+
+            SKS_BR_BankReconciliationTrans SKS_BR_BankReconciliationTrans = new SKS_BR_BankReconciliationTrans();
+
+            SKS_BR_BankReconciliationTrans.parmBankAccountId(conPeek(_params, 4));
+            SKS_BR_BankReconciliationTrans.parmTransDate(conPeek(_params, 2));
+            SKS_BR_BankReconciliationTrans.parmBankAccountStatementNum(conPeek(_params, 3));
+
+            SKS_BR_BankReconciliationTrans.parmTransGuid(sksBankTran.ManualReconciliationID);
+            SKS_BR_BankReconciliationTrans.parmBankTransactionType(sksBankTran.BankTranType);
+            SKS_BR_BankReconciliationTrans.parmCompanyBankAccountId(sksBankTran.AccountId);
+            SKS_BR_BankReconciliationTrans.parmCustAccount(sksBankTran.CustAccount);
+            SKS_BR_BankReconciliationTrans.parmDataAreaId(sksBankTran.dataAreaId);
+            SKS_BR_BankReconciliationTrans.parmSelectableDataArea(sksBankTran.CustCompany);
+            SKS_BR_BankReconciliationTrans.parmSKS_BR_BankCustomerNum(sksBankTran.BankCustomerNum);
+            SKS_BR_BankReconciliationTrans.parmSKS_BR_BankNum(sksBankTran.BankNum);
+            SKS_BR_BankReconciliationTrans.parmImportTranType(sksBankTran.FileTranType);
+            SKS_BR_BankReconciliationTrans.parmRecId(sksBankTran.RecId);
+            SKS_BR_BankReconciliationTrans.parmMatched(sksBankTran.Matched);
+
+            boolean isPosted;
+            boolean isMapped;
+
+            try
+            {
+                SKS_BR_GLProcessing_transactionform locSKS_BR_GLProcessing = new SKS_BR_GLProcessing_transactionform();
+
+                ttsbegin;
+                isMapped = locSKS_BR_GLProcessing.MatchExistingBankTransactions(SKS_BR_BankReconciliationTrans);
+                isPosted = locSKS_BR_GLProcessing.PostGL(SKS_BR_BankReconciliationTrans.parmRecId(), SKS_BR_BankReconciliationTrans);
+                
+                if(isMapped && isPosted)
+                {
+                    ttsCommit;
+                }
+                else
+                {
+                    ttsabort;
+                }
+            }
+            catch (ex)  //SKS_DevOps_20482
+            {
+                str additionalText = ex.Message + ' ' + "@SYS6928" + ':' + num2Str(sksBankTran.TranAmount,10,2,DecimalSeparator::Auto,ThousandSeparator::None) +
+                                        ' ' + "@SKS:SKGPostingFailed";
+                SKS_BR_HistoryTable::insertEvent(SKS_BR_Action::GLAutoPostingFailed,
+                                        sksBankTran.BankHeaderRecId,
+                                        sksBankTran.AccountId,
+                                        sksBankTran.ImportedStatementDate,
+                                        sksBankTran.ImportedStatementNum,
+                                        '',
+                                        additionalText,
+                                        true);
+            }
+            finally
+            {
+                // Always change imported transaction to not be marked as in use 
+                ttsbegin;
+                sksBankTran.reread();
+                sksBankTran.SettlementImportAutoPost = NoYes::No;
+                sksBankTran.unMarkUserPrivate();
+                sksBankTran.update();
+                ttsCommit;
+            }
+        }
+        return conNull();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runAfterAllPosted</Name>
+				<Source><![CDATA[
+    public static void runAfterAllPosted(container _params)
+    {
+        List tasks = new List(Types::Class);
+        for(int i = 3; i < conLen(_params); i++)
+        {
+            tasks.addEnd(conPeek(_params, i+1));
+        }
+
+        boolean threadsRunning = true;
+        while (threadsRunning)
+        {
+            ListEnumerator enumerator = tasks.getEnumerator();
+
+            System.Threading.Tasks.Task currentTask;
+            boolean allCompleted = true;
+
+            while(enumerator.moveNext())
+            {
+                currentTask = enumerator.current();
+
+                if(currentTask.Status == System.Threading.Tasks.TaskStatus::RanToCompletion)
+                {
+                    allCompleted = true && allCompleted;
+                }
+                else
+                {
+                    allCompleted = false;
+                    break;
+                }
+            }
+            threadsRunning = !allCompleted;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,592 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocCustCollectionJourReportDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class DocCustCollectionJourReportDSP extends DocDataSourceProviderSrsReporting
+{
+    CustCollectionJourTmp           headerTableBuffer;
+    CustCollectionJourContract      reportContract;
+    boolean                         custCollectionTransLineAdded, taxLineAdded;
+    CustCollectionLetterJour        journal;
+    RecId                           journalRecId;
+    DocTableFieldsMetadata          extensionFieldsMetadata_CustCollectionJourTmp = DocTableFieldsMetadata::construct(tableStr(CustCollectionJourTmp));
+
+    /* Variables for custom placeholders */
+    str         placeholder_collLetterTitle;
+    str         placeholder_collLetterNum;
+    date        placeholder_collLetterDate;
+    str         placeholder_custAccount;
+    str         placeholder_custName;
+    date        placeholder_dueDate;
+    str         placeholder_paymentCondition;
+    
+    str         placeholder_currency = '';
+    AmountCur   placeholder_balanceDue = 0;
+    AmountCur   placeholder_collectionLetterFee = 0;
+    AmountCur   placeholder_total = 0;
+
+    
+    #define.CollectionLetterHeader('CollectionLetterHeader')
+    #define.CollectionLetterLines('CollectionLetterLines')
+    #define.TaxLines('CollectionLetterLines_Tax')
+    #define.BillingClassification('BillingClassification')
+    #define.DefaultDimensionField('FinancialDimensions')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addCustomLabels</Name>
+				<Source><![CDATA[
+    // This overridden method adds additional custom labels to the DDSP to use them in template designer.
+    // Learn more: https://ax.docentric.com/d365-how-to-manuals/d365-miscellaneous/d365-how-to-add-missing-labels-to-multilingual-reports/
+    protected void addCustomLabels(Map _labelMap)
+    {
+        super(_labelMap);
+
+        // Labels in order of appearance on document from top to bottom, left to right.
+
+        // Pagination.
+        _labelMap.insert(literalStr("@SYS7426"), 'Page');
+        _labelMap.insert(literalStr("@SYS92595"), 'of');
+
+        // Document header.
+        _labelMap.insert(literalStr("@SYS77429"), 'Enterprise number');
+        _labelMap.insert(literalStr("@SYS23346"), 'Terms of payment');
+
+        // Document lines.
+        _labelMap.insert(literalStr("@SYS7715"), 'Balance due');
+        _labelMap.insert(literalStr("@SYS7111"), 'Collection letter fee');
+
+        // Tax information.
+        _labelMap.insert(literalStr("@SYS179721"), 'Sales tax code');
+
+        // Final cost calculation.
+        _labelMap.insert(literalStr("@SYS57614"), 'Fee amount');
+        _labelMap.insert(literalStr("@SYS180808"), 'Round-off');
+        _labelMap.insert(literalStr("@SYS58659"), 'Total');
+
+        // Misc.
+        _labelMap.insert(literalStr("@SYS5231"), 'Giro');
+        _labelMap.insert(literalStr("@SYS7572"), 'Currency');
+        _labelMap.insert(literalStr("@SYS13864"), 'Number');
+        _labelMap.insert(literalStr("@SYS24500"), 'Account');
+        _labelMap.insert(literalStr("@SYS25394"), 'Interest fee');
+        _labelMap.insert(literalStr("@SYS67100"), 'Our ta exempt No.');
+        _labelMap.insert(literalStr("@SYS302694"), 'Interest total');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine(DocXmlRecord _addingRecord, CustCollectionJourTmp _currentLine)
+    {
+        if (_currentLine.CustCollectionTrans_Txt != '' ||
+            _currentLine.CustCollectionTrans_Invoice != '' ||
+            _currentLine.CustCollectionTrans_DueDate != dateNull() ||
+            _currentLine.CustCollectionTrans_RemainAmount != 0)
+        {
+            this.addDataFieldsForLine_Trans(_addingRecord, _currentLine);
+
+            placeholder_balanceDue += _currentLine.CustCollectionTrans_RemainAmount;
+
+            custCollectionTransLineAdded = true;
+        }
+
+        if (_currentLine.TaxCode != '' ||
+            _currentLine.TaxAmount != 0 ||
+            _currentLine.TaxBaseAmount != 0 ||
+            _currentLine.TaxBaseQty != 0 ||
+            _currentLine.TaxAmountMST != 0)
+        {
+            this.addDataFieldsForLine_Tax(_addingRecord, _currentLine);
+            taxLineAdded = true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine_Tax</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine_Tax(DocXmlRecord _addingRecord, CustCollectionJourTmp _currentLine)
+    {
+        // Rename the record from 'CustCollectionJourTmp' to 'CollectionLetterLines_Tax'.
+        _addingRecord.setRecordName(#TaxLines);
+        // Change the label of the record.
+        _addingRecord.setRecordLabel('Taxes'); // NOTE: use literalStr("@LabelID") instead.
+
+        // Add all 'line' fields related to the tax lines.
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, TaxCode));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, PrintCode));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, TaxBaseAmount));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, TaxBaseQty));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, TaxAmount));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, TaxAmountMST));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, TaxExemptDescription));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForLine_Trans</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForLine_Trans(DocXmlRecord _addingRecord, CustCollectionJourTmp _currentLine)
+    {
+        // Rename the record from 'CustCollectionJourTmp' to 'CollectionLetterLines'.
+        _addingRecord.setRecordName(#CollectionLetterLines);
+        // Change the label of the record.
+        _addingRecord.setRecordLabel('Collection letter lines'); // NOTE: use literalStr("@LabelID") instead.
+
+        // Add all 'line' fields from the CustCollectionJourTmp table related to the transaction data.
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTrans_DueDate));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTrans_TransDate));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTrans_Invoice));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTrans_Txt));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTrans_CurrencyCode));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTrans_RemainAmount));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterCode));
+        _addingRecord.addField(fieldStr(CustCollectionJourTmp, OcrLine_FI));
+        
+
+        // Add Extension fields defined on CustCollectionJourTmp, if any.
+        // NOTE: Fields will be added to the child record named ExtensionFields. Change the last parameter to false to add
+        // Extension fields on flat. If the result doesn't suit you, add your Extension fields directly using the addField() method.
+        DocExtensionFieldsHelper::tryAddAllExtensionFieldsToDataRecord(_currentLine, _addingRecord, true, extensionFieldsMetadata_CustCollectionJourTmp);
+
+
+        // TODO: Add here additional fields from the related CustCollectionLetterTrans table (or some other tables).
+        //CustCollectionLetterTrans custCollectionLetterTrans = this.custCollectionLetterTrans(_currentLine.JourTransRecId_DR);
+        //_addingRecord.addCalculatedField('Voucher', custCollectionLetterTrans.Voucher);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDataFieldsForRdpTableRecord</Name>
+				<Source><![CDATA[
+    protected void addDataFieldsForRdpTableRecord(DocXmlRecord _addingRecord, Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        if (_rdpTableName == tableStr(CustCollectionJourTmp))
+        {
+            this.addDataFieldsForLine(_addingRecord, _rdpTableRecord);
+        }
+        else
+        {
+            super(_addingRecord, _rdpTableRecord, _rdpTableName);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addParameters</Name>
+				<Source><![CDATA[
+    protected void addParameters(DocXmlRecordBuilder _recordBuilderParameters)
+    {
+        List            billingClassificationList;
+        ListEnumerator  billingClassificationEnum;
+        DocXmlRecord    billingClassificationDataRecord;
+        Counter         i;
+        str             billingClassificationFieldName, billingClassificationFieldValue;
+
+
+        // Add all parameters except the BillingClassification parameter.
+        // This parameter is of the List data type, and serialization the List data type
+        // to XML List is not supported out-of-the-box by Docentric AX Framework.
+        // That's why we will serialize it manually.
+        super(_recordBuilderParameters);
+
+        // For the BillingClassification parameter add a new data record.
+        billingClassificationDataRecord = _recordBuilderParameters.addCalculatedRecord(#BillingClassification);
+
+        billingClassificationList = reportContract.parmBillingClassification();
+        if (billingClassificationList == null)
+        {
+            return;
+        }
+
+        // Add each element of the list that represents the BillingClassification
+        // parameter as a separate data field.
+        billingClassificationEnum = billingClassificationList.getEnumerator();
+        i = 0;
+        while (billingClassificationEnum.moveNext())
+        {
+            i++;
+            billingClassificationFieldName = strFmt('%1_%2', #BillingClassification, i);
+            billingClassificationFieldValue = billingClassificationEnum.current();
+            if (billingClassificationFieldValue == "@GLS223107")
+            {
+                billingClassificationDataRecord.addCalculatedField(
+                billingClassificationFieldName, 'No value selected');
+            }
+            else
+            {
+                billingClassificationDataRecord.addCalculatedField(
+                billingClassificationFieldName, billingClassificationFieldValue);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return 'Collection letter note DSP';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        DocXmlRecord                headerDataRecord, emptyLineDataRecord;
+        CustCollectionJourTmp       emptyLine;
+
+
+        void addHeaderFields()
+        {
+            // We will skip adding the company related fields since we already have them
+            // in the GeneralData data section at our disposal.
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyPhone));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyTeleFax));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyGiro));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyCoRegNum));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyLogo));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyVATNum));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyName));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyAddress));
+            //headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyEnterpriseNumber));
+
+            // Add all of the rest header fields to the header data record.
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CompanyAddress)).setFieldName('CompanyAddressTranslatedCountry');      //NOTE: Translated with DirUtility::replaceAddressTokenLanguage().
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PrintLogo));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustomerName));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustomerAddress));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterTitle));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterNum));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterDate));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionLetterJour_AccountNum));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, Page));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PaymentCondition));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterDueDate));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterCurrencyCode));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterPaymentReference));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionLetterOCRField));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustVATNum));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectnLetterJour_NPIBankPaymId));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CurrencyCode));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CurrencyAmount));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionLetterJour_Fee));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionLetterJour_Notes));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, FormLetterRemarks_Txt));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PostingsUntil));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, Flag));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, Total));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, FeeAmountEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxAmountEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, FeeInclTaxEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxFreeBalance));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxableBalance));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CurrencyCodeEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxFreeBalanceEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxableBalanceEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustCollectionTaxAmount));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, FICreditorID_DK));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionAmountDecimals));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionAmountNoDecimals));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, RemainAmountToBePaid));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionName));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CollectionAddress));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AmountCheckId));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, BankGroupIdName_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, BankZipCode_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, BankAccountTable_AccountNum_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, BankAccountTable_Clearing_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, Description_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PaymentRef1_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PaymentRef2_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AmountNoDecimals_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNo1_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PaymentId2_PaymentId3_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AmountDecimals_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustAddress_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, CustName_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, OcrLine_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNo2_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, LayoutCode_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, currencyCodeISO_CH));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, GiroType));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, SessionId));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, DateOfCreation));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, ShowTotals));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, ShowTotalsEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, ShowTotalsTaxBalancesEuro));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, ShowTotalsTaxBalances));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNum1_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNum2_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNum4_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNum6_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNum3_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, AccountNum5_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, OcrLine_FI));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxAmountLabel));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, TaxAmountMSTLabel));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PrintTaxAmounts));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, PayReference));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, BillingClassification));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, Enterpriseregister_NO));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, InvoiceReferenceNumber));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, ShowCompanyVATNum));
+
+            // Redundant fields - never get filled:
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, InvoicingName));
+            headerDataRecord.addField(fieldStr(CustCollectionJourTmp, InvoicingAddress));
+        }
+
+
+        // (1) Add data records with fields representing the lines.
+        super(_recordBuilder);
+
+
+        // (2) Add all fields that belong to the header only once.
+        headerDataRecord = _recordBuilder.addRecord(headerTableBuffer).setSingleRecord(true);
+        // Rename the record from 'CustCollectionJourTmp' to 'CollectionLetterHeader'.
+        headerDataRecord.setRecordName(#CollectionLetterHeader);
+        // Change the label of the record.
+        headerDataRecord.setRecordLabel('Collection letter header'); // NOTE: use literalStr("@LabelID") instead.
+        // Add all 'header' fields.
+        addHeaderFields();
+        
+
+        // (3) Add Custom Fields defined on CustTable, if any.
+        // Custom Fields: https://docs.microsoft.com/en-us/dynamics365/unified-operations/fin-and-ops/get-started/user-defined-fields
+        DocCustomFieldsHelper::tryAddAllCustomFieldsToDataRecord(CustTable::find(placeholder_custAccount), headerDataRecord);
+
+
+        // (4) Add Financial dimensions.
+        headerDataRecord.addCalculatedFieldFromEdt(#DefaultDimensionField, extendedTypeStr(DimensionDefault), this.custCollectionLetterJour().DefaultDimension);
+
+       
+        // (5) Add Extension fields defined on CustCollectionJourTmp, if any.
+        // NOTE: Fields will be added to the child record named ExtensionFields. Change the last parameter to false to add
+        // Extension fields on flat. If the result doesn't suit you, add your Extension fields directly using the addField() method.
+        DocExtensionFieldsHelper::tryAddAllExtensionFieldsToDataRecord(headerTableBuffer, headerDataRecord, true, extensionFieldsMetadata_CustCollectionJourTmp);
+
+
+        // TODO: Add here additional fields (or records) to the single header record (headerDataRecord)
+        // by using the related data to headerTableBuffer (CustCollectionJourTmp) or reportContract.
+        //headerDataRecord.addCalculatedField('CustomerGroup', CustTable::find(headerTableBuffer.CustCollectionLetterJour_AccountNum).customerGroup());
+
+
+        // If this is design time, add main or tax lines if they haven't been already added.
+        _recordBuilder.goToTopRecord();
+        if (!this.isRuntime())
+        {
+            emptyLine.clear();
+
+            // Main lines.
+            if (!custCollectionTransLineAdded)
+            {
+                emptyLineDataRecord = _recordBuilder.addRecord(emptyLine);
+                this.addDataFieldsForLine_Trans(emptyLineDataRecord, emptyLine);
+                _recordBuilder.goToTopRecord();
+            }
+
+            // TaxLines.
+            if (!taxLineAdded)
+            {
+                emptyLineDataRecord = _recordBuilder.addRecord(emptyLine);
+                this.addDataFieldsForLine_Tax(emptyLineDataRecord, emptyLine);
+                _recordBuilder.goToTopRecord();
+            }
+        }
+
+
+        // Check the resulting XML.
+        //info(_recordBuilder.exportToXmlStr());
+        //_recordBuilder.exportToXmlFile("ReportMainData.xml");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSelectedRdpTableRecord</Name>
+				<Source><![CDATA[
+    protected void onSelectedRdpTableRecord(Common _rdpTableRecord, TableName _rdpTableName)
+    {
+        CustCollectionJourTmp currentRecord;
+
+        super(_rdpTableRecord, _rdpTableName);
+
+        if (_rdpTableName != tableStr(CustCollectionJourTmp))
+        {
+            return;
+        }
+
+        currentRecord = _rdpTableRecord;
+
+        if (headerTableBuffer.RecId == 0)
+        {
+            // Copy all fields from the first selected record since the majority of them
+            // belong to the report header. We will add them as a separate node in the
+            // generateXmlDataSource method.
+            buf2Buf(currentRecord, headerTableBuffer);
+            headerTableBuffer.RecId = currentRecord.RecId;
+
+            // Store custom placeholders' values.
+            placeholder_collLetterTitle = headerTableBuffer.CollectionLetterTitle;
+            placeholder_collLetterNum = headerTableBuffer.CollectionLetterNum;
+            placeholder_collLetterDate = headerTableBuffer.CollectionLetterDate;
+            placeholder_custAccount = headerTableBuffer.CustCollectionLetterJour_AccountNum;
+            placeholder_custName = headerTableBuffer.CustomerName;
+            placeholder_dueDate = headerTableBuffer.CollectionLetterDueDate;
+            placeholder_paymentCondition = headerTableBuffer.PaymentCondition;
+
+            placeholder_currency = headerTableBuffer.CollectionLetterCurrencyCode;
+            placeholder_collectionLetterFee = headerTableBuffer.CustCollectionLetterJour_Fee;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preRunGenerateDS</Name>
+				<Source><![CDATA[
+    protected void preRunGenerateDS()
+    {
+        super();
+
+        // Initialize here the class global variables.
+        reportContract = this.getSrsRdpContract();
+        journalRecId = reportContract.parmRecordId();
+
+        custCollectionTransLineAdded = false;
+        taxLineAdded = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custCollectionLetterJour</Name>
+				<Source><![CDATA[
+    protected CustCollectionLetterJour custCollectionLetterJour()
+    {
+        if (!journal)
+        {
+            journal = CustCollectionLetterJour::findRecId(journalRecId);
+        }
+
+        return journal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custCollectionLetterTrans</Name>
+				<Source><![CDATA[
+    protected CustCollectionLetterTrans custCollectionLetterTrans(RecId _custCollectionLetterTransRecId)
+    {
+        CustCollectionLetterTrans custCollectionLetterTrans;
+
+        select firstonly custCollectionLetterTrans where custCollectionLetterTrans.RecId == _custCollectionLetterTransRecId;
+
+        return custCollectionLetterTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // List of defined custom placeholders for the report:
+    #define.CollLetterTitle('CollLetterTitle')
+    #define.CollLetterNum('CollLetterNum')
+    #define.CustAccount('CustAccount')
+    #define.CustName('CustName')
+    #define.CustContactName('CustContactName')
+    #define.CollLetterDate('CollLetterDate')
+    #define.DueDate('DueDate')
+    #define.PaymentCondition('PaymentCondition')
+    #define.Currency('Currency')
+    #define.BalanceDue('BalanceDue')
+    #define.CollLetterFee('CollLetterFee')
+    #define.Total('Total')
+
+    [DocPlaceholderAttribute(#CollLetterTitle, 'CLN - Collection Letter Title'),
+     DocPlaceholderAttribute(#CollLetterNum, 'CLN - Collection Letter Number'),
+     DocPlaceholderAttribute(#CustAccount, 'CLN - Customer Account ID'),
+     DocPlaceholderAttribute(#CustName, 'CLN - Customer Name'),
+     DocPlaceholderAttribute(#CustContactName, 'CLN - Customer Contact Name'),
+     DocPlaceholderAttribute(#CollLetterDate, 'CLN - Collection Letter Date'),
+     DocPlaceholderAttribute(#DueDate, 'CLN - Due Date'),
+     DocPlaceholderAttribute(#PaymentCondition, 'CLN - Payment Condition'),
+     DocPlaceholderAttribute(#Currency, 'CLN - Currency'),
+     DocPlaceholderAttribute(#BalanceDue, 'CLN - Balance Due'),
+     DocPlaceholderAttribute(#CollLetterFee, 'CLN - Collection Letter Fee'),
+     DocPlaceholderAttribute(#Total, 'CLN - Total amount')]
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        // Replace standard placeholders.
+        DocPlaceholderManager placeholderMng = super(_reportRunContext, _replaceStandardPlaceholders);
+        
+        // Replace custom placeholders:
+        // -- Placeholder @CollLetterTitle@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CollLetterTitle, placeholder_collLetterTitle);
+
+        // -- Placeholder @CollLetterNum@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CollLetterNum, placeholder_collLetterNum);
+        
+        // -- Placeholder @CustAccount@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustAccount, placeholder_custAccount);
+
+        // -- Placeholder @CollLetterDate@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CollLetterDate, placeholder_collLetterDate);
+
+        // -- Placeholder @DueDate@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#DueDate, placeholder_dueDate);
+
+        // -- Placeholder @Currency@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#Currency, placeholder_currency);
+
+        // -- Placeholder @BalanceDue@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#BalanceDue, placeholder_balanceDue);
+
+        // -- Placeholder @CollLetterFee@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CollLetterFee, placeholder_collectionLetterFee);
+
+        // -- Placeholder @Total@
+        placeholder_total = placeholder_balanceDue + placeholder_collectionLetterFee;
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#Total, placeholder_total);
+
+        // -- Placeholder @PaymentCondition@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#PaymentCondition, placeholder_paymentCondition);
+
+        // -- Placeholder @CustName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustName, placeholder_custName);
+
+        // -- Placeholder @CustContactName@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#CustContactName, DocDspHelper::custContactPersonName(placeholder_custAccount));
+
+
+        // Fill the Print archive contract.
+        _reportRunContext.archiveContract().setCustAccount(placeholder_custAccount);
+        _reportRunContext.archiveContract().setDocument(placeholder_collLetterNum, placeholder_collLetterDate);
+        _reportRunContext.archiveContract().setJournal(this.custCollectionLetterJour().RecId, DocJournalType::CustCollectionLetterJour);
+
+        return placeholderMng;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

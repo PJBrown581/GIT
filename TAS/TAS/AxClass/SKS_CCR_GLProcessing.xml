@@ -1,0 +1,1134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_GLProcessing</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_GLProcessing
+{
+    LedgerJournalTable      ledgerJournalTable;
+    SKS_CCR_BankHeaderRecId  headerRecId;
+    SKS_CCR_FileType         fileType;
+    Line                    gLastLineNumberAttempted;
+    str                     errorText;
+    List                    invoiceNumberList;
+    LedgerJournalEngine     ledgerJournalEngine;
+    List                    customerList; // 9479_CustomerMatching
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createLedgerJournalTable</Name>
+				<Source><![CDATA[
+    private void createLedgerJournalTable(SKS_CCR_BankHeaderRecId _SKS_CCR_BankHeaderRecId, LedgerJournalNameId _JournalName)
+    {
+        ledgerJournalTable = null;
+        ledgerJournalTable.JournalName = _JournalName;
+        ledgerJournalTable.insert();
+
+        ledgerJournalEngine = LedgerJournalEngine_Daily::construct();
+        ledgerJournalEngine.ledgerJournalTable(ledgerJournalTable);
+        ledgerJournalEngine.newJournalActive(ledgerJournalTable);
+
+        SKS_CCR_HistoryTable::insertEvent(SKS_CCR_Action::GLAutoCreated,
+                                         _SKS_CCR_BankHeaderRecId,
+                                         '',dateNull(),
+                                         '',
+                                         ledgerJournalTable.JournalNum
+                                        );
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    private void createLedgerJournalTrans(SKS_CCR_BankTran _SKS_CCR_BankTran,  SKS_BR_ParseRule _SKS_BR_ParseRule)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        DimensionDefault defaultBankDimension;
+        DimensionDefault offsetDefaultBankDimension;
+        //  vvv 12073 vvv
+        //this is the least significant dimension for offset dimensions.  It is from the AX Bank form's, AX vendor form's, AX customer form's, or AX project form's dimensioning.
+        //The GL Processing lookup Rule's "Offset Account Type"'s field tells us what form will be supplying the information. This dimensioning can be
+        //overridden in the following places(in order of ascending precedence): Ledger's Financial Dimensions tab, TAS Tran Type Mapping, GL Lookup's Offset Finanical Dimension sub-from
+        DimensionDefault AccountTypeOffsetDefaultDimension;
+        // ^^^ 12073 ^^^
+        int                 locLengthOfParsedValue; //18569
+
+        DimensionDefault ledgerDimension;
+        SKS_CCR_BankTran locSKS_CCR_BankTran;
+        SKS_PP_Bank     locSKS_PP_Bank;
+        SKS_CCR_BankAcctStmt locSKS_CCR_BankAcctStmt;
+        container       locCrossCompanyList;
+        BankAccountStatement    locParentBankAccountStatement, locBankAccountStatement;
+        SKS_BR_GLMappingRuleLookup SKS_BR_GLMappingRuleLookup;
+        //  vvv 12073 vvv
+        BankAccountTable    locBankAccountTable;
+        CustTable           locCustTable;
+        VendTable           locVendtable;
+        ProjTable           locProjTable;
+        // ^^^ 12073 ^^^
+
+        //// SKS_FDD_13903 - below code commented since GLMatchOrCreate == SKS_BR_GLMatchOrCreate::GLCreateSweepAndMatchZBA is not useful for CCR
+       /* void dupBankTran(boolean _MultiplyByNeg1)
+        {
+            locSKS_CCR_BankTran = null;
+            buf2Buf(_SKS_CCR_BankTran, locSKS_CCR_BankTran);
+            locSKS_CCR_BankTran.GLMappingRuleGroupId = '';
+            locSKS_CCR_BankTran.ParsedValue = '';
+            locSKS_CCR_BankTran.ParseRuleId = '';
+            locSKS_CCR_BankTran.OriginalStatementRecId = locBankAccountStatement.RecId;
+            locSKS_CCR_BankTran.ZBAParentRecid = _SKS_CCR_BankTran.RecId;
+            locSKS_CCR_BankTran.AccountId = BankAccountTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension).AccountID;
+            if(_MultiplyByNeg1)
+                locSKS_CCR_BankTran.TranAmount = locSKS_CCR_BankTran.TranAmount * -1;
+            locSKS_CCR_BankTran.insert();
+        }*/
+
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+        ledgerJournalEngine.initValue(ledgerJournalTrans);
+        ledgerJournalTrans.JournalNum = ledgerJournalTable.JournalNum;
+        ledgerJournalTrans.AccountType = LedgerJournalACType::Bank;
+
+        ledgerJournalEngine.accountModified(ledgerJournalTrans);
+        ledgerJournalEngine.initTaxItemGroup(ledgerJournalTrans);
+
+        ledgerJournalTrans.Company = _SKS_CCR_BankTran.DataAreaId;
+        ledgerJournalTrans.TransDate = _SKS_CCR_BankTran.getGLPostingDate();  //CR-7653
+        ledgerJournalTrans.CurrencyCode = _SKS_CCR_BankTran.TransCurrency;
+        /*changecompany(_SKS_CCR_BankTran.company())
+        {
+            LedgerJournalTrans.CurrencyCode = BankaccountTable::find(_SKS_CCR_BankTran.AccountId).CurrencyCode;
+        }*/
+
+        ledgerJournalTrans.ExchRate = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(ledgerJournalTrans.Company).RecId), ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate).getExchangeRate1();
+
+        container   ReportCurrency;
+        SysDictClass sysDictClass = new SysDictClass(className2Id(classStr(LedgerJournalEngine_Server)));
+        if (sysDictClass && sysDictClass.hasStaticMethod('reportingCurrencyModified'))
+        {
+            changecompany(ledgerJournalTrans.Company)
+            {
+                ReportCurrency = sysDictClass.callStatic('reportingCurrencyModified', LedgerJournalTrans);
+                ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate')) = conPeek(ReportCurrency, 1);
+                ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary')) = conPeek(ReportCurrency, 2);
+            }
+        }
+
+        if(_SKS_CCR_BankTran.ParsedValue)
+        {
+            if(_SKS_BR_ParseRule)
+            {
+                locLengthOfParsedValue = strLen(_SKS_CCR_BankTran.ParsedValue);
+                if(_SKS_CCR_BankTran.ParsedValue == SKS_PP_StringFormats::strSub(_SKS_CCR_BankTran.TranDescription,1,locLengthOfParsedValue) && _SKS_BR_ParseRule.ParseType == SKS_BR_ParseType::CharacterRange && _SKS_BR_ParseRule.ParseField == SKS_BR_ParseField::Description)
+                {
+                    ledgerJournalTrans.Txt = _SKS_CCR_BankTran.TranDescription;
+                }
+            }
+            if(strLen(ledgerJournalTrans.Txt) == 0)
+            {
+                ledgerJournalTrans.Txt = _SKS_CCR_BankTran.ParsedValue + ' : ' + _SKS_CCR_BankTran.TranDescription;
+            }
+        }
+        else
+        {
+            ledgerJournalTrans.Txt = _SKS_CCR_BankTran.TranDescription;
+        }
+
+        if(_SKS_CCR_BankTran.TranCurrencyAmount > 0)
+        {
+            ledgerJournalTrans.AmountCurDebit = _SKS_CCR_BankTran.TranCurrencyAmount;
+        }
+        else
+        {
+            ledgerJournalTrans.AmountCurCredit = _SKS_CCR_BankTran.TranCurrencyAmount * -1;
+        }
+
+        changeCompany(_SKS_CCR_BankTran.company())
+        {
+            ledgerJournalTrans.ledgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_SKS_CCR_BankTran.AccountId, LedgerJournalACType::Bank);
+            ledgerJournalTrans.AccountType = LedgerJournalACType::Bank;
+            ledgerJournalTrans.BankTransType = _SKS_CCR_BankTran.BankTranType;
+            LedgerJournalTrans.TransactionType = LedgerTransType::GeneralJournal;
+            // vvv 12073 vvv
+            locBankAccountTable = null;
+            locBankAccountTable = BankAccountTable::find(_SKS_CCR_BankTran.AccountId);
+            defaultBankDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(_SKS_CCR_BankTran.DefaultDimension, ledgerJournalTable.DefaultDimension);
+            ledgerJournalTrans.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(defaultBankDimension,locBankAccountTable.DefaultDimension);
+            // ^^^ 12073 ^^^
+
+
+            SKS_BR_GLMappingRuleLookup = SKS_CCR_GLProcessing::findLookupValue(_SKS_CCR_BankTran.GLMappingRuleGroupId, _SKS_CCR_BankTran.ParsedValue);
+            if(SKS_BR_GLMappingRuleLookup)
+            {
+                ledgerJournalTrans.OffsetCompany = SKS_BR_GLMappingRuleLookup.OffsetCompany;
+                // vvv 12073 vvv
+                changecompany(SKS_BR_GLMappingRuleLookup.OffsetCompany)
+                {
+                    locBankAccountTable = null;
+                    locCustTable = null;
+                    locVendtable = null;
+                    locProjTable = null;
+                    switch (SKS_BR_GLMappingRuleLookup.OffsetAccountType)
+                    {
+                        case  LedgerJournalACType::Bank:
+                            locBankAccountTable = BankAccountTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension);
+                            AccountTypeOffsetDefaultDimension = locBankAccountTable.DefaultDimension;
+                            break;
+                        case LedgerJournalACType::Cust:
+                            locCustTable = CustTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension);
+                            AccountTypeOffsetDefaultDimension = locCustTable.DefaultDimension;
+                            break;
+                        case LedgerJournalACType::Vend:
+                            locVendTable = VendTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension);
+                            AccountTypeOffsetDefaultDimension = locVendtable.DefaultDimension;
+                            break;
+                        case LedgerJournalACType::Project:
+                            locProjTable = ProjTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension);
+                            AccountTypeOffsetDefaultDimension = locProjTable.DefaultDimension;
+                            break;
+                    }
+                }
+                // ^^^ 12073 ^^^
+                // Thing to be aware of:
+                // OffsetLedgerDimension: when you have an offset account type of Bank, Cust, Vend, or Proj, this is the ACCOUNT ID. Don't try to merge it.
+                // offsetDefaultBankDimension:  this is the actual dimension information that you are tyring to merge.  Look at VSO# 12073's attached design,
+                // it has a really good description with infographics of how these merge.
+                // vvv The following if else/if else handles the merging for the offsetDefaultBankDimension, it get assigned later vvv
+                if(_SKS_CCR_BankTran.company() == SKS_BR_GLMappingRuleLookup.OffsetCompany && SKS_BR_GLMappingRuleLookup.OffsetAccountType == LedgerJournalACType::Ledger)
+                {
+                    ledgerDimension = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension);
+                    offsetDefaultBankDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(ledgerDimension, _SKS_CCR_BankTran.DefaultDimension, ledgerJournalTable.DefaultDimension);
+                }
+                else if (_SKS_CCR_BankTran.company() == SKS_BR_GLMappingRuleLookup.OffsetCompany)
+                {
+                    //Only used if not type ledger
+                    offsetDefaultBankDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(SKS_BR_GLMappingRuleLookup.OffsetDefaultDimension, _SKS_CCR_BankTran.DefaultDimension, ledgerJournalTable.DefaultDimension, AccountTypeOffsetDefaultDimension);
+                }
+                else
+                {
+                    offsetDefaultBankDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(SKS_BR_GLMappingRuleLookup.OffsetDefaultDimension,AccountTypeOffsetDefaultDimension);
+                }
+                // ^^^ The proceeding if else/if else handles the merging for the offsetDefaultBankDimension ^^^
+
+                if(SKS_BR_GLMappingRuleLookup.OffsetAccountType == LedgerJournalACType::Ledger)
+                {
+                    // Only create new dimension if merging in the same company
+                    if(_SKS_CCR_BankTran.company() == SKS_BR_GLMappingRuleLookup.OffsetCompany)
+                    {
+                        ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension, offsetDefaultBankDimension);
+                    }
+                    else
+                    {
+                        ledgerJournalTrans.OffsetLedgerDimension = SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension;
+                    }
+                }
+                else
+                {
+                    ledgerJournalTrans.OffsetLedgerDimension = SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension;
+                    ledgerJournalTrans.OffsetDefaultDimension = offsetDefaultBankDimension;
+                }
+
+                ledgerJournalTrans.OffsetAccountType = SKS_BR_GLMappingRuleLookup.OffsetAccountType;
+                ledgerJournalTrans.SKS_BR_BankTranRecId = _SKS_CCR_BankTran.RecId; // SKS_FDD_9664
+                // SKS_FDD_9536 -->
+                // bank sweep for IHB imported bank statements
+                if(_SKS_CCR_BankTran.company() == SKS_BR_GLMappingRuleLookup.OffsetCompany &&
+                    SKS_BR_GLMappingRuleLookup.OffsetAccountType == LedgerJournalACType::Bank &&
+                    SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension &&
+                    SKS_BR_GLMappingRuleLookup.SKS_IHBIntercoLedgerDimension &&
+                    SKS_PP_Bank::findIHBBank(LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension), SKS_BR_GLMappingRuleLookup.OffsetCompany))
+                {
+                    ledgerJournalTrans.SKS_EFTAP_IHBBankAccount = LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension);
+                    ledgerJournalTrans.DocumentDate = _SKS_CCR_BankTran.ValueDate;//SKS_FDD_9564
+                   
+                }
+                // SKS_FDD_9536 <--
+                /*
+                // SKS_FDD_13903 - below code commented since GLMatchOrCreate == SKS_BR_GLMatchOrCreate::GLCreateSweepAndMatchZBA is not useful for CCR
+                if(SKS_BR_GLMappingRuleLookup.GLMatchOrCreate == SKS_BR_GLMatchOrCreate::GLCreateSweepAndMatchZBA)
+                {
+
+                    //For ZBA transactions, we create the initial SkS_BR_BANKtran in the offset account(Which is unchanged.  We need to then
+                    //duplicate the SKS_BR_BankTran records in their parsed value accounts, as both the same value and and as -1 * value(2 SKS_BR_BankTran records per ZBA tran)
+                    //Each of these new records needs a pointer back to the originating record.
+                    changeCompany(SKS_BR_GLMappingRuleLookup.OffsetCompany)
+                    {
+                        locCrossCompanyList = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+                        select crossCompany:locCrossCompanyList BRCreateBankStatements
+                                from locSKS_PP_Bank
+                                where locSKS_PP_Bank.BankAccountId == _SKS_CCR_BankTran.AccountId;
+                        if(locSKS_PP_Bank.BRCreateBankStatements)
+                        {
+                            //get Concentration Account Statement.
+                            select crossCompany AccountStatementDate, AccountStatementNum, CurrencyCode from locParentBankAccountStatement
+                                                where locParentBankAccountStatement.recid == _SKS_CCR_BankTran.OriginalStatementRecId;
+                            select recid from locBankAccountStatement
+                                where locBankAccountStatement.AccountId == BankAccountTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension).AccountID
+                                    && locBankAccountStatement.AccountStatementDate == locParentBankAccountStatement.AccountStatementDate
+                                    && locBankAccountStatement.AccountStatementNum == locParentBankAccountStatement.AccountStatementNum;
+                            if(!locBankAccountStatement)
+                            {
+                                locSKS_BR_BankAcctStmt = new SKS_BR_BankAcctStmt();
+                                locBankAccountStatement.AccountId = BankAccountTable::findByLedgerDimension(SKS_BR_GLMappingRuleLookup.OffsetLedgerDimension).AccountID;
+                                locBankAccountStatement.AccountStatementNum = locParentBankAccountStatement.AccountStatementNum;
+                                locBankAccountStatement.AccountStatementDate = locParentBankAccountStatement.AccountStatementDate;
+                                locBankAccountStatement.CurrencyCode = locParentBankAccountStatement.CurrencyCode;
+                                locBankAccountStatement = locSKS_BR_BankAcctStmt.createBRStatement(locBankAccountStatement, _SKS_CCR_BankTran.CCRHeaderRecId, true);
+                            }
+
+                        }
+                        dupBankTran(false);
+                        dupBankTran(true);
+                        // The matching rule was only brought this far for the purpose of using it in the duplicated lines.
+                        // Now that they are spun-off, clear the matching rule group id.
+                        _SKS_CCR_BankTran.MatchingRuleGroupId = '';
+
+                    }
+
+                }*/
+            }
+            else
+            {
+                ledgerJournalTrans.OffsetLedgerDimension = this.getGLAccountFromBankTranType(_SKS_CCR_BankTran.BankTranType, defaultBankDimension);
+                ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+                ledgerJournalTrans.SKS_CCR_BankTranRecId = _SKS_CCR_BankTran.RecId;
+                if(errorText != '')
+                {
+                    return;
+                }
+            }
+        }
+
+        if(LedgerJournalTrans.validateWrite()) // validate
+        {
+            ledgerJournalTrans.insert();
+            
+            // SKS_18405
+            if (SKS_BR_GLMappingRuleLookup.OffsetAccountType == LedgerJournalACType::Project &&
+                SKS_BR_GLMappingRuleLookup.CategoryId)
+            {
+                LedgerJournalTrans_Project  ledgerJournalTrans_Project;
+
+                ledgerJournalTrans_Project.clear();
+                ledgerJournalTrans_Project.RefRecId = ledgerJournalTrans.RecId;
+                ledgerJournalTrans_Project.initValue();
+
+                this.initFromProjTable(ledgerJournalTrans, ledgerJournalTrans_Project);
+
+                ledgerJournalTrans_Project.CategoryId = SKS_BR_GLMappingRuleLookup.CategoryId;
+                ledgerJournalTrans_Project.TaxItemGroupSales = ProjCategory::find(ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+                ledgerJournalTrans_Project.LinePropertyId = ProjLinePropertySetup::findLinePropertyId(
+                                                        ledgerJournalTrans.findProjTable().ProjId,
+                                                        ledgerJournalTrans_Project.CategoryId);
+
+                if (ledgerJournalTrans_Project.validateWrite())
+                {
+                    ledgerJournalTrans_Project.insert();
+                }
+            }
+            // SKS_18405
+
+            changeCompany(_SKS_CCR_BankTran.company())
+            {
+                _SKS_CCR_BankTran.LedgerJournalRecId = ledgerJournalTrans.RecId;
+                _SKS_CCR_BankTran.PaymentJournalNum = LedgerJournalTrans.JournalNum;//Bug 7352
+                _SKS_CCR_BankTran.Voucher = ledgerJournalTrans.Voucher;
+                _SKS_CCR_BankTran.MatchedType = SKS_BR_MatchedType::GLCreated;
+                _SKS_CCR_BankTran.MatchConfidence = 100;
+
+                _SKS_CCR_BankTran.update();
+            }
+        }
+        else
+        {
+            errorText = 'Transaction failed validation. Review batch job for details.';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromProjTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SKS_18405 initialize the data from ProjTable
+    /// </summary>
+    /// <param name = "_ledgerJournalTrans">LedgerJournalTrans object</param>
+    /// <param name = "_ledgerJournalTrans_Project">ledgerJournalTrans_Project object</param>
+    void initFromProjTable(
+        LedgerJournalTrans          _ledgerJournalTrans,
+        LedgerJournalTrans_Project  _ledgerJournalTrans_Project)
+    {
+        ProjTable   projTable;
+
+        if (!_ledgerJournalTrans.CurrencyCode)
+        {
+            _ledgerJournalTrans.CurrencyCode = CompanyInfoHelper::standardCurrency();
+        }
+
+        projTable = _ledgerJournalTrans.findProjTable();
+        ProjInvoiceTable ProjInvoiceTableLocal = ProjInvoiceTable::find(projTable.ProjInvoiceProjId);
+ 
+        if (ProjInvoiceTableLocal)
+        {
+            _ledgerJournalTrans_Project.SalesCurrencyId = ProjInvoiceTableLocal.CurrencyId;
+            _ledgerJournalTrans_Project.ProjPriceGroupID = ProjInvoiceTableLocal.ProjPriceGroup;
+        }
+
+        if (!_ledgerJournalTrans_Project.SalesCurrencyId)
+        {
+            if (projTable.CustAccount)
+            {
+                _ledgerJournalTrans_Project.SalesCurrencyId = CustTable::find(projTable.CustAccount).Currency;
+            }
+            else
+            {
+                _ledgerJournalTrans_Project.SalesCurrencyId = CompanyInfoHelper::standardCurrency();
+            }
+        }
+
+        if (!ProjValProjCategorySetUp::checkProjCategory(_ledgerJournalTrans.parmAccount(), _ledgerJournalTrans_Project.CategoryId))
+        {
+            _ledgerJournalTrans_Project.CategoryId = '';
+        }
+        else
+        {
+            _ledgerJournalTrans_Project.CategoryId = (_ledgerJournalTrans_Project.CategoryId ? _ledgerJournalTrans_Project.CategoryId : ProjParameters::find().CostCategory);
+            _ledgerJournalTrans_Project.TaxItemGroupSales    = ProjCategory::find(_ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+        }
+
+        _ledgerJournalTrans_Project.LinePropertyId = ProjLinePropertySetup::findLinePropertyId(projTable.ProjId, _ledgerJournalTrans_Project.CategoryId);
+
+        
+        _ledgerJournalTrans_Project.TaxItemGroupSales = ProjCategory::find(_ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+        _ledgerJournalTrans_Project.LinePropertyId = ProjLinePropertySetup::findLinePropertyId(
+                                                            _ledgerJournalTrans.findProjTable().ProjId,
+                                                            _ledgerJournalTrans_Project.CategoryId);
+
+        if (_ledgerJournalTrans.AccountType == LedgerJournalACType::Project)
+        {
+            _ledgerJournalTrans_Project.ProjId = _ledgerJournalTrans.parmAccount();
+            _ledgerJournalTrans_Project.TaxGroupSales = ProjParameters::taxGroupInvoice(_ledgerJournalTrans.parmAccount());
+            //this.initDefaultDimension(_ledgerJournalTrans);
+        }
+        else if (_ledgerJournalTrans.OffsetAccountType == LedgerJournalACType::Project)
+        {
+            _ledgerJournalTrans_Project.ProjId = _ledgerJournalTrans.parmOffsetAccount();
+            _ledgerJournalTrans_Project.TaxGroupSales = ProjParameters::taxGroupInvoice(_ledgerJournalTrans.parmOffsetAccount());
+            //this.initOffsetDefaultDimension(_ledgerJournalTrans);
+        }
+
+        _ledgerJournalTrans_Project.TaxItemGroupSales = ProjCategory::find(_ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fetchInvoiceDetail</Name>
+				<Source><![CDATA[
+    // SKS_18405
+
+    private SKS_LB_UnstructuredMatchContainers fetchInvoiceDetail(
+        SKS_PP_Bank         _sks_PP_Bank,
+        SKS_CCR_BankTran     _bankTran)
+    {
+        SKS_LB_MatchingRules                sKS_LB_MatchingRules;
+        SKS_LB_UnstructuredRulesMatching    unstructuredRulesMatching = new SKS_LB_UnstructuredRulesMatching();
+        SKS_LB_UnstructuredMatchContainers  matchContainers;
+
+        select UnstrRuleID,lookupType,SearchType from sKS_LB_MatchingRules
+                where sKS_LB_MatchingRules.GroupID == _sks_PP_Bank.MatchingRulesGroupIdCustSettle
+                && sKS_LB_MatchingRules.lookupType == SKS_LB_MatchType::UnstrData;
+
+        if (sKS_LB_MatchingRules.UnstrRuleID)
+        {
+            invoiceNumberList = unstructuredRulesMatching.ParseInvNumbers(_bankTran.TranDescriptionUser, sKS_LB_MatchingRules.UnstrRuleID);
+            matchContainers = unstructuredRulesMatching.CycleValues(invoiceNumberList, _bankTran.CustAccount, _sks_PP_Bank.InvoiceSearchCrossComp);
+        }
+
+        return matchContainers;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorText</Name>
+				<Source><![CDATA[
+    str getErrorText()
+    {
+        ;
+        return errorText;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getGLAccountFromBankTranType</Name>
+				<Source><![CDATA[
+    private LedgerDimensionAccount getGLAccountFromBankTranType(BankTransactionType tranType, DimensionDefault defaultDim)
+    {
+        BANKTRANSTYPE bankTransType;
+        ;
+        select * from bankTransType where bankTransType.BankTransType == tranType;
+        if(!bankTransType)
+        {
+            errorText = strFmt("@SKS525", tranType);
+        }
+        else
+        {
+            if(bankTransType.LedgerDimension == 0)
+            {
+                errorText = strFmt("@SKS526", tranType);
+            }
+        }
+        return LedgerDimensionFacade::serviceCreateLedgerDimension(bankTransType.LedgerDimension, defaultDim);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLastSKS_BR_BankTranAttempted</Name>
+				<Source><![CDATA[
+    public Line getLastSKS_BR_BankTranAttempted()
+    {
+        return gLastLineNumberAttempted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLookupType</Name>
+				<Source><![CDATA[
+    private SKS_LB_MatchType getLookupType(
+    SKS_PP_Bank         _sks_PP_Bank,
+    SKS_CCR_BankTran     _bankTran)
+    {
+        SKS_LB_RemitTxtParse    sKS_LB_RemitTxtParse;
+        SKS_LB_MatchingRules    sKS_LB_MatchingRules;
+
+        select UnstrRuleID,lookupType,SearchType from sKS_LB_MatchingRules
+            where sKS_LB_MatchingRules.GroupID == _sks_PP_Bank.MatchingRulesGroupIdCustSettle
+            && sKS_LB_MatchingRules.lookupType == SKS_LB_MatchType::UnstrData;
+
+        select NumberType from sKS_LB_RemitTxtParse where sKS_LB_RemitTxtParse.SKS_LB_RemitTxtAnalysis == sKS_LB_MatchingRules.UnstrRuleID;
+
+        return sKS_LB_RemitTxtParse.NumberType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    void run()
+    {
+        boolean                             ledgerJournalTableCreated = false;
+        LedgerJournalNameId                 locJournalName;
+        SelectableDataArea                  locGLCreationCompany;
+        SKS_CCR_BankTran                    locSKS_CCR_BankTran;
+        SKS_CCR_BankTran                    locUpdSKS_CCR_BankTran;
+        SKS_PP_Bank                         locSKS_PP_Bank;
+        AmountCur                           curInvoiceAmount, totalInvoiceAmount;
+        boolean                             overPayLastPayLine;
+        SKS_LB_UnstructuredMatchContainers  matchContainers;
+        SKS_LB_JournalAR                    locSKS_LB_JournalAR;
+        SKS_LB_JournalARApplic              locSKS_LB_JournalARApplic;
+        RefRecId                            ctoRecId;
+        int                                 cnt;
+        TransDate                           invDueDate;
+        AmountCur                           remainingAmt, curPayLineAmt;
+        // Auto post settlement rule apply -->
+        boolean                             dontSettle = false;
+        SKS_BR_AutopostInvoiceListTemp      autopostInvoiceListTempInsert;
+        SKS_BR_AutopostInvoiceListTemp      autopostInvoiceListTempBuff;
+        boolean                             isOverPayRemainingcreated = false;
+        SKS_LB_SettlementAction             settlmentAction;
+        String255                           settlmentActionFound;
+        AmountMST                           finalAmount;
+        //CustTransCashDisc                   foundCustTransCashDisc;
+        AmountCur                           CashDiscToTake;
+        boolean                             isDiscountApplied = false;
+        CashDiscAmount                      cashDiscAmount;
+        AmountMST                           pennyDifAmount;
+        AmountMST                           oveUndAmount;
+        boolean                             postGL = false;
+        CustTransOpen                       custTransOpen;
+        AmountCur                           bankTransAmount;
+        boolean                             isMultiCustomerPayment = false;
+        CustAccount                         oldCustomer;
+        container                           virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+        SKS_LB_JournalARApplic              journalARApplic;
+        SKS_BR_BankReconciliationTrans      sKS_BR_BankReconciliationTrans;
+        CustPaymSettlementManager           SettlementManager;
+        CustTrans                           lCustTrans;
+        // Auto post settlement rule apply <--
+        // 9479_CustomerMatching -->
+        SKS_LB_MatchType    sks_LB_MatchType;
+        CustAccount         custAccount;
+        Integer invSettlementRuleStep;
+        // 9479_CustomerMatching <--
+        SKS_CCR_BankTran                     locUpdSKS_CCR_BankTranate;//SKS_Bug_8692
+        SKS_BR_ParseRule                    locSKS_BR_ParseRule; //18569
+      
+          while select forupdate crosscompany locSKS_CCR_BankTran
+                order by  locSKS_CCR_BankTran.GLCreationCompany,
+                    locSKS_CCR_BankTran.JournalName,
+                    locSKS_CCR_BankTran.AccountId
+                where locSKS_CCR_BankTran.CCRHeaderRecId == headerRecId
+                    && locSKS_CCR_BankTran.GLMatchOrCreate == SKS_CCR_GLMatchOrCreate::GLCreate
+              outer join locSKS_BR_ParseRule //18569
+                where locSKS_BR_ParseRule.ParseRuleId == locSKS_CCR_BankTran.ParseRuleId
+                    && locSKS_BR_ParseRule.CCR_IsCCReconciliation == NoYes::Yes
+        {
+            gLastLineNumberAttempted = locSKS_CCR_BankTran.LineNumInFile;
+            // If company has changed, need to load the setup for the new company's
+            // eBanking
+            if(locGLCreationCompany != locSKS_CCR_BankTran.GLCreationCompany
+                    ||     locJournalName != locSKS_CCR_BankTran.JournalName)
+            {
+                ledgerJournalTableCreated = false;
+                locGLCreationCompany = locSKS_CCR_BankTran.GLCreationCompany;
+                locJournalName = locSKS_CCR_BankTran.JournalName;
+            }
+
+            changeCompany(locSKS_CCR_BankTran.GLCreationCompany)
+            {
+                if(!ledgerJournalTableCreated)
+                {
+                    this.createLedgerJournalTable(locSKS_CCR_BankTran.CCRHeaderRecId, locJournalName);
+                    ledgerJournalTableCreated = true;
+                }
+
+                this.createLedgerJournalTrans(locSKS_CCR_BankTran, locSKS_BR_ParseRule);
+                if(errorText != '')
+                {
+                    return;
+                }
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RunFromCreateGLButton</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer sks_br_banktran is selected forUpdate and is passed to other methods where it is modified.")]
+    public void RunFromCreateGLButton(RecId _SKS_CCR_BankTranRecid)
+    {
+        SKS_CCR_BankTran locSKS_CCR_BankTran;
+        SKS_BR_ParseRule locSKS_BR_ParseRule;
+        ;
+
+        select forupdate crosscompany locSKS_CCR_BankTran
+          where locSKS_CCR_BankTran.CCRHeaderRecId == headerRecId &&
+                locSKS_CCR_BankTran.GLMappingRuleGroupId != ''
+                && locSKS_CCR_BankTran.recid == _SKS_CCR_BankTranRecid
+        outer join locSKS_BR_ParseRule
+                where locSKS_BR_ParseRule.ParseRuleId == locSKS_CCR_BankTran.ParseRuleId
+                    && locSKS_BR_ParseRule.CCR_IsCCReconciliation == NoYes::Yes;
+        if(locSKS_CCR_BankTran)
+        {
+            changeCompany(locSKS_CCR_BankTran.GLCreationCompany)
+            {
+                this.createLedgerJournalTable(locSKS_CCR_BankTran.CCRHeaderRecId, locSKS_CCR_BankTran.JournalName);
+                this.createLedgerJournalTrans(locSKS_CCR_BankTran, locSKS_BR_ParseRule);
+                if(errorText != '')
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setHeaderRecId</Name>
+				<Source><![CDATA[
+    void setHeaderRecId(SKS_CCR_BankHeaderRecId _headerRecId)
+    {
+        ;
+        headerRecId = _headerRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findLookupValue</Name>
+				<Source><![CDATA[
+    public static SKS_BR_GLMappingRuleLookup findLookupValue(SKS_BR_GLMappingRuleGroupId _ruleGroupId, SKS_BR_ParsedValue _parsedValue)
+    {
+        SKS_BR_GLMappingRuleLookup SKS_BR_GLMappingRuleLookup;
+        ;
+
+        //if an exact match rule hits, use that
+        select firstOnly SKS_BR_GLMappingRuleLookup where
+            SKS_BR_GLMappingRuleLookup.RuleGroupId == _ruleGroupId &&
+            SKS_BR_GLMappingRuleLookup.SearchOperator == SKS_EB_SearchOperator::Equals &&
+            SKS_BR_GLMappingRuleLookup.LookupValueSql == _parsedValue
+            && SKS_BR_GLMappingRuleLookup.CCR_IsCCReconciliation == NoYes::Yes;  /// SKS_FDD_13903 - To make sure that its picking only CCR format
+
+        if(!SKS_BR_GLMappingRuleLookup)
+        {
+            select firstOnly SKS_BR_GLMappingRuleLookup order by LookupValueSql where
+                SKS_BR_GLMappingRuleLookup.RuleGroupId == _ruleGroupId &&
+                SKS_BR_GLMappingRuleLookup.SearchOperator == SKS_EB_SearchOperator::Contains &&
+                _parsedValue like SKS_BR_GLMappingRuleLookup.LookupValueSql &&
+                _parsedValue like SKS_BR_GLMappingRuleLookup.LookupValue2Sql &&
+                SKS_BR_GLMappingRuleLookup.LookupValue2 != ''
+                && SKS_BR_GLMappingRuleLookup.CCR_IsCCReconciliation == NoYes::Yes;  /// SKS_FDD_13903 - To make sure that its picking only CCR format
+
+            if(!SKS_BR_GLMappingRuleLookup)
+            {
+                select firstOnly SKS_BR_GLMappingRuleLookup order by LookupValueSql where
+                    SKS_BR_GLMappingRuleLookup.RuleGroupId == _ruleGroupId &&
+                    SKS_BR_GLMappingRuleLookup.SearchOperator == SKS_EB_SearchOperator::Contains &&
+                    _parsedValue like SKS_BR_GLMappingRuleLookup.LookupValueSql &&
+                    SKS_BR_GLMappingRuleLookup.LookupValue2 == ''
+                    && SKS_BR_GLMappingRuleLookup.CCR_IsCCReconciliation == NoYes::Yes;  /// SKS_FDD_13903 - To make sure that its picking only CCR format
+            }
+
+        }
+        return SKS_BR_GLMappingRuleLookup;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>colorImportedTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// TFS 7351
+    /// </summary>
+    /// <param name="_bankTransRecId">
+    /// Bank transaction rec id.
+    /// </param>
+    public static void colorImportedTransaction(RefRecId _bankTransRecId)
+    {
+        SKS_LB_JournalARApplic  journalARApplic;
+        SKS_LB_JournalARApplic  ARApplic;
+        BankAccountTrans        accountTrans;
+        SKS_CCR_BankTran         locBanKTran;
+        SKS_CCR_BankTran         banKTranUpt;
+        boolean                 blue;
+        boolean                 yellow;
+        boolean                 red;
+
+        select crosscompany AccountType , Invoice, TransactionAmount ,Status from journalARApplic
+            where (journalARApplic.SKS_CCR_BankTran == _bankTransRecId &&
+                (journalARApplic.AccountType == LedgerJournalACType::Cust && journalARApplic.Invoice == '')); // 7421
+
+        if (journalARApplic.RecId)
+        {
+            blue = true;
+        }
+
+        ttsBegin;
+
+        select crosscompany MatchIndicator, RecId, MatchConfidence, GLMappingRuleGroupId from banKTranUpt
+            where banKTranUpt.RecId == _bankTransRecId;
+
+        changecompany(banKTranUpt.company())
+        {
+            locBanKTran = banKTranUpt;
+            locBanKTran.reread();
+            locBanKTran.selectForUpdate(true);
+            if (locBanKTran.ManualReconciliationID != emptyGuid())
+            {
+                select crosscompany count(RecId) from accountTrans
+                    where accountTrans.SKS_CCR_ManualReconciliationID == locBanKTran.ManualReconciliationID;
+            }
+
+            select crosscompany count(RecId) from ARApplic
+                  where ARApplic.SKS_CCR_BankTran == _bankTransRecId;
+        }
+
+        if (ARApplic.RecId || accountTrans.RecId)
+        {
+            yellow = true;
+        }
+        if(!ARApplic.RecId)
+        {
+            red = true;
+        }
+
+        if(locBanKTran.RecId)
+        {
+            if (blue)
+            {
+                locBanKTran.MatchIndicator = SKS_BR_MatchIndicator::Blue;
+            }
+            else if (yellow)
+            {
+                locBanKTran.MatchIndicator = SKS_BR_MatchIndicator::Yellow;
+                // TFS 7335 -->
+                if(strLen(locBanKTran.GLMappingRuleGroupId) > 0 && locBanKTran.MatchConfidence == 0)
+                {
+                    locBanKTran.MatchConfidence = 100;
+                }
+                // TFS 7335 <--
+            }
+            else if (red)
+            {
+                locBanKTran.MatchIndicator = SKS_BR_MatchIndicator::Red;
+                locBanKTran.MatchConfidence = 0; // TFS 7335
+            }
+            changecompany(banKTranUpt.company())
+            {
+                locBanKTran.update();
+            }
+        }
+        ttsCommit;
+    //  }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>invoiceCurToTransCur</Name>
+				<Source><![CDATA[
+    public Amount invoiceCurToTransCur(Amount _transAmount, SKS_CCR_BankTran _sks_ccr_banktran, RefRecId _custTransRecord)
+    {
+        BankAccountTable        bankAccountTable;
+        CurrencyExchangeHelper  transExchRateHelper;
+        Amount                  amountCur;
+        Amount                  bankTransAmount;
+        Ledger                  ledger;
+        CustTrans               custTrans;
+        container               virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+
+        changecompany(_sks_ccr_banktran.company())
+        {
+            select CurrencyCode, DataAreaId from bankAccountTable
+                where bankAccountTable.AccountID == _sks_ccr_banktran.AccountId;
+        }
+
+        select crossCompany:virtualCompanyCompanies CurrencyCode from custTrans
+                                where custTrans.recid == _custTransRecord;
+
+        if(bankAccountTable.CurrencyCode != custTrans.CurrencyCode)
+        {
+            transExchRateHelper = CurrencyExchangeHelper::construct();
+            ledger = Ledger::find(Ledger::primaryLedger(CompanyInfo::findDataArea(bankAccountTable.DataAreaId).RecId));
+
+            transExchRateHelper.parmLedgerRecId(ledger.RecId);
+            transExchRateHelper.parmExchangeDate(_sks_ccr_banktran.getGLPostingDate()); //stmt date //CR-7653
+            bankTransAmount = CurrencyExchangeHelper::amount(transExchRateHelper.calculateCurrencyToCurrency(custTrans.CurrencyCode, ledger.AccountingCurrency, _transAmount, true));
+            amountCur = CurrencyExchangeHelper::amount(transExchRateHelper.calculateCurrencyToCurrency(ledger.AccountingCurrency,bankAccountTable.CurrencyCode, bankTransAmount, true));
+        }
+        else
+        {
+            amountCur = _transAmount;
+        }
+
+        return amountCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTolerance</Name>
+				<Source><![CDATA[
+    //SKS_FDD_13903     Not using for CCR
+    /*
+    /// <summary>
+    /// Update Settlement rules action taken
+    /// </summary>
+    /// <param name = "_SKS_CCR_BankTran">BankTansaction Record for update</param>
+    /// <param name = "_matchingRulesGroupId">Matching rul group id</param>
+    /// <param name = "_SKS_CCR_SettlementType">Settlement type</param>
+    /// <param name = "_SKS_CCR_SettlementAction">Settlement action</param>
+    /// <param name = "_settlementSKS_CCR_Step">Settlemetn action step</param>
+    /// <param name = "_SKS_LB_UnstrRuleID">Parse rule used for finding customer</param>
+    /// <param name = "_customerRuleSKS_CCR_Step">Parse rule step numbers</param>
+    //9479_CustomerMatching
+    private void updateCustomerSettlementAction(
+        SKS_CCR_BankTran _SKS_CCR_BankTran,
+        SKS_BR_eBankRecCustGroupId _matchingRulesGroupId,
+        Str60 _SKS_BR_SettlementType,
+        SKS_BR_SettlementAction _SKS_BR_SettlementAction,
+        SKS_BR_Step _remitenceSettlementActionStep,
+        SKS_BR_Step _matchingRuleGroupActionStep,
+        SKS_LB_UnstrRuleID _SKS_LB_UnstrRuleID,
+        SKS_BR_Step _customerRuleSKS_BR_Step
+        )
+    {
+        changeCompany(_SKS_CCR_BankTran.company()) //10562
+        {
+            SKS_BR_BankTran   locUpdSKS_CCR_BankTranate;
+
+            select forupdate locUpdSKS_CCR_BankTranate
+                    where locUpdSKS_CCR_BankTranate.RecId == _SKS_CCR_BankTran.RecId;
+
+            ttsbegin;
+            locUpdSKS_CCR_BankTranate.reread();
+            locUpdSKS_CCR_BankTranate.EbankRecMatchingRuleGroupId = _matchingRulesGroupId;
+            locUpdSKS_CCR_BankTranate.SettlementType = _SKS_BR_SettlementType;
+            locUpdSKS_CCR_BankTranate.SettlementAction = _SKS_BR_SettlementAction;
+            locUpdSKS_CCR_BankTranate.RemitenceSettlementActionStep = _remitenceSettlementActionStep;
+            locUpdSKS_CCR_BankTranate.MatchingRuleGroupActionStep = _matchingRuleGroupActionStep;
+            locUpdSKS_CCR_BankTranate.CustRemitAnalysisRule = _SKS_LB_UnstrRuleID;
+            locUpdSKS_CCR_BankTranate.CustomerRuleStep = _customerRuleSKS_BR_Step;
+            locUpdSKS_CCR_BankTranate.update();
+            ttscommit;
+        }
+    }
+
+    /// <summary>
+    /// Get first customer from the list of customer using customer account, IBAN number and Bank account
+    /// </summary>
+    /// <param name = "_textDataList">Customer list</param>
+    /// <param name = "_customerSearchAcrossCompany">Boolean value for Customer search accross company</param>
+    /// <returns>returns customer</returns>
+    // CR-9479
+    public container findCustomerFromTextData(list _textDataList,
+        Noyes   _customerSearchAcrossCompany)
+    {
+        CustAccount                 custAccount;
+        CustTable                   custTable;
+        CustBankAccount             custBankAccount;
+        CustBankAccount             custBankAccountLoc;
+        container                   virtualCompanyCompanies;
+        SKS_LB_CustMatchType        custMatchType;
+        SKS_BR_CustLookUpRefNum     customerLookupNum;
+        Integer                     custRemitParseRuleStep;
+        ListIterator                listIter = new ListIterator(_textDataList);
+
+        if(_customerSearchAcrossCompany)
+        {
+            virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+        }
+        else
+        {
+            virtualCompanyCompanies += curExt();
+        }
+        while(listIter.more())
+        {
+            if(listIter.value().custMatchType())
+            {
+                custMatchType = listIter.value().custMatchType();
+                customerLookupNum = listIter.value().customerLookupNum();
+                custRemitParseRuleStep = listIter.value().custRemitParseRuleStep();
+                switch(custMatchType)
+                {
+                    case SKS_LB_CustMatchType::BankAccountNumber:
+                        select firstonly crossCompany:virtualCompanyCompanies count(RecId) from custBankAccount
+                                where custBankAccount.AccountNum == customerLookupNum;
+                        if(custBankAccount.RecId == 1)
+                        {
+                            select firstonly crossCompany:virtualCompanyCompanies CustAccount from custBankAccountLoc
+                                where custBankAccountLoc.AccountNum == customerLookupNum;
+                            custAccount = custBankAccountLoc.CustAccount;
+                        }
+                        else
+                        {
+                            custAccount = "";
+                        }
+                        break;
+                    case SKS_LB_CustMatchType::CustomerAccountNumber:
+                        select firstonly crossCompany:virtualCompanyCompanies count(RecId) from custTable
+                                where custTable.AccountNum == customerLookupNum;
+                        if(custTable.RecId == 1)
+                        {
+                            custAccount = customerLookupNum;
+                        }
+                        else
+                        {
+                            custAccount = "";
+                        }
+                        break;
+                    case SKS_LB_CustMatchType::IBAN:
+                        select firstonly crossCompany:virtualCompanyCompanies count(RecId) from custBankAccount
+                                where custBankAccount.BankIBAN == customerLookupNum;
+                        if(custBankAccount.RecId == 1)
+                        {
+                            select firstonly crossCompany:virtualCompanyCompanies CustAccount from custBankAccountLoc
+                                where custBankAccountLoc.BankIBAN == customerLookupNum;
+                            custAccount = custBankAccountLoc.CustAccount;
+                        }
+                        else
+                        {
+                            custAccount = "";
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                if(custAccount)
+                {
+                    break;
+                }
+                else
+                {
+                    listIter.next();
+                }
+            }
+        }
+        return [custAccount, custRemitParseRuleStep];
+    }*/
+
+       /// <summary>
+       /// Get tolerance applied amount
+       /// </summary>
+       /// <param name = "_paymentAmount">Payment amount</param>
+       /// <param name = "_invoiceAmount">Invoce amount</param>
+       /// <param name = "_dataAreaId">Data area id</param>
+       /// <returns>returns tolerance details</returns>
+       //  9479_CustomerMatching
+    public container getTolerance(Amount _paymentAmount, Amount _invoiceAmount, DataAreaId _dataAreaId)
+    {
+        AmountMST       paymentAmount = _paymentAmount;
+        AmountMST       differenceAmount;
+        CashDiscAmount  oveUndAmount;
+        CustParameters  custParameters = custParameters::findByCompany(_dataAreaId);
+
+        oveUndAmount = custParameters.MaxMSTOverUnder;
+       // when payment is greater than the invoice amount
+        if(paymentAmount > _invoiceAmount)
+        {
+            differenceAmount = paymentAmount - _invoiceAmount;
+
+            if(differenceAmount <= oveUndAmount)
+            {
+                paymentAmount = paymentAmount - differenceAmount;
+                oveUndAmount = differenceAmount;
+            }
+            else
+            {
+                oveUndAmount = 0;
+                paymentAmount = paymentAmount;
+            }
+        }
+        // when payment is less that the invocie amount
+        else if(paymentAmount < _invoiceAmount)
+        {
+            differenceAmount = _invoiceAmount - paymentAmount;
+            if(differenceAmount <= oveUndAmount)
+            {
+                paymentAmount = paymentAmount + differenceAmount;
+                oveUndAmount = differenceAmount * -1;
+            }
+            else
+            {
+                oveUndAmount = 0;
+                paymentAmount = paymentAmount;
+            }
+        }
+        else
+        {
+            paymentAmount = paymentAmount;
+            oveUndAmount = 0;
+        }
+        return [paymentAmount, oveUndAmount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RemoveZeroesAddPrefixSuffix</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Remove prefixed text from the found text
+    /// </summary>
+    /// <param name = "_removeZeroes">Boolean value to remove zero</param>
+    /// <param name = "_tmpResults">Input result found </param>
+    /// <param name = "_Counter">Text Counter</param>
+    /// <param name = "_RemitParse">Remitence parse rule</param>
+    /// <returns>returns final list</returns>
+    private SKS_LB_RemitTxtData RemoveZeroesAddPrefixSuffix(boolean _removeZeroes, container _tmpResults, int _Counter, SKS_LB_RemitTxtParse  _RemitParse)
+    {
+        SKS_LB_RemitTxtData RemitTxtData = new SKS_LB_RemitTxtData();
+        String255   lcustomerLookupNum;
+
+        if(_removeZeroes)
+        {
+            lcustomerLookupNum =_RemitParse.AXPrefix +  SKS_PP_StringFormats::strLTrimZeroes(conPeek(_tmpResults, _Counter)) + _RemitParse.AXSuffix;
+        }
+        else
+        {
+            lcustomerLookupNum =_RemitParse.AXPrefix +  conPeek(_tmpResults, _Counter) + _RemitParse.AXSuffix;
+        }
+        RemitTxtData.customerLookupNum(lcustomerLookupNum);
+        RemitTxtData.custMatchType(_RemitParse.CustMatchType);
+        RemitTxtData.SearchType(_RemitParse.SearchType);
+        RemitTxtData.custRemitParseRuleStep(_RemitParse.Step);
+
+        return RemitTxtData;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseCustomers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get customer using parse rule
+    /// </summary>
+    /// <param name = "_Note">Imported trans description </param>
+    /// <param name = "_RuleID">Rule group id to search customers from the text</param>
+    /// <returns> returns list of customer text found from the given text</returns>
+    /// 9479_CustomerMatching
+    public List parseCustomers(SKS_BR_NoteMemo _Note, SKS_LB_UnstrRuleId _RuleID) // 7483
+    {
+        SKS_LB_RemitTxtParse            lRemitTxtParse;
+        container                       lResults;
+        container                       tmpInvTextResults;
+        str                             lExpr;
+        int                             Counter;
+        List                            RemitTxtDataList = new List(Types::Class);
+        SKS_LB_UnstructuredRulesMatching    unstructuredRulesMatching = new SKS_LB_UnstructuredRulesMatching();
+
+        while select lRemitTxtParse order by lRemitTxtParse.step where lRemitTxtParse.SKS_LB_RemitTxtAnalysis == _RuleID
+        {
+            tmpInvTextResults = conNull();
+            if(lRemitTxtParse.SKS_LB_DataSearchType == SKS_LB_DataSearchType::NumberLength)
+            {
+                lExpr = '[0-9]{' + int642str(lRemitTxtParse.NumberMin) + ',' + int642str(lRemitTxtParse.Numbermax) + '}';
+                tmpInvTextResults += unstructuredRulesMatching.searchString(_Note, lExpr);
+
+                for(Counter = 1; counter <= conLen(tmpInvTextResults); Counter++)
+                {
+                    if(lRemitTxtParse.RestrictNumberRange)
+                    {
+                        if(str2int(conPeek(tmpInvTextResults, counter)) < lRemitTxtParse.MinValue  ||  str2int(conPeek(tmpInvTextResults, counter)) > lRemitTxtParse.maxValue)
+                        {
+                            tmpInvTextResults = conDel(tmpInvTextResults, Counter, 1);
+                            Counter = Counter - 1;
+                        }
+                        else
+                        {
+                            RemitTxtDataList.addEnd(this.RemoveZeroesAddPrefixSuffix(lRemitTxtParse.RemoveLeadingZeroes, tmpInvTextResults, Counter, lRemitTxtParse));
+                        }
+                    }
+                    else
+                    {
+                        RemitTxtDataList.addEnd(this.RemoveZeroesAddPrefixSuffix(lRemitTxtParse.RemoveLeadingZeroes, tmpInvTextResults, Counter, lRemitTxtParse));
+                    }
+                }
+            }
+            else
+            {
+                tmpInvTextResults += unstructuredRulesMatching.searchString(_Note, lRemitTxtParse.RegularExpression);
+                for(Counter = 1; counter <= conLen(tmpInvTextResults); Counter++)
+                {
+                    RemitTxtDataList.addEnd(this.RemoveZeroesAddPrefixSuffix(lRemitTxtParse.RemoveLeadingZeroes, tmpInvTextResults, Counter, lRemitTxtParse));
+                }
+            }
+
+            lResults += tmpInvTextResults;
+        }
+
+        return RemitTxtDataList;
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

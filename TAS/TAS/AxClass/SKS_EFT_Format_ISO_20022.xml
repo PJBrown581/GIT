@@ -1,0 +1,698 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_Format_ISO_20022</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// SKS_EFT_Format_ISO_20022 extends SKS_EFT_Format
+/// </summary>
+class SKS_EFT_Format_ISO_20022 extends SKS_EFT_Format
+{
+    //------------------------------------------------------------------------------------------------------
+    /// <summary>
+    /// This class is the replacement base class for all ISO 20022 formats.
+    /// Bank specific formats may override nodes if they have specific requirements.
+    /// </summary>
+    //------------------------------------------------------------------------------------------------------
+    XmlDocument             xmlDoc;
+    XmlElement              nodeRoot;
+    XmlElement              GrpHdr;
+    XmlElement              nodePmtInf;
+    BankAccountTable        mBankAccountTable;
+    SKS_EFT_Addenda         mSKS_EFT_Addenda;
+    SKS_EFT_AddendaFormats  mSKS_EFT_AddendaFormats;
+
+    int batchCount;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addressSplit</Name>
+				<Source><![CDATA[
+    protected container addressSplit(SKS_EB_Address  _address)
+    {
+        List            strList = new List(Types::String);
+        container       address;
+        ListIterator    iterator;
+    
+        strlist = strSplit(_address,';');
+        iterator = new ListIterator(strlist);
+    
+        while(iterator.more())
+        {
+            address += iterator.value();
+            iterator.next();
+        }
+    
+        return address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findPostalAddressLineByPartyLocationRole</Name>
+				<Source><![CDATA[
+    protected LogisticsPostalAddress findPostalAddressLineByPartyLocationRole(
+        DirPartyRecId   _party,
+        LogisticsLocationRoleName   _roleName)
+    {
+        DirPartyLocation        partyLocation;
+        LogisticsLocation       logisticsLocation;
+        LogisticsPostalAddress  postalAddress;
+    
+        while select partyLocation
+            where partyLocation.Party == _party
+        {
+            if(strScan(partyLocation.locationRoleNames(),_roleName,1,strLen(partyLocation.locationRoleNames())))
+            {
+                logisticsLocation = logisticsLocation::find(partyLocation.Location);
+                if(logisticsLocation.IsPostalAddress)
+                {
+                    postalAddress = LogisticsPostalAddress::findByLocation(logisticsLocation.RecId);
+                    break;
+                }
+            }
+        }
+    
+        return postalAddress;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatStructure</Name>
+				<Source><![CDATA[
+    protected void formatStructure()
+    {
+        CompanyBankAccountId    prevBankAccountId;
+        PaymMode                prevPaymMode;
+        PaymSpec                prevPaymSpec;
+        CurrencyCode            prevCurrency;
+        SKS_EB_Date             prevEffectiveDate;
+    
+        xmlDoc = XmlDocument::newBlank(this.getEncoding());
+    
+        this.node_MessageRoot();
+    
+        this.node_GrpHdr();
+    
+        while(mSKS_EFT_FileDetail)
+        {
+            // Get SKS_EFT_FileFormatPaymSpec
+            this.getSKS_EFT_FileFormatPaymSpec();
+    
+            if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AR)
+            {
+                // get SKS_EFT_CustomerPaym
+                this.getSKS_EFT_CustomerPaym();
+            }
+            else
+            {
+                // Get SKS_EFT_VendorPaym
+                this.getSKS_EFT_VendorPaym(); 
+            }
+    
+            if(mBankAccountTable.AccountID != mSKS_EFT_FileDetail.BankAccountId)
+            {
+                if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AR)
+                {
+                    // get SKS_EFTAR_Bank
+                    this.getSKS_EFTAR_Bank();
+                }
+                else if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::BTB)
+                {
+                    // get SKS_EFTAR_Bank
+                    this.getSKS_EFTBTB_Bank();
+                }
+                else
+                {
+                    // Get SKS_EFT_Bank
+                    this.getSKS_EFT_Bank();
+                }
+    
+                // Get Bank account
+                mBankAccountTable = BankAccountTable::find(mSKS_EFT_FileDetail.BankAccountId);
+            }
+    
+    
+            if(prevBankAccountId != mSKS_EFT_FileDetail.BankAccountId ||
+               prevPaymMode != mSKS_EFT_FileDetail.PaymMode ||
+               prevPaymSpec != mSKS_EFT_FileDetail.PaymSpec ||
+               prevCurrency != mSKS_EFT_FileDetail.PaymentCurrencyCode ||
+               prevEffectiveDate != mSKS_EFT_FileDetail.EffectiveDate
+               )
+            {
+                this.node_PmtInf();
+    
+                prevBankAccountId = mSKS_EFT_FileDetail.BankAccountId;
+                prevPaymMode = mSKS_EFT_FileDetail.PaymMode;
+                prevPaymSpec = mSKS_EFT_FileDetail.PaymSpec;
+                prevCurrency = mSKS_EFT_FileDetail.PaymentCurrencyCode;
+                prevEffectiveDate = mSKS_EFT_FileDetail.EffectiveDate;
+            }
+    
+            if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AR ||
+               (mSKS_EFT_FileDetail.Module == SKS_EFT_Module::BTB && mSKS_EFT_File.TransferDirection == SKS_BTB_TransferType::Transfer_in))
+            {
+                //For AR
+                this.node_DrctDbtTxInf();
+            }
+            else
+            {
+                // Get RemittanceAddress
+                this.getRemittanceAddress((mSKS_EFT_FileFormatPaymSpec.UseCheckNumber || subStr(mSKS_EFT_FileDetail.PaymSpec, 1, 3) == 'CHK'));
+    
+                //Get Addenda information
+                this.setAddenda();
+    
+                //For AP
+                this.node_CdtTrfTxInf();
+            }
+    
+            next mSKS_EFT_FileDetail;
+        }
+        this.fileWrite(xmlDoc.toString());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCodePage</Name>
+				<Source><![CDATA[
+    protected int getCodePage()
+    {
+        return 65001;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEncoding</Name>
+				<Source><![CDATA[
+    protected str getEncoding()
+    {
+        return 'utf-8';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_CdtTrfTxInf</Name>
+				<Source><![CDATA[
+    protected void node_CdtTrfTxInf()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      2.27: CdtTrfTxInf
+        //------------------------------------------------------------------------------------------------------
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_DrctDbtTxInf</Name>
+				<Source><![CDATA[
+    protected void node_DrctDbtTxInf()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      2.28: DrctDbtTxInf
+        //------------------------------------------------------------------------------------------------------
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //  1.0: GrpHdr
+        //      1.1: MsgId
+        //      1.2: CreDtTm
+        //      1.6: NbOfTxs
+        //      1.7: CtrlSum
+        //      1.8: InitgPty
+        //          Nm
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeGrpHdr;
+        SKS_EFT_FileDetail tmpSKS_EFT_FileDetail;
+    
+        // Select count and sum for this file
+        select COUNT(InvoiceOrigAmountCur), SUM(InvoiceSettleAmountPmtCur) from tmpSKS_EFT_FileDetail
+            where
+                tmpSKS_EFT_FileDetail.FileRecId == mSKS_EFT_File.RecId &&
+                tmpSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                tmpSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+    
+        //  1.0: GrpHdr
+        nodeGrpHdr = nodeRoot.appendChild(xmlDoc.createElement('GrpHdr'));
+    
+        //      1.1: MsgId
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeGrpHdr, 'MsgId', SKS_PP_StringFormats::strRight(mSKS_EFT_File.FileNbr,35));
+    
+        //      1.2: CreDtTm
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeGrpHdr, 'CreDtTm', DateTimeUtil::toStr(DateTimeUtil::utcNow()));
+    
+        //      1.3: Authstn
+        this.node_GrpHdr_Authstn(nodeGrpHdr);
+    
+        //      1.6: NbOfTxs
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeGrpHdr, 'NbOfTxs', num2str(tmpSKS_EFT_FileDetail.InvoiceOrigAmountCur,0,0,0,0));
+    
+        if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AP || mSKS_EFT_FileDetail.Module == SKS_EFT_Module::CNP || (mSKS_EFT_FileDetail.Module == SKS_EFT_Module::BTB && mSKS_EFT_File.TransferDirection == SKS_BTB_TransferType::Transfer_out))
+        {
+            //      1.7: CtrlSum
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeGrpHdr, 'CtrlSum', num2str(tmpSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur * -1,0,2,1,0));
+        }
+        else
+        {
+            //      1.7: CtrlSum
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodeGrpHdr, 'CtrlSum', num2str(tmpSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,0));
+        }
+    
+        //      1.8: InitgPty
+        this.node_GrpHdr_InitgPty(nodeGrpHdr);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_Authstn</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_Authstn(XmlElement _nodeGrpHdr)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.3: Authstn
+        //------------------------------------------------------------------------------------------------------
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_InitgPty</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_InitgPty(XmlElement _nodeGrpHdr)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.8: InitgPty
+        //          Nm
+        //          Id
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodeInitgPty;
+    
+    
+        //      1.8: InitgPty
+        nodeInitgPty = _nodeGrpHdr.appendChild(xmlDoc.createElement('InitgPty'));
+    
+        //          Nm
+        this.node_GrpHdr_InitgPty_Nm(nodeInitgPty);
+    
+        //          Id
+        this.node_GrpHdr_InitgPty_Id(nodeInitgPty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_InitgPty_Id</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_InitgPty_Id(XmlElement _nodeInitgPty)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.8: InitgPty
+        //          Id
+        //------------------------------------------------------------------------------------------------------
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_GrpHdr_InitgPty_Nm</Name>
+				<Source><![CDATA[
+    protected void node_GrpHdr_InitgPty_Nm(XmlElement _nodeInitgPty)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      1.8: InitgPty
+        //          Nm
+        //------------------------------------------------------------------------------------------------------
+        Name companyName;
+    
+        //          Nm
+        companyName = CompanyInfo::find().Name();
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, _nodeInitgPty, 'Nm', this.CharacterReplacement(companyName), 70, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_MessageRoot</Name>
+				<Source><![CDATA[
+    protected void node_MessageRoot()
+    {
+        nodeRoot = xmlDoc.appendChild(xmlDoc.createElement('Document'));
+        if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AR)
+        {
+            SKS_EFT_Format::xmlsetAttributeText(nodeRoot, 'xmlns', 'urn:iso:std:iso:20022:tech:xsd:pain.008.001.02');
+            SKS_EFT_Format::xmlsetAttributeText(nodeRoot, 'xmlns:xsi', 'http://www.w3.org/2001/XMLSchema-instance');
+            nodeRoot = nodeRoot.appendChild(xmlDoc.createElement('CstmrDrctDbtInitn'));
+        }
+        else
+        {
+            SKS_EFT_Format::xmlsetAttributeText(nodeRoot, 'xmlns', 'urn:iso:std:iso:20022:tech:xsd:pain.001.001.03');
+            SKS_EFT_Format::xmlsetAttributeText(nodeRoot, 'xmlns:xsi', 'http://www.w3.org/2001/XMLSchema-instance');
+            nodeRoot = nodeRoot.appendChild(xmlDoc.createElement('CstmrCdtTrfInitn'));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PmtInf</Name>
+				<Source><![CDATA[
+    protected void node_PmtInf()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //  2.0: PmtInf
+        //      2.1: PmtInfId
+        //      2.2: PmtMtd
+        //      2.4: NbOfTxs
+        //      2.5: CtrlSum
+        //      2.6: PmtTpInf
+        //      2.17: ReqdExctnDt
+        //      2.19: Dbtr
+        //      2.20: DbtrAcct
+        //      2.21: DbtrAgt
+        //      2.24 ChrgBr
+        //------------------------------------------------------------------------------------------------------
+        SKS_EFT_FileDetail tmpSKS_EFT_FileDetail;
+    
+        batchCount++;
+    
+        // Select count and sum for this bank account
+        select COUNT(InvoiceOrigAmountCur), SUM(InvoiceSettleAmountPmtCur) from tmpSKS_EFT_FileDetail
+            where
+                tmpSKS_EFT_FileDetail.FileRecId == mSKS_EFT_File.RecId &&
+                tmpSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                tmpSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary &&
+                tmpSKS_EFT_FileDetail.BankAccountId == mSKS_EFT_FileDetail.BankAccountId &&
+                tmpSKS_EFT_FileDetail.EffectiveDate == mSKS_EFT_FileDetail.EffectiveDate &&
+                tmpSKS_EFT_FileDetail.PaymMode == mSKS_EFT_FileDetail.PaymMode &&
+                tmpSKS_EFT_FileDetail.PaymSpec == mSKS_EFT_FileDetail.PaymSpec &&
+                tmpSKS_EFT_FileDetail.PaymentCurrencyCode == mSKS_EFT_FileDetail.PaymentCurrencyCode;
+    
+    
+        //  2.0: PmtInf
+        nodePmtInf = nodeRoot.appendChild(xmlDoc.createElement('PmtInf'));
+    
+        //      2.1: PmtInfId
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'PmtInfId', SKS_PP_StringFormats::strRight(mSKS_EFT_File.FileNbr + '-' + int2str(batchCount),35));
+    
+        //      2.2: PmtMtd
+        if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AR)
+        {
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'PmtMtd', 'DD');
+        }
+        else if(mSKS_EFT_FileFormatPaymSpec.UseCheckNumber == NoYes::Yes || subStr(mSKS_EFT_FileDetail.PaymSpec, 1, 3) == 'CHK')
+        {
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'PmtMtd', 'CHK');
+        }
+        else
+        {
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'PmtMtd', 'TRF');
+        }
+    
+        //      2.3: BtchBookg
+        this.node_PmtInf_BtchBookg(nodePmtInf);
+
+        //      2.4: NbOfTxs
+        SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'NbOfTxs', num2str(tmpSKS_EFT_FileDetail.InvoiceOrigAmountCur,0,0,0,0));
+    
+        if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AP || mSKS_EFT_FileDetail.Module == SKS_EFT_Module::CNP || (mSKS_EFT_FileDetail.Module == SKS_EFT_Module::BTB && mSKS_EFT_File.TransferDirection == SKS_BTB_TransferType::Transfer_out))
+        {
+            //      2.5: CtrlSum
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'CtrlSum', num2str(tmpSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur * -1,0,2,1,0));
+        }
+        else
+        {
+            //      2.5: CtrlSum
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'CtrlSum', num2str(tmpSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,0));
+        }
+    
+        //      2.6: PmtTpInf
+        this.node_PmtInf_PmtTpInf(nodePmtInf);
+    
+        if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AR)
+        {
+            //      2.18: ReqdColltnDt
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'ReqdColltnDt', SKS_PP_StringFormats::strDateYYYYMMDD(mSKS_EFT_FileDetail.EffectiveDate, DateSeparator::Hyphen));
+        }
+        else
+        {
+            //      2.17: ReqdExctnDt
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePmtInf, 'ReqdExctnDt', SKS_PP_StringFormats::strDateYYYYMMDD(mSKS_EFT_FileDetail.EffectiveDate, DateSeparator::Hyphen));
+        }
+    
+        if(mSKS_EFT_FileDetail.Module == SKS_EFT_Module::AP || mSKS_EFT_FileDetail.Module == SKS_EFT_Module::CNP ||
+            (mSKS_EFT_FileDetail.Module == SKS_EFT_Module::BTB && mSKS_EFT_File.TransferDirection == SKS_BTB_TransferType::Transfer_out))
+        {
+            this.node_PmtInf_DbtrNodes(nodePmtInf);
+        }
+        else
+        {
+            this.node_PmtInf_CdtrNodes(nodePmtInf);
+        }
+    
+        //      2.24 ChrgBr
+        this.node_PmtInf_ChrgBr(nodePmtInf);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PmtInf_BtchBookg</Name>
+				<Source><![CDATA[
+    protected void node_PmtInf_BtchBookg(XmlElement _nodePmtInf)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      2.23 BtchBookg
+        //------------------------------------------------------------------------------------------------------
+
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PmtInf_CdtrNodes</Name>
+				<Source><![CDATA[
+    protected void node_PmtInf_CdtrNodes(XmlElement _nodePmtInf)
+    {
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PmtInf_ChrgBr</Name>
+				<Source><![CDATA[
+    protected void node_PmtInf_ChrgBr(XmlElement _nodePmtInf)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      2.24 ChrgBr
+        //------------------------------------------------------------------------------------------------------
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PmtInf_DbtrNodes</Name>
+				<Source><![CDATA[
+    protected void node_PmtInf_DbtrNodes(XmlElement _nodePmtInf)
+    {
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PmtInf_PmtTpInf</Name>
+				<Source><![CDATA[
+    protected void node_PmtInf_PmtTpInf(XmlElement _nodePmtInf)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //      2.6: PmtTpInf
+        //------------------------------------------------------------------------------------------------------
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PstlAdr</Name>
+				<Source><![CDATA[
+    protected void node_PstlAdr(XmlElement _node,
+                                AddressCountryRegionId _countryId,
+                                SKS_EB_Address _address,
+                                AddressZipCodeId _postalCode,
+                                AddressCity _city,
+                                int _length = 35,
+                                SKS_EB_Address _address2 = '',
+                                AddressCountryRegionName  _state = '',
+                                boolean isStructured = false)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //          PstlAdr
+        //              Ctry
+        //              AdrLine
+        //              AdrLine
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodePstlAdr;
+        LogisticsAddressCountryRegionISOCode countryRegion;
+    
+        countryRegion = this.getLogisticsAddressCountryISO(_countryId);
+    
+        if(!isStructured)
+        {
+            if(countryRegion || _address || _postalCode || _city)
+            {
+                //      PstlAdr
+                nodePstlAdr = _node.appendChild(xmlDoc.createElement('PstlAdr'));
+    
+                //          Ctry
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'Ctry', countryRegion, 2, false);
+    
+                //          AdrLine
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'AdrLine', this.CharacterReplacement(_address), _length, false);
+    
+                //          AdrLine
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'AdrLine', strLTrim(_postalCode + ' ' + this.CharacterReplacement(_city)), _length, false);
+            }
+        }
+        else
+        {
+            if( _address || _address2 || _postalCode || _city || _state || countryRegion)
+            {
+                //      PstlAdr
+                nodePstlAdr = _node.appendChild(xmlDoc.createElement('PstlAdr'));
+
+                //          StrtNm
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'StrtNm', this.CharacterReplacement(_address), 70, false);
+    
+                //          BldgNb
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'BldgNb', this.CharacterReplacement(_address2), 16, false);
+    
+                //          PstCd
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'PstCd', _postalCode, 16, false);
+    
+                //          TwnNm
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'TwnNm', this.CharacterReplacement(_city), 35, false);
+    
+                //          CtrySubDvsn
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'CtrySubDvsn', this.CharacterReplacement(_state), 35, false);
+    
+                //          Ctry
+                SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'Ctry', countryRegion, 2, false);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>node_PstlAdr_Structured</Name>
+				<Source><![CDATA[
+    protected void node_PstlAdr_Structured(XmlElement _node,
+                                AddressCountryRegionId _countryId,
+                                SKS_EB_Address _address,
+                                AddressZipCodeId _postalCode,
+                                AddressCity _city,
+                                int _length = 35,
+                            SKS_EB_Address _address2 = '',
+                            AddressCountryRegionName _state = '')
+    {
+        //------------------------------------------------------------------------------------------------------
+        //          PstlAdr
+        //              Ctry
+        //              AdrLine
+        //              AdrLine
+        //------------------------------------------------------------------------------------------------------
+        XmlElement nodePstlAdr;
+        LogisticsAddressCountryRegionISOCode countryRegion;
+    
+        countryRegion = this.getLogisticsAddressCountryISO(_countryId);
+    
+        if(countryRegion || _address || _postalCode || _city || _address2 || _state)
+        {
+            //      PstlAdr
+            nodePstlAdr = _node.appendChild(xmlDoc.createElement('PstlAdr'));
+    
+            //          PstCd
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'PstCd', _postalCode, 16, false);
+    
+            //          TwnNm
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'TwnNm', this.CharacterReplacement(_city), 35, false);
+    
+            //          CtrySubDvsn
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'CtrySubDvsn', this.CharacterReplacement(_state), 35, false);
+    
+            //          Ctry
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'Ctry', countryRegion, 2, false);
+    
+            //          AdrLine
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'AdrLine', this.CharacterReplacement(_address), _length, false);
+    
+            //          AdrLine
+            SKS_EFT_Format::xmlAppendChildNodeText(xmlDoc, nodePstlAdr, 'AdrLine', this.CharacterReplacement(_address2), _length, false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectPaymentRecords</Name>
+				<Source><![CDATA[
+    protected void selectPaymentRecords()
+    {
+        //------------------------------------------------------------------------------------------------------
+        // Standard payment selction
+        // Override if different selection is need for a format
+        //------------------------------------------------------------------------------------------------------
+    
+        //Order by clause must match the clause in the SKS_EFT_Processing.SumByPayment
+        select * from mSKS_EFT_FileDetail
+          order by mSKS_EFT_FileDetail.RecordSection,
+                   mSKS_EFT_FileDetail.PaymMode,
+                   mSKS_EFT_FileDetail.BankAccountId,
+                   mSKS_EFT_FileDetail.PaymentCurrencyCode,
+                   mSKS_EFT_FileDetail.PaymSpec,
+                   mSKS_EFT_FileDetail.EffectiveDate,
+                   mSKS_EFT_FileDetail.DepCountryRegionId,
+                   mSKS_EFT_FileDetail.RecordType,
+                   mSKS_EFT_FileDetail.AccountNum,
+                   mSKS_EFT_FileDetail.PaymentReference,
+                   mSKS_EFT_FileDetail.RecId
+          where mSKS_EFT_FileDetail.FileRecId == mSKS_EFT_File.RecId &&
+                mSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                mSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setAddenda</Name>
+				<Source><![CDATA[
+    protected void setAddenda()
+    {
+        // Override in format if element is needed
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

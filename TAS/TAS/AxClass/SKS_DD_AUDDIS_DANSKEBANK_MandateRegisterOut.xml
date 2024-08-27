@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_DD_AUDDIS_DANSKEBANK_MandateRegisterOut</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_DD_AUDDIS_DANSKEBANK_MandateRegisterOut extends SKS_DD_MandatesBatchOutbound
+{
+    #define.FilePrefixAuddisBACS('AUDDIS_DANSKEBANK_UK_BACS_')
+
+    CustDirectDebitMandate mCustDirectDebitMandate;
+    RefRecId mRefRecID;
+    
+
+    SKS_BF_BankIntType mSKS_BF_BankIntType;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        Batch bat;
+
+        bat = this.parmCurrentBatch();
+        mRefRecID = bat.RecId;
+
+        this.createFile(SKS_EB_MandateType::Auddis);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SendFile</Name>
+				<Source><![CDATA[
+    private boolean SendFile(SKS_EB_CommProcess _SKS_EB_CommProcess,
+                                SKS_EB_FilePath _SKS_EB_FilePath,
+                                SKS_EB_FileName _SKS_EB_FileName)
+    {
+        boolean retval = false;
+        str locParamters;
+        boolean locSendSuccess = false;
+        boolean locErrorFileExists = false;
+        str mReturnMsg;
+
+        //Build params list.
+        locParamters = SKS_EB_Send::getParams(_SKS_EB_CommProcess,
+                                                            _SKS_EB_FileName,
+                                                            _SKS_EB_FilePath,
+                                                            _SKS_EB_FilePath + '\\' + _SKS_EB_FileName,
+                                                            SKS_EB_ParamGroup::unclassified);
+
+        //Launch communications, if any.
+        locSendSuccess = SKS_EB_Send::Send(_SKS_EB_CommProcess,
+                                                locParamters,
+                                                _SKS_EB_CommProcess.CommUserProg,
+                                                _SKS_EB_FilePath + '\\' + _SKS_EB_FileName,
+                                                true,
+                                                FalseTrue::False,
+                                                _SKS_EB_FileName,
+                                                _SKS_EB_FilePath);
+
+        //because the error file could come from AP or AR, you have to use a variable to store if it exist for shared code later.
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(mSKS_BF_BankIntType);
+        fileHub.parmThrowErrorIfException(false);
+        fileHub.runFileInquire(_SKS_EB_FilePath + '\\LOG\\' + _SKS_EB_FileName + '.err');
+        locErrorFileExists = fileHub.attrFileExists();
+        //if commfailed and the previous run wasn't a commfailure, set it to commfailed status
+        if(locErrorFileExists || !locSendSuccess)
+        {
+            mReturnMsg = "@SKS3755";
+            error(mReturnMsg);
+            retval = false;
+        }
+        return retval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFile</Name>
+				<Source><![CDATA[
+    public void createFile(SKS_EB_MandateType _mandateScheme)
+    {
+        SKS_PP_Bank locSKS_PP_Bank;
+        SKS_EB_BankTable locSKS_EB_BankTable;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+        str locDDFilesDir;
+        str locfileName;
+        str fileTxt;
+        SKS_DD_OutboundFormat locSksDDFormatBACS;
+        SKS_EB_FileStorage  sks_EB_FileStorage;
+
+        //BankFabric
+        select firstonly sks_EB_FileStorage;
+
+        if (sks_EB_FileStorage.StorageOption_MandateAutomation == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+        {
+            mSKS_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+        }
+        else
+        {
+            mSKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+        }
+
+        while select crossCompany locSKS_PP_Bank
+            join locSKS_EB_BankTable where locSKS_EB_BankTable.BankAccountID == locSKS_PP_Bank.BankID
+            join locSKS_EB_CommProcess where locSKS_EB_CommProcess.CommID == locSKS_EB_BankTable.OutboundCommId
+            && locSKS_EB_CommProcess.BatchJobId == mRefRecID
+            && locSKS_EB_CommProcess.Direction == SKS_EB_Direction::Outbound
+        {
+            changeCompany(locSKS_PP_Bank.company())
+            {
+                switch(_mandateScheme)
+                {
+                    case SKS_EB_MandateType::Auddis:
+                        mCustDirectDebitMandate = null;     //initialize buffer for company change
+
+                        select * from mCustDirectDebitMandate
+                            where mCustDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Auddis                  &&
+                            mCustDirectDebitMandate.SKS_EB_AutoType == SKS_EB_AutoType::NA                                  &&
+                            mCustDirectDebitMandate.SignatureDate != dateNull() &&
+                            mCustDirectDebitMandate.CreditorBankAccount == locSKS_PP_Bank.BankAccountId;
+
+                        locfileName = #FilePrefixAuddisBACS + System.DateTime::UtcNow.ToString(#DateFormat) + #FileExtestion;
+                        locSksDDFormatBACS = new SKS_DD_OutboundFormat_AUDDIS_DANSKEBANK();
+                        break;
+                    default:
+                        break;
+                }
+
+                if(mCustDirectDebitMandate)
+                {
+                    
+                    if (mSKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric)
+                    {
+
+                        locDDFilesDir = locSKS_EB_BankTable.BankFabricFileLocation;
+                    }
+                    else
+                    {
+                        locDDFilesDir = locSKS_EB_BankTable.OutboundFileLoc;
+                    }
+
+                    if(locDDFilesDir)
+                    {
+                        fileTxt = locSksDDFormatBACS.formatStructure(mCustDirectDebitMandate);
+                        if(strLen(fileTxt) > 0)
+                        {
+                            if (mSKS_BF_BankIntType == SKS_BF_BankIntType::BankFabric)
+                            {
+                                this.fileCreate(locfileName, locDDFilesDir);
+                            }
+                            else
+                            {
+                                this.fileCreate(locDDFilesDir + @'\' + locfileName);
+                            }
+                            
+                            this.fileWrite(fileTxt);
+                            this.fileClose();
+                            this.SendFile(locSKS_EB_CommProcess,locDDFilesDir, locfileName);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

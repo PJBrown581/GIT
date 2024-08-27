@@ -1,0 +1,732 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocSysEmailDistributor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.ApplicationPlatform.Workflow.Instrumentation;
+using UL = Docentric.AX.Framework.Utilities;
+
+public class DocSysEmailDistributor extends SysEmailDistributor
+{
+    #DEFINE.CurrentVersion(1)
+    #LOCALMACRO.CurrentList
+    #ENDMACRO
+
+    QueryRun queryRun;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the class description.
+    /// </summary>
+    /// <returns>Class description</returns>
+    public ClassDescription caption()
+    {
+        return "@DocentricAX2:EmailDistributorBatchDocentric";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the dialog object.
+    /// </summary>
+    /// <returns>Dialog object</returns>
+    public Object dialog()
+    {
+        DialogRunbase dlg = super();
+        if (dlg)
+        {
+            // Add a static text form control to the dialog to display instructions
+            FormBuildControl fbc = dlg.formBuildDesign().controlNum(1);
+            FormBuildStaticTextControl instructionStaticTextCtrl = dlg.formBuildDesign().addControl(FormControlType::StaticText, identifierStr(instructionStaticText), fbc, true);
+            instructionStaticTextCtrl.text("@DocentricAX4:EmailDistributorBatchInstruction");
+            instructionStaticTextCtrl.visible(true);
+        }
+        return dlg;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Contains the code that does the actual job of the class.
+    /// </summary>
+    public void run()
+    {
+        #OCCRetryCount
+        SysOutgoingEmailTable outgoingEmailTable;
+
+        SysEmailProcessorId thisProcessorId = newGuid();
+        xSession xSession = new xSession(sessionId());
+
+
+        // Set the NextRetryDateTime query range value to the current system date
+        QueryBuildRange qbrNextRetryDateTime = SysQuery::findOrCreateRange(queryRun.query().dataSourceTable(tableNum(SysOutgoingEmailTable)), fieldNum(SysOutgoingEmailTable, NextRetryDateTime));
+        qbrNextRetryDateTime.value(strFmt('(%1 <= %2)',
+                fieldStr(SysOutgoingEmailTable, NextRetryDateTime),
+                DateTimeUtil::toStr(DateTimeUtil::getSystemDateTime())));
+
+        try
+        {
+            // Expire any emails that are older than a configured or default days old
+            UL.ReflectionHelper::InvokeInstanceMethod(this, methodStr(SysEmailDistributor, expireEmails));
+
+            // Mark all emails currently available as being processed by this session:
+            while (queryRun.next())
+            {
+                outgoingEmailTable = queryRun.get(tableNum(SysOutgoingEmailTable));
+
+                ttsbegin;
+
+                outgoingEmailTable.selectForUpdate(true);
+                outgoingEmailTable.SessionId = xSession.sessionId();
+                outgoingEmailTable.SessionLoginDateTime = xSession.loginDateTime();
+                outgoingEmailTable.Status = SysEmailStatus::Executing;
+                outgoingEmailTable.ProcessorID = thisProcessorId;
+                // Assert that if record i is accepted then all i+n records must be accepted as well.
+                outgoingEmailTable.update();
+
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            outgoingEmailTable = SysOutgoingEmailTable::find(outgoingEmailTable.EmailItemId, true, ConcurrencyModel::Optimistic);
+
+            EmailSMTPEventSource::EventWriteEmailBatchRunError(
+                SysEmailDistributor::getEmailTableContext(outgoingEmailTable),
+                'Deadlock exception during SysEmailDistributor batch run');
+
+            if ((outgoingEmailTable.Status == SysEmailStatus::Unsent) ||
+                      (outgoingEmailTable.Status == SysEmailStatus::SendAttempted &&
+                       outgoingEmailTable.NextRetryDateTime <= DateTimeUtil::getSystemDateTime()))
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    outgoingEmailTable = SysOutgoingEmailTable::find(outgoingEmailTable.EmailItemId,true,ConcurrencyModel::Optimistic);
+
+
+                    EmailSMTPEventSource::EventWriteEmailBatchRunError(
+                        SysEmailDistributor::getEmailTableContext(outgoingEmailTable),
+                        'Deadlock exception during SysEmailDistributor batch run');
+
+                    if ((outgoingEmailTable.Status == SysEmailStatus::Unsent) ||
+                        (outgoingEmailTable.Status == SysEmailStatus::SendAttempted &&
+                        outgoingEmailTable.NextRetryDateTime <= DateTimeUtil::getSystemDateTime()))
+                    {
+                        retry;
+                    }
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        finally
+        {
+            // Process emails
+            this.processEmails(thisProcessorId);
+
+            // Cleanup
+            this.cleanup(thisProcessorId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processEmails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes the emails for the specified email processor Id.
+    /// </summary>
+    /// <param name = "_emailProcessorId">Email processor Id</param>
+    public void processEmails(SysEmailProcessorId _emailProcessorId)
+    {
+        SysOutgoingEmailTable outgoingEmailTable;
+        utcdatetime nextRetryDateTime;
+        SysEmailRetryNum retryNum;
+        int startInfoLogLine;
+
+        int totalCount = 0;
+        int sentCount = 0;
+
+        // This is safe as it only selects records changed to "Executing" by itself (which are
+        // always commited at this point), on the other hand, it does not lock table for other
+        // email processors running in parallel, so they can "pick up" new emails by setting
+        // their status to executing
+
+        while select optimisticlock outgoingEmailTable
+            index hint StatusIdx
+            where outgoingEmailTable.Status == SysEmailStatus::Executing &&
+                  outgoingEmailTable.ProcessorID == _emailProcessorId
+        {
+            totalCount++;
+
+            // Store the current info log line.
+            startInfoLogLine = infologLine();
+
+            // Check if the Sender field is empty and set to the default value inferred from the default Email provider.
+            if (!outgoingEmailTable.Sender)
+            {
+                outgoingEmailTable.Sender = DocEmailMngHelper::getDefaultEmailProviderEmailAddress();
+            }
+
+            // Validate the outgoing email settings.
+            str errorValidationMsg = DocSysEmailDistributor::validateOutgoingEmail(outgoingEmailTable);
+            if (errorValidationMsg != '')
+            {
+                errorValidationMsg = strFmt("@DocentricAX2:OutgoingEmailInvalid", errorValidationMsg);
+                this.logMessage(outgoingEmailTable, errorValidationMsg, Exception::Error);
+
+                // Mark email as Failed.
+                SysOutgoingEmailTable::markEmailWithFailureMessageAs(outgoingEmailTable.EmailItemId, SysEmailStatus::Failed, errorValidationMsg, true);
+            }
+
+            else
+            {
+                try
+                {
+                    str updateMsgWarning;
+
+                    // Create the email message from the current outgoingEmailTable record.
+                    using (System.Net.Mail.MailMessage mailMsg = outgoingEmailTable.toMailMessage(false))
+                    {
+                        // Update email message with additional fields: Cc, Bcc, Reply-to, Bounce-to, ReadReceipt-to, Delivery notification
+                        // and send it using Docentric email provider.
+                        updateMsgWarning = SysOutgoingEmailTable::updateMailMsgWithAdditionalFields_DC(mailMsg, outgoingEmailTable);
+                    
+                        // Send the email using Docentric email provider.
+                        DocEmailMngHelper::sendEmailMsgUsingEmailProvider(mailMsg);
+                    }
+
+                    // Mark message as Sent.
+                    SysOutgoingEmailTable::markEmailWithFailureMessageAs(outgoingEmailTable.EmailItemId, SysEmailStatus::Sent, '', false);
+                    sentCount++;
+
+                    // If the email is successfully sent, log the warning message if a warning occurred.
+                    if (updateMsgWarning)
+                    {
+                        // Log the warning message.
+                        this.logMessage(outgoingEmailTable, updateMsgWarning, Exception::Warning);
+                    }
+                    else
+                    {
+                        // Otherwise log the info message.
+                        this.logMessage(outgoingEmailTable, "@DocentricAX:EmailSuccessfullySent", Exception::Info);
+                    }
+                }
+                catch
+                {
+                    // Get all messages from the infolog.
+                    str exceptionMsg = DocGlobalHelper::getInfoLogMessages(startInfoLogLine + 1);
+                    InfologData exceptionInfo = infolog.copy(startInfoLogLine + 1, infologLine());
+
+                    // Clear the infolog from the error messages ocurred during emailing the current email message.
+                    infolog.clear(startInfoLogLine);
+
+                    // Log the error message.
+                    this.logMessage(outgoingEmailTable, exceptionMsg, Exception::Error, exceptionInfo);
+
+                    // Handle retries.
+                    if (outgoingEmailTable.WithRetries == true)
+                    {
+                        if (outgoingEmailTable.Status == SysEmailStatus::Unsent)
+                        {
+                            retryNum = 1;
+                        }
+                        else
+                        {
+                            retryNum = outgoingEmailTable.RetryNum + 1;
+                        }
+
+                        nextRetryDateTime = SysEmailRetrySchedule::nextRetryDateAndTime(retryNum);
+
+                        if (nextRetryDateTime != utcDateTimeNull())
+                        {
+                            SysOutgoingEmailTable::scheduleSendRetry(outgoingEmailTable.EmailItemId, nextRetryDateTime);
+                        }
+                        else
+                        {
+                            // all send retries have failed
+                            SysOutgoingEmailTable::markEmailWithFailureMessageAs(outgoingEmailTable.EmailItemId, SysEmailStatus::Failed, exceptionMsg, true);
+                        }
+                    }
+                    else
+                    {
+                        SysOutgoingEmailTable::markEmailWithFailureMessageAs(outgoingEmailTable.EmailItemId, SysEmailStatus::Failed, exceptionMsg, false);
+                    }
+                }
+            }
+        }
+
+        DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:EmailDistributorBatchOperationCompleted", totalCount, sentCount, totalCount - sentCount));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs the error message.
+    /// </summary>
+    /// <param name = "_outgoingEmailTable">The SysOutgoingEmailTable table buffer</param>
+    /// <param name = "_msg">Error message</param>
+    /// <param name = "_errorType">Error type</param>
+    /// <param name = "_infoLog">Infolog data</param>
+    protected void logMessage(SysOutgoingEmailTable _outgoingEmailTable, str _msg, Exception _errorType = Exception::Error, InfologData _infoLog = conNull())
+    {
+        str logMessage;
+        
+        switch (_errorType)
+        {
+            case Exception::Error:
+                // Write the error message to the infolog.
+                logMessage = strfmt("@DocentricAX2:DistributorBatchError", _outgoingEmailTable.EmailItemId, _outgoingEmailTable.Origin, _msg);
+                DocGlobalHelper::handleError(logMessage);
+
+                // Log the error message to the database.
+                if (this.logToDatabase())
+                {
+                    DocSysEmailDistributor::logMessageToDatabase(_outgoingEmailTable, _msg, Exception::Error, _infoLog);
+                }
+                break;
+
+            case Exception::Warning:
+                // Write the warning message to the infolog.
+                logMessage = strfmt("@DocentricAX2:DistributorBatchWarning",
+                                    _outgoingEmailTable.EmailItemId, _outgoingEmailTable.Origin, _msg);
+                DocGlobalHelper::handleWarning(logMessage);
+
+                // Log the warning message to the database.
+                if (this.logToDatabase())
+                {
+                    DocSysEmailDistributor::logMessageToDatabase(_outgoingEmailTable, _msg, Exception::Warning, _infoLog);
+                }
+                break;
+    
+            case Exception::Info:
+                // We are not going to log info message to the infolog, only to the database.
+                /*
+                logMessage = strfmt("@DocentricAX2:DistributorBatchInfo", _outgoingEmailTable.EmailItemId, _outgoingEmailTable.Origin);
+                DocGlobalHelper::handleInfo(logMessage);
+                */
+
+                // Log the info message to the database.
+                if (this.logToDatabase())
+                {
+                    DocSysEmailDistributor::logMessageToDatabase(_outgoingEmailTable, _msg, Exception::Info, _infoLog);
+                }
+                break;
+    
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Only Exception::Error/Warning/Info are expected. %1 not supported', _errorType));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logToDatabase</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag indicating whether logging is enabled.
+    /// </summary>
+    /// <returns>True/False</returns>
+    protected boolean logToDatabase()
+    {
+        DocParameters docentricParameters = DocParameters::find();
+        return docentricParameters.EnableOutgoingEmailLog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logMessageToDatabase</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Writes the error messages to the log table.
+    /// </summary>
+    /// <param name = "_outgoingEmailTable">The SysOutgoingEmailTable buffer</param>
+    /// <param name = "_msg">Error message</param>
+    /// <param name = "_errorType">Error type</param>
+    /// <param name = "_infoLog">Infolog data</param>
+    protected static void logMessageToDatabase(SysOutgoingEmailTable _outgoingEmailTable, str _msg, Exception _errorType, InfologData _infoLog)
+    {
+        DocOutgoingEmailLog log;
+
+        ttsbegin;
+        log.clear();
+        log.EmailItemId = _outgoingEmailTable.EmailItemId;
+        log.ProcessorID = _outgoingEmailTable.ProcessorID;
+        log.Message = _msg;
+        log.Status = _errorType;
+        log.Infolog = _infoLog;
+        log.insert();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateOutgoingEmail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the outgoing email.
+    /// </summary>
+    /// <param name = "_outgoingEmailTable">The SysOutgingEmailTable buffer</param>
+    /// <returns>Validation result</returns>
+    public static str validateOutgoingEmail(SysOutgoingEmailTable _outgoingEmailTable)
+    {
+        str errorMessage;
+
+        void appendErrorMessage(str _appendingMsg)
+        {
+            if (errorMessage)
+            {
+                errorMessage = errorMessage + '\n>> ' + _appendingMsg;
+            }
+            else
+            {
+                errorMessage = '>> ' + _appendingMsg;
+            }
+        }
+
+        str emailTo = _outgoingEmailTable.Recipient;
+        str emailFrom = _outgoingEmailTable.Sender;
+        str emailCc = _outgoingEmailTable.EmailCc_DC;
+        str emailBcc = _outgoingEmailTable.EmailBcc_DC;
+        str emailReplyTo = _outgoingEmailTable.EmailReplyTo_DC;
+        str emailBounceTo = _outgoingEmailTable.EmailBounceTo_DC;
+        str emailReadReceiptTo = _outgoingEmailTable.EmailReadReceiptAddress_DC;
+
+
+        /*** emailTo ***/
+        if (!emailTo)
+        {
+            appendErrorMessage("@DocentricAX:ToFieldNotSpecified");
+        }
+    
+        if (emailTo)
+        {
+            if (!DocGlobalHelper::validateEmailList(emailTo))
+            {
+                appendErrorMessage(strFmt("@DocentricAX:ToEmailAddressesNotValid", emailTo));
+            }
+        }
+    
+        /*** emailCc ***/
+        if (emailCc)
+        {
+            if (!DocGlobalHelper::validateEmailList(emailCc))
+            {
+                appendErrorMessage(strFmt("@DocentricAX:CcEmailAddressesNotValid", emailCc));
+            }
+        }
+    
+        /*** emailBcc ***/
+        if (emailBcc)
+        {
+            if (!DocGlobalHelper::validateEmailList(emailBcc))
+            {
+                appendErrorMessage(strFmt("@DocentricAX:BccEmailAddressesNotValid", emailBcc));
+            }
+        }
+
+        /*** emailReplyTo ***/
+        if (emailReplyTo)
+        {
+            if (!DocGlobalHelper::validateEmailList(emailReplyTo))
+            {
+                appendErrorMessage(strFmt("@DocentricAX:ReplyToEmailAddressesNotValid", emailReplyTo));
+            }
+        }
+
+        /*** emailBounceTo ***/
+        if (emailBounceTo)
+        {
+            if (!DocGlobalHelper::validateEmail(emailBounceTo))
+            {
+                appendErrorMessage(strFmt("@DocentricAX:BounceToEmailAddressesNotValid", emailBounceTo));
+            }
+        }
+        
+        /*** emailReadReceiptTo ***/
+        if (emailReadReceiptTo)
+        {
+            if (!DocGlobalHelper::validateEmail(emailReadReceiptTo))
+            {
+                appendErrorMessage(strFmt("@DocentricAX2:ReadReceiptEmailAddressNotValid", emailReadReceiptTo));
+            }
+        }
+
+        /*** emailFrom ***/
+        if (emailFrom == '')
+        {
+            // Note that if _checkFromAccount == true, this means that emailFrom failed to be set to the default 'From' email account.
+            if (SysEmailParameters::find().MailerNonInteractive == '')
+            {
+                appendErrorMessage("@DocentricAX:BatchEmailProviderNotSet");
+            }
+            else if (DocEmailMngHelper::getDefaultEmailProviderType() == 255)  // Unsupported email provider
+            {
+                appendErrorMessage(strFmt("@DocentricAX4:BatchEmailProviderNotSupported", SysEmailParameters::find().MailerNonInteractive));
+            }
+            else if (DocEmailMngHelper::getDefaultEmailProviderType() == DocEmailProviderType::SMTP)
+            {
+                appendErrorMessage("@DocentricAX:EmailAccountForSMTPNotSet");
+            }
+            else if (DocEmailMngHelper::getDefaultEmailProviderType() == DocEmailProviderType::Exchange)
+            {
+                appendErrorMessage(strFmt("@DocentricAX:EmailUserAccountForExchangeNotSet", curUserId()));
+            }
+        }
+
+        if (emailFrom)
+        {
+            if (!DocGlobalHelper::validateEmail(emailFrom))
+            {
+                appendErrorMessage(strFmt("@DocentricAX:FromEmailAddressesInvalid", emailFrom));
+            }
+        }
+    
+        return errorMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the email distributor batch with the specified args.
+    /// </summary>
+    /// <param name = "args">An instance of the Args class</param>
+    server static void main(Args args)
+    {
+        SysEmailDistributor emailDistributor = DocSysEmailDistributor::getEmailDistributorBatch();
+        
+        if (emailDistributor.prompt())
+        {
+            emailDistributor.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEmailDistributorBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets an instance of the SysEmailDistributor class.
+    /// </summary>
+    /// <returns>An instance of the SysEmailDistributor class</returns>
+    public static SysEmailDistributor getEmailDistributorBatch()
+    {
+        SysEmailDistributor emailDistributor;
+
+        if (DocParameters::find().UseDocentricEmailDistributorBatch)
+        {
+            emailDistributor = new DocSysEmailDistributor();
+        }
+        else
+        {
+            emailDistributor = new SysEmailDistributor();
+        }
+
+        return emailDistributor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether a Select button is to be added to the dialog. If you change the return value to
+    /// true, the button will be added.
+    /// </summary>
+    /// <returns>True</returns>
+    /// <remarks>
+    /// If you click this button, it will show the query form. Therefore, the <c>queryRun</c> method has to
+    /// return a valid <c>queryRun</c>.
+    /// </remarks>
+    public boolean showQueryValues()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustLoadSaveQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the last query must be loaded and saved when you leave the form. Called from the
+    /// <c>SysQueryForm</c> class.
+    /// </summary>
+    /// <returns>
+    /// Returns false by default.
+    /// </returns>
+    public boolean mustLoadSaveQuery()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the <c>QueryRun</c>, which is used by the <c>QueryPrompt.</c>
+    /// </summary>
+    /// <returns>The <c>QueryRun</c>, which is used by the <c>QueryPrompt</c>.</returns>
+    /// <remarks>
+    /// This method is used if a query prompt is the dialog, and if a Select menu item is added to a
+    /// dialog. Do not instantiate the <c>queryRun</c> whenever the method is called. This should be done in
+    /// the <c>unpack</c> method and the <c>initParmDefault</c> method. Or it should be used in the
+    /// <c>init</c> method (if this is used) or in the method only when it is not instantiated.
+    /// </remarks>
+    public QueryRun queryRun()
+    {
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the internal variables.
+    /// </summary>
+    /// <remarks>
+    /// This method is called when no <c>SysLastValue</c> record can be found when calling the
+    /// <c>SysLastValue.GetLast</c> method.
+    /// </remarks>
+    public void initParmDefault()
+    {
+        super();
+
+        this.initQueryRun();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initQueryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the QueryRun object.
+    /// </summary>
+    public void initQueryRun()
+    {
+        // Create a query with predefined ranges used for filtering
+        Query query = new Query();
+        query.title("@DocentricAX4:EmailDistributorBatchQueryTitle");
+        query.name(identifierStr(DocSysEmailDistributor));
+        QueryBuildDataSource qbds  = query.addDataSource(tableNum(SysOutgoingEmailTable));
+
+        QueryBuildRange qbrStatus = qbds.addRange(fieldNum(SysOutgoingEmailTable, Status));
+        qbrStatus.value(strFmt('%1,%2', queryValue(SysEmailStatus::Unsent), queryValue(SysEmailStatus::SendAttempted)));
+        qbrStatus.status(RangeStatus::Hidden);
+
+        // The query range value must be set just before query execution in the run() method
+        QueryBuildRange qbrNextRetryDateTime = qbds.addRange(fieldNum(SysOutgoingEmailTable, NextRetryDateTime));
+        qbrNextRetryDateTime.status(RangeStatus::Hidden);
+
+        qbds.addRange(fieldNum(SysOutgoingEmailTable, CompanyId_DC));
+        qbds.addRange(fieldNum(SysOutgoingEmailTable, ContextInfo_DC));
+        qbds.addRange(fieldNum(SysOutgoingEmailTable, Origin));
+
+        queryRun = new QueryRun(query);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Packs the class variables into the container.
+    /// </summary>
+    /// <returns>Packed container with class variables</returns>
+    public container pack()
+    {
+        container packedClass = super();
+        return SysPackExtensions::appendExtension(packedClass, classStr(DocSysEmailDistributor), [#CurrentVersion, queryRun.pack()]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unpacks the class variables and re-instantiates them.
+    /// </summary>
+    /// <param name = "_packedClass">Packed container with class variables</param>
+    /// <returns>True/False</returns>
+    public boolean unpack(container _packedClass)
+    {
+        boolean result = super(_packedClass);
+        if (result)
+        {
+            container packedClass = SysPackExtensions::findExtension(_packedClass, classStr(DocSysEmailDistributor));
+            if (packedClass == conNull())
+            {
+                // Old versions (before 3.4.1.0) do not have Docentric parameters
+                this.initQueryRun();
+                return result;
+            }
+
+            Integer version = RunBase::getVersion(packedClass);
+            container packedQuery;
+
+            switch (version)
+            {
+                case #CurrentVersion:
+                    [version, packedQuery] = packedClass;
+                    if (packedQuery)
+                    {
+                        queryRun = new QueryRun(packedQuery);
+                    }
+                    result = true;
+                    break;
+
+                default:
+                    result = false;
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

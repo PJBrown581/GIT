@@ -1,0 +1,1652 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_SCF_RF</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_SCF_RF
+{
+    #define.Archive('Archive')
+    #define.formatId('formatId')
+    #define.formatClass('formatClass')
+    str mErrorText;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreatePaymentJournalSettle</Name>
+				<Source><![CDATA[
+    public void CreatePaymentJournalSettle(SKS_SCF_SettlementId _settlementId, NoYes _createinvoiceJournal, NoYes _autoPostJournal)
+    {
+        LedgerJournalTrans jourTrans,ledgerJournalTrans;
+        AccountNum accountNum;
+        str providerId = SKS_SCF_Settlement::find(_settlementId).ProviderID;
+        SKS_SCF_Provider scfProvider = SKS_SCF_Provider::find(providerId);
+        SKS_SCF_SettlementLines locSettlementLines, settlementLinesGrpBy;
+        boolean isPaymJournalCreated = true;
+
+        LedgerJournalTable jourTable;
+        try
+        {
+            ttsbegin;
+            jourTable.JournalName = scfProvider.PaymentJournalName;
+            jourTable.JournalNum  = JournalTableData::newTable(jourTable).nextJournalId();
+            accountNum = jourTable.JournalNum;
+            jourTable.JournalType = LedgerJournalType::Payment;
+            jourTable.NumberSequenceTable = NumberSequenceTable::find(LedgerJournalName::find(jourTable.JournalName).NumberSequenceTable).RecId;
+            jourTable.insert();
+
+            if(scfProvider.PaymentPostingDate == SKS_SCF_PostingDate::CurrentDate)
+            {
+                while select sum(FundedAmt) from settlementLinesGrpBy group by CurrencyCode, VendAccount
+                    where settlementLinesGrpBy.SettlementId == _settlementId
+                    && settlementLinesGrpBy.PaymentJournalNum == ''
+                    && settlementLinesGrpBy.Matched == NoYes::Yes
+                {
+                    jourTrans.JournalNum = accountNum;
+                    NumberSequenceTable numberSequenceTable = NumberSequenceTable::find(jourTable.NumberSequenceTable);
+                    NumberSeq voucherNumSeq = NumberSeq::newGetVoucherFromCode(numberSequenceTable.NumberSequence);
+                    jourTrans.Voucher = voucherNumSeq.voucher();
+                    jourTrans.AccountType = LedgerJournalACType::Vend;
+                    jourTrans.CurrencyCode = settlementLinesGrpBy.CurrencyCode;
+                    jourTrans.initValue();
+                    jourTrans.TransDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()); 
+
+                    RefRecId ledgerDim = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(settlementLinesGrpBy.VendAccount,
+                                         LedgerJournalACType::Vend);
+
+                    jourTrans.LedgerDimension = ledgerDim;
+
+                    jourTrans.offsetAccountType = scfProvider.AccountType;
+                    jourTrans.OffsetLedgerDimension = scfProvider.OffsetLedgerDimension;
+                    jourTrans.AmountCurDebit =0;
+                    jourTrans.AmountCurCredit =0;
+
+                    if(settlementLinesGrpBy.FundedAmt > 0)
+                    {
+                        jourTrans.AmountCurDebit = settlementLinesGrpBy.FundedAmt;
+                    }
+                    else
+                    {
+                        jourTrans.AmountCurCredit = settlementLinesGrpBy.FundedAmt*-1;
+                    }
+                    jourTrans.PaymMode = scfProvider.PaymMode;
+                    jourTrans.SettleVoucher =  SettlementType::SelectedTransact;
+
+                    jourTrans.DefaultDimension = VendTable::find(settlementLinesGrpBy.VendAccount).DefaultDimension;
+
+                    jourTrans.ExchRate = ExchangeRateHelper::exchRate(jourTrans.CurrencyCode, jourTrans.TransDate);  //SKS_DevOps_19973
+
+                    jourTrans.insert();
+               
+                    VendTrans vendTrans;
+
+                    while select locSettlementLines where locSettlementLines.SettlementId == _settlementId && 
+                            locSettlementLines.VendAccount == settlementLinesGrpBy.VendAccount &&
+                            locSettlementLines.CurrencyCode == settlementLinesGrpBy.CurrencyCode &&
+                            locSettlementLines.Matched == NoYes::Yes
+                    {
+                        VendTransOpen vendTransOpen;
+
+                        //SKS_DevOps_19478 --->
+                        select vendTransOpen join
+                                vendTrans where
+                                vendTrans.AccountNum == locSettlementLines.VendAccount &&
+                                vendTrans.invoice == locSettlementLines.InvoiceNumber &&
+                                vendTrans.DueDate == locSettlementLines.DueDate &&
+                                vendTransOpen.RefRecId == vendTrans.RecId;
+                        //SKS_DevOps_19478 <---
+
+                        if (!vendTrans.RecId)
+                        {
+                            throw error("@SKS:SCFInvValidation");
+                        }
+
+                        SpecTrans locSpectrans;
+
+                        if(!SpecTrans::findByRef(ledgerJournalTrans.Company,TableNum(vendTransOPen),
+                                vendTransOpen.RecId))
+                        {
+                            locSpecTrans.SpecTableId = TableNum(ledgerJournalTrans);
+                            locSpecTrans.RefCompany =  ledgerJournalTrans.Company;
+                            locSpecTrans.RefTableId = TableNum(vendTransOPen);
+                            locSpectrans.RefRecId = vendTransOpen.RecId;
+                            locSpecTrans.Balance01 = locSettlementLines.InvoiceBalance;
+                            locSpecTrans.Code = ledgerJournalTrans.CurrencyCode;
+                            locSpecTrans.Payment = NoYes::Yes;
+                            locSpecTrans.insert();
+                        }
+
+                        CustVendOpenTransManager manager = CustVendOpenTransManager::construct(jourTrans);
+                        manager.updateTransMarked(vendTransOpen,true);
+                        manager.updateSettleAmount(vendTransOpen, locSettlementLines.InvoiceBalance);
+                    }
+                }
+            }
+            else
+            {
+                while select sum(FundedAmt) from settlementLinesGrpBy group by CurrencyCode, VendAccount, DueDate
+                    where settlementLinesGrpBy.SettlementId == _settlementId
+                    && settlementLinesGrpBy.PaymentJournalNum == ''
+                    && settlementLinesGrpBy.Matched == NoYes::Yes
+                {
+                    jourTrans.JournalNum = accountNum;
+                   
+                    NumberSequenceTable numberSequenceTable = NumberSequenceTable::find(jourTable.NumberSequenceTable);
+                    NumberSeq voucherNumSeq = NumberSeq::newGetVoucherFromCode(numberSequenceTable.NumberSequence);
+
+                    jourTrans.Voucher = voucherNumSeq.voucher();
+                    jourTrans.AccountType = LedgerJournalACType::Vend;
+                    jourTrans.CurrencyCode = settlementLinesGrpBy.CurrencyCode;
+                    jourTrans.initValue();
+                    jourTrans.TransDate = settlementLinesGrpBy.DueDate;
+
+                    RefRecId ledgerDim = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(settlementLinesGrpBy.VendAccount,
+                                         LedgerJournalACType::Vend);
+
+                    jourTrans.LedgerDimension = ledgerDim;
+
+                    jourTrans.offsetAccountType = scfProvider.AccountType;
+                    jourTrans.OffsetLedgerDimension = scfProvider.OffsetLedgerDimension;
+                    jourTrans.AmountCurDebit =0;
+                    jourTrans.AmountCurCredit =0;
+
+                    if(settlementLinesGrpBy.FundedAmt > 0)
+                    {
+                        jourTrans.AmountCurDebit = settlementLinesGrpBy.FundedAmt;
+                    }
+                    else
+                    {
+                        jourTrans.AmountCurCredit = settlementLinesGrpBy.FundedAmt*-1;
+                    }
+                    jourTrans.PaymMode = scfProvider.PaymMode;
+                    jourTrans.SettleVoucher =  SettlementType::SelectedTransact;
+                    jourTrans.DefaultDimension = VendTable::find(settlementLinesGrpBy.VendAccount).DefaultDimension;
+
+                    jourTrans.ExchRate = ExchangeRateHelper::exchRate(jourTrans.CurrencyCode, jourTrans.TransDate);  //SKS_DevOps_19973
+
+                    jourTrans.insert();
+               
+                    VendTrans vendTrans;
+
+                    while select locSettlementLines where locSettlementLines.SettlementId == _settlementId &&
+                            locSettlementLines.VendAccount == settlementLinesGrpBy.VendAccount &&
+                            locSettlementLines.CurrencyCode == settlementLinesGrpBy.CurrencyCode &&
+                            locSettlementLines.DueDate == settlementLinesGrpBy.DueDate &&
+                            locSettlementLines.Matched == NoYes::Yes
+                    {
+                        VendTransOpen vendTransOpen;
+
+                        //SKS_DevOps_19478 --->
+                        select vendTransOpen join
+                                vendTrans where
+                                vendTrans.AccountNum == locSettlementLines.VendAccount &&
+                                vendTrans.invoice == locSettlementLines.InvoiceNumber &&
+                                vendTrans.DueDate == locSettlementLines.DueDate &&
+                                vendTransOpen.RefRecId == vendTrans.RecId;
+                        //SKS_DevOps_19478 <---
+                        
+                        if (!vendTrans.RecId)
+                        {
+                            throw error("@SKS:SCFInvValidation");
+                        }
+
+                        SpecTrans locSpectrans;
+
+                        if(!SpecTrans::findByRef(ledgerJournalTrans.Company,TableNum(vendTransOPen),
+                                vendTransOpen.RecId))
+                        {
+                            locSpecTrans.SpecTableId = TableNum(ledgerJournalTrans);
+                            locSpecTrans.RefCompany =  ledgerJournalTrans.Company;
+                            locSpecTrans.RefTableId = TableNum(vendTransOPen);
+                            locSpectrans.RefRecId = vendTransOpen.RecId;
+                            locSpecTrans.Balance01 = locSettlementLines.InvoiceBalance;
+                            locSpecTrans.Code = ledgerJournalTrans.CurrencyCode;
+                            locSpecTrans.Payment = NoYes::Yes;
+                            locSpecTrans.insert();
+                        }
+
+                        CustVendOpenTransManager manager = CustVendOpenTransManager::construct(jourTrans);
+                        manager.updateTransMarked(vendTransOpen,true);
+                        manager.updateSettleAmount(vendTransOpen, locSettlementLines.InvoiceBalance);
+                    }
+                }
+            }
+
+            this.insertJournalHistory(accountNum, _settlementId, SKS_SCF_JournalAction::PayJourCreated);
+            ttscommit;
+        }
+        catch(Exception::Error)
+        {
+            this.insertErrorLog(_settlementId, infolog().text());
+            this.insertJournalHistory(ledgerJournalTrans.JournalNum, _settlementId, SKS_SCF_JournalAction::PayJourCreateFailed);
+            isPaymJournalCreated = false;
+            this.UpdateSettlementStatus(_settlementId);
+        }
+
+        if(jourTable)
+        {
+            locSettlementLines.clear();
+
+            update_recordset locSettlementLines
+                setting PaymentJournalNum = jourTable.JournalNum
+                where locSettlementLines.SettlementId == _settlementId &&
+                      locSettlementLines.Matched == NoYes::Yes;
+        }
+            
+        if(_autoPostJournal && jourTable)
+        {
+            try
+            {
+                LedgerJournalCheckPost ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(jourTable, NoYes::Yes);
+                infolog.clear();
+                ledgerJournalCheckPost.validate();
+                {
+                    ledgerJournalCheckPost.run();
+                    this.insertJournalHistory(jourTable.JournalNum, _settlementId, SKS_SCF_JournalAction::PayJourPosted);
+                }
+            }
+            catch(Exception::Error)
+            {
+                this.insertErrorLog(_settlementId, infolog().text());
+                this.insertJournalHistory(jourTable.JournalNum, _settlementId, SKS_SCF_JournalAction::PayJourPostFailed);
+                this.UpdateSettlementStatus(_settlementId);
+            }
+        }
+
+        if(_createinvoiceJournal && isPaymJournalCreated)
+        {
+            this.CreateInvoiceJournal(_settlementId, _autoPostJournal);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertJournalHistory</Name>
+				<Source><![CDATA[
+    private void insertJournalHistory(str _journalId, str _settlementId, SKS_SCF_JournalAction _action)
+    {
+        SKS_SCF_JournalHistory journalHistory;
+
+        journalHistory.Action = _action;
+        journalHistory.JournalId = _journalId;
+        journalHistory.SettlementId = _settlementId;
+        journalHistory.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertErrorLog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts error log.
+    /// </summary>
+    /// <param name = "_settlementId">Settlement Id</param>
+    /// <param name = "_errorMsg">Error message</param>
+    private void insertErrorLog(str _settlementId, str _errorMsg)
+    {
+        SKS_SCF_JournalErrorLog errorLog;
+
+
+        // _errorMsg is not used. And not deleted for backwards support.
+        // These codes added to avoid BP warning.
+        str errorMsg = _errorMsg;
+        errorMsg = errorMsg;
+
+
+        errorLog.SettlementId = _settlementId;
+        errorLog.ErrorText = infolog().text();
+        errorLog.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateInvoiceJournal</Name>
+				<Source><![CDATA[
+    public void CreateInvoiceJournal(SKS_SCF_SettlementId _settlementId, NoYes _autoPostJournal)
+    {
+        str providerId = SKS_SCF_Settlement::find(_settlementId).ProviderID;
+        SKS_SCF_Provider scfProvider = SKS_SCF_Provider::find(providerId);
+        LedgerJournalTable journalHeader;
+        boolean isLineCreated = false;
+
+        try
+        {
+            ttsbegin;
+            infolog.clear();
+            journalHeader.JournalName = scfProvider.InvoiceJournalName;
+            journalHeader.JournalNum = JournalTableData::newTable(journalHeader).nextJournalId();
+            journalHeader.JournalType = LedgerJournalType::VendInvoiceRegister;
+            journalHeader.NumberSequenceTable = NumberSequenceTable::find(LedgerJournalName::find(journalHeader.JournalName).NumberSequenceTable).RecId;
+            journalHeader.insert();
+
+            if(SKS_SCF_Provider::find(providerId).InvoiceCreationGrouping == SKS_SCF_InvoiceCreationGrouping::Currency)
+            {
+                if(scfProvider.InvoicePostingDate == SKS_SCF_PostingDate::CurrentDate)
+                {
+                    SKS_SCF_SettlementLines settlementLinesGrpByCurrency;
+                    while select sum(FundedAmt), RecId from settlementLinesGrpByCurrency group by CurrencyCode
+                        where settlementLinesGrpByCurrency.SettlementId == _settlementId
+                        && settlementLinesGrpByCurrency.PaymentJournalNum!= ''
+                        && settlementLinesGrpByCurrency.InvoiceJournalNum == ''
+                        && settlementLinesGrpByCurrency.Matched == NoYes::Yes
+                    {
+                        this.createJournalLine(_settlementId, settlementLinesGrpByCurrency, providerId, true, journalHeader);
+                        isLineCreated = true; 
+                    }
+                }
+                else
+                {
+                    SKS_SCF_SettlementLines settlementLinesGrpByCurrency;
+                    while select sum(FundedAmt), RecId from settlementLinesGrpByCurrency group by CurrencyCode, DueDate
+                        where settlementLinesGrpByCurrency.SettlementId == _settlementId
+                        && settlementLinesGrpByCurrency.PaymentJournalNum!= ''
+                        && settlementLinesGrpByCurrency.InvoiceJournalNum == ''
+                        && settlementLinesGrpByCurrency.Matched == NoYes::Yes
+                    {
+                        this.createJournalLine(_settlementId, settlementLinesGrpByCurrency, providerId, true, journalHeader);
+                        isLineCreated = true;
+                    }
+                }
+            }
+            else if(SKS_SCF_Provider::find(providerId).InvoiceCreationGrouping == SKS_SCF_InvoiceCreationGrouping::VendorCurrency)
+            {
+                if(scfProvider.InvoicePostingDate == SKS_SCF_PostingDate::CurrentDate)
+                {
+                    SKS_SCF_SettlementLines settlementLinesGrpByVendCur;
+                    while select sum(FundedAmt), RecId from settlementLinesGrpByVendCur group by VendAccount, CurrencyCode
+                        where settlementLinesGrpByVendCur.SettlementId == _settlementId
+                        && settlementLinesGrpByVendCur.PaymentJournalNum!= ''
+                        && settlementLinesGrpByVendCur.InvoiceJournalNum == ''
+                        && settlementLinesGrpByVendCur.Matched == NoYes::Yes
+                    {
+                        this.createJournalLine(_settlementId, settlementLinesGrpByVendCur, providerId, false, journalHeader);
+                        isLineCreated = true;
+                    }
+                }
+                else
+                {
+                    SKS_SCF_SettlementLines settlementLinesGrpByVendCur;
+                    while select sum(FundedAmt), RecId from settlementLinesGrpByVendCur group by VendAccount, CurrencyCode, DueDate
+                    where settlementLinesGrpByVendCur.SettlementId == _settlementId
+                    && settlementLinesGrpByVendCur.PaymentJournalNum!= ''
+                    && settlementLinesGrpByVendCur.InvoiceJournalNum == ''
+                    && settlementLinesGrpByVendCur.Matched == NoYes::Yes
+                    {
+                        this.createJournalLine(_settlementId, settlementLinesGrpByVendCur, providerId, false, journalHeader);
+                        isLineCreated = true;
+                    }
+                }
+            }
+            else // individual transfer
+            {
+                
+                SKS_SCF_SettlementLines settlementLinesIndividualTransfer;
+                while select settlementLinesIndividualTransfer
+                    where settlementLinesIndividualTransfer.SettlementId == _settlementId
+                    && settlementLinesIndividualTransfer.PaymentJournalNum!= ''
+                    && settlementLinesIndividualTransfer.InvoiceJournalNum == ''
+                    && settlementLinesIndividualTransfer.Matched == NoYes::Yes
+                {
+                    this.createJournalLine(_settlementId, settlementLinesIndividualTransfer, providerId, false, journalHeader);
+                    isLineCreated = true;
+                }
+                
+            }
+
+            if(isLineCreated)
+            {
+                SKS_SCF_SettlementLines updSettlementLines;
+
+                update_recordset updSettlementLines
+                    setting InvoiceJournalNum = journalHeader.JournalNum
+                    where updSettlementLines.SettlementId == _settlementId &&
+                          updSettlementLines.Matched == NoYes::Yes;
+
+                this.insertJournalHistory(journalHeader.JournalNum, _settlementId, SKS_SCF_JournalAction::InvoiceJourCreated);
+                ttscommit;
+            }
+            else
+            {
+                Error(strFmt("@SKS:SCFInvoiceJournalCreationValidation", _settlementId));
+                ttsabort;
+            }
+        }
+        catch (Exception::Error)
+        {
+            this.insertErrorLog(_settlementId, infolog().text());
+            this.insertJournalHistory(journalHeader.JournalNum, _settlementId, SKS_SCF_JournalAction::InvoiceJourCreateFailed);
+            this.UpdateSettlementStatus(_settlementId);
+        }
+
+        if (_autoPostJournal && journalHeader && isLineCreated)
+        {
+            try
+            {
+                LedgerJournalCheckPost jourCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(journalHeader, NoYes::Yes, NoYes::Yes);
+                infolog.clear();
+                LedgerJournalTable locjournalHeader;
+                if (jourCheckPost.validate())
+                {
+                    jourCheckPost.run();
+                    select firstonly locjournalHeader where locjournalHeader.JournalNum == journalHeader.JournalNum;
+                    if(locjournalHeader.Posted)
+                    {
+                        this.insertJournalHistory(journalHeader.JournalNum, _settlementId, SKS_SCF_JournalAction::InvoiceJourPosted);
+                    }
+                    else if(!locjournalHeader.Posted || locjournalHeader.Log)
+                    {
+                        this.insertErrorLog(_settlementId, locjournalHeader.Log);
+                        this.insertJournalHistory(journalHeader.JournalNum, _settlementId, SKS_SCF_JournalAction::InvoiceJourPostFailed);
+                        this.UpdateSettlementStatus(_settlementId);
+                    }
+                }
+            }
+            catch (Exception::Error)
+            {
+                this.insertErrorLog(_settlementId, infolog().text());
+                this.insertJournalHistory(journalHeader.JournalNum, _settlementId, SKS_SCF_JournalAction::InvoiceJourPostFailed);
+                this.UpdateSettlementStatus(_settlementId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalLine</Name>
+				<Source><![CDATA[
+    private void createJournalLine(SKS_SCF_SettlementId _settlementId,SKS_SCF_SettlementLines _settlementLinesGrpBy, str _providerId, boolean _grpByCurrency, LedgerjournalTable _journalHeader)
+    {
+        SKS_SCF_Provider scfProvider = SKS_SCF_Provider::find(_providerId);
+
+        LedgerJournalTrans journalTrans;
+        journalTrans.AccountType = LedgerJournalACType::Vend;
+        journalTrans.JournalNum = _journalHeader.JournalNum;
+
+        RefRecId ledgerDim = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_providerId,
+            LedgerJournalACType::Vend);
+
+        journalTrans.LedgerDimension = ledgerDim;
+
+        journalTrans.CurrencyCode = _settlementLinesGrpBy.CurrencyCode;
+
+        NumberSequenceTable numberSequenceTable = NumberSequenceTable::find(_journalHeader.NumberSequenceTable);
+        NumberSeq voucherNumSeq = NumberSeq::newGetVoucherFromCode(numberSequenceTable.NumberSequence);
+        journalTrans.Voucher = voucherNumSeq.voucher();
+
+        VendTable locVendtable = VendTable::find(scfProvider.ProviderID);
+        journalTrans.PaymMode = locVendtable.PaymMode;
+        journalTrans.Payment = locVendtable.PaymTermId;
+        journalTrans.PaymSpec = locVendtable.PaymSpec;
+
+        if(_settlementLinesGrpBy.FundedAmt > 0)
+        {
+            journalTrans.AmountCurCredit = _settlementLinesGrpBy.FundedAmt;
+        }
+        else
+        {
+            journalTrans.AmountCurDebit = _settlementLinesGrpBy.FundedAmt*-1;
+        }
+
+        journalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+        journalTrans.OffsetLedgerDimension = scfProvider.OffsetLedgerDimension;
+
+        if(scfProvider.InvoicePostingDate == SKS_SCF_PostingDate::CurrentDate)
+        {
+            journalTrans.TransDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()); 
+            journalTrans.DocumentDate =DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        }
+        else
+        {
+            journalTrans.TransDate = _settlementLinesGrpBy.DueDate;
+            journalTrans.DocumentDate = _settlementLinesGrpBy.DueDate;
+        }
+
+        if(scfProvider.InvoiceCreationGrouping == SKS_SCF_InvoiceCreationGrouping::IndividualInvoice) //DevOps - 20845
+        {
+            journalTrans.Invoice = _settlementLinesGrpBy.InvoiceNumber;
+        }
+        else
+        {
+            journalTrans.Invoice = NumberSeq::newGetNum(SKS_PP_Setup::numRefSCFInvoiceNum()).num();
+        }
+
+        journalTrans.ExchRate = ExchangeRateHelper::exchRate(journalTrans.CurrencyCode, journalTrans.TransDate);
+        journalTrans.Approver = HcmWorkerLookup::currentWorker();
+        journalTrans.Approved = NoYes::Yes;
+
+        journalTrans.Due = this.getDueDate(journalTrans);
+
+        if(_grpByCurrency)
+        {
+            journalTrans.CustVendBankAccountId = SKS_SCF_ProviderBankSwitchBoard::findBankAccountIdByCurrency(_providerId, _settlementLinesGrpBy.CurrencyCode);
+        }
+        else
+        {
+            journalTrans.CustVendBankAccountId = SKS_SCF_ProviderBankSwitchBoard::findBankAccountIdByVendorCurrency(_providerId, _settlementLinesGrpBy.VendAccount, _settlementLinesGrpBy.CurrencyCode);
+        }
+        journalTrans.DefaultDimension = VendTable::find(_providerId).DefaultDimension;
+
+        journalTrans.VATNumJournal = VendTable::find(_providerId).VATNum;
+
+        journalTrans.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDueDate</Name>
+				<Source><![CDATA[
+    private DueDate getDueDate(LedgerJournalTrans _journalTrans)
+    {
+        DueDate dueDate;
+        PaymTerm payment;
+
+        if (_journalTrans.Payment && _journalTrans.Invoice)
+        {
+            select firstonly payment where payment.PaymTermId == _journalTrans.Payment;
+            dueDate = _journalTrans.DocumentDate + payment.NumOfDays;
+
+        }
+
+        return dueDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>appendFileNbr</Name>
+				<Source><![CDATA[
+    private str appendFileNbr(str _PathFileName,SKS_SCF_RF_NextFileNumber _SKS_SCF_RF_NextFileNumber )
+    {
+        str rtnval = '';
+        System.String locPath;
+        System.Text.StringBuilder locFileNameBuilder;
+        System.String locFileExtension;
+
+        locFileNameBuilder = new System.Text.StringBuilder();
+
+        locPath = System.IO.Path::GetDirectoryName(_PathFileName);
+        locFileNameBuilder.Append(System.IO.Path::GetFileNameWithoutExtension(_PathFileName));
+        if(System.IO.Path::HasExtension(_PathFileName))
+        {
+            locFileExtension = System.IO.Path::GetExtension(_PathFileName);
+        }
+
+        locFileNameBuilder.Append('-');
+        locFileNameBuilder.Append(_SKS_SCF_RF_NextFileNumber);
+
+        if(System.IO.Path::HasExtension(_PathFileName))
+        {
+            locFileNameBuilder.Append(locFileExtension);
+        }
+
+        rtnval = System.IO.Path::Combine(locPath, locFileNameBuilder.ToString());
+
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkDuplicatesAckFiles</Name>
+				<Source><![CDATA[
+    private boolean checkDuplicatesAckFiles(Filename _FileName, utcdatetime _UtcDateTimeModified)
+    {
+        boolean rtnval;
+        SKS_EB_FilePath locSKS_EB_Filename;
+        SKS_SCF_Acknowledgements locSKS_SCF_InboundFile;
+        System.DateTime locSystemDateTime;
+        utcDateTime locModifiedDateTimeMIN, locModifiedDateTimeMAX;
+
+
+        locSystemDateTime = _UtcDateTimeModified;
+        locModifiedDateTimeMIN  = locSystemDateTime.AddSeconds(-1);
+        locModifiedDateTimeMAX  = locSystemDateTime.AddSeconds(1);
+        locSKS_EB_Filename = System.IO.Path::Combine(
+                                System.IO.Path::Combine(System.IO.Path::GetDirectoryName(_FileName),
+                                                        #Archive),
+                                System.IO.Path::GetFileNameWithoutExtension(_FileName));
+
+        while select FilePathName, recid from locSKS_SCF_InboundFile
+            where locSKS_SCF_InboundFile.FileDateTime >= locModifiedDateTimeMIN
+            && locSKS_SCF_InboundFile.FileDateTime <= locModifiedDateTimeMAX
+        {
+            if(strScan(locSKS_SCF_InboundFile.FilePathName, locSKS_EB_Filename,1,strLen(locSKS_SCF_InboundFile.FilePathName)))
+            {
+                rtnval = true;
+            }
+        }
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkDuplicatesSettlementFiles</Name>
+				<Source><![CDATA[
+    private boolean checkDuplicatesSettlementFiles(Filename _FileName, utcdatetime _UtcDateTimeModified)
+    {
+        boolean rtnval;
+        SKS_EB_FilePath locSKS_EB_Filename;
+        SKS_SCF_Settlement locSKS_SCF_InboundFile;
+        System.DateTime locSystemDateTime;
+        utcDateTime locModifiedDateTimeMIN, locModifiedDateTimeMAX;
+
+
+        locSystemDateTime = _UtcDateTimeModified;
+        locModifiedDateTimeMIN  = locSystemDateTime.AddSeconds(-1);
+        locModifiedDateTimeMAX  = locSystemDateTime.AddSeconds(1);
+        locSKS_EB_Filename = System.IO.Path::Combine(
+                                System.IO.Path::Combine(System.IO.Path::GetDirectoryName(_FileName),
+                                                        #Archive),
+        System.IO.Path::GetFileNameWithoutExtension(_FileName));
+
+        while select FilePathName, recid from locSKS_SCF_InboundFile
+            where locSKS_SCF_InboundFile.FileDateTime >= locModifiedDateTimeMIN
+            && locSKS_SCF_InboundFile.FileDateTime <= locModifiedDateTimeMAX
+        {
+            if(strScan(locSKS_SCF_InboundFile.FilePathName, locSKS_EB_Filename,1,strLen(locSKS_SCF_InboundFile.FilePathName)))
+            {
+                rtnval = true;
+            }
+        }
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkFileAgainstFormat</Name>
+				<Source><![CDATA[
+    private str checkFileAgainstFormat(str _filename, str _formatId, boolean _serverPath)
+    {
+        ExecutePermission perm;
+        SysDictClass locSysDictClass;
+        Object locClassInstance;
+        str locClassName = '';
+        str locMatchedClass = '';
+        System.Text.StringBuilder locsbClassName = new System.Text.StringBuilder();
+
+        locsbClassName.Append('SKS_SCF_RF_Format_');
+        locsbClassName.Append(_formatId);
+        locsbClassName.Replace('-', '_');
+        locClassName = locsbClassName.ToString();
+
+        perm = new ExecutePermission();
+        perm.assert();
+
+        locSysDictClass = new SysDictClass(className2Id(locClassName));
+        locClassInstance = locSysDictClass.makeObject(); // Instantiate class
+        locMatchedClass = locSysDictClass.callObject('getFormatId', locClassInstance, _filename, _serverPath); // Run
+        mErrorText = locSysDictClass.callObject('getErrorText', locClassInstance);
+
+        CodeAccessPermission::revertAssert();
+
+
+        return locMatchedClass;
+
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFile</Name>
+				<Source><![CDATA[
+    private SKS_SCF_RF_File getFile(str _FormatClassName, str _filename, boolean _serverPath)
+    {
+        SKS_SCF_RF_File rtnval;
+        ExecutePermission perm;
+        SysDictClass locSysDictClass;
+        Object locClassInstance;
+
+        perm = new ExecutePermission();
+        perm.assert();
+
+        locSysDictClass = new SysDictClass(className2Id(_FormatClassName));
+        locClassInstance = locSysDictClass.makeObject(); // Instantiate class
+        rtnval = locSysDictClass.callObject('getFile', locClassInstance, _filename, _serverPath); // Run
+        mErrorText = locSysDictClass.callObject('getErrorText', locClassInstance);
+
+        locSysDictClass = null;
+        locClassInstance = null;
+        CodeAccessPermission::revertAssert();
+        if(mErrorText != '')
+        {
+            //File Creation Failed
+            error(mErrorText);
+            //Clear List
+            rtnval = null;
+        }
+
+        return rtnval;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFormatId</Name>
+				<Source><![CDATA[
+    private struct getFormatId(SKS_SCF_RF_DirProfile _SKS_SCF_RF_DirProfile, str _filename, boolean _serverPath)
+    {
+        str locFormatID = '';
+        struct locFormatProfile;
+        System.Text.StringBuilder locErrorMessage = new System.Text.StringBuilder();
+
+        //reset the fileformatlist in case it was left in a non-start position
+        _SKS_SCF_RF_DirProfile.resetFormatGroupList();
+        //priming read
+        locFormatProfile = _SKS_SCF_RF_DirProfile.getNextFormatProfile();
+        while(strLen(locFormatID) == 0 && locFormatProfile != null)
+        {
+            if(locFormatProfile != null)
+            {
+                locFormatID = this.checkFileAgainstFormat(_filename, locFormatProfile.value(#formatId), _serverPath);
+            }
+            if(strLen(locFormatID) == 0)
+            {
+                locFormatProfile = _SKS_SCF_RF_DirProfile.getNextFormatProfile();
+            }
+            else
+            {
+                locFormatProfile.value(#formatClass, locFormatID);
+            }
+        }
+        if(strLen(locFormatID) == 0)
+        {
+            _SKS_SCF_RF_DirProfile.resetFormatGroupList();
+            //LABEL:  Unable to find inbound scf format for file:  %1\n
+            locErrorMessage.Append(strFmt(strFmtLB("@SKS:SCFInboundUnableToFindFile"), _filename));
+            //priming read
+            locFormatProfile = _SKS_SCF_RF_DirProfile.getNextFormatProfile();
+            while(locFormatProfile != null)
+            {
+                //LABEL:  Format attempted:  %1\n
+                locErrorMessage.Append(strFmt(strFmtLB("@SKS2866"), locFormatProfile.value(#formatId)));
+                locFormatProfile = _SKS_SCF_RF_DirProfile.getNextFormatProfile();
+            }
+            mErrorText =  locErrorMessage.ToString();
+        }
+        //reset the fileformatlist so that it is not left in a non-start position
+        _SKS_SCF_RF_DirProfile.resetFormatGroupList();
+
+        return locFormatProfile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AckProcessAllDirectories</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning('BPCheckInsertMethodInLoop','This cannot be a Record Insert List.  You have to insert these as you go, because the lines depend on this file being there.')]
+    public void AckProcessAllDirectories(SKS_EB_CommProcess _SKS_EB_CommProcess, boolean _serverPath)
+    {
+        #define.Empty('<Empty>')
+        #define.Error('Error')
+
+        SKS_EB_FileHub locSKS_EB_FileHub = SKS_EB_FileHub::construct();
+        int TempInt; //used to convert System.int32 to int.
+        List locListDirectoriesToProcess = new List(Types::Class);
+        List locListFilesToProcess;
+        ListEnumerator locDirectoriesToProcessEnumerator,locFilesToProcessEnumerator;
+        SKS_SCF_RF_SentFile locSKS_SCF_RF_SentFile;
+        SKS_SCF_RF_Transaction locSKS_SCF_RF_Transaction;
+        str locFilename;
+        str locDestPath;
+        System.Text.StringBuilder locErrorMessage, locWarningMessage;
+        SKS_SCF_RF_DirProfile locSKS_SCF_RF_DirProfile;
+        SKS_SCF_RF_File locSKS_SCF_RF_File;
+        utcDateTime locFileDateTime;
+        str prevPath = '';
+        int transCount;
+        int mult;
+        str inboundFileLineStatus;
+
+        //tables
+        SKS_SCF_AckInboundFileErrorLog       locSKS_SCF_AckInboundFileErrorLog;
+        RecordInsertList                     locRecordInsertList_FileLines;
+        SKS_SCF_Provider                     locSKS_SCF_Provider;
+        SKS_SCF_Acknowledgements             locSKS_SCF_AckInboundFile;
+        SKS_SCF_Acknowledgements             prevSKS_SCF_AckInboundFile;
+        SKS_SCF_AcknowledgementDetails       locSKS_SCF_AckInboundFileLine;
+        SKS_SCF_AcknowledgementDetails       prevSKS_SCF_AckInboundFileLine;
+
+        //structs
+        struct locFormatIDandKeyNumber;
+        
+        locRecordInsertList_FileLines = new RecordInsertList(locSKS_SCF_AckInboundFileLine.TableId);
+        if (_SKS_EB_CommProcess.Module == SKS_EB_Module::SupplyChainFinance)
+        {
+            while select crosscompany AckFilePath, AckFormatId, DataAreaId,ProviderID ,SettlementGenerationOptions from locSKS_SCF_Provider
+                  order by locSKS_SCF_Provider.dataAreaId, locSKS_SCF_Provider.AckFilePath
+                     where locSKS_SCF_Provider.InCommID == _SKS_EB_CommProcess.CommID
+            {
+                if(prevPath != locSKS_SCF_Provider.AckFilePath)
+                {
+                    prevPath = locSKS_SCF_Provider.AckFilePath;
+
+                    locSKS_SCF_RF_DirProfile = new SKS_SCF_RF_DirProfile(locSKS_SCF_Provider.AckFilePath, locSKS_SCF_Provider.company(), locSKS_SCF_Provider.AckFormatId, locSKS_SCF_Provider.ProviderID);
+                    locListDirectoriesToProcess.addEnd(locSKS_SCF_RF_DirProfile);
+                }
+            }
+        }
+       
+        locDirectoriesToProcessEnumerator = locListDirectoriesToProcess.getEnumerator();
+        locDirectoriesToProcessEnumerator.reset();
+
+        while (locDirectoriesToProcessEnumerator.moveNext())
+        {
+            locSKS_SCF_RF_DirProfile = locDirectoriesToProcessEnumerator.current();
+            changeCompany(locSKS_SCF_RF_DirProfile.get_Company())
+            {
+                locListFilesToProcess  = locSKS_EB_FileHub.runDirectoryGetFiles(locSKS_SCF_RF_DirProfile.get_Directory());
+                locFilesToProcessEnumerator = locListFilesToProcess.getEnumerator();
+                locFilesToProcessEnumerator.reset();
+                while(locFilesToProcessEnumerator.moveNext())
+                {
+                    locErrorMessage = new System.Text.StringBuilder();
+                    locWarningMessage = new System.Text.StringBuilder();
+                    locFilename = locFilesToProcessEnumerator.current();
+
+                    locSKS_EB_FileHub.setFileName(locFilename);
+                    locSKS_EB_FileHub.runFileInquire();
+                    locFileDateTime = locSKS_EB_FileHub.attrFileModified();
+                    if(this.checkDuplicatesAckFiles(locFilename, locFileDateTime))
+                    {
+                        locErrorMessage.AppendLine(strFmt("@SKS3156", locFilename));
+                    }
+                    TempInt = locErrorMessage.get_Length();
+                    if(TempInt == 0)
+                    {
+                        locFormatIDandKeyNumber = this.getFormatId(locSKS_SCF_RF_DirProfile, locFilename, _serverPath);
+                        if(locFOrmatIDandkeyNumber != null)
+                        {
+                            locSKS_SCF_RF_File = this.getFile(locFormatIDandKeyNumber.value(#formatClass), locFilename, _serverPath);
+
+                            if(locSKS_SCF_RF_File == null)
+                            {
+                                locErrorMessage.AppendLine(strFmt("@SKS2864", locFilename));
+                            }
+                        }
+                        else
+                        {
+                            locErrorMessage.Clear();
+                            mErrorText = '';
+                            locErrorMessage.AppendLine(strFmt("@SKS:SCFInboundNoRecordsValidation", locFilename));
+                        }
+                    }
+
+                    transCount = 0;
+                    // Even if errors, we will still insert the file into SKS_SCF_Acknowledgements
+                    ttsBegin;
+                    locSKS_SCF_AckInboundFile.FilePathName = locFilename;
+                    locSKS_SCF_AckInboundFile.ImportDateTime = DateTimeUtil::getSystemDateTime();
+                    locSKS_SCF_AckInboundFile.FileDateTime = locFileDateTime;
+                    locSKS_SCF_AckInboundFile.CommunicationId = _SKS_EB_CommProcess.CommID;
+                    locSKS_SCF_AckInboundFile.FormatId = locSKS_SCF_RF_DirProfile.get_FormatId();
+                    locSKS_SCF_AckInboundFile.AcknowledgementId = NumberSeq::newGetNum(SKS_PP_Setup::numRefSCFNextAcknowledgementId()).num();
+                    locSKS_SCF_AckInboundFile.ProviderID = locSKS_SCF_RF_DirProfile.get_ProviderID();
+                    locSKS_SCF_AckInboundFile.insert();
+
+                    // Don't process any further if errors occurred above
+                    TempInt = locErrorMessage.get_Length();
+                    if(locSKS_SCF_RF_File != null && TempInt == 0)
+                    {
+                        //priming read
+                        locSKS_SCF_RF_SentFile = locSKS_SCF_RF_file.getSentFile();
+                        while(locSKS_SCF_RF_SentFile != null)
+                        {
+
+                            //priming read
+                            locSKS_SCF_RF_Transaction = locSKS_SCF_RF_SentFile.getTransaction();
+                            while(locSKS_SCF_RF_Transaction != null)
+                            {
+                                inboundFileLineStatus = '';
+                                locSKS_SCF_AckInboundFileLine = null;
+                                locSKS_SCF_AckInboundFileLine.AcknowledgementId = locSKS_SCF_AckInboundFile.AcknowledgementId;
+
+                                locSKS_SCF_AckInboundFileLine.InvoiceNumber = locSKS_SCF_RF_Transaction.GetInvoiceNum();
+                                locSKS_SCF_AckInboundFileLine.InvoiceAmt = locSKS_SCF_RF_Transaction.GetInvoiceAmount();
+                                locSKS_SCF_AckInboundFileLine.DueDate = locSKS_SCF_RF_Transaction.GetDueDate();
+
+                                select firstonly * from prevSKS_SCF_AckInboundFileLine where prevSKS_SCF_AckInboundFileLine.InvoiceNumber == locSKS_SCF_AckInboundFileLine.InvoiceNumber &&
+                                                                                       prevSKS_SCF_AckInboundFileLine.InvoiceAmt == locSKS_SCF_AckInboundFileLine.InvoiceAmt &&
+                                                                                       prevSKS_SCF_AckInboundFileLine.DueDate == locSKS_SCF_AckInboundFileLine.DueDate &&
+                                                                                       prevSKS_SCF_AckInboundFileLine.VendAccount == locSKS_SCF_AckInboundFileLine.VendAccount;
+
+                                    
+
+                                if(prevSKS_SCF_AckInboundFileLine && prevSKS_SCF_AckInboundFileLine.Status != SKS_SCF_AcknowledgementStatus::Rejected)
+                                {
+                                    locSKS_SCF_AckInboundFileLine.InvoiceNumber = prevSKS_SCF_AckInboundFileLine.InvoiceNumber;
+                                    locSKS_SCF_AckInboundFileLine.VendAccount = prevSKS_SCF_AckInboundFileLine.VendAccount;
+                                    locSKS_SCF_AckInboundFileLine.DueDate = prevSKS_SCF_AckInboundFileLine.DueDate;
+                                    locSKS_SCF_AckInboundFileLine.InvoiceAmt = prevSKS_SCF_AckInboundFileLine.InvoiceAmt;
+                                    locSKS_SCF_AckInboundFileLine.ReferenceNum = prevSKS_SCF_AckInboundFileLine.ReferenceNum;
+                                    locSKS_SCF_AckInboundFileLine.Notes = prevSKS_SCF_AckInboundFileLine.Notes;
+                                    locSKS_SCF_AckInboundFileLine.InvoiceBalance = prevSKS_SCF_AckInboundFileLine.InvoiceBalance;
+                                    locSKS_SCF_AckInboundFileLine.Status = SKS_SCF_AcknowledgementStatus::UnMatched;
+                                    locSKS_SCF_AckInboundFileLine.InvoiceCurrencyCode = prevSKS_SCF_AckInboundFileLine.InvoiceCurrencyCode;
+
+                                    select firstonly ProviderID from prevSKS_SCF_AckInboundFile where prevSKS_SCF_AckInboundFile.AcknowledgementId == prevSKS_SCF_AckInboundFileLine.AcknowledgementId;
+
+                                    locSKS_SCF_AckInboundFile.ProviderID = prevSKS_SCF_AckInboundFile.ProviderID;
+                                    locSKS_SCF_AckInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+
+                                    Info(strFmt("@SKS:SCFInvNumberValidation", locSKS_SCF_AckInboundFileLine.InvoiceNumber, prevSKS_SCF_AckInboundFile.AcknowledgementId));
+                                }
+                                else
+                                {
+                                    locSKS_SCF_AckInboundFileLine.VendAccount = locSKS_SCF_RF_Transaction.GetVendAccount();
+                                    locSKS_SCF_AckInboundFileLine.InvoiceCurrencyCode = locSKS_SCF_RF_Transaction.GetFundedCurr();
+
+                                    if(!locSKS_SCF_RF_Transaction.GetVendAccount())
+                                    {
+                                        SKS_SCF_VendorAdditionalOptions locSKS_SCF_VendorAdditionalOptions;
+
+                                        select firstonly * from locSKS_SCF_VendorAdditionalOptions where locSKS_SCF_VendorAdditionalOptions.FixedValue == locSKS_SCF_RF_Transaction.GetClientNum();
+
+                                        locSKS_SCF_AckInboundFileLine.VendAccount = VendTable::findRecId(locSKS_SCF_VendorAdditionalOptions.VendorPaymRecId).AccountNum;
+                                    }
+                                    locSKS_SCF_AckInboundFileLine.ReferenceNum  = locSKS_SCF_RF_Transaction.GetReferenceNo();
+                                    locSKS_SCF_AckInboundFileLine.Notes = locSKS_SCF_RF_Transaction.GetStatusReason();
+                                    inboundFileLineStatus = locSKS_SCF_RF_Transaction.GetInvoiceStatus();
+                              
+                                    if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'PO')
+                                    {
+                                        mult = -1;
+                                    }
+                                    else if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'CM')
+                                    {
+                                        mult = 1;
+                                    }
+                                    else 
+                                    {
+                                        mult = -1;
+                                    }
+
+                                    if(inboundFileLineStatus == '0')
+                                    {
+                                        locSKS_SCF_AckInboundFileLine.Status = SKS_SCF_AcknowledgementStatus::Rejected;
+                                    }
+
+                                    VendTrans locVendTrans;
+                                    VendTransOpen lVendTransOpen;
+                                    
+                                    //SKS_DevOps_19478 --->
+                                    select firstonly lVendTransOpen join
+                                        locVendTrans where
+                                        locVendTrans.AccountNum == locSKS_SCF_AckInboundFileLine.VendAccount &&
+                                        locVendTrans.invoice == locSKS_SCF_AckInboundFileLine.InvoiceNumber &&
+                                        locVendTrans.DueDate == locSKS_SCF_AckInboundFileLine.DueDate &&
+                                        locVendTrans.AmountCur == locSKS_SCF_AckInboundFileLine.InvoiceAmt * mult &&
+                                        lVendTransOpen.RefRecId == locVendTrans.RecId;
+                                    //SKS_DevOps_19478 <---
+
+
+                                    if(locSKS_SCF_AckInboundFileLine.Status !=  SKS_SCF_AcknowledgementStatus::Rejected)
+                                    {
+
+                                        if(locVendTrans && lVendTransOpen.SKS_SCF_FileNbr)
+                                        {
+                                            locSKS_SCF_AckInboundFileLine.InvoiceBalance = locSKS_SCF_AckInboundFileLine.InvoiceAmt;
+                                            locSKS_SCF_AckInboundFileLine.Status = SKS_SCF_AcknowledgementStatus::Matched;
+                                            locSKS_SCF_AckInboundFileLine.VendAccount = locVendTrans.AccountNum;
+
+                                            locSKS_SCF_AckInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::Complete;
+
+                                            if(locVendTrans.PaymMode)
+                                            {
+                                                SKS_SCF_Provider lSKS_SCF_Provider;
+
+                                                select firstonly ProviderID from lSKS_SCF_Provider
+                                                    where lSKS_SCF_Provider.PaymMode == locVendTrans.PaymMode;
+
+                                                locSKS_SCF_AckInboundFile.ProviderID = lSKS_SCF_Provider.ProviderID;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            locSKS_SCF_AckInboundFileLine.Status = SKS_SCF_AcknowledgementStatus::UnMatched;
+                                            locSKS_SCF_AckInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        VendTransOpen locVendTransOpen;
+
+                                        ttsbegin;
+                                        if(locVendTrans)
+                                        {
+                                            select firstonly forupdate locVendTransOpen
+                                                where locVendTransOpen.RefRecId == locVendTrans.RecId;
+
+                                            if(locVendTransOpen)
+                                            {
+                                                locVendTransOpen.SKS_SCF_FileNbr = '';
+                                                locVendTransOpen.update();
+                                            }
+                                        }
+                                        ttscommit;
+                                        locSKS_SCF_AckInboundFileLine.VendAccount = locVendTrans.AccountNum;
+                                        locSKS_SCF_AckInboundFileLine.InvoiceBalance = locSKS_SCF_AckInboundFileLine.InvoiceAmt;
+                                        locSKS_SCF_AckInboundFileLine.Status = SKS_SCF_AcknowledgementStatus::Rejected;
+                                        locSKS_SCF_AckInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+                                    }
+                                }
+
+                                locRecordInsertList_FileLines.add(locSKS_SCF_AckInboundFileLine);
+                                locSKS_SCF_AckInboundFileLine = null;
+                               
+                                transCount = transCount+1;
+                                locSKS_SCF_RF_Transaction = locSKS_SCF_RF_SentFile.getTransaction();
+                            }
+
+                            locRecordInsertList_FileLines.insertDatabase();
+
+                            locSKS_SCF_RF_SentFile = locSKS_SCF_RF_file.getSentFile();
+
+                            if(locSKS_SCF_RF_SentFile != null)
+                            {
+                                locWarningMessage.AppendLine(strFmt("@SKS3157", locFilename));
+                                break;
+                            }
+                        }
+                    }
+
+                    
+
+                    TempInt = locErrorMessage.get_Length();
+
+                    if(TempInt != 0)
+                    {
+                        locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFilename), #Error));
+                        locErrorMessage.AppendLine(mErrorText);
+
+                        mErrorText = '';//appended to the local message, thus the buffer is cleared.
+                        locDestPath = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFileName), #Error, System.IO.Path::GetFileName(locFileName));
+                        locSKS_EB_FileHub.runFileMoveTo(locDestPath);
+                        locSKS_SCF_AckInboundFile.FileError = NoYes::Yes;
+                        locSKS_SCF_AckInboundFileErrorLog.ErrorText = locErrorMessage.ToString();
+                        locSKS_SCF_AckInboundFileErrorLog.InboundFileRecId = locSKS_SCF_AckInboundFile.RecId;
+                        locSKS_SCF_AckInboundFileErrorLog.insert();
+                        locSKS_SCF_AckInboundFileErrorLog = null;
+
+                        locSKS_SCF_AckInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::Error;
+                    }
+                    else
+                    {
+                        //no errors were encountered, move file to archive
+                        locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFilename), 'Archive'));
+                        locDestPath = this.appendFileNbr(locFilename, locSKS_SCF_AckInboundFile.AcknowledgementId);
+                        locDestPath = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locDestPath),#Archive,System.IO.Path::GetFileName(locDestPath));
+                        locSKS_EB_FileHub.runFileMoveTo(locDestPath);
+                        locErrorMessage.AppendLine(locDestPath);
+                        locSKS_SCF_AckInboundFile.FileError = NoYes::No;
+
+                        SKS_SCF_AcknowledgementDetails groupSKS_SCF_AcknowledgementDetails;
+
+                        select firstonly groupSKS_SCF_AcknowledgementDetails where
+                            groupSKS_SCF_AcknowledgementDetails.AcknowledgementId == locSKS_SCF_AckInboundFile.AcknowledgementId &&
+                            groupSKS_SCF_AcknowledgementDetails.Status != SKS_SCF_AcknowledgementStatus::Matched;
+
+                        if(groupSKS_SCF_AcknowledgementDetails)
+                        {
+                            locSKS_SCF_AckInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+                        }
+
+                        //Write out warning message to infolog;
+                        TempInt = locWarningMessage.get_Length();
+                        if(TempInt > 0)
+                        {
+                            warning(locWarningMessage.ToString());
+                        }
+                    }
+
+                    locSKS_SCF_AckInboundFile.FilePathName = locDestPath;
+
+                    locSKS_SCF_AckInboundFile.TransctionCount = transCount;
+
+                    locSKS_SCF_AckInboundFile.update();
+                    ttsCommit;
+                    locSKS_SCF_AckInboundFile = null;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DueDateBasedSettlement</Name>
+				<Source><![CDATA[
+    public void DueDateBasedSettlement(SKS_EB_CommProcess _SKS_EB_CommProcess)
+    {
+        SKS_SCF_Provider    locSKS_SCF_Provider;
+        SKS_SCF_FileDetail  locSKS_SCF_FileDetail;
+        VendTrans locVendTrans;
+        SKS_SCF_File  locSKS_SCF_File;
+        SKS_SCF_Settlement locSKS_SCF_Settlement;
+        SKS_SCF_SettlementLines locSKS_SCF_SettlementLines;
+        SKS_SCF_JournalErrorLog  locSKS_SCF_JournalErrorLog;
+        System.Text.StringBuilder locErrorMessage;
+        int transCount;
+        AmountMST locFundedAmt;
+        int TempInt;
+        DueDate effectiveDueDate;
+        boolean firstRec = true;
+
+        RecordInsertList    locRecordInsertList_FileLines;
+        locRecordInsertList_FileLines = new RecordInsertList(locSKS_SCF_SettlementLines.TableId);
+
+        //SKS_EB_FileHub locSKS_EB_FileHub = SKS_EB_FileHub::construct();
+
+        if (_SKS_EB_CommProcess.Module == SKS_EB_Module::SupplyChainFinance)
+        {
+            while select crosscompany SettlementGenerationOptions, ProviderID, DataAreaId,BankHolidayGroupID,DueDateLeadDays,AutoPmtInvJrnl,AutoPmtInvPost from locSKS_SCF_Provider
+                  order by locSKS_SCF_Provider.dataAreaId
+                     where locSKS_SCF_Provider.InCommID == _SKS_EB_CommProcess.CommID &&
+                           locSKS_SCF_Provider.SettlementGenerationOptions == SKS_SCF_SettlementGenerationOptions::DueDateBased
+            {
+                changecompany(locSKS_SCF_Provider.DataAreaId)
+                {
+                    locSKS_SCF_File = null;
+                    locSKS_SCF_FileDetail = null;
+                    locSKS_SCF_JournalErrorLog = null;
+                    locSKS_SCF_Settlement = null;
+                    locSKS_SCF_SettlementLines = null;
+                    locVendTrans = null;
+
+                    firstRec = true;
+                    locErrorMessage = new System.Text.StringBuilder();
+                    effectiveDueDate = SKS_SCF_Processing::GetOffsetDate(locSKS_SCF_Provider.DueDateLeadDays,DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()), locSKS_SCF_Provider.BankHolidayGroupID);
+
+                    while select FileNbr, ProviderID, RecId from  locSKS_SCF_File where locSKS_SCF_File.ProviderID == locSKS_SCF_Provider.ProviderID
+                    {
+                        while select locSKS_SCF_FileDetail  where locSKS_SCF_FileDetail.FileRecId ==  locSKS_SCF_File.RecId
+                           && locSKS_SCF_FileDetail.SettlementId ==''
+                           && locSKS_SCF_FileDetail.DueDate <= effectiveDueDate
+                        {
+                            if(firstRec)
+                            {
+                                transCount = 0;
+                                ttsBegin;
+                                locSKS_SCF_Settlement.ImportDateTime = DateTimeUtil::getSystemDateTime();
+                                locSKS_SCF_Settlement.CommunicationId = _SKS_EB_CommProcess.CommID;
+                                locSKS_SCF_Settlement.SettlementId = NumberSeq::newGetNum(SKS_PP_Setup::numRefSCFNextSettlementId()).num();
+                                locSKS_SCF_Settlement.ProviderID = locSKS_SCF_Provider.ProviderID;
+                                locSKS_SCF_Settlement.insert();
+
+                                firstRec = false; 
+                            }
+                            locSKS_SCF_SettlementLines.SettlementId = locSKS_SCF_Settlement.SettlementId;
+
+                            locSKS_SCF_SettlementLines.DueDate = locSKS_SCF_FileDetail.DueDate;
+                            locSKS_SCF_SettlementLines.FundedAmt = locSKS_SCF_FileDetail.Amount;
+                            locSKS_SCF_SettlementLines.InvoiceBalance = locSKS_SCF_FileDetail.Amount;
+                            locSKS_SCF_SettlementLines.InvoiceNumber = locSKS_SCF_FileDetail.Invoice;
+
+                            locSKS_SCF_SettlementLines.VendAccount = locSKS_SCF_FileDetail.VendorAccount;
+                            locSKS_SCF_SettlementLines.CurrencyCode = locSKS_SCF_FileDetail.CurrencyCode;
+                            locSKS_SCF_SettlementLines.FundedCurrency = locSKS_SCF_FileDetail.CurrencyCode;
+                            locSKS_SCF_SettlementLines.Matched = NoYes::Yes;
+                            locSKS_SCF_SettlementLines.Variance = 0;
+                            locSKS_SCF_Settlement.TransactionStatus = SKS_SCF_InboundTransactionStatus::Complete;
+
+                            locRecordInsertList_FileLines.add(locSKS_SCF_SettlementLines);
+                            locSKS_SCF_SettlementLines = null;
+
+                            transCount = transCount+1;
+                            locFundedAmt = locFundedAmt + locSKS_SCF_FileDetail.Amount;
+                        }
+                    }
+                    if(transCount)
+                    {
+                        locRecordInsertList_FileLines.insertDatabase();
+                    }
+                    TempInt = locErrorMessage.get_Length();
+
+                    if(TempInt != 0)
+                    {
+                        locErrorMessage.AppendLine(mErrorText);
+
+                        mErrorText = '';//appended to the local message, thus the buffer is cleared.
+                        locSKS_SCF_Settlement.FileError = NoYes::Yes;
+                        locSKS_SCF_JournalErrorLog.ErrorText = locErrorMessage.ToString();
+                        locSKS_SCF_JournalErrorLog.SettlementId = locSKS_SCF_Settlement.SettlementId;
+                        locSKS_SCF_JournalErrorLog.insert();
+                        locSKS_SCF_JournalErrorLog = null;
+                    }
+                    if(transCount)
+                    {
+                        locSKS_SCF_Settlement.TransctionCount = transCount;
+                        locSKS_SCF_Settlement.TotalAmt = locFundedAmt;
+                        locSKS_SCF_Settlement.update();
+
+                        //We have gotten all the data we can on the import, commit it to the database
+                        ttsCommit;
+                        if(locSKS_SCF_Settlement.FileError == NoYes::No)
+                        {
+                            SKS_SCF_RF::UpdateSettlmtIdToFileDetails(locSKS_SCF_Settlement);
+                            
+                            if(locSKS_SCF_Provider.AutoPmtInvJrnl)
+                            {
+                                if((!locSKS_SCF_Provider.CreateNoMismatch) || (locSKS_SCF_Provider.CreateNoMismatch && locSKS_SCF_Settlement.TransactionStatus != SKS_SCF_InboundTransactionStatus::NeedsReviewed))
+                                {
+                                    this.CreatePaymentJournalSettle(locSKS_SCF_Settlement.SettlementId,true,locSKS_SCF_Provider.AutoPmtInvPost);
+                                }
+                            }
+                        }
+                        locSKS_SCF_Settlement = null;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SettlmtProcessAllDirectories</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning('BPCheckInsertMethodInLoop','This cannot be a Record Insert List.  You have to insert these as you go, because the lines depend on this file being there.')]
+    public void SettlmtProcessAllDirectories(SKS_EB_CommProcess _SKS_EB_CommProcess, boolean _serverPath)
+    {
+        #define.Empty('<Empty>')
+        #define.Error('Error')
+
+        SKS_EB_FileHub locSKS_EB_FileHub = SKS_EB_FileHub::construct();
+        int TempInt; //used to convert System.int32 to int.
+        List locListDirectoriesToProcess = new List(Types::Class);
+        List locListFilesToProcess;
+        ListEnumerator locDirectoriesToProcessEnumerator,locFilesToProcessEnumerator;
+        SKS_SCF_RF_SentFile locSKS_SCF_RF_SentFile;
+        SKS_SCF_RF_Transaction locSKS_SCF_RF_Transaction;
+        str locFilename;
+        str locDestPath;
+        System.Text.StringBuilder locErrorMessage, locWarningMessage;
+        SKS_SCF_RF_DirProfile locSKS_SCF_RF_DirProfile;
+        SKS_SCF_RF_File locSKS_SCF_RF_File;
+        utcDateTime locFileDateTime;
+        str prevPath = '';
+        int transCount;
+        AmountMST locFundedAmt;
+        int mult;
+
+        //tables
+        SKS_SCF_JournalErrorLog SKS_SCF_JournalErrorLog;
+        RecordInsertList    locRecordInsertList_FileLines;
+        SKS_SCF_Provider    locSKS_SCF_Provider;
+        SKS_SCF_Settlement              locSKS_SCF_SettlementInboundFile;
+        SKS_SCF_SettlementLines         locSKS_SCF_SettlementInboundFileLine;
+        SKS_SCF_SettlementLines         prevSKS_SCF_SettlementInboundFileLine;
+
+        //structs
+        struct locFormatIDandKeyNumber;
+        
+        locRecordInsertList_FileLines = new RecordInsertList(locSKS_SCF_SettlementInboundFileLine.TableId);
+        if (_SKS_EB_CommProcess.Module == SKS_EB_Module::SupplyChainFinance)
+        {
+            while select crosscompany SettlementFilePath, SettlementFormatId, ProviderID, DataAreaId,SettlementGenerationOptions from locSKS_SCF_Provider
+                  order by locSKS_SCF_Provider.dataAreaId, locSKS_SCF_Provider.SettlementFilePath
+                     where locSKS_SCF_Provider.InCommID == _SKS_EB_CommProcess.CommID
+            {
+                if(locSKS_SCF_Provider.SettlementGenerationOptions == SKS_SCF_SettlementGenerationOptions::SettlementFileBased)
+                {
+                    if(prevPath != locSKS_SCF_Provider.SettlementFilePath)
+                    {
+                        prevPath = locSKS_SCF_Provider.SettlementFilePath;
+
+                        locSKS_SCF_RF_DirProfile = new SKS_SCF_RF_DirProfile(locSKS_SCF_Provider.SettlementFilePath, locSKS_SCF_Provider.company(), locSKS_SCF_Provider.SettlementFormatId,locSKS_SCF_Provider.ProviderID);
+                        locListDirectoriesToProcess.addEnd(locSKS_SCF_RF_DirProfile);
+                    }
+                }
+            }
+        }
+       
+        locDirectoriesToProcessEnumerator = locListDirectoriesToProcess.getEnumerator();
+        locDirectoriesToProcessEnumerator.reset();
+
+        while (locDirectoriesToProcessEnumerator.moveNext())
+        {
+            locSKS_SCF_RF_DirProfile = locDirectoriesToProcessEnumerator.current();
+            changeCompany(locSKS_SCF_RF_DirProfile.get_Company())
+            {
+                locListFilesToProcess  = locSKS_EB_FileHub.runDirectoryGetFiles(locSKS_SCF_RF_DirProfile.get_Directory());
+                locFilesToProcessEnumerator = locListFilesToProcess.getEnumerator();
+                locFilesToProcessEnumerator.reset();
+                while(locFilesToProcessEnumerator.moveNext())
+                {
+                    locErrorMessage = new System.Text.StringBuilder();
+                    locWarningMessage = new System.Text.StringBuilder();
+                    locFilename = locFilesToProcessEnumerator.current();
+
+                    locSKS_EB_FileHub.setFileName(locFilename);
+                    locSKS_EB_FileHub.runFileInquire();
+                    locFileDateTime = locSKS_EB_FileHub.attrFileModified();
+                    if(this.checkDuplicatesSettlementFiles(locFilename, locFileDateTime))
+                    {
+                        locErrorMessage.AppendLine(strFmt("@SKS3156", locFilename));
+                    }
+                    TempInt = locErrorMessage.get_Length();
+                    if(TempInt == 0)
+                    {
+                        locFormatIDandKeyNumber = this.getFormatId(locSKS_SCF_RF_DirProfile, locFilename, _serverPath);
+                        if(locFOrmatIDandkeyNumber != null)
+                        {
+                            locSKS_SCF_RF_File = this.getFile(locFormatIDandKeyNumber.value(#formatClass), locFilename, _serverPath);
+
+                            if(locSKS_SCF_RF_File == null)
+                            {
+                                locErrorMessage.AppendLine(strFmt("@SKS2864", locFilename));
+                            }
+                        }
+                        else
+                        {
+                            locErrorMessage.Clear();
+                            mErrorText = '';
+                            locErrorMessage.AppendLine(strFmt("@SKS:SCFInboundNoRecordsValidation", locFilename));
+                        }
+                    }
+
+                    transCount = 0;
+
+                    // Even if errors, we will still insert the file into SKS_SCF_Settlement
+                    ttsBegin;
+                    locSKS_SCF_SettlementInboundFile.FilePathName = locFilename;
+                    locSKS_SCF_SettlementInboundFile.ImportDateTime = DateTimeUtil::getSystemDateTime();
+                    locSKS_SCF_SettlementInboundFile.FileDateTime = locFileDateTime;
+                    locSKS_SCF_SettlementInboundFile.CommunicationId = _SKS_EB_CommProcess.CommID;
+                    locSKS_SCF_SettlementInboundFile.SettlementId = NumberSeq::newGetNum(SKS_PP_Setup::numRefSCFNextSettlementId()).num();
+                    locSKS_SCF_SettlementInboundFile.ProviderID = locSKS_SCF_RF_DirProfile.get_ProviderID();
+                    locSKS_SCF_SettlementInboundFile.FormatId = locSKS_SCF_RF_DirProfile.get_FormatId();
+                    
+                    locSKS_SCF_SettlementInboundFile.insert();
+
+                    // Don't process any further if errors occurred above
+                    TempInt = locErrorMessage.get_Length();
+                    if(locSKS_SCF_RF_File != null && TempInt == 0)
+                    {
+                        //priming read
+                        locSKS_SCF_RF_SentFile = locSKS_SCF_RF_file.getSentFile();
+                        while(locSKS_SCF_RF_SentFile != null)
+                        {
+                            //priming read
+                            locSKS_SCF_RF_Transaction = locSKS_SCF_RF_SentFile.getTransaction();
+                            while(locSKS_SCF_RF_Transaction != null)
+                            {
+                                locSKS_SCF_SettlementInboundFileLine = null;
+                               
+
+                                locSKS_SCF_SettlementInboundFileLine.SettlementId = locSKS_SCF_SettlementInboundFile.SettlementId;
+                                locSKS_SCF_SettlementInboundFileLine.InvoiceNumber = locSKS_SCF_RF_Transaction.GetInvoiceNum();
+                                locSKS_SCF_SettlementInboundFileLine.DueDate = locSKS_SCF_RF_Transaction.GetDueDate();
+                                locSKS_SCF_SettlementInboundFileLine.VendAccount = locSKS_SCF_RF_Transaction.GetVendAccount();
+                                //  locSKS_SCF_SettlementInboundFileLine.FundedAmt = locSKS_SCF_RF_Transaction.GetFundedmAmt();
+                                if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'PO')
+                                {
+                                    mult = -1;
+                                    locSKS_SCF_SettlementInboundFileLine.FundedAmt = locSKS_SCF_RF_Transaction.GetFundedmAmt();
+                                }
+                                else if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'CM')
+                                {
+                                    mult = -1;
+                                    locSKS_SCF_SettlementInboundFileLine.FundedAmt = locSKS_SCF_RF_Transaction.GetFundedmAmt() *-1;
+                                }
+                                else
+                                {
+                                    mult = -1;
+                                    locSKS_SCF_SettlementInboundFileLine.FundedAmt = locSKS_SCF_RF_Transaction.GetFundedmAmt();
+                                }
+
+                                select firstonly * from prevSKS_SCF_SettlementInboundFileLine where
+                                    prevSKS_SCF_SettlementInboundFileLine.InvoiceNumber == locSKS_SCF_SettlementInboundFileLine.InvoiceNumber &&
+                                    prevSKS_SCF_SettlementInboundFileLine.VendAccount == locSKS_SCF_SettlementInboundFileLine.VendAccount &&
+                                    prevSKS_SCF_SettlementInboundFileLine.DueDate == locSKS_SCF_SettlementInboundFileLine.DueDate &&
+                                    prevSKS_SCF_SettlementInboundFileLine.FundedAmt == locSKS_SCF_SettlementInboundFileLine.FundedAmt &&
+                                    prevSKS_SCF_SettlementInboundFileLine.Matched == NoYes::Yes;
+
+                                if(prevSKS_SCF_SettlementInboundFileLine)
+                                {
+                                    locSKS_SCF_SettlementInboundFileLine.InvoiceNumber = prevSKS_SCF_SettlementInboundFileLine.InvoiceNumber;
+                                    locSKS_SCF_SettlementInboundFileLine.DueDate = prevSKS_SCF_SettlementInboundFileLine.DueDate;
+                                    if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'CM')
+                                    {
+                                        locSKS_SCF_SettlementInboundFileLine.FundedAmt = prevSKS_SCF_SettlementInboundFileLine.FundedAmt *-1;
+                                    }
+                                    else
+                                    {
+                                        locSKS_SCF_SettlementInboundFileLine.FundedAmt = prevSKS_SCF_SettlementInboundFileLine.FundedAmt;
+                                    }
+                                    locSKS_SCF_SettlementInboundFileLine.ReferenceNum = prevSKS_SCF_SettlementInboundFileLine.ReferenceNum;
+                                    locSKS_SCF_SettlementInboundFileLine.VendAccount = prevSKS_SCF_SettlementInboundFileLine.VendAccount;
+                                    locSKS_SCF_SettlementInboundFileLine.InvoiceBalance = prevSKS_SCF_SettlementInboundFileLine.InvoiceBalance;
+                                    locSKS_SCF_SettlementInboundFileLine.CurrencyCode = prevSKS_SCF_SettlementInboundFileLine.CurrencyCode;
+                                    locSKS_SCF_SettlementInboundFileLine.Matched = NoYes::No;
+                                    locSKS_SCF_SettlementInboundFileLine.Variance = prevSKS_SCF_SettlementInboundFileLine.Variance;
+                                    locSKS_SCF_SettlementInboundFileLine.FundedCurrency = prevSKS_SCF_SettlementInboundFileLine.FundedCurrency;
+                                    locSKS_SCF_SettlementInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+                                    Info(strFmt("@SKS:SCFSettlementInvNumberValidation", locSKS_SCF_SettlementInboundFileLine.InvoiceNumber, prevSKS_SCF_SettlementInboundFileLine.SettlementId));
+                                }
+                                else
+                                {
+                                    locSKS_SCF_SettlementInboundFileLine.ReferenceNum = locSKS_SCF_RF_Transaction.GetReferenceNo();
+                                    locSKS_SCF_SettlementInboundFileLine.FundedCurrency = locSKS_SCF_RF_Transaction.GetFundedCurr();
+
+                                    VendTrans locVendTrans;
+                                    VendTransOpen locVendTransOpen;
+
+
+                                    //SKS_DevOps_19478 --->
+                                    select firstonly locVendTransOpen join
+                                        locVendTrans where
+                                        locVendTrans.AccountNum == locSKS_SCF_SettlementInboundFileLine.VendAccount &&
+                                        locVendTrans.invoice == locSKS_SCF_SettlementInboundFileLine.InvoiceNumber &&
+                                        locVendTrans.DueDate == locSKS_SCF_SettlementInboundFileLine.DueDate &&
+                                        locVendTransOpen.RefRecId == locVendTrans.RecId;
+                                    //SKS_DevOps_19478 <---
+
+
+                                    if(locVendTrans)
+                                    {
+                                       // locSKS_SCF_SettlementInboundFileLine.VendAccount = locVendTrans.AccountNum;
+                                        locSKS_SCF_SettlementInboundFileLine.InvoiceBalance = locVendTrans.AmountCur * mult;
+                                        locSKS_SCF_SettlementInboundFileLine.CurrencyCode = locVendTrans.CurrencyCode;
+
+                                        if(locSKS_SCF_SettlementInboundFileLine.InvoiceBalance != locSKS_SCF_SettlementInboundFileLine.FundedAmt || locVendTransOpen.SKS_SCF_FileNbr =='')
+                                        {
+                                            locSKS_SCF_SettlementInboundFileLine.Matched = NoYes::No;
+                                            locSKS_SCF_SettlementInboundFileLine.Variance = locSKS_SCF_SettlementInboundFileLine.FundedAmt - locSKS_SCF_SettlementInboundFileLine.InvoiceBalance;
+                                            locSKS_SCF_SettlementInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+                                        }
+                                        else
+                                        {
+                                            locSKS_SCF_SettlementInboundFileLine.Matched = NoYes::Yes;
+                                            locSKS_SCF_SettlementInboundFileLine.Variance = 0;
+                                            locSKS_SCF_SettlementInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::Complete;
+                                        }
+                                    }
+                                
+                                }
+
+                                locRecordInsertList_FileLines.add(locSKS_SCF_SettlementInboundFileLine);
+                                locSKS_SCF_SettlementInboundFileLine = null;
+
+                                transCount = transCount+1;
+
+                                if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'PO')
+                                {
+                                    locFundedAmt = locFundedAmt + locSKS_SCF_RF_Transaction.GetFundedmAmt();
+                                }
+                                else if(locSKS_SCF_RF_Transaction.GetInvoiceType() == 'CM')
+                                {
+                                    locFundedAmt = locFundedAmt + locSKS_SCF_RF_Transaction.GetFundedmAmt() *-1;
+                                }
+                                else
+                                {
+                                    locFundedAmt = locFundedAmt + locSKS_SCF_RF_Transaction.GetFundedmAmt();
+                                }
+
+                                locSKS_SCF_RF_Transaction = locSKS_SCF_RF_SentFile.getTransaction();
+                            }
+
+                            locRecordInsertList_FileLines.insertDatabase();
+                            locSKS_SCF_RF_SentFile = locSKS_SCF_RF_file.getSentFile();
+                        }
+                    }
+
+                    TempInt = locErrorMessage.get_Length();
+
+                    if(TempInt != 0)
+                    {
+                        locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFilename), #Error));
+                        locErrorMessage.AppendLine(mErrorText);
+
+                        mErrorText = '';//appended to the local message, thus the buffer is cleared.
+                        locDestPath = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFileName), #Error, System.IO.Path::GetFileName(locFileName));
+                        locSKS_EB_FileHub.runFileMoveTo(locDestPath);
+                        locSKS_SCF_SettlementInboundFile.FileError = NoYes::Yes;
+                        locSKS_SCF_SettlementInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::Error;
+                        SKS_SCF_JournalErrorLog.ErrorText = locErrorMessage.ToString();
+                        SKS_SCF_JournalErrorLog.SettlementId = locSKS_SCF_SettlementInboundFile.SettlementId;
+                        SKS_SCF_JournalErrorLog.insert();
+                        SKS_SCF_JournalErrorLog = null;
+                    }
+                    else
+                    {
+                        //no errors were encountered, move file to archive
+                        locSKS_EB_FileHub.runDirectoryCreate(System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locFilename), 'Archive'));
+                        locDestPath = this.appendFileNbr(locFilename, locSKS_SCF_SettlementInboundFile.SettlementId);
+                        locDestPath = System.IO.Path::Combine(System.IO.Path::GetDirectoryName(locDestPath),#Archive,System.IO.Path::GetFileName(locDestPath));
+                        locSKS_EB_FileHub.runFileMoveTo(locDestPath);
+                        locErrorMessage.AppendLine(locDestPath);
+                        locSKS_SCF_SettlementInboundFile.FileError = NoYes::No;
+
+                        SKS_SCF_SettlementLines groupSKS_SCF_SettlementLines;
+
+                        select firstonly groupSKS_SCF_SettlementLines where
+                            groupSKS_SCF_SettlementLines.SettlementId == locSKS_SCF_SettlementInboundFile.SettlementId &&
+                            groupSKS_SCF_SettlementLines.Matched != NoYes::Yes;
+
+                        if(groupSKS_SCF_SettlementLines)
+                        {
+                            locSKS_SCF_SettlementInboundFile.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+                        }
+
+                        //Write out warning message to infolog;
+                        TempInt = locWarningMessage.get_Length();
+                        if(TempInt > 0)
+                        {
+                            warning(locWarningMessage.ToString());
+                        }
+                    }
+
+                    locSKS_SCF_SettlementInboundFile.FilePathName = locDestPath;
+                    locSKS_SCF_SettlementInboundFile.TransctionCount = transCount;
+                    locSKS_SCF_SettlementInboundFile.TotalAmt = locFundedAmt;
+                    locSKS_SCF_SettlementInboundFile.update();
+                    //We have gotten all the data we can on the import, commit it to the database
+                    ttsCommit;
+                    if(locSKS_SCF_SettlementInboundFile.FileError == NoYes::No)
+                    {
+                        SKS_SCF_RF::UpdateSettlmtIdToFileDetails(locSKS_SCF_SettlementInboundFile);
+                        SKS_SCF_Provider locProvider = SKS_SCF_Provider::find(locSKS_SCF_RF_DirProfile.get_ProviderID());
+                        if(locProvider.AutoPmtInvJrnl)
+                        {
+                            if((!locProvider.CreateNoMismatch) || (locProvider.CreateNoMismatch && locSKS_SCF_SettlementInboundFile.TransactionStatus != SKS_SCF_InboundTransactionStatus::NeedsReviewed))
+                            {
+                                this.CreatePaymentJournalSettle(locSKS_SCF_SettlementInboundFile.SettlementId,true,locProvider.AutoPmtInvPost);
+                            }
+                        }
+                    }
+                    locSKS_SCF_SettlementInboundFile = null;
+                    locFundedAmt = 0;
+                    transCount = 0;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateClass</Name>
+				<Source><![CDATA[
+    boolean ValidateClass(str className, str formatId)
+    {
+        TreeNode tnode2Enum;
+        ;
+
+        tnode2Enum = TreeNode::findNode('Classes');
+        tnode2Enum = tnode2Enum.AOTfindChild(className);
+
+        if (tnode2Enum == null)
+        {
+            error(strFmt("@SKS864", formatId));
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateSettlmtIdToFileDetails</Name>
+				<Source><![CDATA[
+    private static void UpdateSettlmtIdToFileDetails(SKS_SCF_Settlement _SKS_SCF_Settlement)
+    {
+        SKS_SCF_FileDetail lSKS_SCF_Filedetail;
+        SKS_SCF_SettlementLines settlementLines;
+
+        
+        while select InvoiceNumber, SettlementId, VendAccount from settlementLines where settlementLines.SettlementId == _SKS_SCF_Settlement.SettlementId
+        {
+            ttsBegin;
+            select firstonly forupdate lSKS_SCF_Filedetail
+                where lSKS_SCF_Filedetail.Invoice == settlementLines.InvoiceNumber &&
+                      lSKS_SCF_Filedetail.VendorAccount == settlementLines.VendAccount;
+
+            if(lSKS_SCF_Filedetail)
+            {
+                lSKS_SCF_Filedetail.SettlementId = _SKS_SCF_Settlement.SettlementId;
+                lSKS_SCF_Filedetail.update();
+            }
+            ttsCommit;
+        }
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateSettlementStatus</Name>
+				<Source><![CDATA[
+    private void UpdateSettlementStatus(SKS_SCF_SettlementId _SettlementId)
+    {
+        SKS_SCF_Settlement settlement;
+      
+        ttsBegin;
+        select firstonly forupdate settlement
+            where settlement.SettlementId == _SettlementId;
+
+        if(settlement)
+        {
+            settlement.TransactionStatus = SKS_SCF_InboundTransactionStatus::NeedsReviewed;
+            settlement.update();
+        }
+        ttsCommit;
+       
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

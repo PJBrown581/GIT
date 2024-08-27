@@ -1,0 +1,646 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIBatchRecordDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// DSP class for <c>GGIBatchRecord</c> report.
+/// </summary>
+class GGIBatchRecordDSP extends DocDataSourceProviderSrsReporting
+{
+    ProdTable   prodTable;
+
+    #define.FormulaLines('FormulaLines')
+    #define.SerialNumbers('SerialNumbers')
+    #define.ContainerNumbers('Containers')
+    #define.Jobs('Jobs')
+    #define.EquipmentUsed('EquipmentUsed')
+    #define.ApplicationTorque('ApplicationTorque')
+    #define.TorqueEquipment('TorqueEquipment')
+    #define.MeterReading('MeterReading')
+    #define.RouteOperations('RouteOperations')
+    #define.Separator  ('| ')
+    #define.GAL('GAL')
+    #define.LB('LB')
+    #define.Hyphon(' - ')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return "@GGI:BatchRecordDSP";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProductCategory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Returns product categorey information.
+    /// </summary>
+    /// <param name = "_itemId">
+    ///     Order line itemid
+    /// </param>
+    /// <returns>
+    ///     Returns product categorey information
+    /// </returns>
+    String255 getProductCategory(ItemId _itemId)
+    {
+        EcoResProductCategory   ecoResProductCategory;
+        EcoResCategory          ecoResCategory;
+        String255               res = '';
+        EcoResCategoryDescription categoryDescription;
+        RecId                   productRecid;
+        EcoResCategoryHierarchyName hierarchyName;
+
+        productRecid = InventTable::find(_itemId).Product;
+
+        while select EcoResProductCategory
+            where EcoResProductCategory.Product == productRecid
+        {
+            select firstonly EcoResCategory
+                where EcoResCategory.RecId == EcoResProductCategory.Category;
+
+            hierarchyName = ecoResCategoryHierarchy::find(EcoResProductCategory.CategoryHierarchy).Name;
+            categoryDescription = EcoResCategory.Name;
+
+            if (res)
+            {
+                res += ', ';
+            }
+            res += hierarchyName + #Hyphon + categoryDescription;
+        }
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateXmlDataSource</Name>
+				<Source><![CDATA[
+    protected void generateXmlDataSource(DocXmlRecordBuilder _recordBuilder)
+    {
+        GGIBatchRecordControl   batchRecordControl = GGIBatchRecordControl::findActive();
+        InventTable             inventTable;
+        GGIBatchRecordDP        batchRecordDP       = this.getSrsRdpClassRunningInstance();
+        ProdTable               prodTableQuery;
+        SalesTable salesTable;
+        SalesLine salesLine;
+        LogisticsPostalAddress  logisticsAddress;
+        LogisticsLocation       logisticsLocation;
+        utcdatetime validFrom  = DateTimeUtil::minValue();
+        utcdatetime validTo    = DateTimeUtil::maxValue();
+        CustTable               custTable;
+        str                     advNotesHeaderCustomer, advNotesHeaderProduct;
+        FreeNotesTable_IT       notes;
+        GGIBatchRecordPackagingType batchRecordPackType;
+        GGIADRMaxFillWeight     ggiADRMaxFillWeight;
+        InventTableModule       invTableMod;
+        HMIMItemMaterial        hmimItemMaterial;
+
+
+        QueryRun qr = new QueryRun(batchRecordDP.parmQuery());
+      
+        while (qr.next())
+        {
+            prodTableQuery = qr.get(tablenum(ProdTable));
+
+            if (prodTableQuery)
+            {
+                prodTable = prodTableQuery;
+                break;
+            }
+        }
+        
+        inventTable = prodTable.inventTable();
+
+        select firstonly salesTable
+            where salesTable.SalesId == prodTable.InventRefId
+                && prodTable.InventRefType == InventRefType::Sales
+            && salesTable.SalesStatus == SalesStatus::Backorder;
+
+        custTable = custTable::find(salesTable.CustAccount);
+
+        select firstonly batchRecordPackType
+            where batchRecordPackType.PackagingTypeId == inventTable.GGIBatchRecordPackagingTypeId;
+
+        invTableMod = InventTableModule::find(inventTable.ItemId,ModuleInventPurchSales::Invent);
+
+        select firstonly IdentificationCode from hmimItemMaterial
+            where hmimItemMaterial.ItemId == inventTable.ItemId;
+      
+        // Header
+        DocXmlRecord            headerRecord = _recordBuilder.addCalculatedRecord(GGIBatchRecord::BatchRecordHeader);
+
+        headerRecord.addCalculatedField('BatchOrderNumber', prodTable.ProdId).setFieldLabel("@WAX5706");
+        headerRecord.addCalculatedField('ItemNumber', prodTable.ItemId).setFieldLabel("@SYS12836");
+        headerRecord.addCalculatedField('ItemName', prodTable.itemName()).setFieldLabel("@MCR39724");
+        headerRecord.addCalculatedField('UNMaterialCodeId', hmimItemMaterial.IdentificationCode);
+        headerRecord.addCalculatedField('ProductSearchName', EcoResProduct::findByProductNumber(prodTable.ItemId).SearchName);
+        headerRecord.addCalculatedField('SalesTransferOrderNum', prodTable.ggiReference()).setFieldLabel("@GGI:SalesTransferOrder");
+        headerRecord.addCalculatedField('BatchNum', prodTable.inventDim().inventBatchId);
+        //CR_15840_Doc_BatchRecord_DetailQty
+        //if(WHSLoadLine::findFirstForOrderNum(prodTable.ggiReference(), InventTransType::Sales).LoadId != "")
+        //{
+        headerRecord.addCalculatedField('LoadId', WHSLoadLine::findFirstForOrderNum(prodTable.ggiReference(), InventTransType::Sales).LoadId);
+        //}
+        //end CR_15840_Doc_BatchRecord_DetailQty
+        //CR_14502_DDSPBatchRecordInventStyle
+        headerRecord.addCalculatedField('InventStyle',  prodTable.inventDim().InventStyleId);
+        //end CR_14502_DDSPBatchRecordInventStyle
+        headerRecord.addCalculatedField('WMSLocationId', prodTable.inventDim().wMSLocationId);
+        headerRecord.addCalculatedField('RAFUOM', invTableMod.UnitId);
+        headerRecord.addCalculatedField('Qty', prodTable.QtySched);
+        if(UnitOfMeasure::findBySymbol(invTableMod.UnitId).TTBUOMClass != TTBUOMClass::Bulk)
+        {
+            //Add nested qty for containers on non bulk
+            this.addContainerNumbers(headerRecord,prodTable.QtySched);
+        }
+              
+        headerRecord.addCalculatedField('ControlNum', batchRecordControl.ControlId);
+        headerRecord.addCalculatedField('BatchRecordCalenderDate', prodTable.CreatedDateTime);
+        headerRecord.addCalculatedField('Signee', prodTable.ggiSignee());
+        headerRecord.addCalculatedField('NetWeightWithVariance', prodTable.ggiCalculatedFillTolerance());
+        headerRecord.addCalculatedFieldFromEdt('Rework', extendedTypeStr(PmfReworkBatch), prodTable.PmfReworkBatch);
+        headerRecord.addCalculatedField('CostGroup', inventTable.CostGroupId);
+        headerRecord.addCalculatedField('TareWeight', batchRecordPackType.TareWeight);
+        headerRecord.addCalculatedField('ProductCategory', this.getProductCategory(prodTable.ItemId), 'Product Categories');
+        headerRecord.addCalculatedField('ADRMaxFillWeight', InventTable::find(prodTable.ItemId).GGIADRMaxFillWeight, 'ADR Max fill weight');
+
+        if (salesTable)
+        {
+            while select text
+                from notes
+                    where notes.CustVendCode == TableGroupAll::Table
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.GGILogisticsLocationId == ''
+                    && notes.CustVendRelation == custTable.AccountNum
+                    && notes.ItemRelation == ''
+                    && notes.HeaderLines == HeaderLines_IT::Header
+            {
+                advNotesHeaderCustomer = advNotesHeaderCustomer + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.CustVendCode == TableGroupAll::GroupId
+                    && notes.module == ModuleCustVend::Cust
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                    && notes.ItemRelation == ''
+                    && notes.HeaderLines == HeaderLines_IT::Header
+            {
+                advNotesHeaderCustomer = advNotesHeaderCustomer + #Separator + notes.text;
+            }
+
+            select firstonly validtimestate(validFrom, validTo) logisticsAddress
+                where logisticsAddress.RecId == SalesTable.DeliveryPostalAddress;
+
+            select firstonly LocationId
+                from logisticsLocation
+                    where logisticsLocation.RecId == logisticsAddress.Location;
+
+            headerRecord.addCalculatedField('DeliveryAddress', logisticsLocation.Description);
+
+            while select text
+                from notes
+                    where notes.GGIBatchRecord == NoYes::Yes
+                    && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                    && notes.ItemRelation == ''
+                    && notes.HeaderLines == HeaderLines_IT::Header
+            {
+                advNotesHeaderCustomer = advNotesHeaderCustomer + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.CustVendCode == TableGroupAll::Table
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.GGILogisticsLocationId == ''
+                    && notes.CustVendRelation == custTable.AccountNum
+                    && notes.ItemRelation == ''
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.CustVendCode == TableGroupAll::GroupId
+                    && notes.module == ModuleCustVend::Cust
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                    && notes.ItemRelation == ''
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            select firstonly validtimestate(validFrom, validTo) logisticsAddress
+                where logisticsAddress.RecId == SalesTable.DeliveryPostalAddress;
+
+            select firstonly LocationId
+                from logisticsLocation
+                    where logisticsLocation.RecId == logisticsAddress.Location;
+
+            while select text
+                from notes
+                    where notes.GGIBatchRecord == NoYes::Yes
+                    && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                    && notes.ItemRelation == ''
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+            
+            while select text
+                from notes
+                    where notes.GGIBatchRecord == NoYes::Yes
+                    && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                    && notes.ItemRelation == prodTable.Itemid
+                    && notes.CustVendRelation == custTable.AccountNum
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.ItemCode == TableGroupAll::GroupId
+                    && notes.module == ModuleCustVend::Cust
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.ItemRelation == inventTable.FreeNotesGroup_IT
+                    && notes.CustVendRelation == custTable.AccountNum
+                    && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.ItemCode == TableGroupAll::GroupId
+                    && notes.module == ModuleCustVend::Cust
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.ItemRelation == inventTable.FreeNotesGroup_IT
+                    && notes.CustVendRelation == ''
+                    && notes.GGILogisticsLocationId == ''
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.ItemCode == TableGroupAll::GroupId
+                    && notes.module == ModuleCustVend::Cust
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.ItemRelation == inventTable.FreeNotesGroup_IT
+                    && notes.CustVendRelation == custTable.AccountNum
+                    && notes.GGILogisticsLocationId == ''
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.ItemRelation == prodTable.Itemid
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.CustVendCode == TableGroupAll::Table
+                    && notes.GGILogisticsLocationId == ''
+                    && notes.CustVendRelation == custTable.AccountNum
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+
+            while select text
+                from notes
+                    where notes.CustVendCode == TableGroupAll::GroupId
+                    && notes.module == ModuleCustVend::Cust
+                    && notes.GGIBatchRecord == NoYes::Yes
+                    && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                    && notes.ItemRelation == prodTable.Itemid
+                    && notes.HeaderLines == HeaderLines_IT::Lines
+            {
+                advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+            }
+        }
+        
+        while select text
+            from notes
+                where notes.CustVendCode == TableGroupAll::GroupId
+                && notes.module == ModuleCustVend::Cust
+                && notes.GGIBatchRecord == NoYes::Yes
+                && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                && notes.ItemRelation == ''
+                && notes.HeaderLines == HeaderLines_IT::Lines
+        {
+            advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+        }
+
+        while select text
+            from notes
+            where notes.CustVendCode == TableGroupAll::All
+                && notes.module == ModuleCustVend::Cust
+                && notes.GGIBatchRecord == NoYes::Yes
+                && notes.ItemRelation == ''
+                && notes.HeaderLines == HeaderLines_IT::Lines
+        {
+            advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+        }
+       
+        while select text
+            from notes
+                where notes.CustVendCode == TableGroupAll::GroupId
+                && notes.module == ModuleCustVend::Cust
+                && notes.GGIBatchRecord == NoYes::Yes
+                && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                && notes.ItemRelation == prodTable.Itemid
+                && notes.HeaderLines == HeaderLines_IT::Lines
+        {
+            advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+        }
+
+        while select text
+            from notes
+            where notes.CustVendCode == TableGroupAll::All
+                && notes.module == ModuleCustVend::Cust
+                && notes.GGIBatchRecord == NoYes::Yes
+                && notes.ItemRelation == prodTable.Itemid
+                && notes.HeaderLines == HeaderLines_IT::Lines
+        {
+            advNotesHeaderProduct = advNotesHeaderProduct + #Separator + notes.text;
+        }
+               
+        
+        headerRecord.addCalculatedField('GeneralNoteHeaderCustomer', advNotesHeaderCustomer);
+        advNotesHeaderCustomer = '';
+        headerRecord.addCalculatedField('GeneralNoteHeaderProduct', advNotesHeaderProduct);
+        advNotesHeaderProduct = '';
+
+        // #7: add nested for serial nos.
+        this.addSerialNumbers(headerRecord);
+
+        // Formula lines
+        this.addFormulaLines(headerRecord);
+
+        this.addJobs(headerRecord);
+
+        this.addFillingOperation(headerRecord);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addSerialNumbers</Name>
+				<Source><![CDATA[
+    private void addSerialNumbers(DocXmlRecord _headerRecord)
+    {
+        DocXmlRecord    serialNumberRecord;// = _headerRecord.addChildCalculatedRecord(#SerialNumbers);
+        InventTrans     inventTrans;
+        InventTransOrigin inventTransOrigin;
+        InventDim       inventDim;
+ 
+
+        //AL_Support_68496_ModifyQueryForRptPerformance_03.05.2023_ByNamitha
+        while select
+            ReferenceCategory, ReferenceId, RecId
+            from  inventTransOrigin
+            where (inventTransOrigin.ReferenceCategory == InventTransType::ProdLine || inventTransOrigin.ReferenceCategory == InventTransType::Production)
+                && inventTransOrigin.ReferenceId == prodTable.ProdId
+            join
+                inventTransOrigin, inventDimId, ItemId, RecId
+                from  inventTrans
+                where inventTrans.inventTransOrigin == inventTransOrigin.RecId
+                join
+                    inventdimid, InventSerialId, RecId
+                    from inventdim
+                    order by inventDim.inventSerialId asc
+                    where inventDim.inventDimId == inventTrans.inventDimId
+        {
+            if (inventDim.inventSerialId)
+            {
+                serialNumberRecord = _headerRecord.addChildCalculatedRecord(#SerialNumbers);
+                serialNumberRecord.addCalculatedField('SerialId', inventDim.inventSerialId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addContainerNumbers</Name>
+				<Source><![CDATA[
+    private void addContainerNumbers(DocXmlRecord _headerRecord, Qty _qty)
+    {
+        DocXmlRecord    containerRecord;
+       
+        for(int i=1; i<=_qty; i++)
+        {
+            containerRecord = _headerRecord.addChildCalculatedRecord(#ContainerNumbers);
+            containerRecord.addCalculatedField('Container', i);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addFormulaLines</Name>
+				<Source><![CDATA[
+    private void addFormulaLines(DocXmlRecord _headerRecord)
+    {
+        DocXmlRecord    prodBOMRecord;
+        ProdBOM         prodBOM;
+        UnitOfMeasureConversion unitOfMeasureConversion;
+        UnitOfMeasure   uomFrom, uomTo, uomLbs, uomGal;
+        EcoResProduct   ecoResProduct;
+        InventTableModule   inventTableModule;
+        real lbEquivalent;
+
+        while select prodBOM
+            where prodBOM.ProdId == prodTable.ProdId
+        {
+            prodBOMRecord = _headerRecord.addChildCalculatedRecord(#FormulaLines);
+            ecoResProduct = ecoResProduct::findByDisplayProductNumber(prodBOM.ItemId);
+            inventTableModule = inventTableModule::find(prodBOM.ItemId,ModuleInventPurchSales::Invent);
+            uomFrom = UnitOfMeasure::findBySymbol(prodBOM.UnitId);
+            uomTo = UnitOfMeasure::findBySymbol(inventTableModule.UnitId);
+            uomLbs = UnitOfMeasure::findBySymbol(#LB);
+            uomGal = UnitOfMeasure::findBySymbol(#GAL);
+
+            if (uomFrom != uomTo && uomFrom != uomLbs && uomTo.recid == uomLbs.recid)
+            {
+                unitOfMeasureConversion = unitOfMeasureConversion::findByConversion(uomFrom.RecId, uomTo.RecId, ecoResProduct.RecId);
+                lbEquivalent = unitOfMeasureConversion.Factor * abs(prodBOM.QtyBOMCalc);
+                unitOfMeasureConversion = unitOfMeasureConversion::findByConversion(uomTo.RecId, uomFrom.RecId, ecoResProduct.RecId);
+                
+                if (lbEquivalent == 0 && unitOfMeasureConversion.Factor > 0)
+                {
+                    lbEquivalent = abs(prodBOM.QtyBOMCalc) / unitOfMeasureConversion.Factor;
+                }
+            }
+            else
+            {
+                unitOfMeasureConversion = unitOfMeasureConversion::findByConversion(uomFrom.RecId, uomLbs.RecId, ecoResProduct.RecId);
+                lbEquivalent = unitOfMeasureConversion.Factor * abs(prodBOM.QtyBOMCalc);
+                unitOfMeasureConversion = unitOfMeasureConversion::findByConversion(uomLbs.RecId, uomFrom.RecId, ecoResProduct.RecId);
+                
+                if (lbEquivalent == 0 && unitOfMeasureConversion.Factor > 0)
+                {
+                    lbEquivalent = abs(prodBOM.QtyBOMCalc) / unitOfMeasureConversion.Factor;
+                }
+            }
+
+            prodBOMRecord.addCalculatedField('ItemId', prodBOM.ItemId);
+            prodBOMRecord.addCalculatedField('ItemName', prodBOM.inventTable().itemName());
+            //CR_14502_DDSPBatchRecordInventStyle
+            prodBOMRecord.addCalculatedField('InventStyle',  prodBOM.inventDim().InventStyleId);
+            //end CR_14502_DDSPBatchRecordInventStyle
+            prodBOMRecord.addCalculatedField('InventLocationId', prodBOM.inventDim().InventLocationId);
+            prodBOMRecord.addCalculatedField('wmsLocationId', prodBOM.inventDim().wMSLocationId);
+            prodBOMRecord.addCalculatedField('Qty', abs(prodBOM.QtyBOMCalc));
+            prodBOMRecord.addCalculatedField('UnitId', prodBOM.UnitId);
+            prodBOMRecord.addCalculatedField('InventBatchId', prodBOM.inventDim().inventBatchId);
+            prodBOMRecord.addCalculatedField('InventSerialId', prodBOM.inventDim().inventSerialId);
+            prodBOMRecord.addCalculatedField('LicensePlateId', prodBOM.inventDim().LicensePlateId);
+            prodBOMRecord.addCalculatedField('PackagingGroupId', prodBOM.inventTable().PackagingGroupId);
+            prodBOMRecord.addCalculatedField('InventoryUnitId', inventTableModule.UnitId);
+            prodBOMRecord.addCalculatedField('LbEquivalent', lbEquivalent);
+            
+            lbEquivalent = 0;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addJobs</Name>
+				<Source><![CDATA[
+    private void addJobs(DocXmlRecord _headerRecord)
+    {
+        DocXmlRecord                jobRecord;
+        DocXmlRecord                equipmentRecord;
+        DocXmlRecord                applicationTorqueRecord;
+        DocXmlRecord                meterReadingRecord;
+        DocXmlRecord                torqueEquipmentRecord;
+        
+        JmgJobTable                 jobTable;
+        GGIJmgJobApplicationTorque  jobApplicationTorque;
+        GGIJmgJobEquipment          jobEquipment;
+        GGIJmgJobMeterReading       jobMeterReading;
+        GGIJmgJobTorqueEquipment    jobTorqueEquipment;
+
+        jobRecord               = _headerRecord.addChildRecord(jobTable);
+
+        while select jobTable
+            where jobTable.ModuleRefId == prodTable.ProdId
+        {
+            jobRecord.addField(fieldStr(JmgJobTable, JobId)).setFieldValue(jobTable.JobId);
+            jobRecord.addField(fieldStr(JmgJobTable, ItemId)).setFieldValue(jobTable.ItemId);
+         
+            while select jobEquipment
+                where jobEquipment.JobTable == jobTable.RecId
+            {
+                equipmentRecord         = jobRecord.addChildRecord(jobEquipment);
+                equipmentRecord.addField(fieldStr(GGIJmgJobEquipment, EquipmentId)).setFieldValue(jobEquipment.EquipmentId);
+            }
+
+            while select jobApplicationTorque
+                where jobApplicationTorque.JobTable == jobTable.RecId
+            {
+                applicationTorqueRecord = jobRecord.addChildRecord(jobApplicationTorque);
+                applicationTorqueRecord.addField(fieldStr(GGIJmgJobApplicationTorque, ApplicationTorque)).setFieldValue(jobApplicationTorque.ApplicationTorque);
+            }
+
+            while select jobMeterReading
+                where jobMeterReading.JobTable == jobTable.RecId
+            {
+                meterReadingRecord      = jobRecord.addChildRecord(jobMeterReading);
+                meterReadingRecord.addField(fieldStr(GGIJmgJobMeterReading, StartMeter1)).setFieldValue(jobMeterReading.StartMeter1);
+                meterReadingRecord.addField(fieldStr(GGIJmgJobMeterReading, StartMeter2)).setFieldValue(jobMeterReading.StartMeter2);
+                meterReadingRecord.addField(fieldStr(GGIJmgJobMeterReading, EndMeter1)).setFieldValue(jobMeterReading.EndMeter1);
+                meterReadingRecord.addField(fieldStr(GGIJmgJobMeterReading, EndMeter2)).setFieldValue(jobMeterReading.EndMeter2);
+            }
+
+            while select jobTorqueEquipment
+                where jobTorqueEquipment.JobTable == jobTable.RecId
+            {
+                torqueEquipmentRecord   = jobRecord.addChildRecord(jobTorqueEquipment);
+                torqueEquipmentRecord.addField(fieldStr(GGIJmgJobTorqueEquipment, EquipmentId)).setFieldValue(jobTorqueEquipment.EquipmentId);
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addFillingOperation</Name>
+				<Source><![CDATA[
+    private void addFillingOperation(DocXmlRecord _headerRecord)
+    {
+        ProdRoute                       prodRoute;
+        ProdRouteJob                    prodRouteJob, prodRouteJobTaskType;
+        JmgJobTable                     jmgJobTable;
+        WrkCtrActivityRequirementSet    wrkCtrActivityReqSet;
+        DocXmlRecord                    prodRouteRecord;
+        str                             operationNumber;
+      
+        while select prodRoute
+            where prodRoute.ProdId == prodTable.ProdId
+        {
+            while select prodRouteJob
+                where prodRouteJob.OprPriority == prodRoute.OprPriority
+                    && prodRouteJob.oprnum == prodRoute.oprnum
+                    && prodRouteJob.ProdId == prodRoute.prodid
+            {
+                wrkCtrActivityReqSet = WrkCtrActivityRequirementSet::findByProdRouteOpr(prodRoute.OprNum, prodRoute.OprPriority, prodtable.ProdId, curExt());
+          
+                prodRouteRecord = _headerRecord.addChildCalculatedRecord(GGIBatchRecord::FillingStation);
+                operationNumber = int2Str(prodRoute.OprNum);
+            
+                prodRouteRecord.addCalculatedField('OperationNumber', operationNumber);
+                prodRouteRecord.addCalculatedField('JobID', prodRouteJob.jobid);
+                prodRouteRecord.addCalculatedFieldFromEnum('JobType', enumStr(RouteJobType),prodRouteJob.JobType);
+                prodRouteRecord.addCalculatedField("@SYS4528", prodRoute.OprId);
+                prodRouteRecord.addCalculatedField("@SYS89158", wrkCtrActivityReqSet.resourceRequirement().WrkCtrId);
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addBatchNumbers</Name>
+				<Source><![CDATA[
+    private void addBatchNumbers(DocXmlRecord _headerRecord)
+    {
+        DocXmlRecord    prodBatchRecord;
+        GGIProdBatchTmp prodBatchTmp = GGIProdBatchTmp::populateTmpData(prodTable.ProdId);
+
+        while select prodBatchTmp
+        {
+            prodBatchRecord = _headerRecord.addChildRecord(prodBatchTmp);
+
+            prodBatchRecord.addField(fieldStr(GGIProdBatchTmp, ItemId)).setFieldValue(prodBatchTmp.ItemId);
+            prodBatchRecord.addField(fieldStr(GGIProdBatchTmp,InventBatchId )).setFieldValue(prodBatchTmp.InventBatchId);
+            prodBatchRecord.addField(fieldStr(GGIProdBatchTmp, Qty)).setFieldValue(abs(prodBatchTmp.Qty));
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

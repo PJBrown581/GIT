@@ -1,0 +1,388 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_ReadParseMizuho</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Contains reading process of Mizuho files.
+/// </summary>
+public class SKS_BR_ReadParseMizuho extends SKS_BR_ReadParseBase
+{
+    str                     lineStr;
+    int                     numLinesInFile;
+    Amount                  sumEndingBalance;
+    CurrencyCode            currencyCode;
+    System.Text.Encoding    encoding;
+
+
+    // 932 = Japanese (Shift-JIS)
+    // Mizuho files always have this encoding
+    #define.DefaultEncoding(932)
+
+    #define.RecordDelimiter('\r\n')
+    #define.LineBreak('\n\r')
+
+    #define.RecordCodeStatement(1)
+    #define.RecordCodeTransaction(2)
+
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getInboundFile</Name>
+				<Source><![CDATA[
+    public SKS_BR_InboundFile getInboundFile(SKS_EB_FilePathName _filePathAndName, SKS_BF_BankIntType _SKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal)
+    {
+        encoding        = System.Text.Encoding::GetEncoding(#DefaultEncoding);
+        currencyCode    = BankAccountTable::find(this.getSKS_PP_Bank().BankAccountId).CurrencyCode;
+
+        this.initializeFileInfo(_filePathAndName);
+        this.openFile();
+
+        return this.parseFile();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Opens a file.
+    /// </summary>    
+    private void openFile()
+    {
+        if (!gSKS_EB_FileHub.attrfileExists())
+        {
+            throw error(strfmt("@SYS62207",gSKS_EB_FileHub.fileName()));
+        }
+
+        gSKS_EB_FileHub.runFileLoad(gSKS_EB_FileHub.getSKS_BF_BankIntType() == SKS_BF_BankIntType::FileHubLocal ? gSKS_EB_FileHub.fileName() : strFmt(@'%1\%2', gSKS_EB_FileHub.getBFFilePath(),gSKS_EB_FileHub.fileName())
+                                    ,gBRPreReadScript
+                                    ,gBRPreReadScriptParams
+                                    ,gBRPostReadScript
+                                    ,gBRPostReadScriptParams);
+        gSKS_EB_FileHub.streamInit();
+
+        TextStreamIo textStreamIO = TextStreamIo::constructForRead(gSKS_EB_FileHub.streamGet(encoding), #DefaultEncoding);
+        
+        if (!textStreamIO || textStreamIO.status() != IO_Status::Ok)
+        {
+            throw error(strfmt("@SYS19312",gSKS_EB_FileHub.fileName()));
+        }
+
+        textStreamIO.inFieldDelimiter(#RecordDelimiter);
+        textStreamIO.inRecordDelimiter(#RecordDelimiter);
+
+
+        // find total line count
+        while (textStreamIO.status() == IO_status::Ok)
+        {
+            if (textStreamIO.read())
+            {
+                numLinesInFile++;
+            }
+        }
+
+        // close the text stream
+        textStreamIO.finalize();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parses a file.
+    /// </summary>
+    /// <returns>Returns inbound file record</returns>
+    protected SKS_BR_InboundFile parseFile()
+    {
+        System.IO.StreamReader  locStreamReader;
+        System.String           locString;
+        int                     lineCount;
+
+        gSKS_EB_FileHub.streamInit();
+        locStreamReader = new System.IO.StreamReader(gSKS_EB_FileHub.streamGet(encoding), encoding);
+        
+        while (true)
+        {
+            // get next line
+            locString = locStreamReader.ReadLine();
+
+            // stop the loop if there is no line
+            if (locString == null)
+            {
+                break;
+            }
+            
+            lineStr = strrem(locString, #LineBreak);
+            lineCount++;
+            
+
+            // omit records
+            if (!(lineCount > gSKS_BR_FileFormat.OmitHeaderRecs && lineCount < (numLinesInFile - gSKS_BR_FileFormat.OmitTrailerRecs + 1)))
+            {
+                continue;
+            }
+
+            // validate blank records
+            if (strlen(strLRTrim(lineStr)) == 0)
+            {
+                continue;
+            }
+
+            // get record code
+            int recordCode = str2Int(this.getValue(1, 1));
+
+
+            // statement
+            if (recordCode == #RecordCodeStatement)
+            {
+                if (!gSKS_BR_InboundFile)
+                {
+                    gSKS_BR_InboundFile = new SKS_BR_InboundFile();
+                }
+
+                // set current statement
+                if (gSKS_BR_InboundStmt)
+                {
+                    gSKS_BR_InboundStmt.SetEndingBalance(gSKS_BR_InboundStmt.GetEndingBalance() + sumEndingBalance);
+                    gSKS_BR_InboundFile.PushStmt(gSKS_BR_InboundStmt);
+                    gSKS_BR_InboundStmt = null;
+                    sumEndingBalance = 0;
+                }
+
+
+                // create new statement
+                // account
+                str statementAccountNum = this.getValue(64, 10, true);
+
+                // to date
+                str statementToDateStr = SKS_BR_ReadParseMizuho::parseJapaneseDate(this.getValue(17, 6));
+
+                // beginning balance
+                Amount beginningBalance = this.getAmount(116, 14);
+
+
+
+                gSKS_BR_InboundStmt = new SKS_BR_InboundStmt();
+                gSKS_BR_InboundStmt.SetAccount(statementAccountNum);
+                gSKS_BR_InboundStmt.SetNbr(this.generateStatementNum());
+                gSKS_BR_InboundStmt.SetEndingBalance(beginningBalance);
+                gSKS_BR_InboundStmt.SetDate(statementToDateStr);
+            }
+            // transaction
+            else if (recordCode == #RecordCodeTransaction)
+            {
+                // throw error if there is no statement in the file
+                if (!gSKS_BR_InboundStmt)
+                {
+                    throw error("@SKS:BRMizuhoStatementNotFound");
+                }
+
+
+                Amount  amount      = this.getAmount(25, 12);
+                boolean isCredit    = this.getValue(22, 1) == '1';
+
+
+                // transaction date
+                str transactionDateStr = SKS_BR_ReadParseMizuho::parseJapaneseDate(this.getValue(10, 6));
+
+                // value date
+                str valueDateStr = SKS_BR_ReadParseMizuho::parseJapaneseDate(this.getValue(16, 6));
+
+
+                gSKS_BR_InboundTran = new SKS_BR_InboundTran();
+                gSKS_BR_InboundTran.SetCurrency(currencyCode);
+                gSKS_BR_InboundTran.SetBankRefNbr(this.getValue(2, 8));
+                gSKS_BR_InboundTran.SetCustRefNbr(this.getValue(62, 7, true));
+                gSKS_BR_InboundTran.SetTranType(this.getValue(23, 2));
+                gSKS_BR_InboundTran.SetAmt(amount);
+                gSKS_BR_InboundTran.SetIsCredit(isCredit);
+                gSKS_BR_InboundTran.SetDate(transactionDateStr);
+                gSKS_BR_InboundTran.SetValueDate(valueDateStr);
+                gSKS_BR_InboundTran.SetDesc(this.generateDescription());
+
+                gSKS_BR_InboundStmt.PushTrans(gSKS_BR_InboundTran);
+
+                sumEndingBalance += amount;
+            }
+            // skip unknown or unnecessary (like 8 and 9) record codes
+            else
+            {
+                continue;
+            }
+        }
+
+        // close steams
+        locStreamReader.Close();
+        gSKS_EB_fileHub.streamClose();
+
+
+        // set last statement
+        if (gSKS_BR_InboundStmt)
+        {
+            gSKS_BR_InboundStmt.SetEndingBalance(gSKS_BR_InboundStmt.GetEndingBalance() + sumEndingBalance);
+            gSKS_BR_InboundFile.PushStmt(gSKS_BR_InboundStmt);
+            gSKS_BR_InboundStmt = null;
+            sumEndingBalance = 0;
+        }
+
+        return gSKS_BR_InboundFile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateStatementNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates an unique statement number from timestamp.
+    /// </summary>
+    /// <returns>Returns a statement number</returns>
+    private str generateStatementNum()
+    {
+        int time = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+        str dateStr;
+        ;
+  
+        dateStr = date2Str(
+                    DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                    321,
+                    DateDay::Digits2,
+                    DateSeparator::None, // no separator
+                    DateMonth::Digits2,
+                    DateSeparator::None, // no separator
+                    DateYear::Digits4);
+    
+        return dateStr
+                + num2str0(time div 3600       , 2, 0, 0, 0)
+                + num2Str0(time mod 3600 div 60, 2, 0, 0, 0)
+                + num2Str0(time mod 3600 mod 60, 2, 0, 0, 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves and trim a string value from file line.
+    /// </summary>
+    /// <param name = "_position">The position where the retrieve begins</param>
+    /// <param name = "_number">Indicates the number of positions to retrieve</param>
+    /// <param name = "_checkRemoveLeadingZeros">If true, remove leading zero option will check</param>
+    /// <returns>Returns a string value</returns>
+    private str getValue(int _position, int _number, boolean _checkRemoveLeadingZeros = false)
+    {
+        str ret = strLRTrim(subStr(lineStr, _position, _number));
+
+        if (_checkRemoveLeadingZeros
+            && gSKS_BR_FileFormat.RemoveLeadingZeros)
+        {
+            ret = SKS_PP_StringFormats::strLTrimZeroes(ret);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves an amount value according to currency code from file line.
+    /// A bank account setup for JPY with a file value of 00001099820589 will import as ¥1099820589.
+    /// A bank account setup for USD with a file value of 00001099820589 will import as $10998205.89.
+    /// </summary>
+    /// <param name = "_position">The position where the retrieve begins</param>
+    /// <param name = "_number">Indicates the number of positions to retrieve</param>
+    /// <returns>Returns an amount value</returns>
+    private Amount getAmount(int _position, int _number)
+    {
+        str     strValue    = this.getValue(_position, _number);
+        Amount  amount      = str2Num(strValue);
+
+        if (currencyCode != 'JPY'
+            && abs(amount) >= 10) // amount must be 2 digits minimum
+        {
+            amount = amount / 100;
+        }
+
+        return amount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateDescription</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the transaction description.
+    /// </summary>
+    /// <returns>Returns a string</returns>
+    private str generateDescription()
+    {
+        str ret;
+
+        ret += strFmt('DES: %1\n',   this.getValue(49, 6, true));
+        ret += strFmt('DDR: %1\n',   this.getValue(55, 6, true));
+        ret += strFmt('PNCC: %1\n',  this.getValue(61, 1));
+        ret += strFmt('CWTR: %1\n',  this.getValue(82, 48));
+        ret += strFmt('BRN: %1\n',   this.getValue(2, 8, true));
+        ret += strFmt('PNCN: %1\n',  this.getValue(62, 7, true));
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseJapaneseDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parses a string of japanese date and converts to Gregorian date.
+    /// Japanese years differ according to Eras. Right now "Reiwa Era" is active.
+    /// This method does not use System.Globalization.JapaneseCalendar. Because older or un-updated versions of windows don't recognize the "Reiwa Era" like D365 devboxes.
+    /// Using .NET date parsing methods may cause an inconsistent result according to server / windows version.
+    /// Example: 03.12.09 equals to 2021-12-09 in "Reiwa Era" (current)
+    /// Example: 03.12.09 equals to 1991-12-09 in "Heisei Era" (previous, D365 devboxes still recognize this)
+    /// Reiwa 1 = 2019
+    /// Reiwa 2 = 2020
+    /// Reiwa 3 = 2021
+    /// Reiwa 4 = 2022
+    /// About Eras: https://www.ewc.co.jp/Pages/Information/CalendarEN.aspx
+    /// https://learn.microsoft.com/en-us/windows/apps/design/globalizing/japanese-era-change
+    /// </summary>
+    /// <param name = "_dateStr">String date value (yyMMdd)</param>
+    /// <returns>Returns a string Gregorian date (yyyMMdd)</returns>
+    public static str parseJapaneseDate(str _dateStr)
+    {
+        str         ret;
+        const int   eraStartYear = 2019; // Reiwa
+
+        if (_dateStr
+            && strLen(_dateStr) == 6)
+        {
+            // get japanese year
+            int japaneseYear = str2Int(subStr(_dateStr, 1, 2));
+
+            // convert gregorian year
+            int gregorianYear = eraStartYear + japaneseYear - 1;
+
+            // merge gregorian year with month and day
+            ret = int2Str(gregorianYear) + subStr(_dateStr, 3, 6);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

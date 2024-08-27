@@ -1,0 +1,1341 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_Payment</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Class for creating AR payment journal
+/// </summary>
+class SKS_LB_Payment
+{
+    JournalId LBJournalId;
+    SKS_LB_BatchNum LBBatchNumber;
+    real TotalPaymentAmount;
+    real TotalAppliedAmount;
+    boolean UseCheckDate;
+    Date CheckDate;
+    Date TransDate;
+    boolean auto;
+    LedgerJournalId     LBPaymentJournalNum;
+    str                 sksMessage;
+    boolean isStatic; //Issue21511
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>AlterStandardDeductions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delegate
+    /// </summary>
+    /// <param name = "_LBJournalId">_LBJournalId</param>
+    /// <param name = "_LBBatchNumber">_LBBatchNumber</param>
+    delegate void AlterStandardDeductions(
+        JournalId               _LBJournalId,
+        SKS_LB_BatchNum         _LBBatchNumber){}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLBPaymentJournalCommon</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delegate for LBPaymentJournal
+    /// </summary>
+    /// <param name = "_LBJournalId">_LBJournalId</param>
+    /// <param name = "_LBBatchNumber">_LBBatchNumber</param>
+    /// <param name = "_LBPaymentJournalNum">_LBPaymentJournalNum</param>
+    /// <param name = "_totalAppliedAmount">_totalAppliedAmount</param>
+    /// <param name = "_totalPaymentAmount">_totalPaymentAmount</param>
+    /// <param name = "_useCheckDate">_useCheckDate</param>
+    /// <param name = "_checkDate">_checkDate</param>
+    /// <param name = "_transDate">_transDate</param>
+    /// <param name = "_autoCreated">_autoCreated</param>
+    delegate void createLBPaymentJournalCommon(
+        JournalId               _LBJournalId,
+        SKS_LB_BatchNum         _LBBatchNumber,
+        LedgerJournalId         _LBPaymentJournalNum,
+        real                    _totalAppliedAmount,
+        real                    _totalPaymentAmount,
+        boolean                 _useCheckDate,
+        Date                    _checkDate,
+        Date                    _transDate,
+        boolean                 _autoCreated){}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkCustIDRefNbr</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check cust id ref number
+    /// </summary>
+    /// <param name = "_customerCompany">_customerCompany</param>
+    /// <param name = "CustId">CustId</param>
+    /// <param name = "RefNbr">RefNbr</param>
+    /// <returns>journal id</returns>
+    JournalId checkCustIDRefNbr(CompanyId _customerCompany, CustAccount CustId, BankChequeNum RefNbr)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        DimensionDynamicAccount dynamicAccount;
+        ;
+        changeCompany(_customerCompany)
+        {
+            dynamicAccount = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(CustId, LedgerJournalACType::Cust);
+        }
+        select firstonly JournalNum from ledgerJournalTrans
+        where ledgerJournalTrans.LedgerDimension == dynamicAccount && ledgerJournalTrans.PaymReference == RefNbr
+                && ledgerJournalTrans.Company == _customerCompany;
+
+        return ledgerJournalTrans.JournalNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteZeroApplics</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the zero amount applics
+    /// </summary>
+    /// <param name = "recid">recid</param>
+    void deleteZeroApplics(RefRecId recid)
+    {
+        SKS_LB_JournalARApplic sks_lb_journalarapplic;
+        ;
+        delete_from sks_lb_journalarapplic
+            where sks_lb_journalarapplic.SKS_LB_JournalARRecId == recid
+                && sks_lb_journalarapplic.SettleAmountCur == 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Error check
+    /// </summary>
+    /// <returns>boolean</returns>
+    boolean errorCheck()
+    {
+        AmountCur tolerance;
+        str companyid;
+        CustParameters custparameters;
+        SKS_LB_JournalAR sks_lb_journalar;
+        SKS_LB_JournalARErrors sks_lb_journalarerrors;
+        SKS_PP_Setup        sks_pp_setup;
+        DialogButton diagBut;
+        str amtToApplyError;
+        str errText;
+        JournalId existingJournalNbr;
+        real unAppliedAmt;
+        int unAppliedCnt;
+        SKS_LB_JournalAR    JournalARTotals;
+        ;
+
+        str responseErrorText = SKS_PP_Sys::ValidateSKSCommonModel();
+        if (responseErrorText != '')
+        {
+            throw error(responseErrorText);
+        }
+
+        // -------------------------------------------------
+        // WARNING Checking
+        // -------------------------------------------------
+        // Check for docs with fully unapplied payments... give count, option to not continue
+        // Warnings if:
+        //   1) Not all payments are fully applied
+        //   2) There are some Payments with Errors - they will be left behind
+        // Check if any customer/payment IDs (check numbers) are in any other Payment journals (CustID, RefNbr)
+
+        // Payments are not fully applied
+        unAppliedAmt = totalPaymentAmount - totalAppliedAmount;
+
+        // Calculate the Count of Unapplied Payments
+        // Check for duplicate refnbrs/customer
+        unAppliedCnt = 0;
+        amtToApplyError = ''; //string of CustID/Refnbrs that are in error
+
+        // get penny difference amount
+        tolerance = 0;
+        companyid = curExt(); //get current company
+        select firstonly lballowduplicatechks from sks_pp_setup;
+        custparameters = CustParameters::findByCompany(companyid); //get custparameters by company
+        if (custparameters.RecId != 0)
+        {
+            tolerance = custparameters.MaxMSTOverUnder;
+        }
+
+        while select forupdate sks_lb_journalar
+            where sks_lb_journalar.JournalID == LBJournalId && sks_lb_journalar.BatchNum == LBBatchNumber && sks_lb_journalar.AresDed == NoYes::No
+        {
+            if(SKS_PP_Setup::find().LBStandardDed == NoYes::Yes)
+            {
+                select sum(PmtAmountCur) from JournalARTotals where JournalARTotals.ledgerJournalTransrecid == 0
+                    && JournalARTotals.ParentJournalARID == SKS_LB_JournalAR.recid;
+            }
+
+            // Count of Unapplied Payments
+            if (sks_lb_journalar.LedgerJournalTransRecId == 0)
+            {
+                if(this.CalcUnsettledAmount(sks_lb_journalar) != 0)
+                {
+                    unAppliedCnt++;
+                }
+
+                if (sks_lb_journalar.ChkRefNbr != '' && SKS_PP_Setup.LBAllowDuplicateChks == NoYes::No)
+                {
+                    existingJournalNbr = this.checkCustIDRefNbr(sks_lb_journalar.CustomerCompany, sks_lb_journalar.CustAccount, sks_lb_journalar.ChkRefNbr);
+                    if (existingJournalNbr != '')
+                    {
+                        ttsbegin;
+                        sks_lb_journalar.RefNbrDupe = NoYes::Yes;
+                        sks_lb_journalar.update();
+                        ttscommit;
+                        // This customer/reference number (%1) exists in another journal (%2) - the journal cannot be created.  The duplicate payment reference numbers are checked in the 'good' grid.
+                        if(auto)
+                        {
+                            SKS_LB_Process_IMPORTTEMP_Records::createLBFileHistory(SKS_LB_Action::PmtJrnlCreateFail, strfmt("@SKS418", sks_lb_journalar.CustAccount + "@SYS35673" + sks_lb_journalar.ChkRefNbr, existingJournalNbr, LBBatchNumber));
+
+                        }
+                        throw error(strfmt("@SKS418", sks_lb_journalar.CustAccount + "@SYS35673" + sks_lb_journalar.ChkRefNbr, existingJournalNbr));
+                    }
+                    else
+                    {
+                        if (sks_lb_journalar.RefNbrDupe == NoYes::Yes)
+                        {
+                            ttsbegin;
+                            sks_lb_journalar.RefNbrDupe = NoYes::No;
+                            sks_lb_journalar.update();
+                            ttscommit;
+                        }
+                    }
+                }
+                // ApplyAmt greater than Check Amount - error
+                if(sks_lb_journalar.ActualSettleAmountCur != 0)
+                {
+                    if ( abs(sks_lb_journalar.ActualSettleAmountCur) - abs(sks_lb_journalar.PmtAmountCur) > (tolerance + JournalARTotals.PmtAmountCur))
+                    {
+                        amtToApplyError = amtToApplyError + sks_lb_journalar.CustAccount + "@SYS35673" + sks_lb_journalar.ChkRefNbr + "@SYS35667" + ' ';
+                    }
+                }
+            }
+        }
+        if (amtToApplyError != '')
+        {
+            if(!sks_pp_setup::find().FFTPM)
+            {
+                amtToApplyError = substr(amtToApplyError, 0, strLen(amtToApplyError) - 2);
+                SKS_LB_Process_IMPORTTEMP_Records::createLBFileHistory(sks_lb_action::PmtJrnlCreateFail, strfmt("@SKS417", amtToApplyError),'',LBJournalId, LBBatchNumber);
+                // Some invoice amounts to settle are greater than the payment amount.  Customer/Refnbr (%1).  Please move these records to the errors grid and correct the invoice amounts to settle.
+                throw error(strfmt("@SKS417", amtToApplyError));
+            }
+        }
+
+        if (unAppliedCnt > 0)
+        {
+            // some payments have not been fully settled
+            errText = errText + "@SKS414" + ' ' + "@SYS34952" + int2str(unAppliedCnt) + "@SYS35667" + ' ' + num2str(unAppliedAmt,1,2,1,0) + "@SYS34953" + "@SYS35667" + ' ';
+        }
+
+        select count(RecId) from sks_lb_journalarerrors
+            where sks_lb_journalarerrors.JournalID == LBJournalId && sks_lb_journalarerrors.BatchNum == LBBatchNumber;
+        if (sks_lb_journalarerrors.recid > 0)
+        {
+            errText = errText + strFmt("@SKS413", sks_lb_journalarerrors.recid)+', ';
+        }
+
+        // Ask user if they are Sure?
+        if (errText != '')
+        {
+            // Warning, %1Are you sure you want to continue and create the Payment journal?
+            errText = strfmt("@SKS415", substr(errText, 0, strLen(errText) - 2) + '. ');
+        }
+        else
+        {
+            // Are you sure you want to create the Payment journal?
+            errText = "@SKS416";
+        }
+
+        if(!auto 
+            && !isStatic) //Issue21511
+        {
+            diagBut = Box::yesNo(
+                errText,
+                DialogButton::Yes, // Initial focus is on the No button.
+                "@SKS352");
+
+            if (diagBut == DialogButton::Yes)
+            {
+                return true;
+            }
+        }
+        else
+        {
+            return true;
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the payment creation process
+    /// </summary>
+    /// <param name = "autoprocess">autoprocess</param>
+    public void run(boolean autoprocess = false)
+    {
+        str filepathnames;
+        str filepathname;
+        str filename;
+        boolean journalCompleted;   // Bug 7
+        boolean hasReversal;
+        SKS_PP_Setup sks_PP_Setup;
+        SKS_PP_Sys sks_PP_Sys;
+        SKS_LB_Journal sks_LB_Journal;  // Bug 7
+        SKS_LB_JournalAR sks_LB_JournalAR;
+        SKS_LB_Bank sks_LB_Bank;
+        SKS_PP_Bank sks_PP_Bank;
+        SKS_PP_50000Bas sks_PP_50000Bas;
+
+        LedgerJournalTrans AXLedgerJournalTrans;
+        SKS_LB_Setup_AutoCRParms sks_LB_Setup_AutoCRParms;
+        SKS_LB_AutoCreateCreditDebitGroup sks_lb_autocreatecreditdebitgroup;
+        LedgerJournalId ledgerjournalid;
+        SKS_PP_Setup    l_sks_pp_setup;
+        SKS_LB_JournalARApplic l_sks_lb_journalarapplic;
+        PaymTermId          l_paymTermId;
+        CashDiscCode        l_CashDiscCode;
+        CustTable           custTable;
+        DirPartyRecId       lDirPartyRecId;
+        CustAccount         AccountNum;
+        SelectableDataArea  TmpCompany;
+        LedgerJournalTable  lLedgerJournalTable;
+        SKS_LB_Bank         lSKS_LB_Bank;
+        ;
+
+        sks_PP_Sys = new SKS_PP_Sys();
+        sks_PP_50000Bas = new SKS_PP_50000Bas();
+
+
+        auto = autoprocess;
+
+        filepathnames = '';
+
+        select firstonly * from l_sks_pp_setup;
+
+        if (!this.errorCheck())
+        {
+            return;
+        }
+        this.validateDeductionPaymMode();
+        this.createLBPaymentJournalCommon(
+            LBJournalId,
+            LBBatchNumber,
+            LBPaymentJournalNum,
+            totalAppliedAmount,
+            totalPaymentAmount,
+            useCheckDate,
+            checkDate,
+            transDate,
+            auto);
+        this.AlterStandardDeductions(LBJournalId, LBBatchNumber);//Added to facilitate customizations
+
+
+        // Bug 7: See if the all batches in the journal are completed [sksCommon.createPaymentJournal() above sets this]
+        select FirstOnly JournalID, CurrencyCode, BankAcct, FormatID from sks_LB_Journal where sks_LB_Journal.JournalID == LBJournalId && sks_LB_Journal.KeepDelete != SKS_LB_STATUS::Completed;
+
+        journalCompleted = (sks_LB_Journal.RecId == 0); // We found it and it's completed
+
+        //now reread to get the  currency of the specific journal being processed
+        select firstonly CurrencyCode, FormatID, BankAcct from sks_LB_Journal where sks_LB_Journal.JournalId == LBJournalId && sks_LB_Journal.BatchNum == LBBatchNumber;
+        lSKS_LB_bank = SKS_LB_Bank::find(SKS_LB_Journal.BankAcct, SKS_LB_Journal.FormatID);
+
+        if(!auto && lSKS_LB_bank.AutoSubmitWF)
+        {
+            select firstonly forupdate lLedgerJournalTable join AXLedgerJournalTrans join SKS_LB_Journalar where lLedgerJournalTable.journalnum == AXLedgerJournalTrans.Journalnum
+                && AXLedgerJournalTrans.RecId == sks_LB_JournalAR.LedgerJournalTransRecId && sks_LB_JournalAR.JournalId == LBJournalId && sks_LB_JournalAR.BatchNum == LBBatchNumber
+                && lLedgerJournalTable.journalname == lSKS_LB_Bank.LBJournalName;
+            this.SubmitToWorkFlow(lLedgerJournalTable, lSKS_LB_bank.LBJournalName);
+        }
+
+        select FirstOnly LBPath FROM sks_PP_Setup;
+
+        while select forUpdate * from sks_LB_JournalAR
+                where sks_LB_JournalAR.JournalId == LBJournalId && sks_LB_JournalAR.BatchNum == LBBatchNumber
+            join forupdate * from AXLedgerJournalTrans
+                where AXLedgerJournalTrans.RecId == sks_LB_JournalAR.LedgerJournalTransRecId
+        {
+            hasReversal = NoYes::No;
+            changeCompany(sks_LB_JournalAR.CustomerCompany)
+            {
+                lDirPartyRecId = CustTable::find(sks_LB_JournalAR.CustAccount).Party;
+            }
+
+            // Copy the documents
+            if (AXLedgerJournalTrans)
+            {
+                Docu::Copy(sks_LB_JournalAR, AXLedgerJournalTrans);
+            }
+
+            // If a payment journal has been created for this line
+            // delete any applic records with settle amount of 0
+            if(sks_LB_JournalAR.LedgerJournalTransRecId)
+            {
+                this.deleteZeroApplics(sks_LB_JournalAR.RecId);
+            }
+
+            //Bug 7: archive only if the journal is complete and
+            //check to see if this file has already been processed
+            if (journalCompleted &&
+                strscan(filepathnames, sks_LB_JournalAR.Filename + ',', 1, strlen(filepathnames)) == 0)
+            {
+
+                filepathname = sks_LB_JournalAR.Filename;
+                filename = System.IO.Path::GetFileName(filepathname);
+
+                if(filename != '')
+                {
+                    //Fetch the sks_PP_Bank record and sks_LB_Bank record
+                    select firstonly * from sks_LB_Bank where sks_LB_Bank.BankAccountId == sks_lB_JournalAR.BankAcct && sks_LB_Bank.LBFormatId == sks_LB_Journal.FormatID;
+                    select firstonly * from sks_PP_Bank where sks_PP_Bank.BankAccountId == sks_lb_journalAR.BankAcct;
+
+                    //archive the file
+                    SKS_LB_Payment::archive(filename, sks_pp_bank, sks_LB_Bank, autoprocess);
+                }
+                //add the processed file to the list
+                filepathnames = filepathnames + sks_LB_JournalAR.Filename + ',';
+            }
+
+            if(!sks_LB_JournalAR.AutoCRRevJrnlId)
+            {
+                while select WriteOff, TrackingInvoices, SettleAmountCur, LBInvoice, SKS_LB_JournalARRecId, CustTransDataAreaId, RevReasonCode, AutoCROffsetLedgerDimension, AutoRevLedgerDimension, AutoRevOffsetLedgerDimension, CustTransRecId from l_sks_lb_journalarapplic
+                    order by l_sks_lb_journalarapplic.CustTransDataAreaId where l_sks_lb_journalarapplic.SKS_LB_JournalARRecId == sks_LB_JournalAR.RecId && l_sks_lb_journalarapplic.AutoCRAutoRev == NoYes::yes
+                {
+                    sks_LB_Setup_AutoCRParms = SKS_LB_Setup_AutoCRParms::find(l_sks_lb_journalarapplic.CustTransDataAreaId);
+                    sks_lb_autocreatecreditdebitgroup = new SKS_LB_AutoCreateCreditDebitGroup();
+
+                    changeCompany(l_sks_lb_journalarapplic.CustTransDataAreaId)
+                    {
+                        custTable = null;
+                        custTable = CustTable::findByPartyRecId(lDirPartyRecId);
+                    }
+
+
+                    try
+                    {
+                        if (!sks_LB_Setup_AutoCRParms)
+                        {
+                            throw error(strFmt("@SKS:AutoCRParmsNotFound", l_sks_lb_journalarapplic.CustTransDataAreaId));
+                        }
+
+                        if (!sks_LB_Setup_AutoCRParms.AutoCRGenJrnlName)
+                        {
+                            throw error("@SKS:AutoCRGenJrnlNameNotFound");
+                        }
+
+                        if(sks_LB_Setup_AutoCRParms.RevTOPSource == SKS_LB_ReversingSource::Customer)
+                        {
+                            l_paymTermId = custTable.PaymTermId;
+                        }
+                        else
+                        {
+                            l_paymTermId = sks_LB_Setup_AutoCRParms.CustPaymTermCode;
+                        }
+
+                        if(sks_LB_Setup_AutoCRParms.RevCashDiscSource == SKS_LB_ReversingSource::Customer)
+                        {
+                            l_CashDiscCode = custTable.CashDisc;
+                        }
+                        else
+                        {
+                            l_CashDiscCode = sks_LB_Setup_AutoCRParms.CustCashDiscCode;
+                        }
+                        AccountNum = custTable.AccountNum;
+
+                        if(TmpCompany != l_sks_lb_journalarapplic.CustTransDataAreaId)
+                        {
+                            ledgerjournalid = '';
+                            TmpCompany = l_sks_lb_journalarapplic.CustTransDataAreaId;
+                        }
+                        changeCompany(l_sks_lb_journalarapplic.CustTransDataAreaId)
+                        {
+                            ledgerjournalid = sks_lb_autocreatecreditdebitgroup.AutoCreateDebit(sks_LB_Setup_AutoCRParms.AutoCRGenJrnlName, AccountNum,
+                                        LedgerDimensionFacade::serviceCreateLedgerDimension(l_sks_lb_journalarapplic.AutoRevLedgerDimension, l_sks_lb_journalarapplic.AutoRevOffsetLedgerDimension), l_sks_lb_journalarapplic.SettleAmountCur, ledgerjournalid,
+                                l_sks_lb_journalarapplic.LBInvoice, sks_LB_Journal.CurrencyCode, CustTrans::find(l_sks_lb_journalarapplic.CustTransRecId).TransDate, l_sks_lb_journalarapplic.AutoRevOffsetLedgerDimension, SKS_LB_JournalAR.PaymDate, sks_lb_JournalAR.MOP, l_sks_lb_journalarapplic.RevReasonCode,sks_LB_JournalAR.ChkRefNbr, l_sks_lb_journalarapplic.TrackingInvoices, l_sks_lb_journalarapplic.CustTransDataAreaId, l_paymTermId, l_CashDiscCode,
+                                sks_LB_Setup_AutoCRParms.RevTOPSource, sks_LB_Setup_AutoCRParms.RevCashDiscSource);
+                        }
+                        hasReversal = NoYes::Yes;
+                        SKS_LB_Process_IMPORTTEMP_Records::createLBFileHistory(SKS_LB_Action::RevJrnlCreated, "@SKS3165", ledgerjournalid, LBJournalId, LBBatchNumber);
+                    }
+                    catch
+                    {
+                        SKS_LB_Process_IMPORTTEMP_Records::createLBFileHistory(SKS_LB_Action::RevJrnlCreateFailed, strFmt("@SKS3780", l_sks_lb_journalarapplic.CustTransDataAreaId), ledgerjournalid, LBJournalId, LBBatchNumber);
+                    }
+
+                }
+
+                //only update the reversal id if a reversal was created.
+                if (hasReversal)
+                {
+                    SKS_LB_JournalAR.reread();
+
+                    ttsBegin;
+                    SKS_LB_JournalAR.AutoCRRevJrnlId = ledgerjournalid;
+                    SKS_LB_JournalAR.update();
+                    ttsCommit;
+
+                    AXLedgerJournalTrans.SKS_LB_AutoCRRevJrnlNum = ledgerjournalid;
+                }
+
+                if (AXLedgerJournalTrans)
+                {
+                    ttsBegin;
+                    AXLedgerJournalTrans.update();
+                    ttsCommit;
+                }
+            }
+
+        }
+
+        //purge records based on setup record periods to retain
+        sks_PP_50000Bas.PurgeBatches(SKS_PP_FileType::SKS_LockBox);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCheckDate</Name>
+				<Source><![CDATA[
+    void setCheckDate(Date _checkDate)
+    {
+        ;
+        CheckDate = _checkDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLBBatchNumber</Name>
+				<Source><![CDATA[
+    void setLBBatchNumber(SKS_LB_BatchNum _lbBatchNum)
+    {
+        ;
+        LBBatchNumber = _lbBatchNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLBJournalId</Name>
+				<Source><![CDATA[
+    void setLBJournalId(JournalId _lbJournalId)
+    {
+        ;
+        LBJournalId = _lbJournalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLBPaymentJournalNum</Name>
+				<Source><![CDATA[
+    void setLBPaymentJournalNum(LedgerJournalId _lbPaymentJournalNum)
+    {
+        ;
+        LBPaymentJournalNum = _lbpaymentjournalnum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTotalAppliedAmount</Name>
+				<Source><![CDATA[
+    void setTotalAppliedAmount(real _totalAppliedAmount)
+    {
+        ;
+        TotalAppliedAmount = _totalAppliedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTotalPaymentAmount</Name>
+				<Source><![CDATA[
+    void setTotalPaymentAmount(real _totalPaymentAmount)
+    {
+        ;
+        TotalPaymentAmount = _totalPaymentAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTransDate</Name>
+				<Source><![CDATA[
+    void setTransDate(Date _transDate)
+    {
+        ;
+        TransDate = _transDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setUseCheckDate</Name>
+				<Source><![CDATA[
+    void setUseCheckDate(boolean _useCheckDate)
+    {
+        ;
+        UseCheckDate = _useCheckDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateDeductionPaymMode</Name>
+				<Source><![CDATA[
+    private void validateDeductionPaymMode()
+    {
+        CustPaymModeTable   lCustPaymModeTable;
+        SKS_LB_JournalAR    lSKS_LB_Journalar;
+
+        select firstOnly lSKS_LB_Journalar where lSKS_LB_Journalar.JournalId == LBJournalId && lSKS_LB_Journalar.BatchNum == LBBatchNumber
+            && lSKS_LB_Journalar.isDED == NoYes::Yes;
+
+        if(lSKS_LB_Journalar)
+        {
+            select * from lCustPaymModeTable where lCustPaymModeTable.PaymMode == 'DED';
+            if(!lCustPaymModeTable)
+            {
+                throw error("@SKS3904");
+            }
+
+            if(lCustPaymModeTable.PaymentLedgerDimension == 0)
+            {
+                throw error("@SKS3905");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>archive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Archiving method
+    /// </summary>
+    /// <param name = "filename">filename</param>
+    /// <param name = "SKS_PP_Bank">SKS_PP_Bank</param>
+    /// <param name = "sks_lb_bank">sks_lb_bank</param>
+    /// <param name = "autoprocess">autoprocess</param>
+    public static void archive(str filename, SKS_PP_Bank SKS_PP_Bank, SKS_LB_Bank sks_lb_bank, boolean autoprocess)
+    {
+        str filepathname;
+        str completedfile;
+        str newFilePathName;
+        SKS_PP_50001Bas SKS_PP_50001Bas;
+        SKS_LB_Import sks_LB_Import;
+        SKS_LB_Journal lSKS_LB_Journal;
+        SKS_LB_JournalAR lSKS_LB_JournalAR;
+        sks_PP_50001Bas = new SKS_PP_50001Bas('');
+        sks_LB_Import = new SKS_LB_Import();
+        //archive the file
+        sks_PP_50001Bas.ArchiveFiles(SKS_PP_FileType::SKS_LockBox, filename, sks_PP_Bank, sks_LB_Bank, autoprocess);
+        
+        SKS_EB_BankIntegOptWithNoLicense bankIntOption = SKS_EB_FileStorage::find().StorageOption_LB;
+        SKS_BF_BankIntType SKS_BF_BankIntType;
+
+        if(bankIntOption == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+        {
+            SKS_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+            filepathname = sks_LB_Import.CheckLBFolders(SKS_LB_In_Process::InProcess_FolderName, sks_LB_Bank.LBBankFabricLocation) + '\\' + filename;            
+        }
+        else
+        {
+            SKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+            filepathname = sks_LB_Import.CheckLBFolders(SKS_LB_In_Process::InProcess_FolderName, sks_LB_Bank.LBPath) + '\\' + filename;
+            
+        }
+
+        SKS_EB_FileHub  fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType);       
+                
+        fileHub.runFileInquire(filepathname);
+        if (fileHub.attrFileExists())
+        {
+            //<Issue21251>
+            if(sks_LB_Bank.LBArchive || SKS_PP_Setup::find().LBArchive)
+            {
+                str archivePath;
+                str archiveFile;
+
+                if(bankIntOption == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+                {
+                    archivePath = System.IO.Path::GetDirectoryName(System.IO.Path::GetDirectoryName(filepathname));
+                    archiveFile = System.IO.Path::Combine(archivePath + '\\Archive\\', filename);
+                }
+                else
+                {
+                    archivePath = sks_LB_Bank.LBArchive ? sks_LB_Bank.LBArchivePath : SKS_PP_Setup::find().LBPathArchive;
+                    
+                    archiveFile = System.IO.Path::Combine(archivePath, filename);
+
+                }
+
+                fileHub.runFileCopyTo(archiveFile);
+                fileHub.runFileInquire(filepathname);
+            }
+            //</Issue21251>
+
+            //delete/move file
+            if (sks_LB_Bank.LBDelete == NoYes::Yes || SKS_PP_Setup::find().LBDelete)
+            {
+                fileHub.runFileDelete(filepathname);
+                //file deleted
+                info("@SKS478" + ': ' + filepathname);
+
+            }
+            else
+            {
+                //if not to be deleted then move
+                if(bankIntOption == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+                {
+                    completedfile = sks_LB_Import.CheckLBFolders(SKS_LB_In_Process::Complete_FolderName, sks_LB_Bank.LBBankFabricLocation)+ '\\' + filename;                   
+                }
+                else
+                {
+                    completedfile = sks_LB_Import.CheckLBFolders(SKS_LB_In_Process::Complete_FolderName, sks_LB_Bank.LBPath)+ '\\' + filename;
+                }
+
+                fileHub.runFileMoveTo(completedfile); // Move file to completed directory. Will overwrite if file already exists
+
+                //file moved
+                info("@SKS479" + ': ' +filepathname );
+            }
+
+            if ((sks_LB_Bank.LBDelete || SKS_PP_Setup::find().LBDelete)
+                && (sks_lb_bank.LBArchive || SKS_PP_Setup::find().LBArchive))
+            {
+                newFilePathName = strFmt("@SYS322589","@SYS134535") + filename;
+            }
+            else if ((sks_LB_Bank.LBDelete || SKS_PP_Setup::find().LBDelete) 
+                && (sks_lb_bank.LBArchive && !SKS_PP_Setup::find().LBArchive))
+            {
+                newFilePathName = strFmt("@SYS322589","@SKS3306") + filename;
+            }
+            else
+            {
+                newFilePathName = completedfile;
+            }
+
+            ttsbegin;
+
+            update_recordset lSKS_LB_Journal
+                setting FileName = newFilePathName
+            where lSKS_LB_Journal.FileName == filepathname;
+
+            update_recordset lSKS_LB_JournalAR
+                setting FileName = newFilePathName
+            where lSKS_LB_JournalAR.FileName == filepathname;
+
+            ttsCommit;
+        }
+        else    // Bug 7
+        {
+            // File to be processed does not exist
+            warning("@SKS859" + ': ' + filepathname);
+        }
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>contruct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct method
+    /// </summary>
+    /// <returns>sks_lb_payment</returns>
+    static SKS_LB_Payment contruct()
+    {
+        ;
+        return new SKS_LB_Payment();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustomerBankAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create customer bank account method
+    /// </summary>
+    /// <param name = "_sks_lb_journalar">_sks_lb_journalar</param>
+    static server void createCustomerBankAccount(SKS_LB_JournalAR _sks_lb_journalar)
+    {
+
+        CustBankAccount custBankAccount;
+        CustBankAccountId tmpAccountId;
+        SKS_LB_Bank     tmpLBBank;
+        ;
+
+        // <15264/>
+        // insert record in CustBankAccount table if CustBankRegNum and CustBankAccountNum are not blank
+        if(_sks_lb_journalar.CustBankRegNum && _sks_lb_journalar.CustBankAccountNum)
+        {
+            tmpAccountId = "@SKS917" + SKS_PP_StringFormats::strRight(_sks_lb_journalar.CustBankAccountNum, 8);
+            //-- Test and see if we have a record in CustBankAccount
+       
+            changecompany(_sks_lb_journalar.CustomerCompany)
+            {
+                //We are searching for a default customer that exists within any bank acct/format id for the current company
+                //this search is not bank acct/format id specific because we do not want a formatid adding a bank account to a separate format id's dummy customer account
+                select firstonly LBAutoDefaultCust from tmpLBBank where tmpLBBank.LBAutoDefaultCust == _sks_lb_journalar.CustAccount;
+
+                if(!tmpLBBank.LBAutoDefaultCust)
+                {
+                    select count(RecId) from custBankAccount where
+                    (custBankAccount.RegistrationNum == _sks_lb_journalar.CustBankRegNum &&
+                    custBankAccount.AccountNum == _sks_lb_journalar.CustBankAccountNum &&
+                    custBankAccount.CustAccount == _sks_lb_journalar.CustAccount) ||
+                    (custBankAccount.AccountID == tmpAccountId &&
+                    custBankAccount.CustAccount == _sks_lb_journalar.CustAccount);
+
+                    // CustBankAccount record is NOT found, then create it.
+                    if(custBankAccount.RecId == 0)
+                    {
+                        //-- Add CustBankAccount record
+                        custBankAccount.AccountID = tmpAccountId;
+                        custBankAccount.Name = "@SKS352";
+                        custBankAccount.CustAccount = _sks_lb_journalar.CustAccount;
+                        if(!SKS_LB_SecondaryMatch::CheckSwiftIban(_sks_lb_journalar.CustBankRegNum, false))
+                        {
+                            custBankAccount.RegistrationNum = _sks_lb_journalar.CustBankRegNum;
+                        }
+                        else
+                        {
+                            custBankAccount.SWIFTNo = _sks_lb_journalar.CustBankRegNum;
+                        }
+
+                        if(SKS_LB_SecondaryMatch::CheckSwiftIBAN(_sks_lb_journalar.CustBankAccountNum, true))
+                        {
+                            custBankAccount.BankIBAN = _sks_lb_journalar.CustBankAccountNum;
+                        }
+                        else
+                        {
+                            custBankAccount.AccountNum = _sks_lb_journalar.CustBankAccountNum;
+                        }
+
+                        if (custBankAccount.AccountNum || custBankAccount.BankIBAN || custBankAccount.SWIFTNo)
+                        {
+                            custBankAccount.insert();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create settlement method
+    /// </summary>
+    /// <param name = "_JournalAR">_JournalAR</param>
+    /// <param name = "_ledgerJournalTransCustPaymJour">_ledgerJournalTransCustPaymJour</param>
+    /// <param name = "_Journal">_Journal</param>
+    /// <returns>string</returns>
+    public static str CreateSettlement(SKS_LB_JournalAR _JournalAR, LedgerJournalTrans _ledgerJournalTransCustPaymJour, SKS_LB_Journal _Journal)
+    {
+        SKS_LB_JournalARApplic  local_JournalARApplic;
+        //SKS_LB_Journal          local_Journal;
+        CustTrans               local_CustTrans;
+        CustTransOpen           local_CustTransOpen;
+        SpecTransManager        specTransManager;
+        CustPaymSettlementManager   SettlementManager;
+        CustPaymModeTable       lCustPaymModeTable;
+        sks_lb_54000Bas         sks_lb_54000Bas = new sks_lb_54000Bas();
+        LedgerJournalTrans      tmpLedgerJournalTrans;
+        SKS_PP_Setup            sks_pp_setup;
+        str errortext;
+        Amount                  settleAmount;
+        int                     TranCount = 0;
+        LedgerDimensionAccount  mergedLedgerDimension;
+        List                    dimensionSources;
+
+        select firstonly * from sks_pp_setup;
+        specTransManager = SpecTransManager::newFromSpec(_ledgerJournalTransCustPaymJour, false);
+
+        while select crosscompany sks_lb_journalarrecid, custtransrecid, custtransopenrecid, DiscApplyAmount, settleamountcur from local_JournalARApplic
+            where local_JournalARApplic.SKS_LB_JournalARRecId == _JournalAR.RecId && local_journalarapplic.SettleAmountCur != 0
+            join
+            local_CustTrans where local_custtrans.recid == local_JournalARApplic.custtransRecId
+            join
+            local_CustTransOpen where local_CustTransOpen.RecId == local_JournalARApplic.CustTransOpenRecId
+        {
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            //if(SpecTransManager.existForOtherSpec(local_CustTransOpen.company(), local_CustTransOpen.TableId, local_CustTransOpen.RecId))
+            if (local_CustTransOpen.sksGetRemainingAmount() == 0)
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            {
+                errorText = strFmt("@SKS419", local_CustTrans.Invoice);
+                return errortext;
+            }
+
+            if(CustTransCashDisc::find(local_CustTransOpen.TableId, local_CustTransOpen.recid, _JournalAR.paymdate).CashDiscAmount != local_JournalARApplic.DiscApplyAmount)
+            {
+                settlementManager = CustPaymSettlementManager::construct(_ledgerJournalTransCustPaymJour);
+                settlementManager.updateCashDiscAmount(local_CustTransOpen, local_JournalARApplic.DiscApplyAmount);
+            }
+
+            if(_Journal.CurrencyCode != local_CustTrans.CurrencyCode)
+            {
+                //need to undo the exchange
+                settleAmount =  sks_lb_54000Bas.convertCuryAmounts(local_CustTransOpen, _Journal.CurrencyCode, local_CustTrans.CurrencyCode,
+                    ExchangeRateHelper::getExchangeRate1_Static(Ledger::primaryLedger(CompanyInfo::findDataArea(_JournalAR.customercompany).RecId), _Journal.CurrencyCode, _JournalAR.PaymDate),
+                    SKS_LB_ConvertType::PaymtoTran, local_JournalARApplic.SettleAmountCur, _JournalAR.PaymDate);
+            }
+            else
+            {
+                settleAmount = local_JournalARApplic.SettleAmountCur;
+            }
+
+            specTransManager.insert(local_CustTransOpen.company(), local_CustTransOpen.TableId, local_CustTransOpen.RecId, settleAmount, local_CustTrans.CurrencyCode, NoYes::No, local_JournalARApplic.DiscApplyAmount, _JournalAR.paymdate);
+
+            _ledgerJournalTransCustPaymJour.SettleVoucher = SettlementType::SelectedTransact;
+
+            if(TranCount > 0)
+            {
+                _ledgerJournalTransCustPaymJour.MarkedInvoice = '*';
+                _ledgerJournalTransCustPaymJour.MarkedInvoiceCompany = '';
+                _ledgerJournalTransCustPaymJour.MarkedInvoiceRecId = 0;
+            }
+            else
+            {
+                _ledgerJournalTransCustPaymJour.MarkedInvoice = local_CustTrans.Invoice;
+                _ledgerJournalTransCustPaymJour.MarkedInvoiceCompany = local_CustTransOpen.company();
+                _ledgerJournalTransCustPaymJour.MarkedInvoiceRecId = local_CustTransOpen.RecId;
+            }
+
+            trancount++;
+        }
+
+        SKS_LB_Payment::LBFee(_ledgerJournalTransCustPaymJour, _JournalAR.FeeId, _JournalAR.FeeValue);
+        if(SKS_LB_Payment::isOffsetDimMapped(_Journal.FormatID))
+        {
+            _ledgerJournalTransCustPaymJour.OffsetDefaultDimension = _JournalAR.OffsetDimension;
+        }
+
+        if(_JournalAR.isDED)
+        {
+            if(sks_pp_setup.FFTPM)
+            {
+                tmpLedgerJournalTrans = _ledgerJournalTransCustPaymJour;
+                SKS_LB_Payment::TPMFindDedCALL(_JournalAR, tmpLedgerJournalTrans);
+                select firstonly * from lCustPaymModeTable where lCustPaymModeTable.PaymMode == 'DED';
+                _ledgerJournalTransCustPaymJour.PaymMode = 'DED';
+                dimensionSources = new List(Types::Class);
+                mergedLedgerDimension = LedgerDimensionDefaultingEngine::createLedgerDimension(lCustPaymModeTable.paymentLedgerDimension, dimensionSources);
+                _ledgerJournalTransCustPaymJour.OffsetLedgerDimension = mergedLedgerDimension;
+                _ledgerJournalTransCustPaymJour.OffsetAccountType = lCustPaymModeTable.AccountType;
+                
+            }
+
+            _ledgerJournalTransCustPaymJour.DocumentNum = _JournalAR.LBInvoice;
+        }
+        return errortext;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustParameterSettlementType</Name>
+				<Source><![CDATA[
+    public static server SettlementType getCustParameterSettlementType()
+    {
+        SettlementType retSettlementType;
+
+        if(CustParameters::find().AutoSettle)
+        {
+            retSettlementType = SettlementType::OpenTransact;
+        }
+        else
+        {
+            retSettlementType = SettlementType::None;
+        }
+
+        return retSettlementType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDynamicAccountByCompany</Name>
+				<Source><![CDATA[
+    public static DimensionDynamicAccount getDynamicAccountByCompany(CompanyId _customerCompany, LedgerJournalAC _custid)
+    {
+
+        ;
+        changeCompany(_customerCompany)
+        {
+            return LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(_custId, LedgerJournalACType::Cust);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getImportDate</Name>
+				<Source><![CDATA[
+    public static server Date getImportDate(SKS_LB_JournalAR _SKS_LB_JournalAR)
+    {
+        date retDate;
+
+        retDate = DateTimeUtil::date(_SKS_LB_JournalAR.createdDateTime);
+
+        return retDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMethodOfPayment</Name>
+				<Source><![CDATA[
+    static CustPaymMode getMethodOfPayment(CompanyId _customerCompany, CustAccount _custAccount, CompanyBankAccountId _BankAcctId = '', SKS_LB_FormatId _FormatId = '')
+    {
+        SKS_LB_Bank sks_lb_bank;
+        ;
+
+        select firstonly methodofpayment from sks_lb_bank where sks_lb_bank.BankAccountId == _BankAcctId && sks_lb_bank.LBFormatId == _FormatId;
+
+        if (sks_lb_bank.MethodOfPayment != '')
+        {
+            return sks_lb_bank.MethodOfPayment;
+        }
+
+        return custtable::findByCompany(_customerCompany, _custAccount).PaymMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_LB_JournalAR</Name>
+				<Source><![CDATA[
+    public static server SKS_LB_JournalAR getSKS_LB_JournalAR(JournalId _journalId, SKS_LB_BatchNum _batchNumber)
+    {
+        SKS_LB_JournalAR lSKS_LB_JournalAR;
+
+        select count(RecId) from lSKS_LB_JournalAR where
+            lSKS_LB_JournalAR.JournalId == _journalId &&
+            lSKS_LB_JournalAR.BatchNum == _batchNumber;
+
+        return lSKS_LB_JournalAR;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isOffsetDimMapped</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// is offset dimension mapped method
+    /// </summary>
+    /// <param name = "_FormatID">_FormatID</param>
+    /// <returns>boolean</returns>
+    public static boolean isOffsetDimMapped(SKS_LB_FormatId   _FormatID)
+    {
+        SKS_LB_FileFormatDet    FileFormatDet;
+
+        select firstOnly FileFormatDet where FileFormatDet.FormatID == _FormatID && FileFormatDet.FieldType == SKS_LB_FieldType::OffsetDim;
+
+        if(FileFormatDet)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>journalErrorsExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Journal Error exists
+    /// </summary>
+    /// <param name = "_journalId">_journalId</param>
+    /// <param name = "_batchNumber">_batchNumber</param>
+    /// <returns>boolean</returns>
+    public static server boolean journalErrorsExist(JournalId _journalId, SKS_LB_BatchNum _batchNumber)
+    {
+        SKS_LB_JournalARErrors lSKS_LB_JournalARErrors;
+        boolean ret;
+
+        select count(RecId) from lSKS_LB_JournalARErrors where
+            lSKS_LB_JournalARErrors.JournalId == _journalId &&
+            lSKS_LB_JournalARErrors.BatchNum == _batchNumber;
+
+        if(lSKS_LB_JournalARErrors.RecId > 0)
+        {
+            ret = true;
+        }
+        else
+        {
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LBFee</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// LB fee method
+    /// </summary>
+    /// <param name = "ledgerJournalTrans">ledgerJournalTrans</param>
+    /// <param name = "_FeeId">_FeeId</param>
+    /// <param name = "_FeeValue">_FeeValue</param>
+    /// <param name = "_custId">_custId</param>
+    static void LBFee(LedgerJournalTrans ledgerJournalTrans, CustVendPaymFeeId _FeeId, PaymFeeValue _FeeValue, CustAccount _custId = '')
+    {
+        CustVendPaymJournalFee  custVendPaymJournalFee;
+        CustPaymFee custPaymFee;
+        ;
+
+        if(_FeeId != '' && _FeeValue != 0)
+        {
+            ttsBegin;
+
+            custPaymFee = CustPaymFee::find(_FeeId);
+
+            custVendPaymJournalFee.initValue();
+            custVendPaymJournalFee.Module       = ModuleCustVend::Cust;
+            custVendPaymJournalFee.RefRecId     = LedgerJournalTrans.RecId;
+            custVendPaymJournalFee.FeeId        = _FeeId;
+            custVendPaymJournalFee.FeeCurrency  = ledgerJournalTrans.CurrencyCode;
+
+            custVendPaymJournalFee.FeeValue = _FeeValue;
+
+
+            if (custPaymFee.FeePosting == PaymFeePostingCust::Cost)
+            {
+                custVendPaymJournalFee.LedgerJournalACType = LedgerJournalACType::Ledger;
+                custVendPaymJournalFee.LedgerDimension = ledgerJournalTrans.getLedgerDimensionForLedgerType(custPaymFee.LedgerDimension, curext());
+                
+                if(_custId != '')
+                {                    
+                    //custVendPaymJournalFee.LedgerDimension = LedgerDimensionFacade::ServiceCreateLedgerDimension(ledgerJournalTrans.getLedgerDimensionForLedgerType(custPaymFee.LedgerDimension, curext()), Custtable::find(_custId).DefaultDimension);
+                    custVendPaymJournalFee.LedgerDimension = LedgerDimensionFacade::ServiceCreateLedgerDimension(custVendPaymJournalFee.LedgerDimension, Custtable::find(_custId).DefaultDimension);
+                }
+            }
+            else
+            {
+                custVendPaymJournalFee.parmCustVendAccount(ledgerJournalTrans.parmAccount(), LedgerJournalACType::Cust);
+            }
+            custVendPaymJournalFee.DefaultDimension = custtable::findByLedgerDimension(custVendPaymJournalFee.LedgerDimension).DefaultDimension;
+            custVendPaymJournalFee.insert();
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PaymentNumberSequence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// payment number sequence method
+    /// </summary>
+    /// <returns>string</returns>
+    public static str PaymentNumberSequence()
+    {
+        NumberSequenceReference    SetupNumberSequenceReference;
+        NumberSeq  NumberSeq = new NumberSeq();
+        str paymentNumberSequence;
+        ;
+
+        SetupNumberSequenceReference = SKS_PP_Setup::numRefLockboxPaymentReferenceNumber();
+        NumberSeq = NumberSeq::newGetNum(SetupNumberSequenceReference);
+        paymentNumberSequence = NumberSeq.num();
+
+        return paymentnumbersequence;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>TPMFindDedCall</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// TPM find deduction method
+    /// </summary>
+    /// <param name = "_JournalAR">_JournalAR</param>
+    /// <param name = "tmpLedgerJournalTrans">tmpLedgerJournalTrans</param>
+    public static void TPMFindDedCall(SKS_LB_JournalAR   _JournalAR, LedgerJournalTrans tmpLedgerJournalTrans)
+    {
+        tmpLedgerJournalTrans.(fieldName2id(tmpLedgerJournalTrans.tableid, 'FoxDeductionCategoryKey')) = SKS_TPM_PaymentJournal::AssignDedCatToLJT(_JournalAR.CustAccount, _JournalAR.PmtAmountCur, _JournalAR.company(), _JournalAR.FFDedCat);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSKS_LB_JournalAR_Pmt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the sks_lb_journalar payment
+    /// </summary>
+    /// <param name = "_SKS_LB_JournalAR">_SKS_LB_JournalAR</param>
+    /// <param name = "_LedgerJournalTransRecId">_LedgerJournalTransRecId</param>
+    public static server void updateSKS_LB_JournalAR_Pmt(SKS_LB_JournalAR _SKS_LB_JournalAR, RefRecId _LedgerJournalTransRecId)
+    {
+        SKS_LB_JournalAR lSKS_LB_JournalAR;
+
+        update_recordSet lSKS_LB_JournalAR
+            setting LedgerJournalTransRecId = _LedgerJournalTransRecId
+            where lSKS_LB_JournalAR.RecId == _SKS_LB_JournalAR.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SubmitToWorkFlow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// submit to workflow method
+    /// </summary>
+    /// <param name = "_LedgerJournalTable">_LedgerJournalTable</param>
+    /// <param name = "_JournalName">_JournalName</param>
+    private void SubmitToWorkFlow(LedgerJournalTable    _LedgerJournalTable, LedgerJournalNameId _JournalName)
+    {
+        LedgerJournalName   lLedgerJournalName;
+        WorkflowTable       lWorkflowTable;
+
+        ttsbegin;
+        select firstonly * from lLedgerJournalName join lWorkflowTable where lLedgerJournalName.JournalName == _JournalName
+                && lLedgerJournalName.Configuration == lWorkflowTable.SequenceNumber;
+
+        WorkflowVersionTable        workflowConfigurationTable;
+        workflowConfigurationTable = Workflow::findWorkflowConfigToActivateForType(workFlowTypeStr(CustPaymentTemplate),
+                                                                             _LedgerJournalTable.recid,
+                                                                             tableNum(LedgerJournalTable));
+        Workflow::activateFromWorkflowConfigurationId(workflowConfigurationTable.ConfigurationId, _LedgerJournalTable.recid, '', NoYes::No);
+        _LedgerJournalTable.WorkflowApprovalStatus = LedgerJournalWFApprovalStatus::Submitted;
+        _LedgerJournalTable.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CalcUnsettledAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate unsettled amount
+    /// </summary>
+    /// <param name = "_SKS_LB_JournalAR">_SKS_LB_JournalAR</param>
+    /// <returns>amount</returns>
+    public amountcur CalcUnsettledAmount(SKS_LB_JournalAR _SKS_LB_JournalAR)
+    {
+        if(_SKS_LB_JournalAR.IsTransferredToLedger)
+        {
+            return 0;
+        }
+        else
+        {
+            return (_SKS_LB_JournalAR.PmtAmountCur - _SKS_LB_JournalAR.ActualSettleAmountCur);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreatePaymentProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// createPaymentProcess static method
+    /// </summary>
+    /// <param name = "_paymParms">_paymParms</param>
+    /// <Issue21511>
+    public static void CreatePaymentProcess(container _paymParms)
+    {
+        SKS_LB_Payment sks_lb_payment;
+        LedgerJournalId paymentJournalNum = conPeek(_paymParms, 1);
+        JournalId journalNum = conPeek(_paymParms, 2);
+        SKS_LB_BatchNum batchNum = conPeek(_paymParms, 3);
+        real totalAppliedAmount = conPeek(_paymParms, 4);
+        real totalPaymentAmount = conPeek(_paymParms, 5);
+        boolean checked = conPeek(_paymParms, 6);
+        Date checkDate = conPeek(_paymParms, 8);
+        Date transDate = conPeek(_paymParms, 7);
+
+        sks_lb_payment = SKS_LB_Payment::contruct();
+        
+        sks_lb_payment.setIsStatic(true);
+
+        if(paymentJournalNum)
+        {
+            sks_lb_payment.setLBPaymentJournalNum(paymentJournalNum);
+        }
+        
+        sks_lb_payment.setLBJournalId(journalNum);
+        sks_lb_payment.setLBBatchNumber(batchNum);
+        sks_lb_payment.setTotalAppliedAmount(totalAppliedAmount);
+        sks_lb_payment.setTotalPaymentAmount(totalPaymentAmount);
+        
+        if(checked)
+        {
+            sks_lb_payment.setUseCheckDate(true);
+        }
+        else
+        {
+            sks_lb_payment.setUseCheckDate(false);
+            sks_lb_payment.setCheckDate(checkDate);
+        }
+        
+        sks_lb_payment.setTransDate(transDate);
+        
+        sks_lb_payment.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setIsStatic</Name>
+				<Source><![CDATA[
+    //</Issue21511>
+
+    /// <summary>
+    /// setIsStatic method
+    /// </summary>
+    /// <param name = "_isStatic">_isStatic</param>
+    /// <Issue21511>
+    void setIsStatic(boolean _isStatic)
+    {
+        isStatic = _isStatic;
+    }
+    //</Issue21511>
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

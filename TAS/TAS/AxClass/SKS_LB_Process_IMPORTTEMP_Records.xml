@@ -1,0 +1,4161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_Process_IMPORTTEMP_Records</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class  SKS_LB_Process_IMPORTTEMP_Records
+{
+    JournalId  m_LB_JournalID;  // This holds the JournalID for subsequent calls to the main function Journal_ARLB_Insert
+    real    m_AmtApplied;   //Amount Applied for a customer account.  Used in ApplyToCustTransOpen.
+    real    m_ApplyAmtRem;  //Amount of Check remaining to be applied.  Used in ApplyToCustTransOpen.
+    real    m_TotalRemBal;  //Total Remaining Balance for a customer account.  Used in ApplyToCustTransOpen.
+    int     m_Batch_Number;       //Current batch number when being assigned automatically.
+    int     m_Payment_Count;  //Payment counter. Used if batch split is based on count.
+    str     m_Previous_Customer; //holder for previous customer id
+    str     m_Previous_Check;  //holder for previous check number
+    str     m_message;
+    boolean     m_diffdimensions;
+    boolean     m_SumLikeRef;
+    boolean     NoMappedsettlement;
+    InvoiceID m_invcNbr;  // This holds the Invoice number if one exists
+    SKS_LB_Journal tmpSKS_lb_Journal;
+    boolean splitPayment;
+
+    SKS_LB_SettlementMethod m_settleMethod;  // This holds the settlement method
+
+    SKS_LB_JournalAR tmpSKS_LB_JournalAR;
+    SKS_PP_Setup    sks_pp_setup;
+    SKS_LB_JournalAR    sks_lb_journalar;
+
+    SKS_LB_MatchParms lMatchParms;
+
+    BankChequeNum m_ChkNum;
+    AmountCur m_ChkAmt;
+    CustVendAC m_CustAcct;
+    SelectableDataArea m_CustCompany;
+    DimensionDefault m_defaultDimension;
+    SKS_LB_LineNumber m_ParentRecId;
+    NoYes m_autoCreditGenerated;
+    int64 gErrRecordID;
+    SKS_LB_JournalARErrors tmpSKS_LB_JournalARErrors;
+    boolean     UseOldestDueDate;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>AddDataLine</Name>
+				<Source><![CDATA[
+    private void AddDataLine(SKS_LB_FileType filetype, str filename, SKS_EB_FileRecord fileRecord, sks_lb_formatid FormatID, boolean errRec = false)
+    {
+        DocuRef newDocuRef;
+
+        newDocuRef.TypeId = 'Note';
+        newDocuRef.Notes = this.readfileline(FileType, filename, filerecord, FormatID);
+        if(errRec)
+        {
+            newDocuRef.RefCompanyId = TmpSKS_LB_JournalARErrors.DataAreaId;
+            newDocuRef.RefTableId = TmpSKS_LB_JournalARErrors.TableId;
+            newDocuRef.RefRecId = TmpSKS_LB_JournalARErrors.RecId;
+        }
+        else
+        {
+            newDocuRef.RefCompanyId = tmpSKS_LB_JournalAR.DataAreaId;
+            newDocuRef.RefTableId = tmpSKS_LB_JournalAR.TableId;
+            newDocuRef.RefRecId = tmpSKS_LB_JournalAR.RecId;
+        }
+        newDocuRef.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ApplyToCustTransOpen</Name>
+				<Source><![CDATA[
+    void ApplyToCustTransOpen(
+        CustTransOpen       _custTransOpen,
+        JournalId           _journalID,
+        int                 _alwaysApplyDisc,
+        CustCurrencyCode    _pmtCurrencyCode,
+        real                _pmtExchRate,
+        real                _discAmtToApply, //in Pmt currency
+        date                _pmtDate,
+        int64               _pmtRecordID,   // RecordID from XDDBatchARLB (Good grid)
+        str                 _chkNbr,         //Check/CM Number
+        InvoiceId           _invoice,
+        sks_lb_matchtype    _matchtype,
+        boolean             dosettlement,
+        real                _invApplyAmt,
+        CustPaymSettlementManager settlementManager,
+        SKS_LB_WriteoffDetails _WriteOffDetails = null,
+        boolean _sepPaymByInv = false
+    )
+    {
+        real    applyAmt = 0;
+        real    maxToApply = 0;
+        amountcur   amountover = 0;
+        SKS_LB_PaymentAmt sks_lb_paymentAmt;
+        SKS_LB_JournalARApplic  locJournalARApplic;
+        CustTrans CustTrans;
+        ;
+
+        // If settlement method is no settlement, load invoices and apply 0.
+        // If the invoice is already in a spectrans or another lockbox, don't apply more to it.  We will load it with a zero apply amount.
+        if(dosettlement && _custTransOpen)
+        {
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            //if(settlementManager.SKS_lbIsAlreadyMarked(_custTransOpen, 0) && m_SumLikeRef == NoYes::No)
+            if (!_custTransOpen.sksIsAmountFullyCovered())
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            {
+                doSettlement = true;
+            }           
+        }
+        else
+        {
+            dosettlement = false;
+        }
+
+        if(doSettlement)
+        {
+            sks_lb_paymentAmt = this.calculateMaxToApply(_custTransOpen, _pmtCurrencyCode, _pmtExchRate, _pmtDate, _alwaysApplyDisc, _discAmtToApply, _invApplyAmt, settlementManager);
+            _DiscAmtToApply = sks_lb_paymentAmt.DiscAmtToApply();
+            MaxToApply = sks_lb_paymentAmt.MaxToApply();
+
+            if (MaxToApply > 0)
+            {
+                if ((m_ApplyAmtRem - MaxToApply) > 0)
+                {
+                    ApplyAmt = MaxToApply;
+                    m_ApplyAmtRem = m_ApplyAmtRem - MaxToApply;
+                }
+                else
+                {
+                    ApplyAmt = m_ApplyAmtRem;
+                    m_ApplyAmtRem = 0;
+                }
+            }
+            else if (MaxToApply < 0) // Credit note
+            {
+                if(UseOldestDueDate && SKS_PP_Setup::find().LBOldestDueDateCredits)
+                {
+                    ApplyAmt = maxToApply;
+                    m_ApplyAmtRem = m_ApplyAmtRem - MaxToApply;
+                }
+                else if(m_ApplyAmtRem > 0)
+                {
+                    ApplyAmt = 0;
+                }
+                else if ((m_ApplyAmtRem - MaxToApply) < 0)
+                {
+                    ApplyAmt = MaxToApply;
+                    m_ApplyAmtRem = m_ApplyAmtRem - MaxToApply;
+                }
+                else
+                {
+                    ApplyAmt = m_ApplyAmtRem;
+                    m_ApplyAmtRem = 0;
+                }
+            }
+
+            //Keep track of the amount applied and the total remaining balance in class variables
+            m_AmtApplied = m_AmtApplied + ApplyAmt;
+
+            if(ApplyAmt != 0)
+            {
+                m_TotalRemBal = m_TotalRemBal + (MaxToApply - ApplyAmt);
+
+                if(_SepPaymByInv)
+                {
+                    tmpSKS_LB_JournalAR.ActualSettleAmountCur = applyAmt;
+                }
+                else
+                {
+                    tmpSKS_LB_JournalAR.ActualSettleAmountCur = m_AmtApplied;
+                    tmpSKS_LB_JournalAR.PendingSettlement = 0;
+                }
+            }
+
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            amountover = this.InsertJournalARApplic(_DiscAmtToApply, ApplyAmt, _custTransOpen.RecId, _custTransOpen.sksGetRemainingAmount(), _custTransOpen.RefRecId, _custTransOpen.dataAreaId, tmpSKS_LB_JournalAR, _invoice, _matchtype, _WriteOffDetails);
+            //amountover = this.InsertJournalARApplic(_DiscAmtToApply, ApplyAmt, _custTransOpen.RecId, _custTransOpen.AmountCur, _custTransOpen.RefRecId, _custTransOpen.dataAreaId, tmpSKS_LB_JournalAR, _invoice, _matchtype, _WriteOffDetails);
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            changeCompany(_custTransOpen.company())
+            {
+                select count (RecId), maxOf(CustTransdataareaid), maxOf(CustTransRecId) from locJournalARApplic where locJournalARApplic.sks_lb_journalarrecid == tmpSKS_LB_JournalAR.recid
+                    && locJournalARApplic.SettleAmountCur != 0;
+
+                if(locJournalARApplic.recid == 1)
+                {
+                    select firstonly Invoice from custtrans where CustTrans.RecId == locJournalARApplic.custtransrecid;
+                    tmpSKS_LB_JournalAR.invoice = CustTrans.invoice;
+                }
+                else if(locJournalARApplic.recid > 1)
+                {
+                    tmpSKS_LB_JournalAR.invoice = '*';
+                }
+                else
+                {
+                    tmpSKS_LB_JournalAR.invoice = '';
+                }
+            }
+
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            if(amountover && ( _custTransOpen.sksGetRemainingAmount() > 0 && amountover > 0) || (_custTransOpen.sksGetRemainingAmount() < 0 && amountover < 0))
+            //if(amountover && ( _custTransOpen.AmountCur > 0 && amountover > 0) || (_custTransOpen.AmountCur < 0 && amountover < 0))
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            {
+                tmpSKS_LB_JournalAR.ActualSettleAmountCur -= amountover;
+            }
+            TmpSKS_LB_JournalAR.update();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>BlockSKSJournal</Name>
+				<Source><![CDATA[
+    private void BlockSKSJournal()
+    {
+        if(tmpSKS_lb_Journal.SessionId == 0)
+        {
+            tmpSKS_lb_Journal = SKS_LB_JournalInUse::updateBlockServer(tmpSKS_lb_Journal, JournalBlockLevel::None, JournalBlockLevel::InUse, strFmt("@SKS911",tmpSKS_lb_Journal.JournalId, tmpSKS_lb_Journal.BatchNum));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateMaxToApply</Name>
+				<Source><![CDATA[
+    SKS_LB_PaymentAmt calculateMaxToApply(CustTransOpen _custTransOpen, CustCurrencyCode _pmtCurrencyCode, ExchRate _exchRate, date _pmtDate, int _alwaysApplyDisc, real _discAmtToApply, real _settlementamount, CustPaymSettlementManager settlementManager)
+    {
+
+        CustTrans custTrans;
+
+        real    invBalPmtCury;
+        real    discBalPmtCury;
+        real    maxToApply = 0;
+        real    discAmtToApply;
+
+        AmountCur paymentCuryDocBal;
+        AmountCur paymentCuryDiscBal;
+        AmountCur paymentCurySettleAmt;
+
+        AmountCur transCuryDocBal;
+        AmountCur transCuryDiscBal;
+        AmountCur transCurySettleAmt;
+        container Company;
+
+
+        SKS_LB_PaymentAmt sks_lb_paymentAmt = new SKS_LB_PaymentAmt();
+        CustParameters  CustParameters;
+        ;
+        discAmtToApply = _discAmtToApply;
+        // Get the CustTrans you can get it from CustTransOpen
+        custTrans =  _custTransOpen.custTrans();
+        company += _custTransOpen.company();
+        select firstonly crossCompany:Company currencycode from custtrans where custTrans.recid == _custTransOpen.RefRecId;
+
+        discBalPmtCury = settlementManager.calcCashDiscAmountToTake(_custTransOpen);
+        if (!(discBalPmtCury + _settlementamount >= _custTransOpen.AmountCur))
+        {
+            select CashDiscForPartialPaym from CustParameters;
+            if(CustParameters.CashDiscForPartialPaym == noyes::Yes)
+            {
+                discBalPmtCury = settlementManager.calculatePartialApplicableCashDiscount(_custTransOpen, _settlementamount);
+            }
+            else
+            {
+                discBalPmtCury = 0;
+            }
+        }
+
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+        //InvBalPmtCury = _custTransOpen.AmountCur;
+        InvBalPmtCury = _custTransOpen.sksGetRemainingAmount();
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+        //If currency of payment (from file) is different than currency of invoice we are applying the payment to
+        //then we need to convert the payment settlement amont to base, then to convert it to currency of the invoice from base
+        if (_pmtCurrencyCode != custTrans.CurrencyCode)
+        {
+            changeCompany(_custTransOpen.dataAreaId)
+            {
+
+                // This will give you the transaction currency settlement amount with the discount already calculated
+                // It also uses the Method of Payment to determine days of grace
+                transCurySettleAmt = settlementManager.getSettleAmount(_custTransOpen);
+
+                // This is the original document amount in transaction currency
+                transCuryDocBal = _custTransOpen.AmountCur;
+
+                // If you need to calculate discount you can use this
+                // transCuryDiscBal = settlementManager.findCashDisc(_custTransOpen).CashDiscAmount;
+
+                // Or you can subtract transCurySettleAmt from transCuryDocBal to calculate discount
+                transCuryDiscBal = transCuryDocBal - transCurySettleAmt;
+
+                // Payment Currency amounts
+                // This function will convert the Transaction amount to the Currency amount.
+                // It determines if currency conversion is required and will handle a different currency in BAS, Invoice and Payment.
+                // ex: Bas is USD, Invoice in CAD, Payment in MXN
+                paymentCurySettleAmt = settlementManager.SKS_convertTransAmountCurToPaymAmountCur(_custTransOpen, transCurySettleAmt);
+                paymentCuryDocBal = settlementManager.SKS_convertTransAmountCurToPaymAmountCur(_custTransOpen, transCuryDocBal);
+
+                // Always subtract Settlement amount from Doc bal to determine currency.  This prevents rounding issues
+                paymentCuryDiscBal = paymentCuryDocBal - paymentCurySettleAmt;
+
+                InvBalPmtCury = paymentCuryDocBal;
+                DiscBalPmtCury = paymentCuryDiscBal;
+            }
+        }
+
+        //ApplyAmt - Amount to apply to this invoice
+        //DiscApplyAmt - Amount of discount to apply
+        //The Sum of these 2 cannot exceed the custTransOpen.AmountCur
+        if(NoMappedSettlement)
+        {
+            _discAmtToApply = DiscBalPmtCury;
+            maxToApply = invBalPmtCury - DiscBalPmtCury;
+        }
+        else
+        {
+            if (InvBalPmtCury > 0)
+            {
+                if(_alwaysApplyDisc != 1)
+                {
+
+                    if ((_discAmtToApply - DiscBalPmtCury) > 0)//if mapped discount amount is more than the calculated discount amount use the calculated discount amount
+                    {
+                        _discAmtToApply = DiscBalPmtCury;
+                    }
+                }
+
+                if(_settlementamount > invBalPmtCury)
+                {
+                    _settlementamount = invBalPmtCury - _discAmtToApply;
+                }
+
+
+                if(_discAmtToApply != 0 )
+                {
+                    if(_discAmtToApply > DiscBalPmtCury)
+                    {
+                        if((invBalPmtCury - _settlementamount) < _discAmtToApply)//discount amount cannot be greater that the invoice open amount minus the settlement amount
+                        {
+                            _discAmtToApply = invBalPmtCury - _settlementamount;//Set discount amount to the remaining open balance
+                        }
+                    }
+                }
+                else
+                {
+                    if(_settlementamount < invBalPmtCury)
+                    {
+                        if((invBalPmtCury - _settlementamount) <= DiscBalPmtCury)//discount amount cannot be greater that the invoice open amount minus the settlement amount
+                        {
+                            _discAmtToApply = invBalPmtCury - _settlementamount;//Set discount amount to the remaining open balance
+                        }
+                        else
+                        {
+                            if(CustParameters.CashDiscForPartialPaym == noyes::Yes)
+                            {
+                                _discAmtToApply= DiscBalPmtCury;
+                            }
+                        }
+                    }
+                }
+
+                //MaxToApply is the maximum of the InvBalPmtCury  we can apply (assuming there may be some discount)
+                MaxToApply = InvBalPmtCury - _discAmtToApply;
+            }
+            else if(InvBalPmtCury < 0) // Credit note
+            {
+                if(InvBalPmtCury < _settlementamount)
+                {
+                    maxToApply = _settlementamount;
+                }
+                else
+                {
+                    MaxToApply = InvBalPmtCury;
+                }
+                _discAmtToApply = 0;
+            }
+        }
+
+        sks_lb_paymentAmt.DiscAmtToApply(_discAmtToApply);
+        sks_lb_paymentAmt.MaxToApply(MaxToApply);
+
+        return sks_lb_paymentAmt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructSettlementManager1</Name>
+				<Source><![CDATA[
+    private CustPaymSettlementManager constructSettlementManager1(date _paymentDate, CurrencyCode _pmtCuryId, ExchRate _exchRate, CompanyID _customerCompany,
+                    CustAccount _CustAccount, CompanyBankAccountId _BankAcctId = '', SKS_LB_FormatId _FormatId = '')
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        ;
+
+        // Need to construct a temporary LedgerJournalTrans to use in CustPaymSettlementManager
+        ledgerJournalTrans.TransDate = _paymentDate;
+        // This should be based on the current company
+        ledgerJournalTrans.Company = curExt();
+        ledgerJournalTrans.CurrencyCode = _pmtCuryId;
+        ledgerJournalTrans.ExchRate = _exchRate;
+        ledgerJournalTrans.parmAccount(_CustAccount, LedgerJournalACType::Cust);
+        // Pass CustAccount to this method to get PaymMode
+        ledgerJournalTrans.PaymMode = SKS_LB_Payment::getMethodOfPayment(_customerCompany, _CustAccount, _BankAcctId, _FormatId);
+        // This needs set to some value.  If it is 0 an error will occur during debugging
+        ledgerJournalTrans.RecId = 1;
+
+        // Create an instance of the CustPaymSettlementManager class
+        return CustPaymSettlementManager::construct(ledgerJournalTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateAllowErrorNote</Name>
+				<Source><![CDATA[
+    private void CreateAllowErrorNote(str _invoice, real _invApplyAmt, real discAmt, SKS_LB_InvoiceIDErr _InvcErr )
+    {
+        DocuRef newDocuRef;
+
+        ;
+
+        // Loop through all the Doc refs and move them to be
+        // associated with the othe guy.
+        // Then delete the records.
+
+        newDocuRef.TypeId = 'Note';
+        newDocuRef.Notes = 'eSettlement/Lockbox: Invoice ' + _invoice +
+                            ' of amount '
+                            + num2str(_invApplyAmt, 1, 2, 1, 2) + ' with discount amount '
+                            + num2str(_invApplyAmt, 1, 2, 1, 2) + ' contained error ' + enum2str(_InvcErr) + '.';
+        newDocuRef.RefCompanyId = tmpSKS_LB_JournalAR.DataAreaId;
+        newDocuRef.RefTableId = tmpSKS_LB_JournalAR.TableId;
+        newDocuRef.RefRecId = tmpSKS_LB_JournalAR.RecId;
+        newDocuRef.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateDefaultCustNote</Name>
+				<Source><![CDATA[
+    public DocuRef CreateDefaultCustNote(BankChequeNum CheckNum, real CheckAmt, CustAccount CustAcct, str _invoice, real _invApplyAmt, real discAmt, boolean errRec = false)
+    {
+        DocuRef newDocuRef;
+
+        ;
+
+        // Loop through all the Doc refs and move them to be
+        // associated with the othe guy.
+        // Then delete the records.
+
+        newDocuRef.TypeId = 'Note';
+        newDocuRef.Notes = 'eSettlement/Lockbox: Invoice ' + _invoice +
+                            ' of amount '
+                            + num2str(_invApplyAmt, 1, 2, 1, 2) + ' with discount amount '
+                            + num2str(discAmt, 1, 2, 1, 2) + ' was assigned to the default customer.';
+        if(errRec)
+        {
+            newDocuRef.RefCompanyId = TmpSKS_LB_JournalARErrors.DataAreaId;
+            newDocuRef.RefTableId = TmpSKS_LB_JournalARErrors.TableId;
+            newDocuRef.RefRecId = TmpSKS_LB_JournalARErrors.RecId;
+        }
+        else
+        {
+            newDocuRef.RefCompanyId = tmpSKS_LB_JournalAR.DataAreaId;
+            newDocuRef.RefTableId = tmpSKS_LB_JournalAR.TableId;
+            newDocuRef.RefRecId = tmpSKS_LB_JournalAR.RecId;
+        }
+        newDocuRef.insert();
+        return newDocuRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateNote</Name>
+				<Source><![CDATA[
+    private void CreateNote(str _invoice, real _invApplyAmt)
+    {
+        DocuRef newDocuRef;
+
+        ;
+        // Loop through all the Doc refs and move them to be
+        // associated with the othe guy.
+        // Then delete the records.
+
+        //select * from DocuType where
+        newDocuRef.TypeId = 'Note';
+        newDocuRef.Notes = 'eSettlement/Lockbox: Invoice ' + _invoice +
+                               ' is already marked for settlement in another unposted payment. Settlement of '
+                               + num2str(_invApplyAmt, 1, 2, 1, 2) + ' was changed to zero.';
+        newDocuRef.RefCompanyId = tmpSKS_LB_JournalAR.DataAreaId;
+        newDocuRef.RefTableId = tmpSKS_LB_JournalAR.TableId;
+        newDocuRef.RefRecId = tmpSKS_LB_JournalAR.RecId;
+        newDocuRef.insert();
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Currency_From_To</Name>
+				<Source><![CDATA[
+    real Currency_From_To( CurrencyCode pmtCuryID, ExchRate pmtCuryRate, TransDate pmtCuryEffDate, real invBal )
+    {
+        CurrencyExchangeHelper paymExchHelper;
+        ;
+
+        paymExchHelper = CurrencyExchangeHelper::construct();
+
+        paymExchHelper.parmExchangeRate1( PmtCuryRate );
+        paymExchHelper.parmExchangeDate( PmtCuryEffDate );
+
+        return paymExchHelper.calculateAccountingToTransaction(PmtCuryID, InvBal, True );
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FlintFoxFunction</Name>
+				<Source><![CDATA[
+    public amountcur FlintFoxFunction(NoYes isFlintfoxEnabled, Amountcur _invAmount)
+    {
+        if(isFlintfoxEnabled)
+        {
+            return _invAmount * -1;
+        }
+        return _invAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetAutoCreditCreated</Name>
+				<Source><![CDATA[
+    public boolean GetAutoCreditCreated()
+    {
+        return m_autoCreditGenerated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InsertJournalARApplic</Name>
+				<Source><![CDATA[
+    amountcur InsertJournalARApplic(AmountCur _discAmt, AmountCur _settleAmt, int64 _CTORecid, amountCur _CTOAmountCur, int64 _CTORefRecID, selectabledataarea _CTODataareaID, SKS_LB_JournalAR
+                                        _sks_LB_JournalAR, InvoiceId _invoice, sks_lb_matchtype _matchtype, SKS_LB_WriteOffDetails _WriteOffDetails = null)
+    {
+        SKS_LB_JournalARApplic  journalARApplic;
+        CustParameters          CustParameters;
+        CustTrans               lCustTrans;
+        CustTransOpen           lCustTransOpen;
+        CurrencyCode            lCurrencyCode;
+        AmountCur amountover = 0;
+        AmountCur difference = 0;
+        SKS_LB_54000Bas SKS_LB_54000bas = new SKS_LB_54000Bas();
+        container virtualCompanies;
+        ;
+        virtualCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+        CustParameters = CustParameters::find();
+        select forUpdate journalARApplic where journalARApplic.SKS_LB_JournalARRecId == _sks_LB_JournalAR.RecId
+            && journalARApplic.CustTransOpenRecId == _CTORecId;
+
+        if(!tmpSKS_lb_Journal)
+        {
+            select firstOnly tmpSKS_lb_Journal where tmpSKS_lb_Journal.JournalID == _sks_LB_JournalAR.JournalId && TmpSKS_LB_Journal.BatchNum == _sks_LB_JournalAR.BatchNum;
+        }
+
+        if(journalARApplic)
+        {
+            journalARApplic.SettleAmountCur += _settleAmt;
+            journalARApplic.DiscApplyAmount += _discAmt;
+
+            select firstonly crossCompany:virtualCompanies CurrencyCode from lCustTrans where lCustTrans.RecId == _CTORefRecID;
+            select firstonly crossCompany:virtualCompanies lCustTransOpen where lCustTransOpen.RefRecId == _CTORefRecID;
+            lCurrencyCode = lCustTrans.CurrencyCode;
+
+            if(tmpSKS_lb_Journal.currencyCode != lCurrencyCode)
+            {
+                amountover = sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, tmpSKS_lb_Journal.CurrencyCode, lCurrencyCode, tmpSKS_lb_Journal.ExchRate,
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    //SKS_LB_ConvertType::TrantoPaym, lCustTransOpen.AmountCur, _sks_LB_JournalAR.PaymDate) - (journalARApplic.SettleAmountCur + journalARApplic.DiscApplyAmount);
+                    SKS_LB_ConvertType::TrantoPaym, lCustTransOpen.sksGetRemainingAmount(true, true, journalARApplic.RecId), _sks_LB_JournalAR.PaymDate) - (journalARApplic.SettleAmountCur + journalARApplic.DiscApplyAmount);
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            }
+            else
+            {
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                //amountover = (journalARApplic.SettleAmountCur + journalARApplic.DiscApplyAmount) - lCustTransOpen.AmountCur;
+                amountover = (journalARApplic.SettleAmountCur + journalARApplic.DiscApplyAmount) - lCustTransOpen.sksGetRemainingAmount(true, true, journalARApplic.RecId);
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            }
+
+            if((amountover > 0 && _CTOAmountCur > 0) || (amountover < 0 && _CTOAmountCur < 0 ))
+            {
+                journalARApplic.SettleAmountCur = _CTOAmountCur - journalARApplic.DiscApplyAmount;
+                Info(strFmt(' ' + "@SKS2361", tmpSKS_LB_JournalAR.ActualSettleAmountCur, amountover));
+                journalARApplic.FullSettlement = NoYes::Yes;
+            }
+            else if(abs(amountover) <= CustParameters.MaxMSTDiff)
+            {
+                amountover = 0;
+                if(journalARApplic.SettleAmountCur != 0)
+                {
+                    journalARApplic.FullSettlement = NoYes::Yes;
+                }
+
+                if(journalARApplic.DiscApplyAmount != 0)
+                {
+                    journalARApplic.ApplyDiscount = NoYes::Yes;
+                }
+            }
+
+            journalARApplic.update();
+        }
+        else
+        {
+            journalARApplic.DiscApplyAmount = _discAmt;
+            journalARApplic.SettleAmountCur = _settleAmt;
+
+            select firstonly crossCompany:virtualCompanies CurrencyCode from lCustTrans where lCustTrans.RecId == _CTORefRecID;
+            select firstonly crossCompany:virtualCompanies lCustTransOpen where lCustTransOpen.RefRecId == _CTORefRecID;
+            lCurrencyCode = lCustTrans.CurrencyCode;
+
+            if(tmpSKS_lb_Journal.currencyCode != lCurrencyCode)
+            {
+                difference = sks_lb_54000Bas.convertCuryAmounts(lCustTransOpen, tmpSKS_lb_Journal.CurrencyCode, lCurrencyCode, tmpSKS_lb_Journal.ExchRate,
+                    SKS_LB_ConvertType::TrantoPaym, lCustTransOpen.AmountCur, _sks_LB_JournalAR.PaymDate) - (journalARApplic.SettleAmountCur + journalARApplic.DiscApplyAmount);
+            }
+            else
+            {
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                //difference = (_settleAmt + _discAmt) -lCustTransOpen.AmountCur;
+                difference = (_settleAmt + _discAmt) - lCustTransOpen.sksGetRemainingAmount(true, true, journalARApplic.RecId);
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            }
+
+            if(abs(difference) <= CustParameters.MaxMSTDiff || difference == 0)
+            {
+                if(journalARApplic.SettleAmountCur != 0)
+                {
+                    journalARApplic.FullSettlement = NoYes::Yes;
+                }
+
+                if(journalARApplic.DiscApplyAmount != 0)
+                {
+                    journalARApplic.ApplyDiscount = NoYes::Yes;
+                }
+            }
+            journalARApplic.CustTransRecId = _CTORefRecID;
+            journalARApplic.CustTransDataAreaId = _CTODataareaID;
+            journalARApplic.CustTransOpenRecId = _CTORecid;
+            journalARApplic.SKS_LB_JournalARRecId = _sks_LB_JournalAR.RecId;
+            journalARApplic.WriteOff = this.GetAutoCreditCreated();
+            journalARApplic.LBInvoice = _sks_LB_JournalAR.LBInvoice;
+            journalARApplic.FileRecord = _sks_LB_JournalAR.FileRecord;
+            journalARApplic.AltInvLookupRef = _invoice;
+            journalARApplic.AltInvLookupType = _matchtype;
+            journalARApplic.AutoCROffsetLedgerDimension = _sks_LB_JournalAR.AutoCROffsetLedgerDimension;
+            if (gErrRecordID != 0)
+            {
+                journalARApplic.RevReasonCode = tmpSKS_LB_JournalARErrors.RevReasonCode;
+                journalARApplic.AutoCRAutoRev = tmpSKS_LB_JournalARErrors.AutoCRRev;
+                journalARApplic.AutoRevLedgerDimension = tmpSKS_LB_JournalARErrors.AutoRevLedgerDimension;
+                journalARApplic.AutoRevOffsetLedgerDimension = tmpSKS_LB_JournalARErrors.AutoRevOffsetLedgerDimension;
+            }
+            else
+            {
+                if(!this.GetAutoCreditCreated())
+                {
+                    journalARApplic.AutoRevLedgerDimension = _sks_LB_JournalAR.AutoRevLedgerDimension;
+                    journalARApplic.AutoRevOffsetLedgerDimension = _sks_LB_JournalAR.AutoRevOffsetLedgerDimension;
+                }
+                else
+                {
+                    journalARApplic.RevReasonCode = _WriteOffDetails.RevReasonCode;
+                    journalARApplic.AutoCRAutoRev = _WriteOffDetails.AutoRev;
+                    journalARApplic.AutoRevLedgerDimension = _WriteOffDetails.RevLedgerDimension;
+                    journalARApplic.AutoRevOffsetLedgerDimension = _WriteOffDetails.RevOffsetLedgerDimension;
+                }
+            }
+            if(_sks_LB_JournalAR.TrackingInvoices != '')
+            {
+                journalARApplic.TrackingInvoices = _sks_LB_JournalAR.TrackingInvoices;
+            }
+            else
+            {
+                journalARApplic.TrackingInvoices = _invoice;
+            }
+            journalARApplic.insert();
+        }
+        return amountover;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Journal_ARLB_Insert</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning("BPCheckSelectForUpdateAbsent","forupdate is required")]
+    void Journal_ARLB_Insert(
+            TMPSKS_LB_Importing     tmpRecord,
+            CompanyBankAccountId    bankAccount,
+            JournalId               lbJournalID,
+            SKS_LB_BatchNum         _formattedBatNum, 
+            str                     pathFile,
+            Date                    fileDate,
+            SKS_LB_FormatId         formatID,
+            CurrencyCode            pmtCuryID,
+            ExchRate                exchRate,
+            SKS_LB_BatchSplitType   _batchSplitType,
+            SKS_LB_BatchCount       _batchSplitCount,
+            int64                   errRecordID,
+            boolean                 _isReassign = false 
+        )
+    {
+        NoYes                       update_existing_error;
+        CurrencyCode                baseCuryID;
+        date                        paymentDate;
+        str                         lbCustID;
+        NoYes                       suggCustGood;
+        boolean                     defaultcust                 = NoYes::No;
+        boolean                     IgnoreInvErrors             = NoYes::No;
+        SKS_LB_InvoiceIDErr         IgnoredError                = SKS_LB_InvoiceIdErr::OK;
+        boolean                     SepNegPaym                  = false;
+        boolean                     useHeadDateForDiscount      = false;
+        boolean                     MatchWithoutInvoiceNumber   = false;
+
+        //-- Errors:
+        SKS_LB_CustIDErr            custIDErr; // ENUM
+        CustAccount                 custIDSugg; //   A suggested customer ID
+        CustAccount                 tmpCustID;
+        SKS_LB_InvoiceIDErr         invcNbrErr; // ENUM
+        SKS_LB_Journal              lSKS_LB_Journal;
+        NoYes                       journalARRecordExists;
+
+        //-- When moving an Error record to a Payment record
+        //-- These are the "old" values
+        str                         errCustIDErr;
+        str                         errInvcNbrErr;
+        RefRecId                    tmpPartyId;
+        SKS_LB_MatchType            tmpMatchType                = SKS_LB_MatchType::InvoiceNumber;
+        InvoiceId                   tmpMatchValue               = '';
+
+        SKS_PP_SETUP                tmpSKS_PP_SETUP;
+        SKS_LB_Bank                 tmpSKS_LB_Bank;
+        SKS_LB_JournalARErrors      LocalARErrors;
+        sks_lb_journalar            LocalAR;
+        DocuRef                     tmpDocuRef;
+        CustTable                   tmpCustTable;
+        DirPartyTable               dirPartyTable;
+        SKS_LB_Depositor            tmpSKS_LB_Depositor;
+        CustTrans                   tmpInvCustTrans;
+        CustTransOpen               tmpInvCustTransOpen;
+        SKS_LB_FileFormat           tmpSKS_LB_FileFormat;
+        SKS_LB_MatchingRules        MatchingRules;
+        container                   virtualCompanyCompanies;
+        container                   tmpCompany;
+        CompanyId                   cpnyID;
+        CustPaymSettlementManager   settlementManager;
+        SKS_LB_AutoCreateCreditDebitGroup   sks_lb_AutoCreateCreditDebitGroup;
+        SKS_LB_Depositor            l_SKS_LB_Depositor;
+        SKS_LB_CustomerMatching     SKS_LB_CustomerMatching     = new SKS_LB_CustomerMatching();
+        SKS_LB_SecondaryMatch       SKS_LB_SecondaryMatch       = new SKS_LB_Secondarymatch();
+        SKS_LB_WriteoffDetails      sks_lb_writeoffdetails;
+
+        SKS_LB_PaymentAmt           sks_lb_paymentAmt;
+        CustTable                   l_CustTable;
+        DimensionDefault            dimensionDefault;
+        ReasonCode                  AutoCRRevReasonCode;
+        SKS_LB_WriteOffId           WriteOffID;  
+        boolean                     OffsetMapped;
+        boolean                     customerValidation          = false;
+        TaxGroup                    lTaxGroup;
+        ;
+
+        splitPayment            = NoYes::No;
+        m_SumLikeRef            = NoYes::No;
+        NoMappedSettlement      = false;
+        gErrRecordID            = errRecordID;        
+        ErrCustIDErr            = '';
+        ErrInvcNbrErr           = '';
+        m_invcNbr               = '';
+        m_autoCreditGenerated   = tmpRecord.AutoCR;
+        
+        // skip over blank records
+        if( tmpRecord.CustAccount == ''             && tmpRecord.CheckNumber == ''          
+            && tmpRecord.InvoiceNumber == ''        && tmpRecord.CustBankRegNum == ''  
+            && tmpRecord.CustBankAccountNum == ''   && tmpRecord.CheckAmount == 0.0    
+            && tmpRecord.InvAmount == 0.0           && tmpRecord.DiscAmount == 0.0 )
+        {
+            return;
+        }
+
+        // Get corrosponding virtual companies
+        if(tmpRecord.CustomerCompany)
+        {
+            cpnyID = tmpRecord.CustomerCompany;
+        }
+        else
+        {
+            cpnyID = curext();
+        }
+
+        OffsetMapped = SKS_LB_Payment::isOffsetDimMapped(formatID);
+
+
+        // if no check date is passed in, today's date is used as Payment Date
+        // returns True if the date is Null
+        if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.DateDay, tmpRecord.DateMonth, tmpRecord.DateYear))
+        {
+            useHeadDateForDiscount = true;
+            if(tmpSKS_lb_Journal.HeadPaymDate != dateNull())
+            {
+                paymentDate = tmpSKS_lb_Journal.HeadPaymDate;
+            }
+            else
+            {
+                // get Today's date
+                PaymentDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            }
+        }
+        else
+        {
+            PaymentDate = mkDate(tmpRecord.DateDay, tmpRecord.DateMonth, tmpRecord.DateYear);
+        }
+
+        if(tmpRecord.PaymentType == SKS_LB_PaymentType::CreditMemo && tmpRecord.CheckAmount > 0)
+        {
+            tmpRecord.CheckAmount = tmpRecord.CheckAmount * -1;
+        }
+
+        if(tmpRecord.InvSettleType == SKS_LB_InvoiceSettleType::Credit && tmpRecord.InvAmount > 0)
+        {
+            tmpRecord.InvAmount = tmpRecord.InvAmount * -1;
+        }
+
+        //-- If no check amount in file, then set chkamt = InvApplyAmt
+        if(tmpRecord.CheckAmount == 0)
+        {
+            tmpRecord.CheckAmount = tmpRecord.InvAmount;
+        }
+
+        if(tmpRecord.InvAmount == 0)
+        {
+            NoMappedSettlement = true;
+        }
+
+        // get values from PPSetup - used when adding a XDDDepositor record
+        Select firstonly tmpSKS_PP_SETUP;        
+
+        select tmpSKS_LB_Bank
+            where   tmpSKS_LB_Bank.BankAccountId == bankAccount 
+                &&  tmpSKS_LB_Bank.LBFormatId == formatID;
+
+        virtualCompanyCompanies = SKS_LB_54000Bas::LBFindSharedServiceCompanies(tmpSKS_LB_Bank);
+        SKS_LB_CustomerMatching.GetSetCrossCompanyContainer(virtualCompanyCompanies);
+
+        // if we are defaulting from the setup record use it from there. Removed logic. 
+        // setup pushes to bank table. Bank table is always correct.
+        suggCustGood =  tmpSKS_LB_Bank.LBSuggCustGood;
+        
+        // if moving from an Error record, then Suggested Customer is ALWAYS Good
+        if (errRecordID > 0)
+        {
+            Select tmpSKS_LB_JournalARErrors 
+                  where tmpSKS_LB_JournalARErrors.RecId == errRecordID;
+            suggCustGood = NoYes::No;
+        }
+
+        //Need to get the FileFormat record so we know what to do with the Check Amounts (Accumulate or not)
+        select tmpSKS_LB_FileFormat where tmpSKS_LB_FileFormat.FormatID == FormatID;
+
+        if(m_ChkNum != tmpRecord.CheckNumber || m_ParentRecId != tmpRecord.ParentRecid)
+        {
+            m_ChkNum = '';
+            m_ChkAmt = 0.0;
+            m_CustAcct = '';
+            m_CustCompany = '';
+            m_defaultDimension = 0;
+        }
+
+
+        //-- -----------------------------------------------------
+        //-- BEGIN TRANSACTION
+        //-- -----------------------------------------------------
+
+
+        // first time in, journal is either read in or made new
+        // after first time, subsequent batches for the same journalID are maintained within this class
+        // populate SKS_LB_Journal table
+        ttsbegin;
+        if (m_LB_JournalID == '' || m_LB_JournalID != lbJournalID)
+        {
+            Select forupdate tmpSKS_lb_Journal 
+                where tmpSKS_lb_Journal.JournalID == lbJournalID
+                    && tmpSKS_lb_Journal.BatchNum == _formattedBatNum;
+
+            if (errRecordID == 0)
+            {
+                //filler header date in "5" record is 111111
+                if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear))
+                {
+                    tmpSKS_LB_Journal.HeadPaymDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                }
+                else
+                {
+                    tmpSKS_LB_Journal.HeadPaymDate = mkDate( tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear );
+                    if(useHeadDateForDiscount)
+                    {
+                        paymentDate = tmpSKS_lb_Journal.HeadPaymDate;
+                    }
+                }
+            }
+
+            if( tmpSKS_LB_Journal.JournalID == '' )
+            {
+                switch (_batchSplitType)
+                {
+                    case SKS_LB_BatchSplitType::None:
+                        _formattedBatNum = '';
+                        break;
+                    case SKS_LB_BatchSplitType::SplitByCount:
+                        m_Batch_Number = 1;
+                        _formattedBatNum = '00001';
+                        break;
+                    case SKS_LB_BatchSplitType::SplitByIdentifier:
+                        _formattedBatNum = tmpRecord.BatchNum;
+                        break;
+                }
+                tmpSKS_LB_Journal.JournalID = LBJournalID;
+
+                tmpSKS_LB_Journal.BankAcct = BankAccount;
+                tmpSKS_LB_Journal.CurrencyCode = PmtCuryID;
+                tmpSKS_LB_Journal.PmtTotal = 0;
+                tmpSKS_LB_Journal.FormatID = FormatID;
+                tmpSKS_LB_Journal.ExchRate = ExchRate;
+                tmpSKS_LB_Journal.BatchNum = _formattedBatNum;
+                tmpSKS_lb_Journal.FileName = pathfile;
+                tmpSKS_LB_Journal.insert();
+                
+                this.BlockSKSJournal();
+                this.resetCounters();
+            }
+
+            m_LB_JournalID = tmpSKS_LB_Journal.JournalID;
+
+        }   // if (m_LB_JournalID == '' || m_LB_JournalID != lbJournalID)
+
+        if(_batchSplitType == SKS_LB_BatchSplitType::SplitByIdentifier)
+        {
+            if(m_LB_JournalID != LBJournalID
+                || tmpSKS_LB_Journal.BatchNum != tmpRecord.BatchNum
+                || tmpSKS_lb_Journal.BankPmtCnt < tmpRecord.BankPmtCnt)
+            {
+                if(tmpSKS_lb_Journal.BatchNum != tmpRecord.BatchNum)
+                {
+                    tmpSKS_lb_Journal.BatchPmtCnt = 0;
+                    tmpSKS_lb_Journal.ErrCount = 0;
+                    tmpSKS_lb_Journal.PmtTotal = 0;
+                    tmpSKS_lb_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                    tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+                }
+                else
+                {
+                    tmpSKS_lb_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                    tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+                    tmpSKS_lb_Journal.update();
+                }
+            }
+        }
+        else
+        {
+            tmpSKS_lb_Journal.BankPmtCnt += tmpRecord.BankPmtCnt;
+            tmpSKS_lb_Journal.BankPmtTotal += tmpRecord.BankPmtTotal;
+            tmpSKS_lb_Journal.update();
+        }
+        ttscommit;
+
+        //-- First check to see if we have any errors
+        //  -- This will determine which file we dump the data into
+
+        //-- ...Err - error code - what type of error (blank - value is OK)
+        //-- ...Sugg - suggested value via various lookups
+        custIDErr   = SKS_LB_CustIDErr::OK;
+        custIDSugg  = '';
+        invcNbrErr  = SKS_LB_InvoiceIDErr::OK;
+
+        //-- Default settleMethod to XDDSetup value
+        m_settleMethod = tmpSKS_PP_Setup.LBSettlementMethod;
+
+        /*
+        Handling checks split over multiple invoices.
+        •   If the same Custid/check number combination exists in the import file on
+            multiple lines, these will become one combined entry in the SKS_LB_JournalAR record with multiple
+            SKS_LB_JournalARApplic records to represent the invoices it applies to.
+        •   Since a SKS_LB_JournalAR record could now represent multiple rows
+            in the import file, the SKS_LB_JournalARApplic table will now have a FileRecord field,
+            just as the SKS_LB_JournalAR table does, to point to the corresponding row
+            number in the import file.  The FileRecord field in SKS_LB_JournalAR will be -1 in a
+            given record if that record represents multiple rows from the import file, and
+            will contain the actual row number if it represents a single row from the import
+            file. If Records are autogenerated  in the SKS_LB_JournalARApplic table, by the
+            import process those rows will all have the same FileRecord as the parent.
+        •   Rows put into the SKS_LB_JournarARErrors should not be combined even if
+            the Custid/check number is a duplicate to an existing row. They will be combined
+            by the workbench screen if necessary when they are moved to SKS_LB_JournarAR.   */
+
+        //-- ------------------------------------------------------------
+        //-- Invoice Number Checks
+        //-- ------------------------------------------------------------
+        //-- Can match based solely on Invoice Number - even if CustID is not found
+        //-- We have an InvcNbr, check if it is valid
+        //-- Possible error condtions on an invoice
+        //-- Invoice not found
+        //-- Invoice found but not open-no balance
+        //-- Found, but for Wrong customer
+        //-- Inv. Apply Amt > Invoice Bal
+        //-- Other Pending Settlements for this invoice (Already marked for settlement in another Payment journal or LB Journal)
+
+        m_InvcNbr = '';
+        select firstonly CustomParseClass from MatchingRules 
+            where   Matchingrules.GroupID    == tmpsks_lb_bank.matchingrulesGroupID 
+                && (MatchingRules.lookuptype == SKS_LB_MatchType::Custom
+                ||  MatchingRules.lookuptype == SKS_LB_MatchType::CustomerAndAmount
+                ||  MatchingRules.lookuptype == SKS_LB_MatchType::CustomerAndInvBalance
+                ||  MatchingRules.lookupType == SKS_LB_MatchType::UnstrData);
+        //errRecordID flag must be false. Don't want to go through matching process if moving to good grid and no invoice number exists
+        if(MatchingRules && !errRecordID)
+        {
+            MatchWithoutInvoiceNumber = true;
+        }
+
+        if ( (tmpRecord.InvoiceNumber != '' || (errRecordID && tmpSKS_LB_JournalARErrors.CustTransOpenRecId) || MatchWithoutInvoiceNumber))
+        {
+            if(errRecordID)
+            {
+                // If the errRecordID value is set, then the record is in the process of moving from the
+                // error grid to the good grid.
+                // The invoice ID is set by now ( if it can be ) so just see if the invoice exists and
+                // do not do the secondary search.
+                //
+                // Going after CustTrans AND CustTransOpen tables.  CustTrans exist for life of doc
+                // there is a corresponding CustTransOpen linked to the CustTrans only while it is open
+                Select crosscompany:virtualCompanycompanies tmpInvCustTrans
+                            where tmpInvCustTrans.RecId == tmpSKS_LB_JournalARErrors.CustTransRecId
+                        join tmpInvCustTransOpen
+                            where (tmpInvCustTransOpen.RecId == tmpSKS_LB_JournalARErrors.CustTransOpenRecId);
+
+            }
+
+            if (tmpInvCustTransOpen)
+            {
+                invcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                this.ReduceCreditWriteOffProcess(tmpRecord, tmpInvCustTransOpen, tmpSKS_PP_SETUP, tmpInvCustTrans, paymentDate, 
+                                                    virtualCompanyCompanies, formatID, bankAccount, pathFile, fileDate, TmpSKS_LB_Journal);
+            }
+            else
+            {
+                lMatchParms = SKS_LB_SecondaryMatch.ReferenceMatch(bankAccount, lbJournalID, tmpSKS_LB_Journal.BatchNum, pathFile, tmpRecord.FileDate, formatID,
+                                                                    virtualCompanycompanies, tmpsks_lb_bank.matchingrulesGroupID, tmpRecord);
+                customerValidation = lMatchParms.CustomerValidation();
+                if(lMatchParms.CustomOnAccount() == true)
+                {
+                    if(_batchSplitType != SKS_LB_BatchSplitType::None)
+                    { 
+                        select forupdate firstOnly tmpSKS_LB_JournalAR 
+                            where tmpSKS_LB_JournalAR.recid == lMatchParms.Journalarrecid();
+                        if(tmpSKS_LB_JournalAR)
+                        {
+                            this.SplitBatch(tmpSKS_LB_JournalAR, _batchSplitType, tmpRecord, _isReassign, _batchSplitCount, 
+                                                                tmpSKS_LB_Journal, pathFile);
+                        }
+                    }
+                    if( errRecordID != 0)
+                    {
+                        if ( errRecordID != 0 )
+                        {
+                            delete_from tmpSKS_LB_JournalARErrors
+                                where tmpSKS_LB_JournalARErrors.RecId == errRecordID;
+                        }
+                    }
+                    return;
+                }
+
+                tmpMatchType = lMatchParms.MatchType();
+                tmpMatchValue = lMatchParms.MatchValue();
+                invcNbrErr = lMatchParms.invoiceIDErr();
+                m_CustCompany = TmpInvCustTransOpen.dataareaid;
+
+                if(invcNbrErr != SKS_LB_InvoiceIDErr::MultipleMatchesFound)
+                {
+                    tmpInvCustTransOpen = lMatchParms.matchTransOpen();
+                    m_CustCompany = TmpInvCustTransOpen.dataareaid;
+
+                    if(tmpRecord.isDED == NoYes::No)
+                    {
+                        if (tmpInvCustTransOpen)
+                        {
+                            if(tmpSKS_PP_SETUP.FFTPM && tmpInvCustTransOpen.AmountCur > 0 && tmpRecord.InvAmount < 0)
+                            {
+                                tmpInvCustTransOpen = null;
+                                tmpRecord.isDED = NoYes::Yes;
+                                invcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                            }
+                            else if(tmpSKS_PP_SETUP.LBStandardDed && tmpInvCustTransOpen.AmountCur > 0 && tmpRecord.InvAmount < 0)
+                            {
+                                tmpInvCustTransOpen = null;
+                                tmpRecord.AresDed = NoYes::Yes;
+                                InvcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                                tmpRecord.invamount = tmpRecord.invamount * -1;
+                            }
+                            else
+                            {
+                                tmpInvCustTrans = TmpInvCustTransOpen.custTrans();
+                                m_defaultdimension = tmpInvCustTrans.DefaultDimension;
+                                tmpRecord.isDED = NoYes::No;
+                            }
+
+                            this.ReduceCreditWriteOffProcess(tmpRecord, tmpInvCustTransOpen, tmpSKS_PP_SETUP, tmpInvCustTrans, paymentDate, 
+                                                                virtualCompanyCompanies, formatID, bankAccount, pathFile, fileDate, tmpSKS_LB_Journal);
+                        }
+                        else if(tmpRecord.InvAmount < 0) // If a credit memo
+                        {
+                            invcNbrErr = SKS_LB_InvoiceIDErr::CreditNoteNotFound;
+                        }
+                    }
+                    else
+                    {
+                        if (tmpInvCustTransOpen)
+                        {                         
+                            invcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                            custIDSugg = tmpInvCustTransOpen.AccountNum;
+                            m_CustCompany = tmpInvCustTransOpen.company();
+                            tmpInvCustTransOpen = null;
+                        }
+                    } // if(tmpRecord.isDED == NoYes::No)
+                } // if(invcNbrErr != SKS_LB_InvoiceIDErr::MultipleMatchesFound)
+            } // if (tmpInvCustTransOpen)
+
+            //-- We have an Invoice Number, if valid account customer number was provided, cross check to invoice customer,
+            //   else invoice customer becomes suggested customer.
+
+            if (TmpInvCustTransOpen)
+            {
+                container CustomerInfo;
+                CustomerInfo = this.AssignCustomerByFoundInvoice(tmpInvCustTrans, TmpInvCustTransOpen, tmpRecord, CustIDErr, InvcNbrErr, custIDSugg, m_CustCompany, customerValidation);
+                invcNbrErr = conPeek(CustomerInfo, 1);
+                m_CustCompany = conPeek(CustomerInfo, 2);
+                custIDErr = conPeek(CustomerInfo, 3);
+                custIDSugg = conPeek(CustomerInfo, 4);
+                tmpInvCustTrans = conPeek(CustomerInfo, 5);
+                TmpInvCustTransOpen = conPeek(CustomerInfo, 6);
+            }
+            //-- have an invoice number
+        } // if ( (tmpRecord.InvoiceNumber != '' || (errRecordID && tmpSKS_LB_JournalARErrors.CustTransOpenRecId) || MatchWithoutInvoiceNumber))
+        // If a credit memo and no number supplied, put in errors grid
+        else if(tmpRecord.InvAmount < 0)
+        {
+            // if coming from error screen - read that record
+            if ( ErrRecordID != 0 )
+            {
+                Select tmpSKS_LB_JournalARErrors where tmpSKS_LB_JournalARErrors.RecId == ErrRecordID;
+                if (tmpSKS_LB_JournalARErrors.InvoiceIdErr == SKS_LB_InvoiceIdErr::DebitAdjustment)
+                {
+                    SepNegPaym = true;
+                    invcNbrErr = SKS_LB_InvoiceIdErr::DebitAdjustment;
+                }
+                else
+                {
+                    invcNbrErr = SKS_LB_InvoiceIDErr::CreditNoteNotFound;
+                }
+            }
+        }
+
+        // invoice Number found for this customer
+        m_InvcNbr = tmpInvCustTrans.Invoice;
+
+        // have an Invoice and don't have an invapplyamt
+        If (tmpInvCustTransOpen && tmpRecord.InvAmount == 0 )
+        {
+            if(tmpInvCustTransOpen.AmountCur < 0) // If a credit note, always use doc balance
+            {
+                tmpRecord.InvAmount = tmpInvCustTransOpen.AmountCur;
+            }
+            else
+            {
+                tmpRecord.InvAmount = tmpRecord.CheckAmount; // Use check amount
+            }
+        }
+
+        // If invoice numbe exists and is good up to this point,
+        // 1) be sure it isn't already marked in another Payment or LB Journal
+        // 2) check that settle amount is correct sign.
+        if (tmpInvCustTransOpen && (invcNbrErr == SKS_LB_InvoiceIDErr::OK))
+        {
+            if(tmpInvCustTransOpen.AmountCur > 0 && tmpRecord.InvAmount < 0  && tmpSKS_PP_SETUP.AutoCR)
+            {
+                //-- Test and see if we have a record in XDDDepositor
+                l_SKS_LB_Depositor = SKS_LB_Depositor::findWithSetup(m_CustCompany, custIDSugg);
+            }
+
+            if(l_SKS_LB_Depositor.AutoCR)
+            {
+                tmpInvCustTransOpen.RecId = 0;
+                tmpRecord.CustAccount = custIDSugg;
+            }
+            else
+            {
+                // Create an instance of the CustPaymSettlementManager class
+                changeCompany(m_CustCompany)
+                {
+                    settlementManager = SKS_LB_Process_ImportTemp_Records::constructSettlementManager(PaymentDate, PmtCuryID, ExchRate, m_CustCompany, TmpInvCustTransOpen.AccountNum, bankAccount, formatID);
+                }
+
+                if(tmpInvCustTransOpen.AmountCur > 0 && tmpRecord.InvAmount < 0)
+                {
+                    invcNbrErr = SKS_LB_InvoiceIDErr::SettleAmountMustBePositive;
+                }
+                else if (tmpInvCustTransOpen.AmountCur < 0 && tmpRecord.InvAmount > 0)
+                {
+                    invcNbrErr = SKS_LB_InvoiceIDErr::SettleAmountMustBeNegative;
+                }
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                //else if (settlementManager.SKS_lbIsAlreadyMarked(tmpInvCustTransOpen, 0))
+                else if (tmpInvCustTransOpen.sksIsAmountFullyCovered())
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                {
+                    tmpSKS_LB_JournalARErrors.InvoiceIdErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                    invcNbrErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    /*if(tmpSKS_PP_Setup.LBSumRefNum == NoYes::Yes)
+                    {
+                        if(SKS_LB_54000Bas::IsMarkedByCheck(tmpInvCustTransOpen.RecId, tmpRecord.CheckNumber, lbJournalID, tmpRecord.ParentRecid, TmpSKS_LB_Journal.Batchnum))
+                        {
+                            m_SumLikeRef = NoYes::Yes;
+                            invcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                            Info(strFmt("@SKS2360", tmpRecord.InvAmount, tmpRecord.CheckNumber, tmpRecord.InvoiceNumber));
+                        }
+                        else
+                        {
+                            tmpSKS_LB_JournalARErrors.InvoiceIdErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                            invcNbrErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                        }
+                    
+                    }
+                    else if(tmpSKS_LB_Bank.SepPaymByInv == NoYes::Yes
+                                    && !SKS_LB_54000Bas::IsMarkedByCheck(tmpInvCustTransOpen.RecId, tmpRecord.CheckNumber, 
+                                                            lbJournalID, tmpRecord.ParentRecid, TmpSKS_LB_Journal.Batchnum))
+                    {
+                        tmpSKS_LB_JournalARErrors.InvoiceIdErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                        invcNbrErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                    }
+                    else
+                    {
+                        // There is an existing SpecTrans from another transaction.
+                        tmpSKS_LB_JournalARErrors.InvoiceIdErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                        invcNbrErr = SKS_LB_InvoiceIDErr::AlreadyMarked;
+                    }
+                    */
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                }
+                else if ((tmpInvCustTransOpen.AmountCur > 0 && tmpRecord.InvAmount > 0) 
+                            || (tmpInvCustTransOpen.AmountCur < 0 && tmpRecord.InvAmount < 0))
+                {
+                    //If coming from error grid set error status to OK
+                    if ( errRecordID != 0 )
+                    {
+                        tmpSKS_LB_JournalARErrors.InvoiceIdErr = SKS_LB_InvoiceIdErr::OK;
+                        invcNbrErr = SKS_LB_InvoiceIdErr::OK;
+                    }
+                    else
+                    {
+                        sks_lb_paymentAmt = this.calculateMaxToApply(tmpInvCustTransOpen, PmtCuryID, ExchRate, PaymentDate, tmpSKS_PP_SETUP.LBAlwaysApplyDisc, 
+                                                                        tmpRecord.DiscAmount, tmpRecord.InvAmount, settlementManager);
+
+                        //Verify whether the reduce settle amount to balance process should be run
+                        if( ((tmpRecord.InvAmount > 0 && tmpRecord.InvAmount > sks_lb_paymentAmt.MaxToApply()) && (tmpSKS_PP_SETUP.LBRedSettleInvBal == NoYes::No))
+                            || ((tmpRecord.InvAmount < 0 && tmpRecord.InvAmount < sks_lb_paymentAmt.MaxToApply()) && (tmpSKS_PP_SETUP.LBRedSettleCRBal == NoYes::No)))
+                        {
+                            //Part of the import process.  Set error status to Inv. Apply Amt Greater than Inv. Balance
+                            InvcNbrErr = SKS_LB_InvoiceIDErr::InvApplyAmtGreaterThanInvBal;
+                        }
+
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        if ((tmpInvCustTransOpen.sksGetRemainingAmount() < tmpRecord.InvAmount) && tmpSKS_PP_SETUP.LBRedSettleInvBal == NoYes::No)
+                        {
+                            InvcNbrErr = SKS_LB_InvoiceIDErr::InvApplyAmtGreaterThanInvBal;
+                        }
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                        if(tmpRecord.InvAmount > SKS_LB_PaymentAmt.MaxToApply() && invcNbrErr != SKS_LB_InvoiceIDErr::InvApplyAmtGreaterThanInvBal)
+                        {
+                            tmpRecord.InvAmount = SKS_LB_PaymentAmt.MaxToApply();
+                        }
+                    }
+                }
+            } //  if(l_SKS_LB_Depositor.AutoCR)
+
+        } // if (tmpInvCustTransOpen && (invcNbrErr == SKS_LB_InvoiceIDErr::OK))
+        
+        if(invcNbrErr == SKS_LB_InvoiceIdErr::OK)
+        {
+            if(OffsetMapped)
+            {
+                if(tmpRecord.OffsetDimensionReference != '' && tmpRecord.OffsetDimension == 0 && errRecordID == 0)
+                {
+                    invcNbrErr = SKS_LB_InvoiceIdErr::OffsetDimensionNotFound;
+                }
+            }
+        }
+        // if we found an invoice, then customer or customer error was determined by the invoice process.
+        // if no invoice, then we need to look for a customer by other means if possible.
+        if (!tmpInvCustTransOpen.RecId)
+        {
+            if(custIDSugg == '')
+            {
+                if( tmpRecord.CustAccount != '' )
+                {
+                    if (errRecordID != 0) //if company from error grid read for the specific company)
+                    {
+                        tmpCompany = [tmpSKS_LB_JournalARErrors.CustomerCompany];
+                        Select crosscompany:tmpCompany * from TmpCustTable where TmpCustTable.AccountNum == tmpRecord.CustAccount;
+                        m_CustCompany = tmpSKS_LB_JournalARErrors.CustomerCompany;
+
+                    }
+                    else
+                    {
+                        if(tmpRecord.CustomerCompany)
+                        {
+                            m_CustCompany = tmpRecord.CustomerCompany;
+                        }
+                        else
+                        {
+                            SKS_LB_CustomerMatching.CustIDMatch(tmpRecord.CustAccount);
+                            custIDErr = SKS_LB_CustomerMatching.ParmCustomerError();
+                            //Redundant code necessary for customizations
+                            if(custIDErr == SKS_LB_CustIDErr::OK)
+                            {
+                                tmpRecord.CustAccount = SKS_LB_CustomerMatching.ParmAccountNum();
+                            }
+                            //Redundant code necessary for customizations
+                            m_CustCompany = SKS_LB_CustomerMatching.ParmCompanyId();
+                        }
+                    }
+                }
+                else
+                {
+                    custIDErr = SKS_LB_CustIDErr::NoCustID;
+                }
+            } // if(custIDSugg == '')
+
+            if(custIDErr != SKS_LB_CustIDErr::OK && custIDErr != SKS_LB_CustIDErr::InvcNbrLookup)
+            {
+                if (tmpRecord.CustBankRegNum != '' )
+                {
+                    if(!SKS_LB_SecondaryMatch::CheckSwiftIBAN(tmpRecord.CustBankRegNum, false ))
+                    {
+                        SKS_LB_CustomerMatching.CustBankAcctRTNMatch(tmpRecord.CustBankAccountNum, tmpRecord.CustBankRegNum, virtualCompanyCompanies);
+                        CustIDSugg = SKS_LB_CustomerMatching.ParmAccountNum();
+                        m_CustCompany = SKS_LB_CustomerMatching.ParmCompanyId();
+                        custIDErr = SKS_LB_CustomerMatching.ParmCustomerError();
+                    }
+                    Else//qualifies as swift code
+                    {
+                        SKS_LB_CustomerMatching.CustSwiftAcctMatch(tmpRecord.CustBankAccountNum, tmpRecord.CustBankRegNum, virtualCompanyCompanies);
+                        CustIDSugg = SKS_LB_CustomerMatching.ParmAccountNum();
+                        m_CustCompany = SKS_LB_CustomerMatching.ParmCompanyId();
+                        custIDErr = SKS_LB_CustomerMatching.ParmCustomerError();
+                    }
+                }
+
+                if(tmpRecord.CustBankAccountNum != '' && custIDsugg == '')
+                {
+                    if(SKS_LB_SecondaryMatch::CheckSwiftIBAN(tmpRecord.CustBankAccountNum, true))
+                    {
+                        SKS_LB_CustomerMatching.CustIBANMatch(tmpRecord.CustBankAccountNum, virtualCompanyCompanies);//qualifies as IBAN
+                        CustIDSugg = SKS_LB_CustomerMatching.ParmAccountNum();
+                        m_CustCompany = SKS_LB_CustomerMatching.ParmCompanyId();
+                        custIDErr = SKS_LB_CustomerMatching.ParmCustomerError();
+                    }
+                }
+                //Bank Reg checks
+
+                //-- Try to find Cust based on Name - locate within Name...
+                if (CustIDSugg == '')
+                {
+                    if(TmpRecord.CustName != '')
+                    {
+                        SKS_LB_CustomerMatching.CustNameMatch(tmpRecord.CustName);
+                        CustIDSugg = SKS_LB_CustomerMatching.ParmAccountNum();
+                        m_CustCompany = SKS_LB_CustomerMatching.ParmCompanyId();
+                        custIDErr = SKS_LB_CustomerMatching.ParmCustomerError();
+                    }
+                }
+                //-Cust Name checks - end
+                // All the cust lookups are done at this point. If still didn't find a cust sugg for this line, and one and only one customer was found so far for other
+                // lines on this check, then infer that the customer for this line is likely the same as the rest of the lines.
+                if (custIDSugg == '')
+                {
+                    if(m_ChkNum == tmpRecord.CheckNumber && m_ChkAmt == tmpRecord.CheckAmount && m_ParentRecId == tmpRecord.ParentRecid)
+                    {
+                        if(m_CustAcct != tmpSKS_LB_Bank.LBAutoDefaultCust)
+                        {
+                            custIDSugg = m_CustAcct;
+                            m_CustCompany = m_CustCompany;
+                            dimensionDefault = m_defaultDimension;
+                            CustIDErr = SKS_LB_CustIDErr::OK;
+                        }
+                    }
+                }
+
+                //This should take care of the default customer logic
+                if(custIDSugg == '')
+                {
+                    if(tmpSKS_LB_Bank.LBAutoDefaultCust != '')
+                    {
+                        Select crosscompany:virtualCompanycompanies * from TmpCustTable where TmpCustTable.AccountNum == tmpSKS_LB_Bank.LBAutoDefaultCust;
+                        //this.CreateDefaultCustNote(tmpRecord.CheckNumber, tmpRecord.CheckAmount, tmpSKS_LB_Bank.LBAutoDefaultCust, tmpRecord.InvoiceNumber, tmpRecord.InvAmount, tmpRecord.DiscAmount);
+                        defaultcust = NoYes::yes;
+                        custIDSugg = tmpSKS_LB_Bank.LBAutoDefaultCust;
+                        custIDErr = SKS_LB_CustIDErr::OK;
+                        m_CustCompany = tmpCustTable.company();
+                    }
+                }
+
+            } // if(custIDErr != SKS_LB_CustIDErr::OK)
+            //-- CustID found - end
+
+            if ( (CustIDErr == SKS_LB_CustIDErr::OK || CustIDErr == SKS_LB_CustIDErr::InvcNbrLookup || CustIDErr == SKS_LB_CustIDErr::BankTransLookUp)
+                    || ( (CustIDErr == SKS_LB_CustIDErr::NameLookup ||  CustIDErr == SKS_LB_CustIDErr::ManualLookup) && (strRTrim(CustIDSugg) != '' && SuggCustGood == NoYes::Yes))
+                    && tmpRecord.InvAmount < 0 )
+            {
+                //-- @CustIDSugg could be non-blank if SuggCustGood = 1 and CustIDErr = B/N/I
+                if (strRTrim(CustIDSugg) != '' )
+                {
+                    tmpCustID = CustIDSugg;
+                }
+                else
+                {
+                    tmpCustID = tmpRecord.CustAccount;
+                }
+
+                // Find SKS_LB_Depositor or Create if it doesn't exist
+                tmpSKS_LB_Depositor = SKS_EFT_CustomerLoad::CreateFindCustomerRecord(tmpCustID, null, true, true, true, m_CustCompany);
+
+                if(tmpSKS_LB_Depositor != null)
+                {
+                    writeOffID = tmpSKS_LB_Depositor.WriteOffId;
+                }
+                else
+                {
+                    writeOffID = tmpSKS_PP_Setup.LBWriteOffId;
+                }
+
+                select firstOnly SKS_LB_WriteoffDetails order by SKS_LB_WriteoffDetails.ThresholdAmount asc
+                    where SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules == writeOffId
+                        && sks_lb_writeoffdetails.CustomerCompany == m_CustCompany
+                        && sks_lb_writeoffdetails.ThresholdAmount >= abs(tmpRecord.InvAmount)
+                        && SKS_LB_WriteoffDetails.ThresholdAmount != 0
+                        && SKS_LB_WriteoffDetails.AutoCR == NoYes::Yes;
+
+                //make sure no auto write-offs are created for the default customer
+                if(SKS_LB_WriteoffDetails.AutoCR == NoYes::Yes && tmpSKS_PP_SETUP.AutoCR && !defaultcust)
+                {
+                    try
+                    {
+                        lTaxGroup = SKS_LB_Setup_AutoCRParms::find(m_CustCompany).TaxGroup;
+                        changeCompany(m_CustCompany)
+                        {
+                            sks_lb_AutoCreateCreditDebitGroup = new SKS_LB_AutoCreateCreditDebitGroup();
+
+                            m_InvcNbr = sks_lb_AutoCreateCreditDebitGroup.AutoCreateCredit(CustTable::find(tmpCustID).InvoiceAccount, tmpCustID, SKS_LB_WriteoffDetails.CRLedgerDimension, tmpRecord.InvAmount,
+                                    tmpRecord.InvoiceNumber, tmpSKS_LB_Journal.CurrencyCode, paymentDate, sks_lb_writeoffdetails.CROffsetLedgerDimension, paymentDate, lTaxGroup, tmpRecord.PaymentMOP ?   tmpRecord.PaymentMOP : SKS_LB_Bank::find(bankaccount, FormatID).MethodOfPayment,
+                                    sks_lb_writeoffdetails.ReasonCode, tmpRecord.CheckNumber, tmpRecord.InvoiceNumber, m_CustCompany);
+
+                            AutoCRRevReasonCode = SKS_LB_WriteoffDetails.RevReasonCode;
+
+                            if(m_invcNbr)
+                            {
+                                invcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                                m_autoCreditGenerated = NoYes::Yes;
+                                tmpRecord.isDED = NoYes::No;
+                                tmpRecord.AresDed = NoYes::No;
+                                tmpInvCustTrans = null;
+                                TmpInvCustTransOpen = null;
+                                
+                                select tmpInvCustTrans
+                                    where (tmpInvCustTrans.Invoice == m_invcNbr )
+                                join  tmpInvCustTransOpen
+                                    where (tmpInvCustTrans.RecId == tmpInvCustTransOpen.RefRecId);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        InvcNbrErr = SKS_LB_InvoiceIDErr::CreditNoteNotFound;
+                    }
+                }
+                else
+                {
+                    if(tmpSKS_PP_SETUP.FFTPM)
+                    {
+                        tmpRecord.isDED = NoYes::Yes;
+                        InvcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                        tmpRecord.invamount = this.FlintFoxFunction(tmpSKS_PP_Setup.FFTPM, tmpRecord.InvAmount);
+                    }
+                    else if (tmpSKS_PP_SETUP.LBStandardDed)
+                    {
+                        tmpRecord.AresDed = NoYes::Yes;
+                        InvcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                        tmpRecord.invamount = tmpRecord.invamount * -1;
+                    }
+                    else
+                    {
+                        if(InvcNbrErr != SKS_LB_InvoiceIDErr::MultipleMatchesFound && InvcNbrErr != SKS_LB_InvoiceIDErr::DebitAdjustment)
+                        {
+                            InvcNbrErr = SKS_LB_InvoiceIdErr::SettleAmountMustBePositive;
+                        }
+                    }
+                }
+            } // if(SKS_LB_WriteoffDetails.AutoCR == NoYes::Yes && tmpSKS_PP_SETUP.AutoCR && !defaultcust)
+            else
+            {
+                if(tmpRecord.isDED)
+                {
+                    InvcNbrErr = SKS_LB_InvoiceIDErr::OK;
+                    tmpRecord.invamount = this.FlintFoxFunction(tmpSKS_PP_Setup.FFTPM, tmpRecord.InvAmount);
+                }
+            }
+        } // if ( (CustIDErr == SKS_LB_CustIDErr::OK || CustIDErr == SKS_LB_CustIDErr::InvcNbrLookup || CustIDErr == SKS_LB_CustIDErr::BankTransLookUp)
+
+        //This should take care of all cases in which an invoice error would need ignored
+        if(
+            (invcNbrErr == SKS_LB_InvoiceIdErr::AlreadyMarked && (tmpSKS_PP_SETUP.LBErrorGridAllowMovePmt == NoYes::No || errRecordID == 0))
+            ||
+            (invcNbrErr != SKS_LB_InvoiceIdErr::DebitAdjustment && invcNbrErr != SKS_LB_InvoiceIdErr::ok && invcNbrErr != SKS_LB_InvoiceIdErr::AlreadyMarked)
+           )
+        {
+            if(tmpSKS_LB_Bank.LBAutoIgnoreErr == NoYes::Yes)
+            {
+                ignoreinverrors = NoYes::Yes;
+                ignoredError = invcNbrErr;
+                invcNbrErr = SKS_LB_InvoiceIdErr::OK;
+                tmpInvCustTrans = null;
+                tmpInvCustTransOpen = null;
+            }
+        }
+
+        //-- Good Records -
+        //-- 1) CustIDErr blank or Invoice Nbr LU Name - OK
+        //-- 2) CustIDErr - Bank transit/Name/Manual
+        //--        and CustIDSugg non-blank
+        //--        and Option for Suggested Customers to be Good records
+        //-- 3) InvcNbrErr blank - OK
+        //-- 4) InvcNbrErr - Amount to Apply > Invc Balance - OK
+        if ( 
+                ( CustIDErr == SKS_LB_CustIDErr::OK || CustIDErr == SKS_LB_CustIDErr::InvcNbrLookup || CustIDErr == SKS_LB_CustIDErr::BankTransLookUp)
+                || (
+                        (CustIDErr == SKS_LB_CustIDErr::NameLookup ||  CustIDErr == SKS_LB_CustIDErr::ManualLookup) 
+                            && (strRTrim(CustIDSugg) != '' && SuggCustGood == NoYes::Yes)
+                    )
+                &&
+                    (InvcNbrErr == SKS_LB_InvoiceIDErr::OK)
+                ||
+                    (invcNbrErr == SKS_LB_InvoiceIdErr::AlreadyMarked && tmpSKS_PP_SETUP.LBErrorGridAllowMovePmt == NoYes::Yes && errRecordID != 0)
+                ||
+                    (invcNbrErr == SKS_LB_InvoiceIdErr::DebitAdjustment)
+           )
+        {
+
+            //-- Lockbox file CustID
+            lbCustID = tmpRecord.CustAccount;
+
+            //-- @CustIDSugg could be non-blank if SuggCustGood = 1 and CustIDErr = B/N/I
+            if (strRTrim(custIDSugg) != '' )
+            {
+                tmpCustID = custIDSugg;
+            }
+            else
+                tmpCustID = tmpRecord.CustAccount;
+
+            tmpCompany = [m_CustCompany ? m_CustCompany : curExt()];
+
+            //-- Get Customer's name          
+            /* 
+            tmpPartyID = CustTable::find(tmpCustID).Party;
+            tmpRecord.CustName = CustTable::find(tmpCustID).name();
+            */
+            Select crossCompany:tmpCompany AccountNum, Party, DefaultDimension
+                from tmpCustTable
+                join Name
+                    from dirPartyTable
+                    WHERE tmpCustTable.Party == dirPartyTable.RecId
+                        && tmpCustTable.AccountNum == tmpCustID;
+
+            tmpPartyID = dirPartyTable.RecID;
+            tmpRecord.CustName = dirPartyTable.Name;
+
+            //-- errRecordID <> 0 if we're moving an Error to a Payment
+            //-- In this case @CustID is actually the CustIDSugg,
+            //--    so we need to get the LB CustID
+            if ( errRecordID != 0 )
+            {
+                //Determine if we're using changed payment amounts
+                if (tmpSKS_pp_setup.LBErrorShowChgdPmt == 1 && tmpSKS_LB_JournalARErrors.ChangedPmtAmountCur != 0)
+                {
+                    tmpRecord.CheckAmount = tmpSKS_LB_JournalARErrors.ChangedPmtAmountCur;
+                }
+                invcNbrErr = tmpSKS_LB_JournalARErrors.InvoiceIdErr;
+                dimensionDefault = tmpSKS_LB_JournalARErrors.DefaultDimension;
+                tmpMatchType = tmpSKS_LB_JournalARErrors.altInvlookuptype;
+                tmpMatchValue = tmpSKS_LB_JournalARErrors.AltInvLookupRef;
+            }
+            else
+            {
+                dimensionDefault = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(tmpSKS_PP_SETUP, tmpInvCustTrans.DefaultDimension, 
+                                                tmpCustTable.DefaultDimension, tmpSKS_LB_Bank.LBJournalName, m_CustCompany);
+            }
+            
+            JournalARRecordExists = NoYes::No;
+
+            if(!tmpRecord.isDED && !tmpRecord.AresDed)
+            {
+                JournalARRecordExists = this.SetJournalARRecordExists(tmpRecord, tmpSKS_LB_Bank, dimensionDefault, tmpPartyId, tmpCustID, OffsetMapped, SepNegPaym, m_CustCompany);
+                tmpSKS_LB_JournalAR = this.getsetTmpJournalAR();
+            }
+
+            // Find SKS_LB_Depositor or Create if it doesn't exist
+            tmpSKS_LB_Depositor = SKS_EFT_CustomerLoad::CreateFindCustomerRecord(tmpCustID, null, true, true, true, m_CustCompany);
+
+            //Check to see if writeoffDetails was already selected as part of the auto-credit functionality
+            if(!sks_lb_writeoffdetails)
+            {
+                select firstonly thresholdamount, SKS_LB_WriteoffRules, AutoRev, RevLedgerDimension, RevOffsetLedgerDimension, CRLedgerDimension 
+                    from SKS_LB_WriteoffDetails order by SKS_LB_WriteoffDetails.ThresholdAmount asc
+                    where SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules == tmpSKS_LB_Depositor.WriteOffId
+                        && SKS_LB_WriteoffDetails.ThresholdAmount > tmpRecord.InvAmount 
+                        && SKS_LB_WriteoffDetails.ThresholdAmount != 0;
+            }
+
+            m_settleMethod = tmpSKS_LB_Depositor.LBSettlementMethod;            
+            
+            tmpSKS_LB_JournalAR.PaymDate = PaymentDate;
+
+            if(JournalARRecordExists == NoYes::Yes)
+            {
+                //Update the line items with the latest line number from the file
+                tmpSKS_LB_JournalAR.CustName = tmpRecord.CustName;
+                tmpSKS_LB_JournalAR.DiscApplyAmt = tmpRecord.DiscAmount;
+
+                if(tmpRecord.FileLineNbrBegin > tmpSKS_LB_JournalAR.FileRecord)
+                {
+                    tmpSKS_LB_JournalAR.FileRecord = tmpRecord.FileLineNbrBegin;
+                }
+                tmpSKS_LB_JournalAR.LBInvoice = tmpRecord.LBInvoice;
+
+                if(  tmpSKS_LB_FileFormat.PmtAmtEQSumChkAmts == NoYes::Yes )
+                {
+                    tmpSKS_LB_JournalAR.PmtAmountCur = tmpSKS_LB_JournalAR.PmtAmountCur + tmpRecord.CheckAmount;
+                }
+
+                if(m_autoCreditGenerated || tmpRecord.AutoCR)
+                {
+                    tmpSKS_lb_JournalAR.WriteOff = NoYes::Yes;
+
+                    if(SKS_LB_WriteoffDetails.AutoRev)
+                    {
+                        tmpSKS_LB_JournalAR.AutoCRRev = NoYes::Yes;
+                    }
+                    else
+                    {
+                        tmpSKS_LB_JournalAR.AutoCRRev = NoYes::No;
+                    }
+                }
+
+                if(errRecordID != 0)
+                {
+                    if(tmpSKS_LB_JournalARErrors.Description != '')
+                    {
+                        if(tmpSKS_LB_JournalAR.Description != '')
+                        {
+                            if(tmpSKS_LB_JournalAR.Description != tmpSKS_LB_journalarerrors.Description)
+                            {
+                                info(strFmt("@SKS3084", tmpSKS_LB_JournalARErrors.Description, tmpSKS_LB_JournalAR.ChkRefNbr, tmpSKS_LB_JournalAR.CustAccount));
+                            }
+                            else
+                            {
+                                tmpSKS_LB_JournalAR.Description = tmpSKS_LB_JournalARErrors.Description;
+                            }
+                        }
+                        else
+                        {
+                            tmpSKS_LB_JournalAR.Description = tmpSKS_LB_JournalARErrors.Description;
+                        }
+                    }
+                }
+
+                if(strScan(tmpSKS_LB_JournalAR.PaymNote, tmpRecord.paymnote, 0, strLen(tmpSKS_LB_JournalAR.paymnote)) == 0)
+                {
+                    tmpSKS_LB_JournalAR.PaymNote += tmpRecord.PaymNote;
+                }
+
+                tmpSKS_LB_JournalAR.FeeValue += tmpRecord.FeeValue;
+                tmpSKS_LB_JournalAR.update();
+            }
+            else
+            {                
+                // <15071>                    
+                InvoiceId                       invoiceIdLoc, lbInvoiceLoc;
+                AmountCur                       pmtAmountCurLoc;
+                NoYesId                         autoCRRev;
+                LedgerDimensionDefaultAccount   autoRevLedgerDimension, autoRevOffsetLedgerDimension;
+                NoYesId                         paymJrnlFlag;
+                SKS_LB_BatchNum                 batchNum;
+                CustVendPaymFeeId               feeId;
+                PaymFeeValue                    feeValue;
+                LedgerDimensionDefaultAccount   offsetCRDimension;
+                RefRecId                        parentJournalARIDRef;
+
+                // populate SKS_LB_JournalAR table
+                //If the same Customer exists in current company use the current company customer
+                if(m_CustCompany != curext() && tmpSKS_PP_SETUP.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::ImportCompany)
+                {
+                    select l_CustTable where l_CustTable.Party == tmpPartyId && l_CustTable.AccountNum == tmpCustID;
+
+                    if(l_CustTable)
+                    {
+                        m_CustCompany = curext();
+                    }
+                }
+
+                if(tmpRecord.isDED)
+                {
+                    invoiceIdLoc = tmprecord.InvoiceNumber;
+                    lbInvoiceLoc = tmpRecord.LBInvoice;
+                    if(errRecordID != 0 )
+                    {
+                        pmtAmountCurLoc = TmpRecord.CheckAmount;
+                    }
+                    else
+                    {
+                        pmtAmountCurLoc = tmpRecord.InvAmount;
+                    }
+                    if(tmpRecord.LBInvoice == '')
+                    {
+                        lbInvoiceLoc = tmpRecord.CheckNumber;
+                    }
+                }
+                else if (tmpRecord.AresDed)
+                {
+                    invoiceIdLoc = '';
+                    lbInvoiceLoc = '';
+                    pmtAmountCurLoc = abs(tmpRecord.InvAmount);
+                }
+                else
+                {
+                    invoiceIdLoc = m_InvcNbr;
+                    lbInvoiceLoc = tmpRecord.LBInvoice;
+                    pmtAmountCurLoc = tmpRecord.CheckAmount;
+                }                
+
+                if(m_autoCreditGenerated)
+                {
+                    if(tmpRecord.AutoCRAutoRev)
+                    {
+                        autoCRRev = NoYes::Yes;
+                        autoRevLedgerDimension = tmprecord.AutoRevLedgerDimension;
+                        autoRevOffsetLedgerDimension = tmprecord.AutoRevOffsetLedgerDimension;
+                    }
+                    else
+                    {
+                        if(SKS_LB_WriteoffDetails.AutoRev)
+                        {
+                            autoCRRev = NoYes::Yes;
+                            autoRevLedgerDimension = sks_lb_writeoffdetails.RevLedgerDimension;
+                            autoRevOffsetLedgerDimension = sks_lb_writeoffdetails.RevOffsetLedgerDimension;
+                        }
+                        else
+                        {
+                            autoCRRev = NoYes::No;
+                        }
+                    }
+                }
+                
+                if(tmpSKS_PP_SETUP.PayJrnlDeposit)
+                {
+                    paymJrnlFlag = NoYes::Yes;
+                }
+                else
+                {
+                    paymJrnlFlag = NoYes::No;
+                }
+                
+                if ( errRecordID != 0 )
+                {
+                    //don't change batch number if just moving from bad grid to good
+                    tmpSKS_LB_JournalAR.BatchNum = tmpSKS_LB_JournalARErrors.BatchNum;
+                }
+                else
+                {
+                    switch (_batchSplitType)
+                    {
+                        case SKS_LB_BatchSplitType::None:
+                            tmpSKS_LB_JournalAR.BatchNum = '';
+                            break;
+
+                        case SKS_LB_BatchSplitType::SplitByCount:
+                            if(!tmpRecord.isDED && !tmpRecord.AresDed)
+                            {
+                                select firstOnly localAR
+                                where localAR.ChkRefNbr == tmpRecord.CheckNumber
+                                    && localAR.ParentRecId == tmpRecord.ParentRecId
+                                    && localAR.JournalId == TmpSKS_LB_Journal.JournalID
+                                    && localAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                                    && LocalAR.isDED == NoYes::No
+                                    && LocalAR.AresDed == NoYes::no;
+
+                                if (!localAR)
+                                {
+                                    select firstOnly LocalARErrors
+                                    where LocalARErrors.ChkRefNbr == tmpRecord.CheckNumber
+                                        && LocalARErrors.ParentRecId == tmpRecord.ParentRecId
+                                        && LocalARErrors.JournalId == TmpSKS_LB_Journal.JournalID
+                                        && LocalARErrors.Batchnum == TmpSKS_LB_Journal.Batchnum
+                                        && LocalARErrors.isDED == NoYes::No
+                                        && LocalARErrors.AresDed == NoYes::No;
+
+                                    if(!localARErrors)
+                                    {
+                                        // Error lines add to the payment count but never cause a split(bump up batnbr)
+                                        // since this line may go with another line already in this batch.
+                                        m_Payment_Count = m_Payment_Count + 1;
+                                    }
+                                }
+                                
+                                if (m_Payment_Count  > _batchSplitCount)
+                                {
+                                    this.resetCounters();
+
+                                    m_Payment_Count = m_Payment_Count + 1;
+                                    m_Batch_Number = m_Batch_number + 1;
+
+                                    //filler header date in "5" record is 111111
+                                    if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear))
+                                    {
+                                        tmpSKS_LB_Journal.HeadPaymDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                                    }
+                                    else
+                                    {
+                                        tmpSKS_LB_Journal.HeadPaymDate = mkDate( tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear );
+                                        if(useHeadDateForDiscount)
+                                        {
+                                            paymentDate = tmpSKS_lb_Journal.HeadPaymDate;                                            
+                                        }
+                                    }
+                                }
+
+                                tmpSKS_LB_JournalAR.BatchNum = SKS_PP_StringFormats::strRight('0000' + strRTrim(int2Str(m_Batch_Number)),5);
+                            }
+                            break;
+
+                        case SKS_LB_BatchSplitType::SplitByIdentifier:
+                            //filler header date in "5" record is 111111
+                            if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear))
+                            {
+                                tmpSKS_LB_Journal.HeadPaymDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                            }
+                            else
+                            {
+                                tmpSKS_LB_Journal.HeadPaymDate = mkDate( tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear );
+                                if(useHeadDateForDiscount)
+                                {
+                                    paymentDate = tmpSKS_lb_Journal.HeadPaymDate;
+                                    //tmpSKS_LB_JournalAR.PaymDate = paymentDate;
+                                }
+                            }
+                            tmpSKS_LB_JournalAR.BatchNum = tmpRecord.BatchNum;
+                            break;
+                    }
+                    
+                    if (tmpSKS_LB_Journal.BatchNum != tmpSKS_LB_JournalAR.Batchnum)
+                    {
+                        tmpSKS_LB_Journal.Batchnum = tmpSKS_LB_JournalAR.Batchnum;
+                        tmpSKS_LB_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                        tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+
+                        // Batch switched, Make New journal if not already exists.
+                        select count(PmtTotal) from lSKS_LB_Journal
+                            where lSKS_LB_Journal.JournalID == tmpSKS_LB_JournalAR.JournalId
+                                && lSKS_LB_Journal.BatchNum == tmpSKS_LB_JournalAR.BatchNum;
+
+                        if (lSKS_LB_Journal.PmtTotal == 0)
+                        {
+                            tmpsks_LB_journal.PmtTotal = tmpRecord.CheckAmount;
+                            tmpSKS_LB_Journal.BatchPmtCnt = 0;
+                            tmpSKS_lb_Journal.ErrCount = 0;
+                            tmpSKS_lb_Journal.FileName = pathfile;
+                            tmpSKS_lb_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                            tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+                            tmpSKS_lb_Journal.FormatID = formatID;
+                            tmpSKS_LB_Journal.insert();
+                        }
+                        _formattedBatNum = tmpSKS_LB_Journal.Batchnum;
+                    }
+                }              
+                
+                if ( errRecordID != 0 )
+                {
+                    //don't change batch number if just moving from bad grid to good.
+                    batchNum = tmpSKS_LB_JournalARErrors.BatchNum;
+                }
+                else
+                {
+                    switch (_batchSplitType)
+                    {
+                        case SKS_LB_BatchSplitType::None:
+                            batchNum = '';
+                            break;
+
+                        case SKS_LB_BatchSplitType::SplitByCount:
+                            if (m_Payment_Count  > _batchSplitCount)
+                            {
+                                this.resetCounters();
+
+                                m_Payment_Count = m_Payment_Count + 1;
+                                m_Batch_Number = m_Batch_number + 1;
+                                batchNum = SKS_PP_StringFormats::strRight(strRTrim(int2Str(m_Batch_Number)),5);
+                            }
+                            else
+                            {
+                                batchNum = tmpSKS_lb_Journal.BatchNum;
+                            }
+                            break;
+
+                        case SKS_LB_BatchSplitType::SplitByIdentifier:
+                            //filler header date in "5" record is 111111
+                            if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear))
+                            {
+                                tmpSKS_LB_Journal.HeadPaymDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                            }
+                            else
+                            {
+                                tmpSKS_LB_Journal.HeadPaymDate = mkDate(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear);
+                                
+                                if(useHeadDateForDiscount)
+                                {
+                                    paymentDate = tmpSKS_lb_Journal.HeadPaymDate;                                
+                                }
+                            }
+                            batchNum = tmpRecord.BatchNum;
+                            break;
+
+                    }
+
+                    if (tmpSKS_LB_Journal.BatchNum != batchNum)
+                    {
+                        // Batch switched, Make New journal if not already exists.
+                        select count(PmtTotal) from lSKS_LB_Journal
+                            where lSKS_LB_Journal.JournalID == tmpSKS_LB_JournalAR.JournalID
+                                    && lSKS_LB_Journal.BatchNum == batchNum;
+                        if (lSKS_LB_Journal.PmtTotal == 0)
+                        {
+                            tmpsks_LB_journal.PmtTotal = tmpRecord.CheckAmount;
+                            tmpSKS_LB_Journal.BatchPmtCnt = 0;
+                            tmpSKS_lb_Journal.ErrCount = 0;
+                            tmpSKS_lb_Journal.FileName = pathfile;
+                            tmpSKS_lb_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                            tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+                            tmpSKS_lb_Journal.FormatID = formatID;
+                            tmpSKS_LB_Journal.insert();
+                        }
+                        _formattedBatNum = tmpSKS_LB_Journal.Batchnum;
+                    }                    
+                }          
+                
+                if(errRecordID != 0)
+                {
+                    feeId = tmpSKS_LB_JournalARerrors.FeeId;
+
+                    if(feeId != '')
+                    {
+                        feeValue = tmpSKS_LB_JournalARerrors.FeeValue;
+                    }
+                }
+                else
+                {
+                    feeId = tmpSKS_LB_FileFormat.FeeId;
+
+                    if(feeId != '')
+                    {
+                        feeValue = tmpRecord.FeeValue;
+                    }
+                }
+
+                if(AutoCRRevReasonCode == '')
+                {
+                    AutoCRRevReasonCode = tmpRecord.RevReasonCode;
+                }               
+                
+                if(tmpRecord.AutoCROffsetLedgerDimension == 0)
+                {
+                    offsetCRDimension = SKS_LB_WriteOffDetails.CRLedgerDimension;
+                }
+                else
+                {
+                    offsetCRDimension = tmpRecord.AutoCROffsetLedgerDimension;
+                }
+                
+                if(tmpRecord.AresDed)
+                {
+                    parentJournalARIDRef = this.ARDeductionParentRecordFindCreate(bankAccount, lbJournalID, tmpSKS_LB_Journal.BatchNum, pathFile, 
+                                                                                fileDate, formatID, tmpCustID, virtualCompanycompanies, tmpRecord);
+                }
+                
+                SKS_LB_JournalARRecord journalARRecord = new SKS_LB_JournalARRecord();
+                journalARRecord.setAll(bankAccount, tmpCustID, custIDErr, custIDSugg, m_CustCompany, fileDate, pathFile,
+                    formatID, invoiceIdLoc, lbInvoiceLoc, pmtAmountCurLoc, tmpPartyId, tmpInvCustTransOpen.RecId, 
+                    tmpInvCustTrans.RecId, dimensionDefault, autoCRRev, autoRevLedgerDimension, autoRevOffsetLedgerDimension, 
+                    paymJrnlFlag, paymentDate, batchNum, feeId, feeValue, autoCRRevReasonCode, offsetCRDimension, offsetMapped, parentJournalARIDRef);
+
+                tmpSKS_LB_JournalAR = this.initTmpSKS_LB_JournalAR(tmpRecord, journalARRecord);
+                // </15071>
+
+                SKS_LB_Process_IMPORTTEMP_Records::CreateStandardDED(tmpSKS_LB_JournalAR.ParentJournalARID, tmpSKS_LB_JournalAR.RecId, 
+                                                                        tmpSKS_LB_JournalAR.PmtAmountCur, tmpRecord);
+                if(defaultcust)
+                {
+                    this.CreateDefaultCustNote(tmpRecord.CheckNumber, tmpRecord.CheckAmount, tmpSKS_LB_Bank.LBAutoDefaultCust, tmpRecord.InvoiceNumber, 
+                                                                        tmpRecord.InvAmount, tmpRecord.DiscAmount);
+                    this.AddDataLine(tmpSKS_LB_FileFormat.FileType, tmpSKS_LB_JournalAR.filename, tmpSKS_LB_JournalAR.filerecord, formatID);
+                }
+
+                if(IgnoreInvErrors)
+                {
+                    this.CreateAllowErrorNote(tmpRecord.InvoiceNumber, tmpRecord.InvAmount, tmpRecord.DiscAmount, IgnoredError);
+                    this.AddDataLine(tmpSKS_LB_FileFormat.FileType, tmpSKS_LB_JournalAR.Filename, tmpSKS_LB_JournalAR.FileRecord, formatID);
+                }
+
+                if(m_ChkNum != tmpRecord.CheckNumber && m_ParentRecId != tmpRecord.ParentRecid)
+                {
+                    m_ChkNum = tmpRecord.CheckNumber;
+                    m_ChkAmt = tmpRecord.CheckAmount;
+                    m_CustAcct = tmpSKS_LB_JournalAR.CustAccount;
+                    m_CustCompany = tmpSKS_lb_JournalAR.CustomerCompany;
+                    m_defaultDimension = tmpSKS_LB_JournalAR.DefaultDimension;
+                    m_ParentRecId = tmpRecord.ParentRecId;
+                }
+            }
+
+            // Move all the NOTES on the Error Line to the good line
+            if(tmpSKS_LB_JournalARErrors && errRecordID != 0 )
+            {
+                Docu::Copy(tmpSKS_LB_JournalARErrors, tmpSKS_LB_JournalAR);
+                
+                ttsbegin;
+                while select forupdate tmpDocuRef
+                    where tmpDocuRef.RefCompanyId == tmpSKS_LB_JournalARErrors.dataAreaId
+                        && tmpDocuRef.RefTableId == tmpSKS_LB_JournalARErrors.TableId
+                        && tmpDocuRef.RefRecId == tmpSKS_LB_JournalARErrors.RecId
+                {
+                    tmpDocuRef.delete();
+                }
+                ttscommit;        
+            }
+
+            //-- Do application
+            if(tmpSKS_PP_SETUP.LBErrorGridAllowMovePmt == NoYes::Yes && errRecordID != 0 && m_SumLikeRef == NoYes::No && InvcNbrErr == SKS_LB_InvoiceIDErr::AlreadyMarked)
+            {
+                this.createnote(tmpRecord.InvoiceNumber, tmpRecord.InvAmount);
+                this.Journal_ARLB_Insert_Apply(tmpRecord.CheckAmount,
+                                            tmpSKS_LB_Journal.JournalID,
+                                            tmpCustID,
+                                            0,
+                                            0,
+                                            paymentDate,
+                                            tmpSKS_LB_JournalAR.RecID,
+                                            tmpRecord.CheckNumber,
+                                            tmpInvCustTransOpen.RecId,
+                                            tmpInvCustTrans.RecId,
+                                            baseCuryID, 
+                                            tmpMatchValue, 
+                                            tmpMatchType, 
+                                            sks_lb_writeoffdetails);
+            }
+            else
+            {
+                this.Journal_ARLB_Insert_Apply(tmpRecord.CheckAmount,
+                                            tmpSKS_LB_Journal.JournalID,
+                                            tmpCustID,
+                                            tmpRecord.InvAmount,
+                                            tmpRecord.DiscAmount,
+                                            paymentDate,
+                                            tmpSKS_LB_JournalAR.RecID,
+                                            tmpRecord.CheckNumber,
+                                            tmpInvCustTransOpen.RecId,
+                                            tmpInvCustTrans.RecId,
+                                            baseCuryID,     
+                                            tmpMatchValue, 
+                                            tmpMatchType, 
+                                            sks_lb_writeoffdetails);
+            }
+
+            if ( JournalARRecordExists == NoYes::Yes )
+            {
+                if(defaultcust)
+                {
+                    this.CreateDefaultCustNote(tmpRecord.CheckNumber, tmpRecord.CheckAmount, tmpSKS_LB_Bank.LBAutoDefaultCust, tmpRecord.InvoiceNumber, 
+                                                tmpRecord.InvAmount, tmpRecord.DiscAmount);
+                    this.AddDataLine(tmpSKS_LB_FileFormat.FileType, tmpSKS_LB_JournalAR.filename, tmpSKS_LB_JournalAR.filerecord, formatID);
+                }
+
+                if(IgnoreInvErrors)
+                {
+                    this.CreateAllowErrorNote(tmpRecord.InvoiceNumber, tmpRecord.InvAmount, tmpRecord.DiscAmount, ignoredError);
+                    this.AddDataLine(tmpSKS_LB_FileFormat.FileType, tmpSKS_LB_JournalAR.Filename, tmpSKS_LB_JournalAR.FileRecord, formatID);
+                }
+
+                if(TmpSKS_LB_FileFormat.FileType != SKS_LB_FileType::WFARRemitFile)
+                {
+                    TmpSKS_LB_JournalAR.filerecord = -1;
+                }
+
+                if(tmpSKS_LB_JournalAR.Invoice == '' )
+                {
+                    tmpSKS_LB_JournalAR.invoice = tmpRecord.InvoiceNumber;//14095
+                }
+                else if(tmpSKS_LB_JournalAR.invoice != TmpRecord.LBInvoice)
+                {
+                    tmpSKS_LB_JournalAR.Invoice = '*';
+                    TmpSKS_LB_JournalAR.LBInvoice = '';
+                }
+
+                tmpSKS_LB_JournalAR.LBInvoice = '';
+                tmpSKS_LB_JournalAR.CustTransOpenRecId = 0;
+                tmpSKS_LB_JournalAr.CustTransRecId = 0;
+
+                if(tmpSKS_LB_JournalAR.Prepayment == NoYes::No)
+                {
+                    tmpSKS_LB_JournalAR.Prepayment = tmpRecord.prepayment;
+                }
+
+                tmpSKS_LB_JournalAR.update();
+            }
+
+            //-- If creating XDDBatchARLB from the Error file
+            //-- now remove the Error record
+            if ( errRecordID != 0 )
+            {
+                delete_from tmpSKS_LB_JournalARErrors 
+                    where tmpSKS_LB_JournalARErrors.RecId == errRecordID;
+            }
+        }
+        else
+        {
+            // <15071>
+            SKS_LB_WriteOffId writeOffIdLoc;
+            SelectableDataArea customerCompanyLoc;
+            CustName custName;
+            InvoiceId invoiceId;
+            LedgerDefaultDimensionValueSet defaultDimension;
+            sks_lb_batchnum batchNum;
+            DimensionDefault offsetDimension;
+
+            select forupdate tmpSKS_LB_JournalARErrors
+                where tmpSKS_LB_JournalARErrors.RecId == errRecordID;
+            if( tmpSKS_LB_JournalARErrors )
+            {
+                update_existing_error = NoYes::Yes;
+                info("@SKS483");
+            }
+            
+            if(tmpSKS_LB_Depositor.WriteOffId != '')
+            {
+                writeOffIdLoc = tmpSKS_LB_Depositor.WriteOffId;
+            }
+            else
+            {
+                writeOffIdLoc = tmpsks_pp_setup.LBWriteOffId;
+            }
+            
+            if(m_diffDimensions == NoYes::Yes)
+            {
+                custIDSugg = m_CustAcct;
+                m_CustCompany = m_CustCompany;
+            }
+           
+            if(custIDSugg != '' || custIDErr == SKS_LB_CustIDErr::OK)
+            {
+                customerCompanyLoc = m_CustCompany;
+            }
+            else
+            {
+                customerCompanyLoc = cpnyID;
+            }
+
+            custName = SKS_LB_CustomerMatching.FindNameByCustIDSugg(custIDSugg, tmpRecord.CustName, customerCompanyLoc);
+            
+            if(InvcNbrErr == SKS_LB_InvoiceIdErr::FoundForWrongCustomer)
+            {
+                invoiceId = m_InvcNbr;
+            }
+            else
+            {
+                invoiceId = tmpRecord.InvoiceNumber;
+            }
+            
+            defaultDimension = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(TmpSks_pp_setup, m_defaultDimension, tmpCustTable.DefaultDimension, tmpSKS_LB_Bank.LBJournalName,customerCompanyLoc);
+                        
+            if( update_existing_error == NoYes::No )
+            {
+                switch (_batchSplitType)
+                {
+                    case SKS_LB_BatchSplitType::None:
+                        batchNum = '';
+                        break;
+
+                    case SKS_LB_BatchSplitType::SplitByCount:
+                        // On error records, only check if check number changed since correct customer may not
+                        // be known yet.
+                        select firstOnly LocalAR
+                            where LocalAR.ChkRefNbr == tmpRecord.CheckNumber
+                                && LocalAR.ParentRecId == tmpRecord.ParentRecId
+                                && LocalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                                && LocalAR.Batchnum == TmpSKS_LB_Journal.Batchnum;
+
+                        if (!LocalAR)
+                        {
+                            select firstOnly LocalARErrors
+                                where LocalARErrors.ChkRefNbr == tmpRecord.CheckNumber
+                                    && LocalARErrors.ParentRecId == tmpRecord.ParentRecId
+                                    && LocalARErrors.JournalId == TmpSKS_LB_Journal.JournalID
+                                    && LocalARErrors.Batchnum == TmpSKS_LB_Journal.Batchnum;
+
+                            if(!LocalARErrors)
+                            {
+                                // Error lines add to the payment count but never cause a split(bump up batnbr)
+                                // since this line may go with another line already in this batch.
+                                m_Payment_Count = m_Payment_Count + 1;
+                            }
+                        }
+                        
+                        if (m_Payment_Count  > _batchSplitCount)
+                        {
+                            this.resetCounters();
+                            m_Payment_Count = m_Payment_Count + 1;
+                            m_Batch_Number = m_Batch_number + 1;
+                        }
+                        batchNum = SKS_PP_StringFormats::strRight('0000' + strRTrim(int2Str(m_Batch_Number)),5);
+                        
+                        if (tmpSKS_LB_Journal.BatchNum != batchNum)
+                        {
+                            //filler header date in "5" record is 111111
+                            if(SKS_LB_Process_IMPORTTEMP_Records::NullDateCheck(tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear))
+                            {
+                                tmpSKS_LB_Journal.HeadPaymDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                            }
+                            else
+                            {
+                                tmpSKS_LB_Journal.HeadPaymDate = mkDate( tmpRecord.HeadDateDay, tmpRecord.HeadDateMonth, tmpRecord.HeadDateYear );
+                                if(useHeadDateForDiscount)
+                                {
+                                    paymentDate = tmpSKS_lb_Journal.HeadPaymDate;
+                                }
+                            }
+
+                            // Batch switched, Make New journal if not already exists.
+                            select count(PmtTotal) 
+                                from lSKS_LB_Journal
+                                where lSKS_LB_Journal.JournalID == tmpSKS_LB_JournalARErrors.JournalId
+                                    && lSKS_LB_Journal.BatchNum == batchNum;
+                            if (lSKS_LB_Journal.PmtTotal == 0)
+                            {
+                                tmpSKS_lb_Journal.PmtTotal = 0;
+                                tmpSKS_LB_Journal.Batchnum = batchNum;
+                                tmpSKS_lb_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                                tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+                                tmpSKS_lb_Journal.FormatID = formatID;
+                                tmpSKS_LB_Journal.insert();
+
+                                this.BlockSKSJournal();
+                            }
+                            _formattedBatNum = tmpSKS_LB_Journal.Batchnum;
+                        }
+                        break;
+
+                    case SKS_LB_BatchSplitType::SplitByIdentifier:
+                        batchNum = tmpRecord.BatchNum;
+                        if (tmpSKS_LB_Journal.BatchNum != batchNum)
+                        {
+                            // Batch switched, Make New journal if not already exists.
+                            select count(PmtTotal) from lSKS_LB_Journal
+                                where lSKS_LB_Journal.JournalID == tmpSKS_LB_JournalARErrors.JournalId
+                                    && lSKS_LB_Journal.BatchNum == batchNum;
+                            if (lSKS_LB_Journal.PmtTotal == 0)
+                            {
+                                tmpSKS_lb_Journal.FileName = pathfile;
+                                tmpSKS_LB_Journal.Batchnum = batchNum;
+                                tmpSKS_lb_Journal.BankPmtCnt = tmpRecord.BankPmtCnt;
+                                tmpSKS_lb_Journal.BankPmtTotal = tmpRecord.BankPmtTotal;
+                                tmpSKS_lb_Journal.FormatID = formatID;
+                                TmpSKS_LB_Journal.insert();
+                                this.BlockSKSJournal();
+                            }
+                            _formattedBatNum = tmpSKS_LB_Journal.Batchnum;
+                        }
+                        break;
+
+                }   // switch
+                    
+            }   // else            
+
+            
+            if(offsetMapped)
+            {
+                offsetDimension = tmpRecord.OffsetDimension;
+            }
+
+            SKS_LB_JournalARErrorRecord journalARErrorRecord = new SKS_LB_JournalARErrorRecord();            
+            journalARErrorRecord.setAll(writeOffIdLoc, BankAccount, tmpMatchType, tmpMatchValue, CustIDErr, customerCompanyLoc, 
+                                            CustIDSugg, custName, fileDate, formatID, pathFile, invoiceId, InvcNbrErr, 
+                                            tmpInvCustTrans, tmpInvCustTransOpen, defaultDimension, update_existing_error, 
+                                            batchNum, tmpSKS_LB_FileFormat.FeeId, offsetDimension, paymentDate);
+            tmpSKS_LB_JournalARErrors = this.initTmpSKS_LB_JournalARErrors(tmpRecord,journalARErrorRecord);          
+            // </15071>
+            
+            if(defaultcust)
+            {
+                this.CreateDefaultCustNote(tmpRecord.CheckNumber, tmpRecord.CheckAmount, tmpSKS_LB_Bank.LBAutoDefaultCust, tmpRecord.InvoiceNumber, 
+                                            tmpRecord.InvAmount, tmpRecord.DiscAmount, true);
+                this.AddDataLine(tmpSKS_LB_FileFormat.FileType, tmpSKS_LB_JournalARErrors.filename, tmpSKS_LB_JournalARErrors.filerecord, formatID, true);
+            }
+
+        }       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Journal_ARLB_Insert_Apply</Name>
+				<Source><![CDATA[
+    void Journal_ARLB_Insert_Apply
+    (
+        real                        _chkAmt, //check amount or CM original balance (Pmt Currency)
+        JournalId                   _lbBatNbr,
+        CustAccount                 _custID,
+        real                        _invApplyAmt, //amount to apply to the invoice (Pmt Currency)
+        real                        _discApplyAmt, //in Pmt currency
+        date                        _pmtDate,
+        int64                       _pmtRecordID,    // RecordID from XDDBatchARLB (Good grid)
+        str                         _chkNbr, //Check/CM Number
+        int64                       _custTransOpenRefRecId,
+        int64                       _custTransRefRecId,
+        CustCurrencyCode            _baseCurrencyCode,
+        InvoiceID                   _matchValue,
+        sks_lb_matchtype            _matchType,
+        SKS_LB_WriteoffDetails      _WriteOffDetails = null
+    )
+    {
+        int                     alwaysApplyDisc = 0;
+        CustCurrencyCode        pmtCurrencyCode;
+        real                    pmtExchRate;
+        SKS_LB_Journal          sks_lb_journal;
+        SKS_LB_JournalARApplic  journalARApplic;
+        CustTrans               custtrans;
+        CustTransOpen           custtransopen;
+        container               virtualCompanyCompanies;
+        CompanyId               cpnyID;
+        CustPaymSettlementManager   SettlementManager;
+        boolean                 doSettlement = true;
+        RefRecId                origARRecID;    
+        SKS_LB_Bank             lSKS_LB_Bank;
+        ;
+
+        //Get Setup Values
+        Select LBAlwaysApplyDisc from sks_pp_setup;
+        AlwaysApplyDisc = sks_pp_setup.LBAlwaysApplyDisc;
+
+        //Get Journal Values
+        Select CurrencyCode, ExchRate from sks_lb_journal where sks_lb_journal.JournalID == _LBBatNbr;
+        PmtCurrencyCode = sks_lb_journal.CurrencyCode;
+        PmtExchRate = sks_lb_journal.ExchRate;
+      
+        //BankAccount values
+        lSKS_LB_Bank = SKS_LB_Bank::find(tmpSKS_LB_JournalAR.BankAcct, tmpSKS_LB_JournalAR.FormatID);
+
+        // Get the companies that are in the virtual company.
+        cpnyID = tmpSKS_LB_Journalar.CustomerCompany;
+
+        virtualCompanyCompanies = SKS_LB_54000Bas::LBFindSharedServiceCompanies(lSKS_LB_Bank);
+        //m_AmtApplied is used to hold the current settlement amount for the bank account.
+        m_AmtApplied = tmpSKS_LB_JournalAR.ActualSettleAmountCur;
+
+        // holds the remaininb balance for affected invoices. Affected invoices is only this invoice if an invoice is specified. Otherwise, it is the
+        // sum of all invoice remaining balances for this customer.
+        m_TotalRemBal = 0;
+
+        //Get a specific invoice
+        if (_custTransOpenRefRecId)
+        {
+            //Going after CustTrans or CustTransOpen tables.  CustTrans exist for life of doc
+            //there is a corresponding CustTransOpen linked to the CustTrans only while it is open
+            Select crosscompany:virtualCompanycompanies custtrans join custtransopen
+            where (custtrans.AccountNum == custtransopen.AccountNum) && (custtrans.RecId == custtransopen.RefRecId)
+                && (custtrans.RecId == _CustTransRefRecId) && (custtransopen.RecID == _CustTransOpenRefRecId) &&
+                  (custtransopen.AmountCur != 0);
+
+
+            if (custtrans && custtransopen)
+            {
+                changeCompany(custtransopen.company())
+                {
+                    settlementManager = SKS_LB_Process_ImportTemp_Records::constructSettlementManager(_pmtDate, pmtCurrencyCode, pmtExchRate, custtransopen.dataAreaId, _custID, tmpSKS_LB_JournalAR.BankAcct, tmpSKS_LB_JournalAR.FormatID);
+                }
+
+                m_ApplyAmtRem = _InvApplyAmt;
+
+                // Delete any zero applic record that exists for this SKS_LB_JournalAR record and this Invoice.
+                delete_from journalARApplic where
+                    journalARApplic.SKS_LB_JournalARRecId == tmpSKS_LB_JournalAR.RecId &&
+                    journalARApplic.CustTransOpenRecId == custtransopen.RecId &&
+                    journalARApplic.SettleAmountCur == 0;
+
+                this.ApplyToCustTransOpen( custtransopen, _LBBatNbr, AlwaysApplyDisc, PmtCurrencyCode, PmtExchRate, _DiscApplyAmt,
+                                            _PmtDate, _PmtRecordID, _ChkNbr, _matchValue, _matchType, true, _invApplyAmt, SettlementManager, _WriteOffDetails);
+            }
+        }
+        else
+        {
+            if(_chkAmt < 0 || m_settleMethod == SKS_LB_SettlementMethod::External) // If External and no invoice number, stop
+            {
+                return;
+            }
+
+            m_ApplyAmtRem = _ChkAmt;
+
+            // Delete any zero applic records for this SKS_LB_JournalAR record.
+            // This allows additional settle amounts to be applied
+            delete_from journalARApplic where
+                journalARApplic.SKS_LB_JournalARRecId == tmpSKS_LB_JournalAR.RecId &&
+                journalARApplic.SettleAmountCur == 0;
+
+            if(m_settleMethod == SKS_LB_SettlementMethod::NoSettlement)
+            {
+                SKS_LB_Process_IMPORTTEMP_Records::CreateNoSettlementApplicRecords(tmpSKS_LB_JournalAR.RecId, tmpSKS_LB_JournalAR.FileRecord, tmpSKS_LB_JournalAR.LBInvoice, _custID, TmpSKS_lb_journalar.CustomerCompany, virtualCompanycompanies);
+            }
+            else
+            {
+                this.OldestDueDate_NoSettlement(tmpSKS_LB_JournalAR.RecId, doSettlement,
+                    pmtCurrencyCode, pmtExchRate, _lbBatNbr,
+                    _custID, _invApplyAmt, _discApplyAmt, _pmtDate,
+                    _chkNbr, _WriteOffDetails,
+                    lSKS_LB_Bank, AlwaysApplyDisc);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new()
+    {
+        ;
+        m_LB_JournalID = '';
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ReadFileLine</Name>
+				<Source><![CDATA[
+    private str ReadFileLine(SKS_LB_FileType filetype, str filename, SKS_EB_FileRecord fileRecord, sks_lb_formatid fileformatid)
+    {
+        SKS_LB_ReadFileCSV CSVReader;
+        SKS_LB_ReadFileFixed FixedReader;
+        SKS_LB_ReadFileEDI EDIReader;
+        SKS_LB_ReadFileSymcor SymReader;
+        SKS_LB_ReadFileBAI2 BAI2Reader;
+        SKS_LB_ReadFileWFARRMF WFARRMFReader;
+        SKS_LB_ReadFileWFRMF WFRMFReader;
+
+        str returnString = '';
+        int readResult = 1;
+
+        new FileIOPermission(fileName, 'R').assert();
+
+        switch (fileType)
+        {
+            case SKS_LB_FileType::CSV:
+                CSVReader = new SKS_LB_ReadFileCSV();
+                CSVReader.setFileName(fileName);
+                CSVReader.setFormatId(fileFormatId);
+                CSVReader.openFile();
+                readResult = CSVReader.Read_Line(fileRecord);
+                returnString = CSVReader.Get_Current_Line();
+                CSVReader.closeFile();
+                break;
+            case SKS_LB_FileType::FixedField:
+                FixedReader = new SKS_LB_ReadFileFixed();
+                FixedReader.setFileName(fileName);
+                FixedReader.setFormatId(fileFormatId);
+                FixedReader.openFile();
+                readResult = FixedReader.Read_Line(fileRecord);
+                returnString = FixedReader.Get_Current_Line();
+                FixedReader.closeFile();
+                break;
+            case SKS_LB_FileType::TabDelimited:
+                CSVReader = new SKS_LB_ReadFileCSV();
+                CSVReader.useTabDelimiter();
+                CSVReader.setFileName(fileName);
+                CSVReader.setFormatId(fileFormatId);
+                CSVReader.openFile();
+                readResult = CSVReader.Read_Line(fileRecord);
+                returnString = CSVReader.Get_Current_Line();
+                CSVReader.closeFile();
+                break;
+            case SKS_LB_FileType::EDI820:
+            case SKS_LB_FileType::EDI823:
+                EDIReader = new SKS_LB_ReadFileEDI();
+                EDIReader.setFileName(fileName);
+                EDIReader.setFormatId(fileFormatId);
+                EDIReader.openFile();
+                readResult = EDIReader.Read_Line(fileRecord);
+                returnString = EDIReader.Get_Current_Line();
+                EDIReader.closeFile();
+                break;
+
+            case SKS_LB_FileType::Symcor:
+                SymReader = new SKS_LB_ReadFileSymcor();
+                SymReader.setFileName(fileName);
+                SymReader.setFormatId(fileFormatId);
+                SymReader.openFile();
+                readResult = SymReader.Read_Line(fileRecord);
+                returnString = SymReader.Get_Current_Line();
+                SymReader.closefile();
+                break;
+
+            case SKS_LB_FileType::WFARRemitFile:
+                WFARRMFReader = new SKS_LB_ReadFileWFARRMF();
+                WFARRMFReader.setFileName(fileName);
+                WFARRMFReader.setFormatId(fileFormatId);
+                WFARRMFReader.openFile();
+                readResult = WFARRMFReader.Read_Line(fileRecord);
+                returnString = WFARRMFReader.Get_Current_Line();
+                WFARRMFReader.closefile();
+                break;
+
+            case SKS_LB_FileType::WFRMF:
+                WFRMFReader = new SKS_LB_ReadFileWFRMF();
+                WFRMFReader.setFileName(fileName);
+                WFRMFReader.setFormatId(fileFormatId);
+                WFRMFReader.openFile();
+                readResult = WFRMFReader.Read_Line(fileRecord);
+                returnString = WFRMFReader.Get_Current_Line();
+                WFRMFReader.closefile();
+                break;
+
+            default : // Make BAI the default.  Base BAI class can be used to get current BAI line
+                BAI2Reader = new SKS_LB_ReadFileBAI2();
+                BAI2Reader.setFileName(fileName);
+                BAI2Reader.setFormatId(fileFormatId);
+                BAI2Reader.openFile();
+                readResult = BAI2Reader.Read_Line(fileRecord);
+                returnString = BAI2Reader.Get_Current_Line();
+                BAI2Reader.closeFile();
+                break;
+        }
+
+        return returnString;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ReduceCreditWriteOffProcess</Name>
+				<Source><![CDATA[
+    Public boolean ReduceCreditWriteOffProcess(TmpSKS_LB_Importing tmpRecord, CustTransOpen TmpInvCustTransOpen, SKS_PP_SETUP tmpSKS_PP_Setup, CustTrans   TmpInvCustTrans, PaymDate paymentDate, container virtualCompanyCompanies, SKS_LB_FormatId formatID, CompanyBankAccountId bankAccount,str pathfile, date filedate, SKS_LB_Journal LB_Journal)
+    {
+        SKS_LB_Depositor tmpSKS_LB_Depositor;
+        SKS_LB_WriteOffId WriteOffID;
+        SKS_LB_WriteoffDetails SKS_LB_WriteOffDetails;
+        SKS_LB_AutoCreateCreditDebitGroup sks_lb_AutoCreateCreditDebitGroup;
+        TaxGroup    lTaxGroup;
+        AmountCur   pmtAmt;
+        boolean     ret = false;
+
+        if(tmpRecord.InvAmount < 0 //Credit note match
+            && abs(tmpRecord.invAmount) > abs(TmpInvCustTransOpen.AmountCur)//Amount in file is greater than the amount available in for the credit note
+            && TmpSKS_PP_Setup.LBWriteOffRuleCROverSettle
+            && tmpSKS_PP_SETUP.AutoCR)//Create writeoff for credit oversettlement turned on
+        {
+            ret = true;
+            if (TmpInvCustTrans.AccountNum == tmpRecord.CustAccount || tmpRecord.CustAccount == '')
+            {
+                tmpSKS_LB_Depositor = SKS_EFT_CustomerLoad::CreateFindCustomerRecord(TmpInvCustTransOpen.AccountNum, null, true, true, true, TmpInvCustTransOpen.company());
+
+                if(tmpSKS_LB_Depositor != null)
+                {
+                    WriteOffID = tmpSKS_LB_Depositor.WriteOffId;
+                }
+                else
+                {
+                    WriteOffID = tmpSKS_PP_Setup.LBWriteOffId;
+                }
+
+                select firstOnly SKS_LB_WriteoffDetails order by SKS_LB_WriteoffDetails.ThresholdAmount asc
+                    where SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules == WriteOffId
+                        && sks_lb_writeoffdetails.CustomerCompany == TmpInvCustTransOpen.company()
+                        && sks_lb_writeoffdetails.ThresholdAmount >= (abs(tmpRecord.invAmount) - abs(TmpInvCustTransOpen.AmountCur))
+                        && SKS_LB_WriteoffDetails.ThresholdAmount != 0
+                        && SKS_LB_WriteoffDetails.AutoCR == NoYes::Yes;
+
+                if(SKS_LB_WriteoffDetails)//make sure no auto write-offs are created for the default customer
+                {
+                    lTaxGroup = SKS_LB_Setup_AutoCRParms::find(sks_lb_writeoffdetails.CustomerCompany).TaxGroup;
+                    changeCompany(TmpInvCustTransOpen.company())
+                    {
+                        sks_lb_AutoCreateCreditDebitGroup = new SKS_LB_AutoCreateCreditDebitGroup();
+
+                        m_InvcNbr = sks_lb_AutoCreateCreditDebitGroup.AutoCreateCredit(
+                                        CustTable::find(TmpInvCustTrans.AccountNum).InvoiceAccount,
+                                        TmpInvCustTrans.AccountNum,
+                                        SKS_LB_WriteoffDetails.CRLedgerDimension,
+                                        (abs(tmpRecord.invAmount) - abs(TmpInvCustTransOpen.AmountCur)) * -1 ,
+                                        tmpRecord.InvoiceNumber,
+                                        LB_Journal.CurrencyCode,
+                                        paymentDate,
+                                        sks_lb_writeoffdetails.CROffsetLedgerDimension,
+                                        paymentDate,
+                                        lTaxGroup,
+                                        tmpRecord.PaymentMOP,
+                                        sks_lb_writeoffdetails.ReasonCode,
+                                        tmpRecord.CheckNumber,
+                                        tmpRecord.InvoiceNumber,
+                                        TmpInvCustTransOpen.company());
+
+                        if(m_invcNbr)
+                        {
+                            pmtAmt = TmpSKS_LB_JournalAR.PmtAmountCur;
+
+                            TmpSKS_LB_JournalAR = this.RetrieveOrInitAR(tmpRecord,
+                                virtualCompanyCompanies,
+                                formatID,
+                                bankAccount,
+                                LB_Journal,
+                                TmpInvCustTrans.DefaultDimension,
+                                pathFile,
+                                fileDate,
+                                (abs(tmpRecord.invAmount) - abs(TmpInvCustTransOpen.AmountCur)) * -1,
+                                m_invcNbr,
+                                paymentDate,
+                                tmpRecord.CustAccount != '' ? tmpRecord.CustAccount : TmpInvCustTrans.AccountNum);
+
+                            if(SKS_LB_FileFormat::find(tmpSKS_LB_JournalAR.FormatID).PmtAmtEQSumChkAmts)
+                            {
+                                ttsBegin;
+                                TmpSKS_LB_JournalAR.PmtAmountCur = pmtAmt;
+                                tmpSKS_LB_JournalAR.update();
+                                ttsCommit;
+                            }
+                            else
+                            {
+                                ttsbegin;
+                                TmpSKS_LB_JournalAR.PmtAmountCur = (abs(tmpRecord.invAmount) - abs(TmpInvCustTransOpen.AmountCur)) * -1;
+                                tmpSKS_LB_JournalAR.update();
+                                ttscommit;
+                            }
+                            this.WriteOffSettlementCreation(TmpSKS_LB_JournalAR, SKS_LB_WriteoffDetails);
+                            TmpSKS_LB_JournalAR = null;
+                        }
+                    }
+                }
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetCounters</Name>
+				<Source><![CDATA[
+    void resetCounters()
+    {
+        m_Payment_Count = 0;
+        m_Previous_Customer = '';
+        m_Previous_Check = '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RetrieveOrInitAR</Name>
+				<Source><![CDATA[
+    public SKS_LB_JournalAR RetrieveOrInitAR(TmpSKS_LB_Importing _TmpRecord, container _VirtualCompanyCompanies, SKS_LB_FormatId _formatID, CompanyBankAccountId _bankAccount, SKS_LB_Journal _Journal, DimensionDefault _DefaultDimension, str _pathfile, date _filedate, AmountCur _SettleAmt, InvoiceID _CreatedWriteoffInvoiceNum, paymdate _PaymentDate, custaccount _custAcct)
+    {
+        SKS_LB_SecondaryMatch   SecondaryMatch = new SKS_LB_SecondaryMatch();
+        sks_lb_journalar        JournalAR;
+        SKS_LB_Bank             tmpSKS_LB_Bank;
+
+        select seppaymbyinv FROM tmpSKS_LB_Bank
+            where tmpSKS_LB_Bank.BankAccountId == _bankAccount && tmpSKS_LB_Bank.LBFormatId == _formatID;
+
+        if(tmpSKS_LB_Bank.SepPaymByInv)
+        {
+            JournalAR = SecondaryMatch.InitARRecord(_bankAccount, _Journal.JournalID, _Journal.BatchNum, _pathfile, _FileDate, _formatID, _CustAcct, _VirtualCompanyCompanies, _TmpRecord, _SettleAmt, _CreatedWriteoffInvoiceNum, _DefaultDimension);
+        }
+        else
+        {
+            JournalAR = SecondaryMatch.CheckExistingAR(_CustAcct,  _VirtualCompanyCompanies, _formatID, _bankAccount, _Journal, _DefaultDimension, _TmpRecord);
+
+            if(!JournalAR)
+            {
+                JournalAR = SecondaryMatch.InitARRecord(_bankAccount, _Journal.JournalID, _Journal.BatchNum, _pathfile, _FileDate, _formatID, _CustAcct, _VirtualCompanyCompanies, _TmpRecord, _SettleAmt, '*', _DefaultDimension);
+            }
+            else
+            {
+                //Need to update the existing record with the credit write off amounts
+                ttsBegin;
+                JournalAR.TrackingInvoices += _TmpRecord.InvoiceNumber;
+                JournalAR.ActualSettleAmountCur += _SettleAmt;
+                JournalAR.update();
+                ttsCommit;
+            }
+        }
+        return JournalAR;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SetAutoCreditCreated</Name>
+				<Source><![CDATA[
+    public boolean SetAutoCreditCreated(boolean _autoCredit)
+    {
+        m_autoCreditGenerated = _autoCredit;
+        return m_autoCreditGenerated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SplitBatch</Name>
+				<Source><![CDATA[
+    public void SplitBatch(sks_lb_journalar _TMPSKS_LB_Journalar, SKS_LB_BatchSplitType _batchSplitType, TMPSKS_LB_Importing _tmpRecord, Boolean _isReassign, int _batchSplitCount, SKS_LB_Journal _SKS_LB_Journal, str _pathfile)
+    {
+        sks_lb_journalar    localAR;
+        sks_lb_journalarerrors    LocalARErrors;
+        SKS_LB_FileFormat   SKS_LB_FileFormat;
+        AmountCur           BatchPaymAmount;
+
+        select FileType from SKS_LB_FileFormat where SKS_LB_FileFormat.FormatID == TmpSKS_LB_Journal.FormatID;
+        switch (_batchSplitType)
+        {
+            case SKS_LB_BatchSplitType::None:
+                TmpSKS_LB_JournalAR.BatchNum = '';
+                break;
+            case SKS_LB_BatchSplitType::SplitByCount:
+
+                Select firstOnly localAR
+                where localAR.ChkRefNbr == _tmpRecord.CheckNumber
+                && localAR.ParentRecId == _tmpRecord.ParentRecId
+                && localAR.JournalId == TmpSKS_LB_Journal.JournalID
+                && localAR.Batchnum == TmpSKS_LB_Journal.Batchnum;
+
+                if (!localAR)
+                {
+                    Select firstOnly LocalARErrors
+                    where LocalARErrors.ChkRefNbr == _tmpRecord.CheckNumber
+                    && LocalARErrors.ParentRecId == _tmpRecord.ParentRecId
+                    && LocalARErrors.JournalId == TmpSKS_LB_Journal.JournalID
+                    && LocalARErrors.Batchnum == TmpSKS_LB_Journal.Batchnum;
+
+                    if(!LocalARErrors)
+                    {
+                        // Error lines add to the payment count but never cause a split(bump up batnbr)
+                        // since this line may go with another line already in this batch.
+                        m_Payment_Count = m_Payment_Count + 1;
+                    }
+                }
+
+                if (m_Payment_Count  > _batchSplitCount)
+                {
+                    this.resetCounters();
+                    m_Payment_Count = m_Payment_Count + 1;
+                    m_Batch_Number = m_Batch_number + 1;
+                }
+                TmpSKS_LB_JournalAR.BatchNum = SKS_PP_StringFormats::strRight('0000' + strRTrim(int2Str(m_Batch_Number)),5);
+                tmpSKS_LB_JournalAR.update();
+                break;
+            case SKS_LB_BatchSplitType::SplitByIdentifier:
+                TmpSKS_LB_JournalAR.BatchNum = _tmpRecord.BatchNum;
+                tmpSKS_LB_JournalAR.update();
+                break;
+
+        }
+        if (TmpSKS_LB_Journal.BatchNum != TmpSKS_LB_JournalAR.Batchnum)
+        {
+            CurrencyCode origCurr = _SKS_LB_Journal.CurrencyCode;
+            ExchRate    lExchRate = _SKS_LB_Journal.ExchRate;
+
+            // Batch switched, Make New journal if not already exists.
+            select count(PmtTotal) from TmpSKS_LB_Journal
+                where TmpSKS_LB_Journal.JournalID == TmpSKS_LB_JournalAR.JournalId
+                    && TmpSKS_LB_Journal.BatchNum == TmpSKS_LB_JournalAR.BatchNum;
+            if (TmpSKS_LB_Journal.PmtTotal == 0)
+            {
+                TmpSKS_LB_Journal.Batchnum = TmpSKS_LB_JournalAR.Batchnum;
+                TmpSKS_LB_Journal.JournalID = TmpSKS_LB_JournalAR.JournalId;
+                TmpSKS_LB_Journal.BankAcct = TmpSKS_LB_JournalAR.BankAcct;
+                tmpSKS_lb_Journal.FormatID = TmpSKS_LB_JournalAR.FormatID;
+                tmpsks_LB_journal.PmtTotal = _tmpRecord.CheckAmount;
+                tmpSKS_lb_Journal.BankPmtCnt = _tmpRecord.BankPmtCnt;
+                tmpSKS_lb_Journal.BankPmtTotal = _tmpRecord.BankPmtTotal;
+                tmpSKS_lb_Journal.CurrencyCode = origCurr;
+                tmpSKS_LB_Journal.BatchPmtCnt = 0;
+                tmpSKS_lb_Journal.ErrCount = 0;
+                tmpSKS_lb_Journal.FileName = _pathfile;
+                tmpSKS_lb_Journal.ExchRate = lExchRate;
+                TmpSKS_LB_Journal.insert();
+            }
+        }
+        else
+        {
+            if((SKS_LB_FileFormat.FileType != SKS_LB_FileType::CSV && SKS_LB_FileFormat.FileType != SKS_LB_FileType::FixedField && SKS_LB_FileFormat.FileType != SKS_LB_FileType::TabDelimited))
+            {
+                while select sum(PmtAmountCur) from localAR  group by localAR.ParentRecid, localAR.BatchNum, localAR.JournalId
+                    where localAR.BatchNum == _SKS_LB_Journal.BatchNum && localAR.JournalId == _SKS_LB_Journal.JournalId
+                        && localAR.isDED == NoYes::No && localAR.AresDed == NoYes::No
+                {
+                    BatchPaymAmount += localAR.PmtAmountCur;
+                }
+            }
+            else
+            {
+                if(!SKS_LB_Bank::find(_TMPSKS_LB_Journalar.BankAcct, SKS_LB_FileFormat.FormatID).SepPaymByInv)
+                {
+                    while select Sum(pmtamountcur) from localAR Group by localAR.CustAccount, localAR.ChkRefNbr, localAR.defaultdimension, localAR.JournalID, localAR.batchnum, localAR.PmtAmountCur
+                        where localAR.JournalId == _SKS_LB_Journal.JournalId  &&
+                            localAR.BatchNum == _SKS_LB_Journal.BatchNum &&
+                            localAR.isDED == NoYes::No && localAR.AresDed == NoYes::No
+                    {
+                        BatchPaymAmount += localAR.PmtAmountCur;
+                    }
+                }
+                else
+                {
+                    select Sum(pmtamountcur) from localAR 
+                        where localAR.JournalId == _SKS_LB_Journal.JournalId  &&
+                            localAR.BatchNum == _SKS_LB_Journal.BatchNum &&
+                            localAR.isDED == NoYes::No && localAR.AresDed == NoYes::No;
+
+                    BatchPaymAmount = localAR.PmtAmountCur;
+                }
+            }
+            tmpSKS_lb_Journal.PmtTotal = BatchpaymAmount;
+            TmpSKS_LB_Journal.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>WriteOffSettlementCreation</Name>
+				<Source><![CDATA[
+    public void WriteOffSettlementCreation(sks_lb_journalar JournalAR, SKS_LB_WriteOffDetails _WriteOffDetails)
+    {
+        CustTrans               CTRecord;
+        CustTransOpen           CTORecord;
+
+        Select Invoice from CTRecord
+            where (CTRecord.Invoice == m_invcNbr )
+            join  AmountCur, RecId, RefRecId, DataAreaId from CTORecord
+            where (CTRecord.RecId == CTORecord.RefRecId);
+
+        this.SetAutoCreditCreated(true);//This is a global field used in InsertJournalARApplic to determine if the applic record is created as a writeoff or not
+        this.InsertJournalARApplic(0, CTORecord.AmountCur, CTORecord.RecId, CTORecord.AmountCur, CTORecord.RefRecId, CTORecord.dataAreaId, JournalAR, m_invcNbr, SKS_LB_MatchType::InvoiceNumber, _WriteOffDetails);//This line creates the write off
+        this.SetAutoCreditCreated(false);//Set this field back as it is global and will need to be used for the next record
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CalcBatchTotals</Name>
+				<Source><![CDATA[
+    static Void CalcBatchTotals(JournalID  myJournalID, sks_LB_FileType   FileType, noYes PmtAmtEQSumChkAmts, sks_lb_batchnum    BatchNum = '')
+    {
+        SKS_LB_JournalARErrors  sks_lb_journalARErrors;
+        SKS_LB_JournalARErrors  dupe_lb_journalARErrors;
+        SKS_LB_JournalAR        sks_lb_journalAR2;
+        SKS_LB_JournalAR        localsks_lb_journalAR;
+        SKS_LB_Journal          localSKS_LB_Journal;
+        SKS_PP_Setup            msks_pp_setup;
+        Real                    CurrAmt;
+        Accountnum              CustAccount;
+        BankChequeNum           ChkRefNbr;
+        int intRowCount;
+        real realPmtTotal;
+        ;
+
+        realPmtTotal = 0;
+        intRowCount = 0;
+        CustAccount = '';
+        ChkRefNbr = '';
+        select LBErrorShowChgdPmt From msks_pp_setup;
+
+        if (batchNum == '')
+        {
+            select forUpdate localsks_lb_Journal
+                where localsks_lb_Journal.JournalID == myJournalID;
+        }
+        else
+        {
+            select forUpdate localsks_lb_Journal
+                where localsks_lb_Journal.JournalID == myJournalID
+                    && localsks_lb_Journal.BatchNum == batchNum;
+        }
+
+        While (localsks_lb_Journal)
+        {
+            ttsBegin;
+
+            BatchNum = localSKS_LB_Journal.BatchNum;
+            intRowCount = 0;
+            realPmtTotal = 0;
+
+            //keep running total
+            //Check if we have already have the total for the payment
+            if(PmtAmtEQSumChkAmts == NoYes::Yes)
+            {
+                while select ChangedPmtAmountCur, ChkRefNbr, CustAccount, PmtAmountCur, FormatID, ParentRecID from sks_lb_journalARErrors
+                    order By sks_lb_journalARErrors.CustAccount, sks_lb_journalARErrors.ChkRefNbr
+                    WHERE sks_lb_journalARErrors.JournalId == myJournalID &&
+                          sks_lb_journalARErrors.BatchNum == BatchNum &&
+                          sks_lb_journalARErrors.isDED == NoYes::No &&
+                          sks_lb_journalARErrors.aresded == NoYes::No
+                {
+                    if(ChkRefNbr != sks_lb_journalARErrors.ChkRefNbr || CustAccount != sks_lb_journalARErrors.CustAccount)
+                    {
+                        ChkRefNbr = sks_lb_journalARErrors.ChkRefNbr;
+                        CustAccount = sks_lb_journalARErrors.CustAccount;
+                        intRowCount++;
+                    }
+                    realPmtTotal = 0;
+                    
+                    CurrAmt = sks_lb_journalARErrors.PmtAmountCur;
+                    if (mSKS_PP_Setup.LBErrorShowChgdPmt == NoYes::Yes)
+                    {
+                        if (sks_lb_journalARErrors.ChangedPmtAmountCur != 0)
+                        {
+                            CurrAmt = sks_lb_journalARErrors.ChangedPmtAmountCur;
+                        }
+                    }
+                    //Payment amount = sum of check amouts, so total all values
+                    realPmtTotal = realPmtTotal + CurrAmt;
+                }
+            }
+            else
+            {
+                if((FileType != SKS_LB_FileType::CSV && FileType != SKS_LB_FileType::FixedField && FileType != SKS_LB_FileType::TabDelimited))
+                {
+                    select minOf(pmtamountcur) from sks_lb_journalARErrors group by sks_lb_journalarerrors.ParentRecid, sks_lb_journalarerrors.BatchNum,
+                        sks_lb_journalarerrors.JournalId where sks_lb_journalARErrors.BatchNum == BatchNum
+                            && sks_lb_journalARErrors.JournalId == myJournalId
+                            && sks_lb_journalARErrors.isDED == NoYes::No
+                            && sks_lb_journalARErrors.AresDed == NoYes::No;
+                }
+                else
+                {
+                    select minOf(pmtamountcur) from sks_lb_journalARErrors Group by sks_lb_journalARErrors.CustAccount, sks_lb_journalARErrors.ChkRefNbr, sks_lb_journalARErrors.defaultdimension,
+                        sks_lb_journalARErrors.JournalID, sks_lb_journalARErrors.batchnum, sks_lb_journalARErrors.PmtAmountCur
+                    WHERE sks_lb_journalARErrors.JournalId == myJournalID &&
+                          sks_lb_journalARErrors.BatchNum == BatchNum &&
+                          sks_lb_journalARErrors.isDED == NoYes::No &&
+                          sks_lb_journalARErrors.AresDed == NoYes::No;
+                }
+
+                while(sks_lb_journalARErrors)
+                {
+
+                    CurrAmt = sks_lb_journalARErrors.PmtAmountCur;
+                    if (mSKS_PP_Setup.LBErrorShowChgdPmt == NoYes::Yes)
+                    {
+                        if (sks_lb_journalARErrors.ChangedPmtAmountCur != 0)
+                        {
+                            CurrAmt = sks_lb_journalARErrors.ChangedPmtAmountCur;
+                        }
+                    }
+
+                    if(SKS_LB_Process_IMPORTTEMP_Records::Parentrecidfiletype(FileType))
+                    {
+                        Select firstOnly ParentRecid from sks_lb_journalAR2
+                            where sks_lb_journalAR2.ParentRecId == sks_lb_journalARErrors.ParentRecId
+                            && sks_lb_journalAR2.JournalId == myJournalID
+                            && sks_lb_journalAR2.Batchnum == Batchnum
+                            && sks_lb_journalAR2.isDED == NoYes::No
+                            && sks_lb_journalAR2.AresDed == NoYes::No;
+                    }
+                    else
+                    {
+                        Select firstOnly sks_lb_journalAR2
+                            where sks_lb_journalAR2.CustAccount == sks_lb_journalARErrors.CustAccount
+                            && sks_lb_journalAR2.ChkRefNbr == sks_lb_journalARErrors.ChkRefNbr
+                            && sks_lb_journalAR2.JournalId == myJournalID
+                            && sks_lb_journalAR2.Batchnum == Batchnum
+                            && sks_lb_journalAR2.DefaultDimension == sks_lb_journalARErrors.DefaultDimension
+                            && sks_lb_journalAR2.isDED == NoYes::No
+                            && sks_lb_journalAR2.AresDed == NoYes::No;
+
+                    }
+
+                    If(!dupe_lb_journalARErrors && !sks_lb_journalar2)
+                    {
+                        realPmtTotal += sks_lb_journalARErrors.PmtAmountCur;
+                    }
+
+                    intRowCount++;
+
+                    next sks_lb_journalARErrors;
+                }
+            }
+            select count(FileRecord), sum(PmtAmountCur) from localsks_lb_journalAR where localsks_lb_journalAR.journalid == myJournalID && localsks_lb_journalAR.batchnum == BatchNum
+                && localsks_lb_journalAR.isDED == NoYes::No && localsks_lb_journalAR.AresDed == NoYes::No;
+
+            localSKS_LB_Journal.BatchBadPmtTotal = realPmtTotal;
+            localSKS_LB_Journal.ErrCount = intRowCount;
+            localSKS_LB_Journal.BatchPmtCnt =  localSKS_LB_JournalAR.filerecord + intRowCount;
+            localSKS_LB_Journal.PmtTotal = localsks_lb_journalAR.PmtAmountCur;
+            localSKS_LB_Journal.update();
+            ttsCommit;
+
+            next localsks_lb_Journal;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CheckInUseReasonCode</Name>
+				<Source><![CDATA[
+    public static boolean CheckInUseReasonCode(ReasonCode   Reason, SelectableDataArea ReasonCompany)
+    {
+        SKS_LB_JournalARApplic  sks_lb_journalarapplic;
+        SKS_LB_JournalARErrors  sks_lb_journalarerrors;
+        SKS_LB_WriteoffDetails  sks_lb_writeoffdetails;
+        SelectableDataArea      tmpCpny;
+        DataArea                dataarea;
+        int                     ConCounter;
+        container               virtualCompanyCompanies;
+        ;
+
+        if(ReasonCompany == '')
+        {
+            ReasonCompany = curext();
+        }
+        else
+        {
+            select firstonly dataArea where
+                   dataArea.Id == ReasonCompany &&
+                   dataArea.isVirtual == 1;
+        }
+        virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+
+        for(ConCounter = 1; ConCounter <= conLen(virtualCompanyCompanies); ConCounter++)
+        {
+            sks_lb_journalarapplic = null;
+            sks_lb_journalarerrors = null;
+            sks_lb_writeoffdetails = null;
+            tmpCpny = conPeek(virtualCompanyCompanies, conCounter);
+            if(dataarea)
+            {
+                ReasonCompany = tmpCpny ;
+            }
+            changeCompany(tmpCpny)
+            {
+                select firstonly sks_lb_journalarapplic where sks_lb_journalarapplic.custtransdataareaid == ReasonCompany && SKS_lb_journalarapplic.RevReasonCode == Reason;
+                if(sks_lb_journalarapplic)
+                {
+                    error("@SKS3526");
+                    return false;
+                }
+
+                select firstOnly crossCompany:virtualCompanyCompanies sks_lb_journalarerrors where sks_lb_journalarerrors.CustomerCompany == ReasonCompany && sks_lb_journalarerrors.RevReasonCode == Reason;
+                if(sks_lb_journalarerrors)
+                {
+                    error("@SKS3526");
+                    return false;
+                }
+
+                select firstonly crossCompany:virtualCompanyCompanies sks_lb_writeoffdetails where sks_lb_writeoffdetails.CustomerCompany == ReasonCompany && (sks_lb_writeoffdetails.RevReasonCode == Reason || sks_lb_writeoffdetails.ReasonCode == Reason);
+                if(sks_lb_writeoffdetails)
+                {
+                    error("@SKS3526");
+                    return false;
+                }
+
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructSettlementManager</Name>
+				<Source><![CDATA[
+    public static CustPaymSettlementManager constructSettlementManager(date _paymentDate, CurrencyCode _pmtCuryId, ExchRate _exchRate, CompanyID _customerCompany,
+                    CustAccount _CustAccount,  CompanyBankAccountId _BankAcctId = '', SKS_LB_FormatId _FormatId = '', PaymMode _PaymMode = '')
+    {
+        //Now passing a method of payment into the method. This way grace days can work with BankRec. BankRec methods will simply need to figure out the method of payment being
+        //used and pass it in.
+        LedgerJournalTrans ledgerJournalTrans;
+
+        // Need to construct a temporary LedgerJournalTrans to use in CustPaymSettlementManager
+        ledgerJournalTrans.TransDate = _paymentDate;
+        // This should be based on the current company
+        ledgerJournalTrans.Company = curExt();
+        ledgerJournalTrans.CurrencyCode = _pmtCuryId;
+        ledgerJournalTrans.ExchRate = _exchRate;
+        ledgerJournalTrans.parmAccount(_CustAccount, LedgerJournalACType::Cust, _customerCompany);
+        // Pass CustAccount to this method to get PaymMode
+        if(_BankAcctId != '' && _FormatId != '')
+        {
+            ledgerJournalTrans.PaymMode = SKS_LB_Payment::getMethodOfPayment(_customerCompany, _CustAccount, _BankAcctId, _FormatId);
+        }
+        else
+        {
+            ledgerJournalTrans.PaymMode = _paymMode;
+        }
+        // This needs set to some value.  If it is 0 an error will occur during debugging
+        ledgerJournalTrans.RecId = 1;
+
+        // Create an instance of the CustPaymSettlementManager class
+        return CustPaymSettlementManager::construct(ledgerJournalTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLBFileHistory</Name>
+				<Source><![CDATA[
+    static void createLBFileHistory(SKS_LB_Action  _Action,
+                                         SKS_EB_AdditionalData  _AdditionalData = '',
+                                         LedgerJournalId        _JournalNum = '',
+                                         JournalId              _JournalID = '',
+                                         SKS_LB_BatchNum        _BatchNum = '')
+    {
+        SKS_LB_FileHistory lSKS_LB_FileHistory;
+
+        ttsBegin;
+
+        lSKS_LB_FileHistory.Action = _Action;
+        lSKS_LB_FileHistory.AdditionalData = _AdditionalData;
+        lSKS_LB_FileHistory.JournalNum = _JournalNum;
+        lSKS_LB_FileHistory.JournalID = _Journalid;
+        lSKS_LB_FileHistory.BatchNum = _BatchNum;
+
+        lSKS_LB_FileHistory.insert();
+        ttsCommit;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateNoSettlementApplicRecords</Name>
+				<Source><![CDATA[
+    public static server void CreateNoSettlementApplicRecords(RefRecId ARRecId, SKS_EB_FileRecord EBFileRecord, InvoiceId ARInvoice, CustAccount _custID, SelectableDataArea cpnyID, container _virtualCompanyCompanies)
+    {
+        SKS_LB_JournalARApplic  journalarapplic;
+        CustTransOpen           custTransOpen;
+        RecordInsertList        journalARApplicList = new RecordInsertList(tableNum(SKS_LB_JournalARApplic));
+        CustTable               TmpCustTable;
+        CustTable               lCustTable;
+        DirPartyTable           dirPartyTable;
+
+        Select crossCompany:_virtualCompanyCompanies AccountNum, Party, DefaultDimension
+                from TmpCustTable
+                join Name
+                    from dirPartyTable
+                    WHERE TmpCustTable.Party == dirPartyTable.RecId
+                        && TmpCustTable.AccountNum == _custID
+                        && TmpCustTable.dataareaid == cpnyID;
+
+        While
+            select crosscompany :_virtualCompanyCompanies RefRecId, DataAreaId, RecId
+            from custtransopen where custtransopen.AccountNum == _CustID
+                && custtransopen.AmountCur != 0
+            join lCustTable
+                where lCustTable.Party == TmpCustTable.Party
+                && lCustTable.AccountNum == custtransopen.AccountNum
+            notexists join journalARApplic where custtransopen.RecId == journalARApplic.CustTransOpenRecId
+                && journalARApplic.SKS_LB_JournalARRecId == ARRecId
+        {
+            journalarapplic.CustTransRecId = custtransopen.RefRecId;
+            journalarapplic.CustTransDataAreaId = custtransopen.DataAreaId;
+            journalarapplic.CustTransOpenRecId = custtransopen.RecId;
+            journalarapplic.SKS_LB_JournalARRecId = ARRecId;
+            journalarapplic.LBInvoice = ARInvoice;
+            journalarapplic.FileRecord = EBFileRecord;
+            journalarapplic.AltInvLookupType = SKS_LB_MatchType::InvoiceNumber;
+            journalARApplicList.add(journalarapplic);
+        }
+
+        journalARApplicList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LBDimensionMerge</Name>
+				<Source><![CDATA[
+    public static server DimensionDefault LBDimensionMerge(sks_pp_setup sks_pp_setup,
+                                                            dimensionDefault InvDimension,
+                                                            dimensionDefault CustDimension,
+                                                            LedgerJournalNameID JournalName,
+                                                            DataAreaId customerCompany)        
+    {
+        dimensionDefault    JournalDimension;
+        LedgerJournalName   LedgerJournalName;
+
+        if(!SKS_PP_SETUP.LBUseInvoiceDimensions)
+        {
+            InvDimension = 0;
+        }
+
+        if(!sks_pp_setup.LBDefaultFromCust)
+        {
+            CustDimension = 0;
+        }
+
+        if(!sks_pp_setup.LBDefaultFromJournal)
+        {
+            JournalDimension = 0;
+        }
+        else
+        {
+            DataAreaId importingCompany = curext();
+            if (customerCompany != importingCompany && customerCompany != '')
+            {
+                changecompany(customerCompany)
+                {
+                    LedgerInterCompany ledgerInterCompany = LedgerInterCompany::findCompanyPair(importingCompany,customerCompany);
+                    JournalDimension = LedgerJournalName::find(ledgerInterCompany.JournalName).DefaultDimension;
+                }
+            }
+            else
+            {
+                LedgerJournalName = LedgerJournalName::find(JournalName);
+                JournalDimension = LedgerJournalName.DefaultDimension;
+            }
+        }
+
+        return LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(InvDimension, CustDimension, JournalDimension);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>NullDateCheck</Name>
+				<Source><![CDATA[
+    public static boolean NullDateCheck(Days _Days, Months _Months, Yr _Yr)
+    {
+        if ((_Days == 11 && _Months == 11 && _Yr == 2011) || (_Days == 0 && _Months == 0 && _Yr == 0) || (_Days == 1 && _Months == 1 && _Yr == 1900))
+        {
+            return true;//Date is null
+        }
+        //info
+        return False;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ParentRecIDFileType</Name>
+				<Source><![CDATA[
+    Public static boolean ParentRecIDFileType(SKS_LB_FileType  LBFileType)
+    {
+        if (LBFileType == SKS_LB_FileType::BAI2 ||
+            LBFileType == SKS_LB_FileType::EDI820 ||
+            LBFileType == SKS_LB_FileType::EDI823 ||
+            LBFileType == SKS_LB_FileType::Symcor ||
+            LBFileType == SKS_LB_FileType::CAMT54V1 ||
+            LBFileType == SKS_LB_FileType::CAMT54V2 ||
+            LBFileType == SKS_LB_FileType::WFARRemitFile ||
+            LBFileType == SKS_LB_FileType::WFRMF ||
+            LBFileType == SKS_LB_FileType::Colombia ||
+            LBFileType == SKS_LB_FileType::IntReceive)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MarkedApplicSearch</Name>
+				<Source><![CDATA[
+    public static SKS_LB_JournalARApplic MarkedApplicSearch(RefRecId    _CtoRecID)
+    {
+        SKS_LB_JournalARApplic  lJournalARApplic;
+        SKS_LB_JournalAR        lSKS_LB_JournalAR;
+        SKS_BR_BankTran         lSKS_BR_BankTran;
+        container               virtualCompanyCompanies;
+
+        virtualCompanyCompanies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+
+        select firstOnly crosscompany:virtualCompanyCompanies lJournalarapplic
+            where lJournalarapplic.CustTransOpenRecId == _CtoRecID
+                && lJournalarapplic.SettleAmountCur != 0
+        join RecId from lSKS_LB_JournalAR
+            where lSKS_LB_JournalAR.recid == lJournalarapplic.SKS_LB_JournalARRecId
+                 && lSKS_LB_JournalAR.LedgerJournalTransRecId == 0;
+
+        if(!lJournalARApplic)
+        {
+            select firstOnly crosscompany:virtualCompanyCompanies lJournalarapplic
+                where lJournalarapplic.CustTransOpenRecId == _CtoRecID
+                    && lJournalarapplic.TransactionAmount != 0
+            join RecId from lSKS_BR_BankTran
+                where lSKS_BR_BankTran.recid == lJournalarapplic.SKS_BR_BankTran
+                    && lSKS_BR_BankTran.LedgerJournalRecID == 0;
+        }
+
+        return lJournalARApplic;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ARDeductionParentRecordFindCreate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public RefRecId ARDeductionParentRecordFindCreate(CompanyBankAccountId _bankAccount, JournalId lbJournalID, SKS_LB_BatchNum _formattedBatNum, str _pathFile, Date _fileDate, SKS_LB_FormatId _formatID, CustAccount _CustAccount, container _virtualCompanyCompanies, TMPSKS_LB_Importing _tmpRecord)
+    {
+        SKS_LB_JournalAR    ParentJournalAR;
+        SKS_LB_SecondaryMatch   SecondaryMatch = new SKS_LB_SecondaryMatch();
+        Select * from ParentJournalAR
+                    where  ParentJournalAR.CustAccount == _CustAccount
+                            && ParentJournalAR.ChkRefNbr == _tmpRecord.CheckNumber
+                            && ParentJournalAR.JournalId == lbJournalID
+                            && ParentJournalAR.Batchnum == _formattedBatNum;
+
+        if(!ParentJournalAR)
+        {
+            ttsbegin;
+            ParentJournalAR = SecondaryMatch.InitARRecord(_bankAccount, lbJournalID, _formattedBatNum, _pathfile, _FileDate, _formatID, _CustAccount, _VirtualCompanyCompanies, _TmpRecord, 0);
+            ttscommit;
+        }
+        return ParentJournalAR.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateStandardDED</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public static SKS_LB_Deductions CreateStandardDED(RefRecId  ParentRecid, RefRecId ARRecid, AMountCur _Amount, TmpSKS_LB_Importing _importing)
+    {
+        SKS_LB_Deductions   LBDeduction;
+        if(!SKS_PP_Setup::find().LBStandardDed)
+        {
+            return LBDeduction;
+        }
+
+        
+        SKS_LB_JournalAR    JournalARParent = SKS_LB_JournalAR::find(ParentRecid);
+        LBDeduction.JournalARParentRecId           = JournalARParent.RecId;
+        LBDeduction.JournalID                      = JournalARParent.journalid;
+        LBDeduction.AccountNum                     = JournalARParent.CustAccount;
+        LBDeduction.CurrencyCode                   = SKS_LB_Journal::FindByBatchAndJournalNum(JournalARParent.BatchNum, JournalARParent.JournalId).CurrencyCode;
+        LBDeduction.HcmWorkerId                    = HcmWorker::userId2Worker(curUserId());
+        LBDeduction.TAMDeductionType               = _importing.TAMDeductionType ? _importing.TAMDeductionType : SKS_PP_Setup::find().LBDeductionType;
+        LBDeduction.JournalARRecId                 = ARRecid;
+        LBDeduction.AmountCur                      = _Amount;
+        if(_importing.PaymNote == '')
+        {
+            LBDeduction.Notes                      = JournalARParent.PaymNote;
+        }
+        else
+        {
+            LBDeduction.Notes                      = _importing.PaymNote;
+        }
+        LBDeduction.insert();
+        //Added to facilitate customizations
+        return LBDeduction;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UseCurrentCompanyCustomer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///This method was added to support a customization for a customer.
+    /// </summary>
+    protected boolean UseCurrentCompanyCustomer()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>OldestDueDate_NoSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public void OldestDueDate_NoSettlement(RefRecId _origARRecID, boolean _doSettlement, 
+        CustCurrencyCode pmtCurrencyCode, real pmtExchRate, JournalId _lbBatNbr, 
+        CustAccount _custID, real _invApplyAmt, real _discApplyAmt, date _pmtDate, 
+        str _chkNbr, SKS_LB_WriteoffDetails _WriteOffDetails, 
+        SKS_LB_Bank _LBBank, boolean _AlwaysApplyDiscount, boolean _FromForm = false)
+    {
+        SKS_LB_Journal          sks_lb_journal;
+        SKS_LB_JournalARApplic  journalARApplic;
+        CustTrans               custtrans;
+        CustTransOpen           custtransopen;
+        container               virtualCompanyCompanies;
+        CompanyId               cpnyID;
+        CustPaymSettlementManager   SettlementManager;
+        sks_lb_journalar        PrevJournalAR;
+        int                     tranCount = 1;
+        SelectableDataArea      tmpCPNYID;
+        real                    splitPayAmt;
+        CustTable               TmpCustTable;
+        CustTable               lCustTable;
+        DirPartyTable           dirPartyTable;
+        sks_pp_setup            lSetup = sks_pp_setup::find();
+
+        UseOldestDueDate = true;
+
+        virtualCompanyCompanies = SKS_LB_54000Bas::LBFindSharedServiceCompanies(_LBBank);
+        if(_FromForm)
+        {
+            //Need to reselect since the record came from outside the tts scope
+            select forupdate tmpSKS_LB_JournalAR where tmpSKS_LB_JournalAR.RecId == _origARRecID;
+        }
+
+        Select crossCompany:virtualCompanyCompanies AccountNum, Party, DefaultDimension
+                from TmpCustTable
+                join Name
+                    from dirPartyTable
+                    WHERE TmpCustTable.Party == dirPartyTable.RecId
+                        && TmpCustTable.AccountNum == _custID
+                        && TmpCustTable.dataareaid == tmpSKS_LB_JournalAR.CustomerCompany;
+
+        //Apparently the Application method will be by Due Date, oldest date first.  So if an invoice number was not passed in then
+        //apply the chkamount to documents (custtransopen) by due date.
+        if(!_FromForm)
+        {
+            select crosscompany:virtualCompanycompanies custtransopen
+                Order By custtransopen.DueDate, custtransopen.RecId
+                where custtransopen.AccountNum == _CustID
+                  && custtransopen.AmountCur != 0
+                join lCustTable
+                where lCustTable.AccountNum == custtransopen.AccountNum
+                && lCustTable.Party == TmpCustTable.Party
+                notexists join journalARApplic
+                where custtransopen.RecId == journalARApplic.CustTransOpenRecId
+                      && journalARApplic.SKS_LB_JournalARRecId == _origARRecID;
+        }
+        else
+        {
+            select crosscompany:virtualCompanycompanies custtransopen
+                Order By custtransopen.DueDate, custtransopen.RecId
+                where custtransopen.AccountNum == _CustID
+                  && custtransopen.AmountCur != 0
+                join lCustTable
+                where lCustTable.AccountNum == custtransopen.AccountNum
+                && lCustTable.Party == TmpCustTable.Party
+                notexists join journalARApplic
+                where custtransopen.RecId == journalARApplic.CustTransOpenRecId
+                    && journalARApplic.SKS_LB_JournalARRecId == _origARRecID
+                    && journalARApplic.SettleAmountCur != 0;
+        }
+        ttsbegin;
+        while(custtransopen)
+        {
+            if(tranCount > 1 && _LBBank.SepPaymByInv)
+            {
+                //Essentially need to create an exact copy of the current payment record with a different RecId so it will create a new payment record.
+                //This new record still needs contained in the TmpSKS_LB_journalAR record because it is used in ApplyToCustTransOpen() below
+                if(_doSettlement)
+                {
+                   
+                    ttsbegin;
+                    PrevJournalAR.data(tmpSKS_LB_JournalAR.data());
+                    tmpSKS_LB_JournalAR = null;
+                    buf2Buf(PrevJournalAR, tmpSKS_LB_JournalAR);
+                    tmpSKS_LB_JournalAR.PmtAmountCur = m_ApplyAmtRem;
+                    tmpSKS_LB_JournalAR.ActualSettleAmountCur = 0;
+                    tmpSKS_LB_JournalAR.Invoice = '';
+                    tmpSKS_LB_JournalAR.insert();
+                    _origARRecID = tmpSKS_LB_JournalAR.RecId;
+                    PrevJournalAR.PmtAmountCur = PrevJournalAR.ActualSettleAmountCur;
+                    PrevJournalAR.write();
+                    ttscommit;
+                }
+
+            }
+
+            if(custtransopen.dataAreaId != tmpCpnyId)
+            {
+                tmpcpnyid = custtransopen.dataareaid;
+                changeCompany(custtransopen.company())
+                {
+                    settlementManager = SKS_LB_Process_ImportTemp_Records::constructSettlementManager(_pmtDate, pmtCurrencyCode, pmtExchRate, custtransopen.dataAreaId, _custID);
+                }
+            }
+
+            if(!_FromForm)
+            {
+                real invApplyAmtFinal = _invApplyAmt;
+
+                if(tmpSKS_LB_JournalAR.PmtAmountCur - tmpSKS_LB_JournalAR.ActualSettleAmountCur > 0 && (custtransopen.AmountCur > 0 || lSetup.LBOldestDueDateCredits))
+                {
+                    _doSettlement = true;
+
+                    // <<20151>>
+                    // if oldest due date marked and cust trans is minus then it settlement works for minus amount
+                    // like clicking the "Settle oldest due date" button on LB workbench - Settlements form.
+                    if (UseOldestDueDate
+                        && SKS_PP_Setup::find().LBOldestDueDateCredits
+                        && custtransopen.AmountCur < 0
+                        && custtransopen.AmountCur < (tmpSKS_LB_JournalAR.PmtAmountCur - tmpSKS_LB_JournalAR.ActualSettleAmountCur))
+                    {
+                        invApplyAmtFinal = custtransopen.AmountCur;
+                    }
+                    // <<20151>>
+                }
+                else
+                {
+                    _doSettlement = false;
+                }
+                this.ApplyToCustTransOpen(custtransopen, _LBBatNbr, _AlwaysApplyDiscount, PmtCurrencyCode, PmtExchRate, _DiscApplyAmt,
+                                        _PmtDate, _origARRecID, _ChkNbr, custtrans.Invoice, SKS_LB_MatchType::InvoiceNumber, _doSettlement, invApplyAmtFinal, SettlementManager,_WriteOffDetails, _LBBank.SepPaymByInv);
+            }
+            else
+            {
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                //if(!settlementManager.SKS_lbIsAlreadyMarked(custtransopen, 0))
+                // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                {
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    //if(custtransopen.amountcur < tmpSKS_LB_JournalAR.PmtAmountCur - tmpSKS_LB_JournalAR.ActualSettleAmountCur)
+                    if(custtransopen.sksGetRemainingAmount() < tmpSKS_LB_JournalAR.PmtAmountCur - tmpSKS_LB_JournalAR.ActualSettleAmountCur)
+                    // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    {
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //_invApplyAmt = custtransopen.amountcur;
+                        _invApplyAmt = custtransopen.sksGetRemainingAmount();
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                    }
+                    else
+                    {
+                        _invApplyAmt = tmpSKS_LB_JournalAR.PmtAmountCur - tmpSKS_LB_JournalAR.ActualSettleAmountCur;
+                    }
+                    
+                    this.GetSetAmtApplied(tmpSKS_LB_JournalAR.ActualSettleAmountCur);
+                    this.ApplyToCustTransOpen(custtransopen, _LBBatNbr, _AlwaysApplyDiscount, PmtCurrencyCode, PmtExchRate, 0,
+                                        _PmtDate, _origARRecID, _ChkNbr, custtrans.Invoice, SKS_LB_MatchType::InvoiceNumber, true, _invApplyAmt, SettlementManager, null, _LBBank.SepPaymByInv);
+                }
+            }
+
+            if(tmpSKS_LB_JournalAR.PmtAmountCur - tmpSKS_LB_JournalAR.ActualSettleAmountCur != 0)
+            {
+                tranCount++;
+                next custtransopen;
+            }
+            else
+            {
+                custtransopen = null;
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SetJournalARRecordExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///SIGNATURE LOCKED BY CUSTOMIZATION
+    /// </summary>
+    public boolean SetJournalARRecordExists(TmpSKS_LB_Importing tmpRecord, SKS_LB_Bank tmpSKS_LB_Bank, DimensionDefault dimensionDefault, RefRecId tmpPartyId, CustAccount tmpCustID, boolean Offsetmapped, boolean SepNegPaym, SelectableDataArea _CustomerCompany = '')
+    {
+        RefRecId                OffsetDim;
+        boolean                 JournalARRecordExists;
+        boolean                 ARFound;
+        //See if the record already exists
+        //If it does then that means there is more than one payment in this file for the customer
+        //and it has the same check number
+        //So on the second one after calling the insert_apply function, set the filerecord to -1
+        if(tmpRecord.ParentRecId == 0)
+        {
+            Select forUpdate TmpSKS_LB_JournalAR
+                    where   TmpSKS_LB_JournalAR.Party == tmpPartyId
+                            && TmpSKS_LB_JournalAR.CustAccount == tmpCustID
+                            && TmpSKS_LB_JournalAr.ChkRefNbr == tmpRecord.CheckNumber
+                            && TmpSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                            && TmpSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                            && tmpSKS_LB_JournalAR.DefaultDimension == dimensionDefault
+                            && TmpSKS_LB_JournalAr.ChkRefNbr != ''
+                            && tmpSKS_LB_JournalAR.isDED == NoYes::No
+                            && tmpSKS_LB_JournalAR.AresDed == NoYes::no;
+
+
+            if (TmpSKS_LB_JournalAR.ChkRefNbr > '')
+            {
+                if(tmpSKS_LB_Bank.SepPaymByInv == NoYes::Yes)
+                {
+                    splitPayment = NoYes::Yes;
+                    tmpSKS_LB_JournalAR.pmtwassplit = NoYes::Yes;
+                    TmpSKS_LB_JournalAR.update();
+                }
+                else
+                {
+                    JournalARRecordExists = NoYes::Yes;
+                }
+            }
+        }
+        else
+        {
+
+            tmpSKS_LB_JournalAR = this.findArtoSplit(tmpSKS_LB_Bank.SepPaymByInv, tmpRecord, _CustomerCompany);
+
+            if(tmpSKS_LB_JournalAR)
+            {
+                
+                if(OffsetMapped)
+                {
+                    OffsetDim = tmpRecord.offsetdimension;
+                }
+
+                if(TmpSKS_LB_JournalAR.Party != tmpPartyId 
+                        || TmpSKS_LB_JournalAR.CustAccount != tmpCustID
+                        || tmpSKS_LB_JournalAR.DefaultDimension != dimensionDefault
+                        || tmpSKS_LB_JournalAR.OffsetDimension != OffsetDim
+                        || tmpSKS_LB_Bank.SepPaymByInv == NoYes::Yes 
+                        || SepNegPaym
+                        || (SKS_PP_Setup::find().LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany && tmpSKS_LB_JournalAR.CustomerCompany != _CustomerCompany))
+                {
+
+                    TmpSKS_LB_JournalAR.PmtAmountCur -= tmpRecord.InvAmount;
+                    tmpSKS_LB_JournalAR.FeeValue = 0;
+                    tmpSKS_LB_JournalAR.PmtWasSplit = NoYes::Yes;
+                    TmpSKS_LB_JournalAR.update();
+                    splitPayment = NoYes::Yes;
+                    tmpRecord.CheckAmount = tmpRecord.InvAmount;
+
+                    Select forUpdate TmpSKS_LB_JournalAR
+                            where
+                            TmpSKS_LB_JournalAR.Party == tmpPartyId
+                            && TmpSKS_LB_JournalAR.CustAccount == tmpCustID
+                            && TmpSKS_LB_JournalAR.ChkRefNbr == tmpRecord.CheckNumber
+                            && TmpSKS_LB_JournalAR.ParentRecId == tmpRecord.ParentRecId
+                            && TmpSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                            && TmpSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                            && tmpSKS_LB_JournalAR.DefaultDimension == dimensionDefault
+                            && tmpSKS_LB_JournalAR.OffsetDimension == OffsetDim
+                            && tmpSKS_LB_JournalAR.isDED == NoYes::No
+                            && tmpSKS_LB_JournalAR.AresDed == NoYes::no;
+
+                    if(tmpSKS_LB_JournalAR && ((tmpSKS_LB_Bank.SepPaymByInv == NoYes::No && !SepNegPaym)|| m_sumlikeref == NoYes::yes ))
+                    {
+                        TmpSKS_LB_JournalAR.PmtAmountCur += tmpRecord.InvAmount;
+                        TmpSKS_LB_JournalAR.update();
+
+                        JournalARRecordExists = NoYes::Yes;
+                    }
+                }
+                else
+                {
+                    JournalARRecordExists = NoYes::Yes;
+
+                    Select forUpdate TmpSKS_LB_JournalAR
+                    order by TmpSKS_LB_JournalAR.RecId
+                    where TmpSKS_LB_JournalAR.ChkRefNbr == tmpRecord.CheckNumber
+                    && TmpSKS_LB_JournalAR.ParentRecId == tmpRecord.ParentRecId
+                    && TmpSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                        && TmpSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                        && tmpSKS_LB_JournalAR.isDED == NoYes::No
+                        && tmpSKS_LB_JournalAR.AresDed == NoYes::no;
+
+                    if(tmpSKS_LB_JournalAR && SKS_PP_Setup::find().LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany && tmpSKS_LB_JournalAR.CustomerCompany != _CustomerCompany)
+                    {
+                        TmpSKS_LB_JournalAR.PmtAmountCur -= tmpRecord.InvAmount;
+                        TmpSKS_LB_JournalAR.update();
+
+                        Select forUpdate TmpSKS_LB_JournalAR
+                        order by TmpSKS_LB_JournalAR.RecId
+                            where TmpSKS_LB_JournalAR.ChkRefNbr == tmpRecord.CheckNumber
+                            && TmpSKS_LB_JournalAR.ParentRecId == tmpRecord.ParentRecId
+                            && TmpSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                                && TmpSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                                && tmpSKS_LB_JournalAR.CustomerCompany == _CustomerCompany
+                                && tmpSKS_LB_JournalAR.isDED == NoYes::No
+                                && tmpSKS_LB_JournalAR.AresDed == NoYes::no;
+
+                        TmpSKS_LB_JournalAR.PmtAmountCur += tmpRecord.InvAmount;
+                        TmpSKS_LB_JournalAR.update();
+                    }
+                }
+            }
+            else
+            {
+                JournalARRecordExists = NoYes::No;
+
+                Select forUpdate TmpSKS_LB_JournalAR
+                order by TmpSKS_LB_JournalAR.RecId
+                    where TmpSKS_LB_JournalAR.ChkRefNbr == tmpRecord.CheckNumber
+                    && TmpSKS_LB_JournalAR.ParentRecId == tmpRecord.ParentRecId
+                    && TmpSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                        && TmpSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                        && tmpSKS_LB_JournalAR.isDED == NoYes::No
+                        && tmpSKS_LB_JournalAR.AresDed == NoYes::no;
+
+                if(tmpSKS_LB_JournalAR && SKS_PP_Setup::find().LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany && tmpSKS_LB_JournalAR.CustomerCompany != _CustomerCompany)
+                {
+                    TmpSKS_LB_JournalAR.PmtAmountCur -= tmpRecord.InvAmount;
+                    TmpSKS_LB_JournalAR.update();
+                    splitPayment = NoYes::Yes;
+                    tmpRecord.CheckAmount = tmpRecord.InvAmount;
+                }
+            }
+        }
+
+        if(JournalARRecordExists)
+        {
+            this.GetSetGlobalJournalAR(tmpSKS_LB_JournalAR);
+        }
+        else
+        {
+            this.GetSetGlobalJournalAR(null);
+        }
+
+        return JournalARRecordExists;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getsetTmpJournalAR</Name>
+				<Source><![CDATA[
+    SKS_LB_JournalAR getsetTmpJournalAR(SKS_LB_JournalAR _tmpSKS_LB_JournalAR = tmpSKS_LB_JournalAR)
+    {
+        ;
+    
+        if (!prmIsDefault(_tmpSKS_LB_JournalAR))
+        {
+            tmpSKS_LB_JournalAR = _tmpSKS_LB_JournalAR;
+        }
+    
+        return tmpSKS_LB_JournalAR;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSetApplyAmtRem</Name>
+				<Source><![CDATA[
+    real GetSetApplyAmtRem(real _m_ApplyAmtRem = m_ApplyAmtRem)
+    {
+        ;
+    
+        if (!prmIsDefault(_m_ApplyAmtRem))
+        {
+            m_ApplyAmtRem = _m_ApplyAmtRem;
+        }
+    
+        return m_ApplyAmtRem;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSetAmtApplied</Name>
+				<Source><![CDATA[
+    real GetSetAmtApplied(real _m_AmtApplied = m_AmtApplied)
+    {
+        ;
+    
+        if (!prmIsDefault(_m_AmtApplied))
+        {
+            m_AmtApplied = _m_AmtApplied;
+        }
+    
+        return m_AmtApplied;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSetGlobalJournalAR</Name>
+				<Source><![CDATA[
+    SKS_LB_JournalAR GetSetGlobalJournalAR(SKS_LB_JournalAR _TmpSKS_LB_JournalAR = TmpSKS_LB_JournalAR)
+    {
+        ;
+    
+        if (!prmIsDefault(_TmpSKS_LB_JournalAR))
+        {
+            TmpSKS_LB_JournalAR = _TmpSKS_LB_JournalAR;
+        }
+    
+        return TmpSKS_LB_JournalAR;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSetGlobalSplitPayment</Name>
+				<Source><![CDATA[
+    boolean GetSetGlobalSplitPayment(boolean _splitPayment = splitPayment)
+    {
+        ;
+    
+        if (!prmIsDefault(_splitPayment))
+        {
+            splitPayment = _splitPayment;
+        }
+    
+        return splitPayment;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSetGlobalTmpJournal</Name>
+				<Source><![CDATA[
+    SKS_LB_Journal GetSetGlobalTmpJournal(SKS_LB_Journal _TmpSKS_LB_Journal = TmpSKS_LB_Journal)
+    {
+        ;
+    
+        if (!prmIsDefault(_TmpSKS_LB_Journal))
+        {
+            TmpSKS_LB_Journal = _TmpSKS_LB_Journal;
+        }
+    
+        return TmpSKS_LB_Journal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getsetm_CustCompany</Name>
+				<Source><![CDATA[
+    SelectableDataArea getsetm_CustCompany(SelectableDataArea _m_CustCompany = m_CustCompany)
+    {
+        ;
+    
+        if (!prmIsDefault(_m_CustCompany))
+        {
+            m_CustCompany = _m_CustCompany;
+        }
+    
+        return m_CustCompany;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AssignCustomerByFoundInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///Added method as an extension point. 
+    ///Original use was for "Found for wrong customer" situation. Customization allows to return null for custTrans and CustTransOpen so that "on account" payment can happen
+    /// </summary>
+    public container AssignCustomerByFoundInvoice(CustTrans tmpInvCustTrans, CustTransOpen tmpInvCustTransOpen, TmpSKS_LB_Importing TmpRecord
+        , SKS_LB_CustIDErr custIDErr, SKS_LB_InvoiceIDErr invcNbrErr, CustAccount custIDSugg, CompanyId customerCompany, boolean CustomerValidation)
+    {
+        container   ConCustomerInfo;
+        CustTable   TmpCustTable;
+        container   TmpCompany = [tmpInvCustTrans.DataAreaId];
+
+        //look for customer in the invoiceCompany
+        changecompany(tmpInvCustTrans.DataAreaId)
+        {
+            Select * from TmpCustTable where TmpCustTable.AccountNum == tmpRecord.CustAccount;
+        }
+        if(!tmpCustTable)
+        {
+            Select crosscompany:TmpCompany * from TmpCustTable where TmpCustTable.AccountNum == tmpRecord.CustAccount;
+        }
+
+        if (tmpRecord.CustAccount != '' && tmpCustTable.AccountNum != '' && customerValidation == true)
+        {
+            // if we found a record and it doesn't match, then set "wrong customer" error
+            if (  TmpInvCustTrans.AccountNum != tmpRecord.CustAccount || tmpCustTable.dataAreaId != tmpInvCustTrans.dataAreaId)
+            {
+                // InvcNbr exists but is for another customer
+                InvcNbrErr = SKS_LB_InvoiceIDErr::FoundForWrongCustomer;
+                customerCompany = curext();
+            }
+            else
+            {
+                CustIDErr = SKS_LB_CustIDErr::InvcNbrLookup;
+                CustIDSugg = TmpInvCustTrans.AccountNum;
+                customerCompany = tmpInvCustTrans.company();
+            }
+        }
+        else
+        {
+            CustIDErr = SKS_LB_CustIDErr::InvcNbrLookup;
+            // a customer from a found invoice number overrides a suggested customer by other means (name lookup, etc.).
+            CustIDSugg = TmpInvCustTrans.AccountNum;
+            customerCompany = tmpInvCustTrans.company();
+        }
+
+        //Returning a lot of seemingly unnecessary variables for the use of extensions/customizations
+        ConCustomerInfo += [InvcNbrErr, customerCompany, CustIDErr, CustIDSugg, tmpInvCustTrans, tmpInvCustTransOpen];
+        return ConCustomerInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpSKS_LB_JournalAR</Name>
+				<Source><![CDATA[
+    protected SKS_LB_JournalAR initTmpSKS_LB_JournalAR(TMPSKS_LB_Importing tmpRecord, SKS_LB_JournalARRecord journalARRecord)
+    {
+        SKS_LB_JournalAR tmpSKS_LB_JournalARLoc;
+
+        tmpSKS_LB_JournalARLoc.data(tmpSKS_LB_JournalAR);
+
+        tmpSKS_LB_JournalARLoc.CustBankAccountNum = tmpRecord.CustBankAccountNum;
+        tmpSKS_LB_JournalARLoc.CustBankRegNum = tmpRecord.CustBankRegNum;
+        tmpSKS_LB_JournalARLoc.BankAcct = journalARRecord.getBankAccount();
+        tmpSKS_LB_JournalARLoc.ChkRefNbr = tmpRecord.CheckNumber;
+        tmpSKS_LB_JournalARLoc.CustAccount = journalARRecord.getTmpCustID();
+        tmpSKS_LB_JournalARLoc.CustAccountErr = journalARRecord.getCustIDErr();
+        tmpSKS_LB_JournalARLoc.CustAccountSugg = journalARRecord.getCustIDSugg();
+        tmpSKS_LB_JournalARLoc.CustName = tmpRecord.CustName;        
+        tmpSKS_LB_JournalARLoc.CustomerCompany = journalARRecord.getCustomerCompany();
+        tmpSKS_LB_JournalARLoc.DiscApplyAmt = tmpRecord.DiscAmount;
+        tmpSKS_LB_JournalARLoc.ImageIdentifierFront = tmpRecord.ImageIdentifierFront;
+        tmpSKS_LB_JournalARLoc.ImageIdentifierBack = tmpRecord.ImageIdentifierBack;
+        tmpSKS_LB_JournalARLoc.FileDate = journalARRecord.getFileDate();
+        tmpSKS_LB_JournalARLoc.Filename = journalARRecord.getPathFile();
+        tmpSKS_LB_JournalARLoc.FormatID = journalARRecord.getFormatID();
+        tmpSKS_LB_JournalARLoc.FileRecord = tmpRecord.FileLineNbrBegin;
+        tmpSKS_LB_JournalARLoc.ParentRecId = tmpRecord.ParentRecId;        
+        tmpSKS_LB_JournalARLoc.Invoice = journalARRecord.getInvoiceIdLoc();
+        tmpSKS_LB_JournalARLoc.LBInvoice = journalARRecord.getLBInvoiceLoc();
+        tmpSKS_LB_JournalARLoc.PmtAmountCur = journalARRecord.getPmtAmountCurLoc();
+        tmpSKS_LB_JournalARLoc.ActualSettleAmountCur = 0;
+        tmpSKS_LB_JournalARLoc.JournalId = TmpSKS_LB_Journal.JournalID;
+        tmpSKS_LB_JournalARLoc.LBCustAccount = tmpRecord.CustAccount;
+        tmpSKS_LB_JournalARLoc.LBSettlementMethod = m_settleMethod;
+        tmpSKS_LB_JournalARLoc.LedgerJournalTransRecId = 0;
+        tmpSKS_LB_JournalARLoc.MarkedForApply = NoYes::No;
+        tmpSKS_LB_JournalARLoc.Party = journalARRecord.getTmpPartyId();
+        tmpSKS_LB_JournalARLoc.PendingSettlement = 0;
+        tmpSKS_LB_JournalARLoc.CustTransOpenRecId = journalARRecord.getCustTransOpenRef();
+        tmpSKS_LB_JournalARLoc.CustTransRecId = journalARRecord.getCustTransRef();
+        tmpSKS_LB_JournalARLoc.WriteOff = m_autoCreditGenerated;
+        tmpSKS_LB_JournalARLoc.DefaultDimension = journalARRecord.getDimensionDefault();
+        tmpSKS_LB_JournalARLoc.AutoCRRev = tmpRecord.AutoCRAutoRev;
+        tmpSKS_LB_JournalARLoc.AutoRevLedgerDimension = tmpRecord.AutoRevLedgerDimension;
+        tmpSKS_LB_JournalARLoc.AutoRevOffsetLedgerDimension = tmpRecord.AutoRevOffsetLedgerDimension;
+        tmpSKS_LB_JournalARLoc.PmtWasSplit = splitPayment || tmpSKS_LB_JournalARErrors.PmtWasSplit;
+        tmpSKS_LB_JournalARLoc.AutoCRRev = journalARRecord.getAutoCRRev();
+        tmpSKS_LB_JournalARLoc.AutoRevLedgerDimension = journalARRecord.getAutoRevLedgerDimension();
+        tmpSKS_LB_JournalARLoc.AutoRevOffsetLedgerDimension = journalARRecord.getAutoRevOffsetLedgerDimension();
+        tmpSKS_LB_JournalARLoc.PayJrnlDeposit = journalARRecord.getPaymJrnlFlag();
+        tmpSKS_LB_JournalARLoc.PaymDate = journalARRecord.getPaymentDate();
+        tmpSKS_LB_JournalARLoc.BatchNum = journalARRecord.getBatchNum();
+        tmpSKS_LB_JournalARLoc.FeeId = journalARRecord.getFeeId();
+        tmpSKS_LB_JournalARLoc.FeeValue = journalARRecord.getFeeValue();
+        tmpSKS_LB_JournalARLoc.FileDate = tmpRecord.FileDate;          
+
+        if(tmpRecord.Description != '')
+        {
+            tmpSKS_LB_JournalARLoc.Description = tmpRecord.Description;
+        }
+        tmpSKS_LB_JournalARLoc.RevReasonCode = journalARRecord.getAutoCRRevReasonCode();
+        tmpSKS_LB_JournalARLoc.AutoCROffsetLedgerDimension = journalARRecord.getOffsetCRDimension();
+        tmpSKS_LB_JournalARLoc.TrackingInvoices = tmpRecord.TrackingInvoices;
+        tmpSKS_LB_JournalARLoc.Prepayment = tmpRecord.prepayment;
+        tmpSKS_LB_JournalARLoc.OffsetDimensionReference = tmpRecord.OffsetDimensionReference;
+        tmpSKS_LB_JournalARLoc.PaymNote = tmpRecord.PaymNote;
+        tmpSKS_LB_JournalARLoc.isDED = tmpRecord.isDED;
+        if(tmpRecord.isDED)
+        {
+            tmpSKS_LB_JournalARLoc.FFDedCat = SKS_TPM_PaymentJournal::FindDeductionCategory(tmpSKS_LB_JournalARLoc.CustAccount, tmpSKS_LB_JournalARLoc.PmtAmountCur, tmpSKS_LB_JournalARLoc.company(), tmpSKS_LB_JournalARLoc.FFDedCat, tmpRecord);
+        }
+        tmpSKS_LB_JournalARLoc.MOP = tmpRecord.PaymentMOP;
+        tmpSKS_LB_JournalARLoc.LineNumber = tmpRecord.FileLineNbrBegin;
+
+        if(journalARRecord.getOffsetMapped())
+        {
+            tmpSKS_LB_JournalARLoc.OffsetDimension = tmpRecord.OffsetDimension;
+        }
+
+        if(tmpRecord.AresDed)
+        {
+            tmpSKS_LB_JournalARLoc.ParentJournalARID = journalARRecord.getParentJournalARIDRefRec();
+            tmpSKS_LB_JournalARLoc.PmtAmountCur = tmpRecord.InvAmount;
+            tmpSKS_LB_JournalARLoc.ActualSettleAmountCur = 0;
+            tmpSKS_LB_JournalARLoc.AresDed = NoYes::Yes;
+        }             
+
+        tmpSKS_LB_JournalARLoc.insert();
+
+        return tmpSKS_LB_JournalARLoc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpSKS_LB_JournalARErrors</Name>
+				<Source><![CDATA[
+    protected SKS_LB_JournalARErrors initTmpSKS_LB_JournalARErrors(TMPSKS_LB_Importing tmpRecord, SKS_LB_JournalARErrorRecord journalARErrorRecord)
+    {
+        SKS_LB_JournalARErrors tmpSKS_LB_JournalARErrorsLoc;
+
+        tmpSKS_LB_JournalARErrorsLoc.data(tmpSKS_LB_JournalARErrors);
+                       
+        tmpSKS_LB_JournalARErrorsLoc.WriteOffId = journalARErrorRecord.getWriteoffIdLoc();
+        tmpSKS_LB_JournalARErrorsLoc.CustBankAccountNum = tmpRecord.CustBankAccountNum;
+        tmpSKS_LB_JournalARErrorsLoc.CustBankRegNum = tmpRecord.CustBankRegNum;
+        tmpSKS_LB_JournalARErrorsLoc.ImageIdentifierFront = tmpRecord.ImageIdentifierFront;
+        tmpSKS_LB_JournalARErrorsLoc.ImageIdentifierBack = tmpRecord.ImageIdentifierBack;
+        tmpSKS_LB_JournalARErrorsLoc.ChkRefNbr = tmpRecord.CheckNumber;
+        tmpSKS_LB_JournalARErrorsLoc.CustAccount = tmpRecord.CustAccount;
+        tmpSKS_LB_JournalARErrorsLoc.BankAcct = journalARErrorRecord.getBankAccount();
+        tmpSKS_LB_JournalARErrorsLoc.AltInvLookupType = journalARErrorRecord.getTmpMatchType();
+        tmpSKS_LB_JournalARErrorsLoc.AltInvLookupRef = journalARErrorRecord.getTmpMatchValue();
+        tmpSKS_LB_JournalARErrorsLoc.CustAccountErr = journalARErrorRecord.getCustIDErr();
+        tmpSKS_LB_JournalARErrorsLoc.CustomerCompany = journalARErrorRecord.getCustomerCompany();
+        tmpSKS_LB_JournalARErrorsLoc.CustAccountSugg = journalARErrorRecord.getCustIDSugg();
+        tmpSKS_LB_JournalARErrorsLoc.CustName = journalARErrorRecord.getCustName();
+        tmpSKS_LB_JournalARErrorsLoc.DiscApplyAmt = tmpRecord.DiscAmount;
+        tmpSKS_LB_JournalARErrorsLoc.FileRecord = tmpRecord.FileLineNbrBegin;
+        tmpSKS_LB_JournalARErrorsLoc.ParentRecId = tmpRecord.ParentRecId;
+        tmpSKS_LB_JournalARErrorsLoc.LBInvoice = tmpRecord.LBInvoice;
+        tmpSKS_LB_JournalARErrorsLoc.Filename  = journalARErrorRecord.getPathFile();
+        tmpSKS_LB_JournalARErrorsLoc.FormatID = journalARErrorRecord.getFormatId();
+        tmpSKS_LB_JournalARErrorsLoc.FileDate = journalARErrorRecord.getFileDate();
+        tmpSKS_LB_JournalARErrorsLoc.Invoice = journalARErrorRecord.getInvoiceId();
+        tmpSKS_LB_JournalARErrorsLoc.LBInvoice = tmpRecord.LBInvoice;
+        tmpSKS_LB_JournalARErrorsLoc.InvoiceIdErr = journalARErrorRecord.getInvcNbrErr();
+        tmpSKS_LB_JournalARErrorsLoc.JournalId = TmpSKS_LB_Journal.JournalID;
+        tmpSKS_LB_JournalARErrorsLoc.PendingSettlement = 0;
+        tmpSKS_LB_JournalARErrorsLoc.LBSettlementMethod = m_settleMethod;
+        if(tmpRecord.isDED == NoYes::Yes )
+        {
+            tmpSKS_LB_JournalARErrorsLoc.isDED = tmpRecord.isDED;
+            tmpSKS_LB_JournalARErrorsLoc.PmtAmountCur = tmpRecord.InvAmount;
+            tmpSKS_LB_JournalARErrorsLoc.ActualSettlementAmountCur = 0;
+        }
+        else
+        {
+            tmpSKS_LB_JournalARErrorsLoc.AresDed = tmpRecord.AresDed;
+            tmpSKS_LB_JournalARErrorsLoc.PmtAmountCur = tmpRecord.CheckAmount;
+            tmpSKS_LB_JournalARErrorsLoc.ActualSettlementAmountCur = tmpRecord.InvAmount;
+        }
+
+        tmpSKS_LB_JournalARErrorsLoc.CustTransOpenRecId = journalARErrorRecord.getTmpInvCustTransOpen().RecId;
+        tmpSKS_LB_JournalARErrorsLoc.CustTransRecId = journalARErrorRecord.getTmpInvCustTrans().RecId;
+        tmpSKS_LB_JournalARErrorsLoc.DefaultDimension = journalARErrorRecord.getDefaultDimension();
+        
+        if(journalARErrorRecord.getUpdate_existing_error() == NoYes::Yes )
+        {            
+            tmpSKS_LB_JournalARErrorsLoc.update();
+        }
+        else
+        {
+            tmpSKS_LB_JournalARErrorsLoc.BatchNum = journalARErrorRecord.getBatchNum();
+            tmpSKS_LB_JournalARErrorsLoc.FeeId = journalARErrorRecord.getFeeId();
+
+            if(tmpSKS_LB_JournalARErrorsLoc.FeeId != '')
+            {
+                tmpSKS_LB_JournalARErrorsLoc.FeeValue = TmpRecord.FeeValue;
+            }
+
+            tmpSKS_LB_JournalARErrorsLoc.Description = tmpRecord.Description;
+            tmpSKS_LB_JournalARErrorsLoc.filedate = tmpRecord.filedate;
+            tmpSKS_LB_JournalARErrorsLoc.PaymNote  = tmpRecord.PaymNote;
+            tmpSKS_LB_JournalARErrorsLoc.Prepayment  = tmpRecord.Prepayment;
+            tmpSKS_LB_JournalARErrorsLoc.OffsetDimension = journalARErrorRecord.getOffsetDimension();
+            tmpSKS_LB_JournalARErrorsLoc.OffsetDimensionReference = tmpRecord.OffsetDimensionReference;
+            tmpSKS_LB_JournalARErrorsLoc.MOP = tmpRecord.PaymentMOP;
+            tmpSKS_LB_JournalARErrorsLoc.LineNumber = tmpRecord.FileLineNbrBegin;
+            tmpSKS_LB_JournalARErrorsLoc.PaymDate = journalARErrorRecord.getPaymentDate();
+
+            tmpSKS_LB_JournalARErrorsLoc.insert();
+        }
+
+        return tmpSKS_LB_JournalARErrorsLoc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findArtoSplit</Name>
+				<Source><![CDATA[
+    public sks_lb_journalar findArtoSplit(boolean _seppaymbyInv, TmpSKS_LB_Importing _tmpRecord, dataareaid _customercompany)
+    {
+        SKS_LB_JournalAR lSKS_LB_JournalAR;
+        if(SKS_PP_Setup::find().LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany && _seppaymbyInv == NoYes::No)
+        {
+
+            Select forUpdate lSKS_LB_JournalAR
+                    order by lSKS_LB_JournalAR.RecId
+                        where lSKS_LB_JournalAR.ChkRefNbr == _tmpRecord.CheckNumber
+                        && lSKS_LB_JournalAR.ParentRecId == _tmpRecord.ParentRecId
+                        && lSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                            && lSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                            && lSKS_LB_JournalAR.CustomerCompany == _CustomerCompany
+                            && lSKS_LB_JournalAR.isDED == NoYes::No
+                            && lSKS_LB_JournalAR.AresDed == NoYes::no;
+        }
+        else
+        {
+            Select forUpdate lSKS_LB_JournalAR
+                order by lSKS_LB_JournalAR.RecId
+                    where lSKS_LB_JournalAR.ChkRefNbr == _tmpRecord.CheckNumber
+                    && lSKS_LB_JournalAR.ParentRecId == _tmpRecord.ParentRecId
+                    && lSKS_LB_JournalAR.JournalId == TmpSKS_LB_Journal.JournalID
+                        && lSKS_LB_JournalAR.Batchnum == TmpSKS_LB_Journal.Batchnum
+                        && lSKS_LB_JournalAR.isDED == NoYes::No
+                        && lSKS_LB_JournalAR.AresDed == NoYes::no;
+        }
+
+        return lSKS_LB_JournalAR;
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

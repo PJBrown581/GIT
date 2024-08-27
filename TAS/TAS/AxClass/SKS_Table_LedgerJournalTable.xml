@@ -1,0 +1,3921 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_Table_LedgerJournalTable</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_Table_LedgerJournalTable
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreateAndSend</Name>
+				<Source><![CDATA[
+    public static str CreateAndSend(LedgerJournalTable _orig, LedgerJournalTable _curr)
+    {
+        str returnMessage;
+
+        try
+        {
+            //Make sure it is an EFT+ type transaction (AP Payment and has a EFT Journal State)
+            if ((_curr.JournalType == LedgerJournalType::Payment
+                    || _curr.JournalType == LedgerJournalType::CustPayment
+                    || _curr.JournalType == LedgerJournalType::Daily)
+                && _curr.SKS_EFT_JournalState != SKS_EFT_JournalState::NotApplicable
+                && SKS_Table_LedgerJournalTable::EFTMOPExists(_curr))
+            {
+                // If posting and state was partially transferred, change it to transferred since rejected lines will be moved out during posting
+                if((!_orig.Posted && _curr.Posted)
+                    && _curr.SKS_EFT_JournalState == SKS_EFT_JournalState::PartiallyTransferred)
+                {
+                    _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                }
+                // Transmit status is being directly set/unset
+                else if (( _orig.SKS_EFT_JournalState == SKS_EFT_JournalState::Ready
+                        || _orig.SKS_EFT_JournalState == SKS_EFT_JournalState::PartiallyTransferred
+                        || _orig.SKS_EFT_JournalState == SKS_EFT_JournalState::Errors) &&
+                        _curr.SKS_EFT_JournalState == SKS_EFT_JournalState::Transferred)
+                {
+                    if(!SKS_EFT_JournalValidate::isJournalException(_curr.JournalNum))
+                    {
+                        returnMessage = SKS_Table_LedgerJournalTable::SyncEFTRecords(true, _curr);
+                    }
+                    else
+                    {
+                        _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Errors;
+                    }
+                }
+                else if (_orig.SKS_EFT_JournalState == SKS_EFT_JournalState::Transferred
+                        && _curr.SKS_EFT_JournalState == SKS_EFT_JournalState::Ready)
+                {
+                    if (SKS_EFT_JournalValidate::validateUnset(_curr.JournalType, _curr, true))
+                    {
+                        returnMessage = SKS_Table_LedgerJournalTable::SyncEFTRecords(false, _curr);
+                    }
+                    else
+                    {
+                        _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                    }
+                }
+                /* #16422
+                else if (!_orig.approver && _curr.approver && _curr.journaltype == LedgerJournalType::CustPayment)
+                {
+                    //for direct debit only
+                    if (sks_eft_journalvalidate::validateset(_curr.journaltype, _curr, true))
+                    {
+                        _curr.sks_eft_journalstate = sks_eft_journalstate::transferred;
+
+                        returnmessage = sks_table_ledgerjournaltable::synceftrecords(true, _curr);
+                    }
+                    else
+                    {
+                        _curr.sks_eft_journalstate = sks_eft_journalstate::errors;
+                    }
+                }
+                */
+                else if (!_orig.approver && _curr.approver && _curr.journaltype == LedgerJournalType::Daily)
+                {
+                    if (sks_eft_journalvalidate::validateset(_curr.journaltype, _curr, true))
+                    {
+                        _curr.sks_eft_journalstate = sks_eft_journalstate::transferred;
+
+                        returnmessage = sks_table_ledgerjournaltable::synceftrecords(true, _curr);
+                    }
+                    else
+                    {
+                        _curr.sks_eft_journalstate = sks_eft_journalstate::errors;
+                    }
+                }
+                else if (_orig.Approver && !_curr.Approver)
+                {
+                    if (SKS_EFT_JournalValidate::validateUnset(_curr.JournalType, _curr, true))
+                    {
+                        returnMessage = SKS_Table_LedgerJournalTable::SyncEFTRecords(false, _curr);
+                        _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Ready;
+                    }
+                    else
+                    {
+                        _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                    }
+                }
+                else if (_orig.WorkflowApprovalStatus == LedgerJournalWFApprovalStatus::Approved
+                        && _curr.WorkflowApprovalStatus != LedgerJournalWFApprovalStatus::Approved)
+                {
+                    if (SKS_EFT_JournalValidate::validateUnset(_curr.JournalType, _curr, true))
+                    {
+                        returnMessage = SKS_Table_LedgerJournalTable::SyncEFTRecords(false, _curr);
+                        _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Ready;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            returnMessage = "@SKS3757";
+            error(returnMessage);
+            _curr.SKS_EFT_JournalState = SKS_EFT_JournalState::Errors;
+        }
+
+        return returnMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>EFTMOPExists</Name>
+				<Source><![CDATA[
+    public static boolean EFTMOPExists(LedgerJournalTable _ledgerJournalTable)
+    {
+        LedgerJournalTrans lLedgerJournalTrans;
+        VendPaymModeTable lvendPaymModeTable;
+        CustPaymModeTable lcustPaymModeTable;
+        SKS_BTB_PaymModeTable   lSKS_BTB_PaymModeTable;
+
+        if(_ledgerJournalTable.JournalType == LedgerJournalType::Payment)
+        {
+            select firstonly RecId from lLedgerJournalTrans
+                where lLedgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+            join SKS_EFT_FormatId from lvendPaymModeTable
+                where lvendPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode
+                    && lvendPaymModeTable.SKS_EFT_PaymMode;
+        }
+
+        if(_ledgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+        {
+            if(SKS_Table_LedgerJournalTable::checkCustReimbursement(_ledgerJournalTable))
+            {
+                select firstonly RecId from lLedgerJournalTrans
+                    where lLedgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+                join SKS_CNP_FormatId from lcustPaymModeTable
+                    where lcustPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode
+                        && lcustPaymModeTable.SKS_CNP_PaymMode;
+            }
+            else
+            {
+                select firstonly RecId from lLedgerJournalTrans
+                        where lLedgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+                    join SKS_EFT_FormatId from lcustPaymModeTable
+                        where lcustPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode
+                            && lcustPaymModeTable.SKS_EFT_PaymMode;
+            }
+        }
+
+        if(_ledgerJournalTable.JournalType == LedgerJournalType::Daily)
+        {
+            select firstonly RecId from lLedgerJournalTrans
+                where lLedgerJournalTrans.JournalNum == _ledgerJournalTable.JournalNum
+            join FormatId from lSKS_BTB_PaymModeTable
+                where lSKS_BTB_PaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode;
+                    //&& lcustPaymModeTable.SKS_EFT_PaymMode;
+        }
+
+        return lLedgerJournalTrans.Recid ? true : false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetEFTModule</Name>
+				<Source><![CDATA[
+    public server static SKS_EFT_Module GetEFTModule(LedgerJournalId _journalNum)
+    {
+        SKS_EFT_Module result = -1; //Prevents a false positive for AP when not in a payment journal
+        LedgerJournalTable ledgerJournalTable;
+        ;
+
+        select firstonly JournalType from ledgerJournalTable
+            where ledgerJournalTable.JournalNum == _journalNum;
+
+        if(ledgerJournalTable.JournalType == LedgerJournalType::Payment)
+        {
+            result = SKS_EFT_Module::AP;
+        }
+        else if(ledgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+        {
+            if(SKS_Table_LedgerJournalTable::checkCustReimbursement(ledgerJournalTable))
+            {
+                result = SKS_EFT_Module::CNP;
+            }
+            else
+            {
+                result = SKS_EFT_Module::AR;
+            }
+        }
+        else if(ledgerJournalTable.JournalType == LedgerJournalType::Daily && SKS_Table_LedgerJournalTable::checkBTBTransferJournal(ledgerJournalTable))
+        {
+            result = SKS_EFT_Module::BTB;
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetEFTState</Name>
+				<Source><![CDATA[
+    public server static SKS_EFT_JournalState GetEFTState(LedgerJournalId _journalNum)
+    {
+        LedgerJournalTable ledgerJournalTable;
+        ;
+        select firstonly JournalNum, SKS_EFT_JournalState from ledgerJournalTable
+            where ledgerJournalTable.JournalNum == _journalNum;
+
+        return ledgerJournalTable.SKS_EFT_JournalState;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RemoveFXAllRecords</Name>
+				<Source><![CDATA[
+    private static server void RemoveFXAllRecords(LedgerJournalId _journalNum)
+    {
+        LedgerJournalTrans lLedgerJournalTrans;
+        SKS_EFT_FilePmtSelection lSKS_EFT_FilePmtSelection;
+
+        while select SKS_EFT_APPmtSelectionRecId, RecId from lLedgerJournalTrans
+            join PmtJournalNum, FXAProcessing, RecId from lSKS_EFT_FilePmtSelection
+            where lLedgerJournalTrans.SKS_EFT_APPmtSelectionRecId == lSKS_EFT_FilePmtSelection.RecId &&
+            lSKS_EFT_FilePmtSelection.PmtJournalNum == _journalNum &&
+            lSKS_EFT_FilePmtSelection.FXAProcessing == NoYes::Yes
+        {
+            SKS_FXA_Details::deleteByLedgerJournalTransRecid(lLedgerJournalTrans.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SetEFTJournalState</Name>
+				<Source><![CDATA[
+    public server static boolean SetEFTJournalState(LedgerJournalTable _LedgerJournalTable, boolean _Autocreate = false, boolean _MultiSelect = false)
+    {
+        BankAccountTable    lBankAccountTable;
+        LedgerJournalTrans  lLedgerJournalTrans;
+        SKS_EFT_Bank        lSKS_EFT_Bank;
+        SKS_EB_CommProcess  lSKS_EB_CommProcess;
+        VendPaymModeTable   lVendPaymModeTable;
+        CustPaymModeTable   lCustPaymModeTable;
+        SKS_EFTAR_Bank      lSKS_EFTAR_Bank;
+        SKS_BTB_PaymModeTable btbPaymModeTable;
+        SKS_EFTBTB_Bank btbBank;
+        SKS_EFTCNP_Bank     lSKS_EFTCNP_Bank;
+        str                 message;    //SKS_Bug:7232
+
+        boolean ret = false;
+
+        if (_LedgerJournalTable.SKS_EFT_JournalState == SKS_EFT_JournalState::Transferred)
+        {
+            if(!_MultiSelect)
+            {
+                if (box::okCancel("@SKS1204", DialogButton::Ok)== DialogButton::Ok)
+                {
+                    _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Ready;
+                    ret = true;
+                }
+            }
+            else
+            {
+                _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Ready;
+                ret = true;
+            }
+
+        }
+        else
+        {
+            if (!_Autocreate)
+            {
+                if(!_MultiSelect)
+                {
+                    //SKS_Bug:7232 - Begin;
+                    if(_LedgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+                    {
+                        message = "@SKS1205";
+                    }
+                    else if(_LedgerJournalTable.JournalType == LedgerJournalType::Daily)
+                    {
+                        message = "@SKS:BankTransferMsg";
+                    }
+                    else
+                    {
+                        message = "@SKS4430";
+                    }
+                    //SKS_Bug:7232 - End;
+                    if(box::okCancel(message, DialogButton::Ok)== DialogButton::Ok)
+                    {
+                        _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                        ret = true;
+                    }
+                }
+                else
+                {
+                    _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                    ret = true;
+                }
+            }
+            else
+            {
+                if (_LedgerJournalTable.JournalType == LedgerJournalType::Payment)
+                {
+                    select firstonly JournalNum, OffsetLedgerDimension, PaymMode from lLedgerJournalTrans
+                        where lLedgerJournalTrans.JournalNum == _LedgerJournalTable.JournalNum
+                        join PaymMode, SKS_EFT_PaymMode from lVendPaymModeTable
+                            where lVendPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode &&
+                                lVendPaymModeTable.SKS_EFT_PaymMode == NoYes::Yes;
+
+                    lBankAccountTable = BankAccountTable::findByLedgerDimension(lLedgerJournalTrans.OffsetLedgerDimension);
+                    lSKS_EFT_Bank = SKS_EFT_Bank::find(lBankAccountTable.AccountID, lLedgerJournalTrans.PaymMode);
+                    select firstonly CommID, CommType from lSKS_EB_CommProcess where lSKS_EB_CommProcess.CommID == lSKS_EFT_Bank.APCommID;
+                }
+                else if (_LedgerJournalTable.JournalType == LedgerJournalType::Daily)
+                {
+                    select JournalNum, OffsetLedgerDimension, PaymMode from lLedgerJournalTrans
+                        where lLedgerJournalTrans.JournalNum == _LedgerJournalTable.JournalNum
+                        join PaymMode from btbPaymModeTable
+                            where btbPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode;
+
+                    lBankAccountTable = BankAccountTable::findByLedgerDimension(lLedgerJournalTrans.OffsetLedgerDimension);
+                    btbBank = SKS_EFTBTB_Bank::find(lBankAccountTable.AccountID, lLedgerJournalTrans.PaymMode);
+                    select CommID, CommType from lSKS_EB_CommProcess where lSKS_EB_CommProcess.CommID == btbBank.BTBCommID;
+                }
+                else
+                {
+                    if(SKS_Table_LedgerJournalTable::checkCustReimbursement(_LedgerJournalTable))
+                    {
+                        select firstonly JournalNum, OffsetLedgerDimension, PaymMode from lLedgerJournalTrans
+                            where lLedgerJournalTrans.JournalNum == _LedgerJournalTable.JournalNum
+                            join PaymMode, SKS_CNP_PaymMode from lCustPaymModeTable
+                                where lCustPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode &&
+                                    lCustPaymModeTable.SKS_CNP_PaymMode == NoYes::Yes;
+
+                        lBankAccountTable = BankAccountTable::findByLedgerDimension(lLedgerJournalTrans.OffsetLedgerDimension);
+                        lSKS_EFTCNP_Bank = SKS_EFTCNP_Bank::find(lBankAccountTable.AccountID, lLedgerJournalTrans.PaymMode);
+                        select CommID, CommType from lSKS_EB_CommProcess where lSKS_EB_CommProcess.CommID == lSKS_EFTCNP_Bank.CNPCommID;
+                    }
+                    else
+                    {
+                        select firstonly JournalNum, OffsetLedgerDimension, PaymMode from lLedgerJournalTrans
+                            where lLedgerJournalTrans.JournalNum == _LedgerJournalTable.JournalNum
+                            join PaymMode, SKS_EFT_PaymMode from lCustPaymModeTable
+                                where lCustPaymModeTable.PaymMode == lLedgerJournalTrans.PaymMode &&
+                                    lCustPaymModeTable.SKS_EFT_PaymMode == NoYes::Yes;
+
+                        lBankAccountTable = BankAccountTable::findByLedgerDimension(lLedgerJournalTrans.OffsetLedgerDimension);
+                        lSKS_EFTAR_Bank = SKS_EFTAR_Bank::find(lBankAccountTable.AccountID, lLedgerJournalTrans.PaymMode);
+                        select firstonly CommID, CommType from lSKS_EB_CommProcess where lSKS_EB_CommProcess.CommID == lSKS_EFTAR_Bank.ARCommID;
+                    }
+                    
+
+                }
+                //FDD - 11060 -->
+                SKS_EB_FileStorage lSKS_EB_FileStorage;
+                select firstOnly StorageOption_APEFTFXDD from lSKS_EB_FileStorage;
+                if (!lSKS_EB_CommProcess)
+                {
+                    if(_LedgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+                    {
+
+                        if(box::okCancel("@SKS3005", DialogButton::Ok)== DialogButton::Ok)
+                        {
+                            _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                            ret = true;
+                        }
+                    }
+                }
+                //FDD - 11060 <--
+                else if(lSKS_EB_CommProcess && (lSKS_EB_CommProcess.CommType == SKS_PP_CommunicationsType::Browser && lSKS_EB_FileStorage.StorageOption_APEFTFXDD == SKS_EB_BankIntegOptWithNoLicense::FileHubLocalEnumValue))
+                {
+                    error(strFmt("@SKS3003", lSKS_EFT_Bank.BankAccountId, enum2str(lSKS_EB_CommProcess.CommType)));
+                }
+                else
+                {
+                    if(!_MultiSelect)
+                    {
+                        if(lSKS_EB_FileStorage.StorageOption_APEFTFXDD == SKS_EB_BankIntegOptWithNoLicense::FileHubLocalEnumValue)
+                        {
+                            if (lSKS_EB_CommProcess.CommType == SKS_PP_CommunicationsType::None)
+                            {
+                                if(box::okCancel("@SKS3005", DialogButton::Ok)== DialogButton::Ok)
+                                {
+                                    _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                                    ret = true;
+                                }
+                            }
+                            else if (lSKS_EB_CommProcess.CommType == SKS_PP_CommunicationsType::User)
+                            {
+                                if(box::okCancel("@SKS3007", DialogButton::Ok)== DialogButton::Ok)
+                                {
+                                    _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                                    ret = true;
+                                }
+                            }
+                            //SKS_Bug:11522--->
+                            else if (lSKS_EB_CommProcess.CommType == SKS_PP_CommunicationsType::WebService)
+                            {
+                                if(box::okCancel("@SKS3007", DialogButton::Ok)== DialogButton::Ok)
+                                {
+                                    _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                                    ret = true;
+                                }
+                            }
+                            //SKS_Bug:11522<---
+                            else
+                            {
+                                error("@SKS3006");
+                            }
+                        }
+                        else
+                        {
+                            if(box::okCancel("@SKS:SKGBankFabricPaymentFileComm", DialogButton::Ok)== DialogButton::Ok)
+                            {
+                                _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                                ret = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _LedgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+                        ret = true;
+                    }
+                }
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncAPEFTRecords</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","The mTrans buffer is shared with local methods which do execute updates on it.")]
+    private server static str SyncAPEFTRecords(boolean _create, LedgerJournalTable ledgerJournalTable)
+    {
+        // This routine creates/deletes the EFT records for use by SK-Ebanking.
+        // This is called whenever a Payment Journal is identified as ready to be transmitted to the bank.
+        LedgerJournalTrans mTransSummary;
+        LedgerJournalTrans mTransGroup;
+        LedgerJournalTrans mTrans;
+        SKS_EFTAP_File lSKS_EFTAP_File;
+        SKS_EFT_FileFormat locSKS_EFT_FileFormat, fileFormatSelect;
+        VendPaymModeTable mPaymMode;
+        //Bug 10228 -->
+        SKS_EFT_FormatGroup formatGroupLoc; //formatGroupLocLast since it was not used for any process
+        //BUG 10228 <--
+
+        //IHB SKS 9536 start
+        SKS_EFT_Processing lSKS_EFT_Processing;
+        SKS_EFT_FileNbr    preFileNbr;
+        boolean messagePrinted = false;
+        //IHB SKS 9536 end
+        container APFileNumberCon;
+        boolean rejectedLines = false;
+        boolean locFileCreated = false;
+        int cnt = 0;
+
+        SKS_EFT_FileFormatPaymSpec sksSpecSummary;
+        SKS_EFT_FilePmtSelection mPmtSelection;
+        SKS_EFT_Bank gSKS_EFT_Bank;
+        SKS_EFT_Setup    sks_EFT_Setup = SKS_EFT_Setup::find(); //Bug 10759
+        //SKS_FDD_10590 -->
+        DataAreaId       paymJournalCompany = curExt();
+        boolean          supportMultiCompany;
+        boolean          supportMultipleEffecticeDates;
+        boolean          createSendMultiCompany = sks_EFT_Setup.APCreateSendCompany && sks_EFT_Setup.APCreateSendCompany != paymJournalCompany ? true : false;
+        container        multiCompanies = SKS_EB_VirtualCompany::getEFT_APMultiCompanies();
+        //SKS_FDD_10590 <--
+        //SKS_Bugs_11845 -->
+        SKS_EFTAP_File          sks_EFTAP_FileSkip;
+        SKS_EFT_Processing      sks_eft_processingAP =  new SKS_EFT_Processing();
+        str                     errors;
+        str returnMessage;
+        //SKS_Bugs_11845 <--
+
+
+        // function to insert the Payment Selections
+        void buildTrans(TransDate _transDate, PaymSpec _paymSpec, NoYes _FilterSeparateFile, NoYes _SelectByPaymentDate, NoYes _SamePaymentDate)
+        {
+            SKS_EFT_FilePmtSelection pmtSelectionExists;
+            BankAccountTable bankAccountTable;
+            SKS_EFT_FileFormat lSKS_EFT_FileFormat;
+
+            ttsbegin;
+            if(mTrans.PaymentStatus == CustVendPaymStatus::Rejected)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    error("@SKS3064");
+                    Throw Exception::Error;
+                }
+                rejectedLines = true;
+            }
+            else
+            {
+                bankAccountTable = BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension);
+                if(gSKS_EFT_Bank.BankAccountId != bankAccountTable.AccountID
+                    || gSKS_EFT_Bank.PaymMode != mPaymMode.PaymMode)
+                {
+                    select firstOnly BankAccountID, PaymMode, FXAEnabled from gSKS_EFT_Bank
+                        where gSKS_EFT_Bank.BankAccountId == bankAccountTable.AccountID
+                        && gSKS_EFT_Bank.PaymMode == mTransSummary.PaymMode;
+                }
+                if(gSKS_EFT_Bank.FXAEnabled == NoYes::Yes 
+                    && sks_EFT_Setup.ModFX) //Issue22083
+                {
+                    mPmtSelection.FXAProcessing = NoYes::Yes;
+
+                    //<Issue20996: Checking FXAProcessing if is FX> 
+                    if(!lSKS_EFTAP_File.FXAProcessing)
+                    {
+                        ttsbegin;
+                        lSKS_EFTAP_File.selectForUpdate(true);
+                        lSKS_EFTAP_File.FXAProcessing = NoYes::Yes;
+                        lSKS_EFTAP_File.update();
+                        ttscommit;
+                    }
+                    //<Issue20996>
+                }
+                else
+                {
+                    mPmtSelection.FXAProcessing = NoYes::No;
+                }
+                mPmtSelection.PaymMode = mtransSummary.PaymMode;
+                mPmtSelection.PmtCount += 1;
+                mPmtSelection.PmtTotal += mtrans.calcDebitMST();
+                mPmtSelection.PmtTotal -= mtrans.calcCreditMST();
+                mPmtSelection.Module = SKS_EFT_Module::AP;
+                mPmtSelection.PmtJournalNum = ledgerJournalTable.JournalNum;
+                mPmtSelection.PmtBankAccountId = bankAccountTable.AccountID;
+                mPmtSelection.PmtDate = _transDate;
+                mPmtSelection.PaymSpec = _paymSpec;
+                mPmtSelection.PaymSpecSeparateFile = _FilterSeparateFile;
+                mPmtSelection.PaymSpecSameDate = _SamePaymentDate;
+                mPmtSelection.PaymSpecByDate = _SelectByPaymentDate;
+                mPmtSelection.Company = mtransSummary.DataAreaId; //SKS_FDD_10590
+                mPmtSelection.PrimaryFormat = NoYes::No; // Primary format is determined later
+                //Get Format Group
+                select firstonly FormatGroup, FormatId from lSKS_EFT_FileFormat where lSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+                mPmtSelection.FormatId = mPaymMode.SKS_EFT_FormatId;
+                mPmtSelection.FormatGroup = lSKS_EFT_FileFormat.FormatGroup;
+                SKS_EFT_FileFormat sKS_EFT_FileFormat_1;
+
+                select firstonly sKS_EFT_FileFormat_1
+                    where sKS_EFT_FileFormat_1.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+                SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_EFT_FormatId, mTrans.PaymSpec);
+
+                SKS_EFT_Bank lSKS_EFT_Bank = SKS_EFT_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset;
+
+                if(sKS_EFT_FileFormat_1.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::PaymSpecOffset)
+                {
+                    offset = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.EffectiveDateOffset,
+                                                                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                lSKS_EFT_Bank.BankHolidayGroupId);
+
+                    mPmtSelection.EffectiveDate = offset;
+                }
+
+                if(mPmtSelection.PmtCount == 1) // If first, deteremine if record exists or if new should be created
+                {
+                    cnt++;
+                    if(sKS_EFT_FileFormat_1.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::PaymSpecOffset)
+                    {
+                        select firstonly forupdate pmtSelectionExists where pmtSelectionExists.PmtJournalNum == ledgerJournalTable.JournalNum
+                            && pmtSelectionExists.PmtBankAccountId == bankAccountTable.AccountID
+                            && pmtSelectionExists.PaymMode == mtransSummary.PaymMode
+                            && pmtSelectionExists.PmtDate == _transDate
+                            && pmtSelectionExists.PaymSpec == _paymSpec  // SKS_Bug_10221
+                            && pmtSelectionExists.EffectiveDate == mPmtSelection.EffectiveDate;
+                    }
+                    else
+                    {
+                        select firstonly forupdate pmtSelectionExists where pmtSelectionExists.PmtJournalNum == ledgerJournalTable.JournalNum
+                            && pmtSelectionExists.PmtBankAccountId == bankAccountTable.AccountID
+                            && pmtSelectionExists.PaymMode == mtransSummary.PaymMode
+                            && pmtSelectionExists.PmtDate == _transDate
+                            && pmtSelectionExists.PaymSpec == _paymSpec; // SKS_Bug_10221
+                    }
+
+                    if(pmtSelectionExists && pmtSelectionExists.FileRecId == lSKS_EFTAP_File.RecId)
+                    {
+                        pmtSelectionExists.PmtCount += 1;
+                        pmtSelectionExists.PmtTotal += mtrans.calcDebitMST();
+                        pmtSelectionExists.PmtTotal -= mtrans.calcCreditMST();
+                        pmtSelectionExists.update();
+                        mPmtSelection = pmtSelectionExists;
+                    }
+                    else
+                    {
+                        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes  || sks_EFT_Setup.APCreateSendLeter == NoYes::Yes) //Bug 10759
+                        {
+                            mPmtSelection.FileRecId = lSKS_EFTAP_File.RecId;
+                        }
+                        mPmtSelection.insert();
+                    }
+                }
+                else
+                {
+                    mPmtSelection.update();
+                }
+                mTrans.SKS_EFT_APPmtSelectionRecId = mPmtSelection.RecId;
+                mTrans.doUpdate();
+
+                ttscommit;
+
+                if(gSKS_EFT_Bank.FXAEnabled == NoYes::Yes
+                    && SKS_EFT_Setup::find().ModFX == NoYes::Yes) //Issue21792
+                {
+                    SKS_Table_LedgerJournalTable::SyncFXAllRecords(mTrans, gSKS_EFT_Bank);
+                }
+            }
+        }
+
+        // function to reset line totals.
+        void resetCount()
+        {
+            mPmtSelection.PmtCount = 0;
+            mPmtSelection.PmtTotal = 0;
+        }
+
+        //IHB  SKS 9536 start
+        void updateEffectiveDate()
+        {
+            select firstonly locSKS_EFT_FileFormat
+                    where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+            ttsbegin;
+            if(locSKS_EFT_FileFormat.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::FormatOffset)
+            {
+                lSKS_EFTAP_File.EffectiveDate = mtrans.TransDate;
+            }
+            else
+            {
+                lSKS_EFTAP_File.EffectiveDate = dateNull();
+            }
+            //10590
+            changecompany(lSKS_EFTAP_File.DataAreaId)
+            {
+                lSKS_EFTAP_File.selectForUpdate(true);
+                lSKS_EFTAP_File.update();
+            }
+            ttscommit;
+        }
+        //IHB  SKS 9536 end
+
+        boolean setExistingFile()
+        {
+            boolean ret = false;
+            errors = sks_eft_processingAP.CheckUserSelectionAP(sks_EFTAP_FileSkip.RecId,
+                                                                0,
+                                                                multiCompanies,
+                                                                true,
+                                                                sks_eft_processingAP,
+                                                                mTransSummary.DataAreaId,
+                                                                mtransSummary.OffsetLedgerDimension,
+                                                                mtransSummary.PaymMode,
+                                                                mtransSummary.PaymSpec,
+                                                                mtransSummary.TransDate);
+
+            if(errors != '')
+            {
+                error(errors);
+                Throw Exception::Error;
+            }
+            else if(errors == '' && sks_eft_processingAP.parmIgnoreFile())
+            {
+                sks_eft_processingAP.parmIgnoreFile(false);
+            }
+            else
+            {
+                lSKS_EFTAP_File = sks_EFTAP_FileSkip;
+                ret = true;
+            }
+
+            return ret;
+        }
+
+        void selectFileDateNoSpecNo()
+        {
+            if(fileFormatSelect.EffectiveDateMethod != SKS_EFT_EffectiveDateMethod::PaymSpecOffset ||
+               (fileFormatSelect.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::PaymSpecOffset &&
+                supportMultipleEffecticeDates))
+            {
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes
+                                && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_EFT_FormatId, mTransSummary.PaymSpec);
+
+                SKS_EFT_Bank lSKS_EFT_Bank = SKS_EFT_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.EffectiveDateOffset,
+                                                                        DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                        lSKS_EFT_Bank.BankHolidayGroupId);
+
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.EffectiveDate == offset
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        void selectFileDateNoSpecYes()
+        {
+            SKS_EFT_FilePmtSelection paymentSelection;
+
+            while
+                select * from sks_EFTAP_FileSkip
+                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                    && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes
+                            && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                {
+                    continue;
+                }
+
+                if(setExistingFile())
+                {
+                    break;
+                }
+            }
+        }
+
+        void selectFileDateYesSpecNo()
+        {
+            if(fileFormatSelect.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::FormatOffset)
+            {
+                SKS_EFT_Bank lSKS_EFT_Bank = SKS_EFT_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset = SKS_EFT_Processing::GetOffsetDate(fileFormatSelect.EffectiveDateOffset,
+                                                                        mTransSummary.TransDate,
+                                                                        lSKS_EFT_Bank.BankHolidayGroupId);
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.EffectiveDate == offset
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(sks_EFTAP_FileSkip.EffectiveDate == offset && setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.PmtDate == mTransSummary.TransDate
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        void selectFileDateYesSpecYes()
+        {
+            SKS_EFT_FilePmtSelection paymentSelection;
+
+            if(fileFormatSelect.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::FormatOffset)
+            {
+                SKS_EFT_Bank lSKS_EFT_Bank = SKS_EFT_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset = SKS_EFT_Processing::GetOffsetDate(fileFormatSelect.EffectiveDateOffset,
+                                                                        mTransSummary.TransDate,
+                                                                        lSKS_EFT_Bank.BankHolidayGroupId);
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                        && sks_EFTAP_FileSkip.EffectiveDate == offset
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(sks_EFTAP_FileSkip.EffectiveDate == offset && setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.PmtDate == mTransSummary.TransDate
+                        && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(APFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Main routine
+        if (!_create)
+        {
+            ttsbegin;
+
+            SKS_Table_LedgerJournalTable::RemoveFXAllRecords(ledgerJournalTable.JournalNum);
+            while select forupdate mTrans
+            join mPmtSelection
+                where mTrans.SKS_EFT_APPmtSelectionRecId == mPmtSelection.RecId &&
+                mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum
+            {
+                mTrans.SKS_EFT_APPmtSelectionRecId = 0;
+                mTrans.doUpdate();
+            }
+
+            delete_from mPmtSelection where mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum;
+
+            ttscommit;
+            return '';
+        }
+
+        While
+        select
+            PaymMode
+            , OffsetLedgerDimension
+            , PaymSpec
+            , TransDate
+        from mTransSummary
+        where mTransSummary.JournalNum == ledgerJournalTable.JournalNum
+                && mTransSummary.SKS_EFT_APPmtSelectionRecId == 0
+            && mTransSummary.TransactionType != LedgerTransType::Fee 
+        join
+                SKS_EFT_FormatID
+        from mPaymMode
+        where mPaymMode.PaymMode == mTransSummary.PaymMode
+        join
+            FormatGroup
+            , EffectiveDateMethod
+            , EffectiveDateOffset
+        from fileFormatSelect
+        where fileFormatSelect.FormatId == mPaymMode.SKS_EFT_FormatId
+        join
+            maxof(SelectByPaymentDate)
+            , maxof(FilterSeparateFile)
+            , maxof(SamePaymentDate)
+            , EffectiveDateOffset
+        from sksSpecSummary
+        group by
+            fileFormatSelect.EffectiveDateMethod
+            , fileFormatSelect.EffectiveDateOffset
+            , fileFormatSelect.FormatGroup
+            , mPaymMode.SKS_EFT_FormatID
+            , mTransSummary.PaymMode
+            , mTransSummary.TransDate
+            , mTransSummary.PaymSpec
+            , mTransSummary.OffsetLedgerDimension
+        where sksSpecSummary.FormatId == mPaymMode.SKS_EFT_FormatId
+            && sksSpecSummary.PaymSpec == mTransSummary.PaymSpec
+        {
+            lSKS_EFTAP_File = null;
+            sks_EFTAP_FileSkip = null;
+            // SKS_FDD_10590 -->
+            if(createSendMultiCompany && SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatID).SupportsMultiCompany == NoYes::Yes && multiCompanies)
+            {
+                supportMultiCompany = true;
+            }
+            // SKS_FDD_10590 <--
+
+            // SKS_FDD_10383-->
+            if (SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatID).SupportsMultipleEffectiveDates == NoYes::Yes)
+            {
+                supportMultipleEffecticeDates = true;
+            }
+            // SKS_FDD_10383<---
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No && supportMultiCompany)
+                {
+                    changecompany(sks_EFT_Setup.APCreateSendCompany)
+                    {
+                        selectFileDateNoSpecNo();
+                    }
+                }
+                else
+                {
+                    selectFileDateNoSpecNo();
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No && supportMultiCompany)
+                {
+                    changecompany(sks_EFT_Setup.APCreateSendCompany)
+                    {
+                        selectFileDateNoSpecYes();
+                    }
+                }
+                else
+                {
+                    selectFileDateNoSpecYes();
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No && supportMultiCompany)
+                {
+                    changecompany(sks_EFT_Setup.APCreateSendCompany)
+                    {
+                        selectFileDateYesSpecNo();
+                    }
+                }
+                else
+                {
+                    selectFileDateYesSpecNo();
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No && supportMultiCompany)
+                {
+                    changecompany(sks_EFT_Setup.APCreateSendCompany)
+                    {
+                        selectFileDateYesSpecYes();
+                    }
+                }
+                else
+                {
+                    selectFileDateYesSpecYes();
+                }
+            }
+
+            if(lSKS_EFTAP_File)
+            {
+                locFileCreated = true;
+            }
+            else
+            {
+                locFileCreated = false;
+            }
+            //IHB end
+
+
+            if(!locFileCreated && (ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.APCreateSendLeter == NoYes::Yes))
+            {
+                // SKS_FDD_10590 -->
+                if(supportMultiCompany && ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    // If createSendMultiCompany is enabled create the file in APCreateSendCompany
+                    changecompany(sks_EFT_Setup.APCreateSendCompany)
+                    {
+                        select locSKS_EFT_FileFormat where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+                        ttsbegin;
+                        lSKS_EFTAP_File = null;
+                        lSKS_EFTAP_File.create(SKS_EFT_Module::AP,locSKS_EFT_FileFormat.PreNote,false,locSKS_EFT_FileFormat);
+                        lSKS_EFTAP_File.FormatGroup =  SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatId).FormatGroup; //Bug 10228
+                        lSKS_EFTAP_File.insert();
+                        ttscommit;
+                    }
+                }
+                else     // SKS_FDD_10590 <--
+                {
+                    select locSKS_EFT_FileFormat where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+                    ttsbegin;
+                    lSKS_EFTAP_File.create(SKS_EFT_Module::AP,locSKS_EFT_FileFormat.PreNote,false,locSKS_EFT_FileFormat);
+                    lSKS_EFTAP_File.FormatGroup =  SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatId).FormatGroup; //Bug 10228
+                    lSKS_EFTAP_File.insert();
+                    ttscommit;
+                }
+                //Bug 10759
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select TransDate, PaymSpec
+                    from mtransGroup
+                    group by TransDate, PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.TransDate == mTransSummary.TransDate
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_APPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_APPmtSelectionRecId == 0
+                        && mTrans.TransactionType != LedgerTransType::Fee
+                    {
+                        if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.APCreateSendLeter == NoYes::Yes) && lSKS_EFTAP_File) //FDD-10590
+                        {
+                            updateEffectiveDate(); //IHB SKS 9536
+                        }
+
+                        buildTrans(mtrans.TransDate,
+                                    mtrans.PaymSpec,
+                                    sksSpecSummary.FilterSeparateFile,
+                                    sksSpecSummary.SelectByPaymentDate,
+                                    sksSpecSummary.SamePaymentDate);
+                    }
+                }
+
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                //IHB SKS 9536
+                select TransDate
+                from mtransGroup
+                group by TransDate
+                where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                    && mtransGroup.PaymMode == mTransSummary.PaymMode
+                    && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                    && mtransGroup.TransDate == mTransSummary.TransDate
+                    && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                    && mtransGroup.SKS_EFT_APPmtSelectionRecId == 0;
+
+                resetCount();
+                While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_APPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                {
+                    if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.APCreateSendLeter == NoYes::Yes) && lSKS_EFTAP_File) //FDD-10590
+                    {
+                        updateEffectiveDate(); //IHB SKS 9536
+                    }
+
+                    buildTrans(mtrans.TransDate,
+                                    '',
+                                    SKSSpecSummary.FilterSeparateFile,
+                                    SKSSpecSummary.SelectByPaymentDate,
+                                    SKSSpecSummary.SamePaymentDate);
+                }
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select PaymSpec
+                    from mtransGroup
+                    group by PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_APPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.SKS_EFT_APPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                    {
+                        buildTrans(DateNull(),
+                                    mtrans.PaymSpec,
+                                    sksSpecSummary.FilterSeparateFile,
+                                    sksSpecSummary.SelectByPaymentDate,
+                                    sksSpecSummary.SamePaymentDate);
+                    }
+                }
+            }
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                resetCount();
+                While select forupdate *
+                    from mtrans
+                    where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                        && mtrans.PaymMode == mTransSummary.PaymMode
+                        && mtrans.PaymSpec == mTransSummary.PaymSpec
+                        && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtrans.SKS_EFT_APPmtSelectionRecId == 0
+                        && mTrans.TransactionType != LedgerTransType::Fee
+                {
+                    buildTrans(DateNull(),
+                                    '',
+                                    SKSSpecSummary.FilterSeparateFile,
+                                    SKSSpecSummary.SelectByPaymentDate,
+                                    SKSSpecSummary.SamePaymentDate);
+                }
+            }
+
+
+            if(rejectedLines)
+            {
+                ledgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::PartiallyTransferred;
+            }
+
+            //IHB  SKS 9536 start
+            if(cnt > 0)
+            {
+                if(preFileNbr != '' && preFileNbr !=  lSKS_EFTAP_File.FileNbr)
+                {
+                    messagePrinted = false;
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    if(conFind(APFileNumberCon, lSKS_EFTAP_File.FileNbr) == 0)//Checks to make sure file number isn't duplicate
+                    {
+                        APFileNumberCon += lSKS_EFTAP_File.FileNbr;//Add file number to the container
+                    }
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.APCreateSendLeter == NoYes::Yes) //Bug 10759
+                {
+                    if(supportMultiCompany  && ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                    {
+                        changecompany(sks_EFT_Setup.APCreateSendCompany)
+                        {
+                            SKS_EFT_Processing::AutoCreateAndSend(lSKS_EFTAP_File, ledgerJournalTable, SKS_EFT_Module::AP, supportMultiCompany);
+                        }
+                    }
+                    else
+                    {
+                        SKS_EFT_Processing::AutoCreateAndSend(lSKS_EFTAP_File, ledgerJournalTable, SKS_EFT_Module::AP);
+                    }
+                }
+                //Bug 10759
+
+                if(!messagePrinted)
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.APCreateSendLeter == NoYes::Yes) //Bug 10759
+                    {
+                        if(locFileCreated)
+                        {
+                            info(strFmt("@SKS:SKGAddPaymentToEFT", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId));
+                        }
+                        else
+                        {
+                            info(strFmt("@SKS3066", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId)); //FDD-10590
+                        }
+                        messagePrinted = true;
+                    }
+                    //Bug 10759
+                }
+                preFileNbr = lSKS_EFTAP_File.FileNbr;
+            }
+            //IHB  SKS 9536 end
+        }
+
+        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+        {
+            boolean printReport = false;
+            LedgerJournalName ledgerJournalName = LedgerJournalName::find(ledgerJournalTable.JournalName);
+
+            // check if workflow is enabled
+            if(ledgerJournalName && !ledgerJournalName.WorkflowApproval)
+            {
+                printReport = sks_EFT_Setup::find().APPrintAudit;
+            }
+
+            lSKS_EFT_Processing = new SKS_EFT_Processing();
+            For(int iter = 1; iter <= conLen(APFileNumberCon); iter++)
+            {
+                lSKS_EFT_Processing.APARrocess_EFT(conPeek(APFileNumberCon, iter),
+                                                    SKS_PP_NextActionDisplay::CreateSendFile,
+                                                    printReport,
+                                                    SKS_EFT_Module::AP,
+                                                    null,
+                                                    false,
+                                                    true);//SKS_Bug_11847
+                if(lSKS_EFT_Processing.getReturnMsg() != '')
+                {
+                    returnMessage = lSKS_EFT_Processing.getReturnMsg();
+                    error("@SKS3756");
+                }
+            }
+        }
+
+        return returnMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncAREFTRecords</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","The mTrans buffer is shared with local methods which do execute updates on it.")]
+    private server static SKS_EFT_FileNbr SyncAREFTRecords(boolean _create, LedgerJournalTable ledgerJournalTable)
+    {
+        // This routine creates/deletes the EFT records for use by SK-Ebanking.
+        // This is called whenever a Payment Journal is identified as ready to be transmitted to the bank.
+        LedgerJournalTrans mTransSummary;
+        LedgerJournalTrans mTransGroup;
+        LedgerJournalTrans mTrans;
+
+        CustPaymModeTable mPaymMode;
+
+        SKS_EFT_Processing      lSKS_EFT_Processing;
+        SKS_EFT_FileNbr         preFileNbr;
+        container filenumber;
+
+        boolean messagePrinted  = false;
+        boolean rejectedLines   = false;
+        boolean locFileCreated  = false;
+        container ARFileNumberCon;
+        int cnt = 0;
+        SKS_EFT_FileFormatPaymSpec sksSpecSummary;
+        SKS_EFT_FilePmtSelection mPmtSelection;
+        SKS_EFT_FileFormat  sksFileFormat;
+
+        //SKS_FDD_11060
+        SKS_EFT_FileFormat locSKS_EFT_FileFormat, fileFormatSelect;
+        SKS_EFT_FormatGroup formatGroupLoc; //removed formatGroupLocLast since it was not used for any process
+        SKS_EFTAP_File      lSKS_EFTAP_File, lSKS_EFTAP_FileLoc;
+
+        SKS_EFT_Setup    sks_EFT_Setup = SKS_EFT_Setup::find();
+        DataAreaId       paymJournalCompany = curExt();
+        boolean          supportMultiCompany;
+        boolean          createSendMultiCompany = sks_EFT_Setup.ARCreateSendCompany && sks_EFT_Setup.ARCreateSendCompany != paymJournalCompany ? true : false;
+        container        multiCompanies = SKS_EB_VirtualCompany::getDDMultiCompanies();
+        //SKS_FDD_11060
+
+        //SKS_Bugs_11845 -->
+        SKS_EFTAP_File          sks_EFTAP_FileSkip;
+        SKS_EFT_Processing      sks_eft_processingDD =  new SKS_EFT_Processing();
+        str                     errors;
+        //SKS_Bugs_11845 <--
+
+        // function to insert the Payment Selections
+        void buildTrans(TransDate _transDate, PaymSpec _paymSpec, NoYes _FilterSeparateFile, NoYes _SelectByPaymentDate, NoYes _SamePaymentDate, NoYes _payDateIsEffDate)
+        {
+            SKS_EFT_FilePmtSelection pmtSelectionExists;
+            BankAccountTable bankAccountTable;
+            SKS_LB_Depositor sks_lb_depositor;
+            SKS_EFT_FileFormat lSKS_EFT_FileFormat;
+
+            ttsbegin;
+            if(mTrans.PaymentStatus == CustVendPaymStatus::Rejected)
+            {
+                rejectedLines = true;
+            }
+            else
+            {
+                bankAccountTable = BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension);
+                mPmtSelection.PaymMode = mtransSummary.PaymMode;
+                mPmtSelection.PmtCount += 1;
+                mPmtSelection.PmtTotal += mtrans.calcCreditMST();
+                mPmtSelection.PmtTotal -= mtrans.calcDebitMST();
+                mPmtSelection.Module = SKS_EFT_Module::AR;
+                mPmtSelection.PmtJournalNum = ledgerJournalTable.JournalNum;
+                mPmtSelection.PmtBankAccountId = bankAccountTable.AccountID;
+                mPmtSelection.PmtDate = _transDate;
+                mPmtSelection.PaymSpec = _paymSpec;
+                mPmtSelection.FormatId = mPaymMode.SKS_EFT_FormatId;
+                mPmtSelection.PaymSpecSeparateFile = _FilterSeparateFile;
+                mPmtSelection.Company = mtransSummary.DataAreaId; // SKS_FDD_10590
+                mPmtSelection.PrimaryFormat = NoYes::No; // Primary format is determined later
+                //Get Format Group
+                select firstonly FormatGroup, FormatId from lSKS_EFT_FileFormat where lSKS_EFT_FileFormat.FormatId ==mPaymMode.SKS_EFT_FormatId;
+                mPmtSelection.FormatGroup = lSKS_EFT_FileFormat.FormatGroup;
+
+                //Update settings for Payment Date is Effective Date checkbox
+                if(_payDateIsEffDate)
+                {
+                    mPmtSelection.PaymSpecSameDate = NoYes::Yes;
+                    mPmtSelection.PaymSpecByDate = NoYes::Yes;
+                }
+                else
+                {
+                    mPmtSelection.PaymSpecSameDate = _SamePaymentDate;
+                    mPmtSelection.PaymSpecByDate = _SelectByPaymentDate;
+                }
+
+                //Update Advance e-mail setting for customers
+                select firstonly AENotification from sks_lb_depositor where sks_lb_depositor.AccountNum == SKS_EFT_Common::getAccountNum(mTrans.LedgerDimension);
+
+                if(!mPmtSelection.AdvEmail)
+                {
+                    mPmtSelection.AdvEmail = sks_lb_depositor.AENotification;
+                }
+
+                SKS_EFT_FileFormat sKS_EFT_FileFormat_1;
+
+                select firstonly sKS_EFT_FileFormat_1
+                    where sKS_EFT_FileFormat_1.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+                SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_EFT_FormatId, mTrans.PaymSpec);
+
+                SKS_EFTAR_Bank lSKS_EFTAR_Bank = SKS_EFTAR_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset;
+
+                if(sKS_EFT_FileFormat_1.EffectiveDateOffsetPaymSpec == NoYes::Yes)
+                {
+                    offset = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.AREffectiveDateOffset,
+                                                                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                lSKS_EFTAR_Bank.BankHolidayGroupId);
+                }
+
+                if(mPmtSelection.PmtCount == 1) // If first, deteremine if record exists or if new should be created
+                {
+                    cnt++;
+                    select firstonly forupdate pmtSelectionExists where pmtSelectionExists.PmtJournalNum == ledgerJournalTable.JournalNum
+                        && pmtSelectionExists.PmtBankAccountId == bankAccountTable.AccountID
+                        && pmtSelectionExists.PaymMode == mtransSummary.PaymMode
+                        && pmtSelectionExists.PmtDate == _transDate
+                        && pmtSelectionExists.PaymSpec == _paymSpec;
+                    //&& pmtSelectionExists.FileRecId == 0;
+
+                    if(pmtSelectionExists && pmtSelectionExists.FileRecId == lSKS_EFTAP_File.RecId)
+                    {
+                        pmtSelectionExists.PmtCount += 1;
+                        pmtSelectionExists.PmtTotal += mtrans.calcCreditMST();
+                        pmtSelectionExists.PmtTotal -= mtrans.calcDebitMST();
+                        pmtSelectionExists.update();
+                        mPmtSelection = pmtSelectionExists;
+                    }
+                    else
+                    {
+                        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes  || sks_EFT_Setup.ARCreateSendLater == NoYes::Yes) //Bug 10759
+                        {
+                            mPmtSelection.FileRecId = lSKS_EFTAP_File.RecId;
+                        }
+                        mPmtSelection.insert();
+                    }
+                }
+                else
+                {
+                    mPmtSelection.update();
+                }
+                mTrans.SKS_EFT_ARPmtSelectionRecId = mPmtSelection.RecId;
+                mTrans.doUpdate();
+                ttscommit;
+            }
+        }
+
+        // function to reset line totals.
+        void resetCount()
+        {
+            mPmtSelection.PmtCount = 0;
+            mPmtSelection.PmtTotal = 0;
+        }
+
+        void updateEffectiveDate()
+        {
+            select firstonly locSKS_EFT_FileFormat
+                    where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+            ttsbegin;
+
+            lSKS_EFTAP_File.EffectiveDate = mtrans.TransDate;
+
+            //11060
+            changecompany(lSKS_EFTAP_File.DataAreaId)
+            {
+                lSKS_EFTAP_File.selectForUpdate(true);
+                lSKS_EFTAP_File.update();
+            }
+            ttscommit;
+        }
+
+
+        boolean setExistingFile()
+        {
+            boolean ret = false;
+            errors = sks_eft_processingDD.CheckUserSelectionAR(sks_EFTAP_FileSkip.RecId,
+                                                                0,
+                                                                multiCompanies,
+                                                                true,
+                                                                sks_eft_processingDD,
+                                                                mTransSummary.DataAreaId,
+                                                                mtransSummary.OffsetLedgerDimension,
+                                                                mtransSummary.PaymMode,
+                                                                mtransSummary.PaymSpec,
+                                                                mtransSummary.TransDate);
+
+            if(errors != '')
+            {
+                error(errors);
+                Throw Exception::Error;
+            }
+            else if(errors == '' && sks_eft_processingDD.parmIgnoreFile())
+            {
+                sks_eft_processingDD.parmIgnoreFile(false);
+            }
+            else
+            {
+                lSKS_EFTAP_File = sks_EFTAP_FileSkip;
+                ret = true;
+            }
+
+            return ret;
+        }
+
+        // Main routine
+        if (!_create)
+        {
+            ttsbegin;
+            while select forupdate crosscompany mTrans // FDD_11060
+            join mPmtSelection
+                where mTrans.SKS_EFT_ARPmtSelectionRecId == mPmtSelection.RecId &&
+                mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum
+            {
+                changecompany(mTrans.DataAreaId)
+                {
+                    mTrans.SKS_EFT_ARPmtSelectionRecId = 0;
+                    mTrans.doUpdate();
+                }
+            }
+
+            delete_from mPmtSelection where mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum;
+            ttscommit;
+            return '';
+        }
+
+
+        While
+            select
+                  PaymMode
+                , OffsetLedgerDimension
+                , PaymSpec
+                , TransDate
+            from mTransSummary
+            where mTransSummary.JournalNum == ledgerJournalTable.JournalNum
+                && mTransSummary.SKS_EFT_ARPmtSelectionRecId == 0
+                && mTransSummary.TransactionType != LedgerTransType::Fee
+            join
+                  SKS_EFT_FormatID
+            from mPaymMode
+            where mPaymMode.PaymMode == mTransSummary.PaymMode
+            join
+                  FormatGroup
+                , PayDateIsEffDate
+                , SplitJournalByDate
+                , EffectiveDateOffsetPaymSpec
+            from fileFormatSelect
+            where fileFormatSelect.FormatId == mPaymMode.SKS_EFT_FormatId
+            join
+                  maxof(SelectByPaymentDate)
+                , maxof(FilterSeparateFile)
+                , maxof(SamePaymentDate)
+                , AREffectiveDateOffset
+            from sksSpecSummary
+            group by
+                  fileFormatSelect.EffectiveDateMethod
+                , fileFormatSelect.EffectiveDateOffset
+                , fileFormatSelect.FormatGroup
+                , mPaymMode.SKS_EFT_FormatID
+                , mTransSummary.PaymMode
+                , mTransSummary.TransDate
+                , mTransSummary.PaymSpec
+                , mTransSummary.OffsetLedgerDimension
+            where sksSpecSummary.FormatId == mPaymMode.SKS_EFT_FormatId
+                && sksSpecSummary.PaymSpec == mTransSummary.PaymSpec
+        {
+            lSKS_EFTAP_File = null;
+            sks_EFTAP_FileSkip = null;
+
+            //VSTS_11060
+            if(createSendMultiCompany && SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatID).SupportsMultiCompany == NoYes::Yes && multiCompanies)
+            {
+                supportMultiCompany = true;
+            }
+            //VSTS_11060
+
+            select firstonly PayDateIsEffDate, SplitJournalByDate, EffectiveDateOffsetPaymSpec from sksFileFormat where sksFileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+
+            SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec1;
+            SKS_EFTAR_Bank lSKS_EFTAR_Bank;
+            date offset;
+
+            if(sksFileFormat.EffectiveDateOffsetPaymSpec == NoYes::Yes)
+            {
+                lSKS_EFT_FileFormatPaymSpec1 = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_EFT_FormatId, mTransSummary.PaymSpec);
+
+                lSKS_EFTAR_Bank = SKS_EFTAR_Bank::findByCompany(mTransSummary.company(),
+                                                                            BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                            mTransSummary.PaymMode);
+
+                offset = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec1.AREffectiveDateOffset,
+                                                            mTransSummary.TransDate,
+                                                            lSKS_EFTAR_Bank.BankHolidayGroupId);
+            }
+            else
+            {
+                lSKS_EFTAR_Bank = SKS_EFTAR_Bank::findByCompany(mTransSummary.company(),
+                                                                            BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                            mTransSummary.PaymMode);
+
+                offset = SKS_EFT_Processing::GetOffsetDate(fileFormatSelect.EffectiveDateOffset,
+                                                            mTransSummary.TransDate,
+                                                            lSKS_EFTAR_Bank.BankHolidayGroupId);
+            }
+
+
+            //SKS_FDD_11060 <--
+            //IHB start if already file num exists for format id, it will select existing record
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    if(supportMultiCompany)
+                    {
+                        changecompany(sks_EFT_Setup.ARCreateSendCompany)
+                        {
+                            if (sksFileFormat.SplitJournalByDate == NoYes::Yes)
+                            {
+                                while select * from sks_EFTAP_FileSkip
+                                        where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                            && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                {
+                                    if(setExistingFile())
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                while select * from sks_EFTAP_FileSkip
+                                        where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                {
+                                    if(setExistingFile())
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else if (sksFileFormat.SplitJournalByDate == NoYes::Yes)
+                    {
+                        while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                    && sks_EFTAP_FileSkip.EffectiveDate == offset
+                        {
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if(SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatID).EffectiveDateOffsetPaymSpec == NoYes::Yes)
+                        {
+                            SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_EFT_FormatId, mTransSummary.PaymSpec);
+
+                            date offsetval = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.AREffectiveDateOffset,
+                                                                        DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                        lSKS_EFTAR_Bank.BankHolidayGroupId);
+
+
+                            while select * from sks_EFTAP_FileSkip
+                                        where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                            && sks_EFTAP_FileSkip.EffectiveDate == offsetval
+                            {
+                                if(setExistingFile())
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            while select * from sks_EFTAP_FileSkip
+                                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                            {
+                                if(setExistingFile())
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    if(SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatID).EffectiveDateOffsetPaymSpec == NoYes::Yes)
+                    {
+                        SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_EFT_FormatId, mTransSummary.PaymSpec);
+
+                        date offsetval = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.AREffectiveDateOffset,
+                                                                        DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                        lSKS_EFTAR_Bank.BankHolidayGroupId);
+
+
+                        while select * from sks_EFTAP_FileSkip
+                                        where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                            && sks_EFTAP_FileSkip.EffectiveDate == offsetval
+                        {
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                        {
+                            if(!conFind(ARFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                            {
+                                continue;
+                            }
+
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    if(supportMultiCompany)
+                    {
+                        changecompany(sks_EFT_Setup.ARCreateSendCompany)
+                        {
+                            if (sksFileFormat.SplitJournalByDate == NoYes::Yes)
+                            {
+                                while select * from sks_EFTAP_FileSkip
+                                        where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                            && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                        join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                            && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                                {
+                                    if(setExistingFile())
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                while select * from sks_EFTAP_FileSkip
+                                        where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                        join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                            && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                                {
+                                    if(setExistingFile())
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else if (sksFileFormat.SplitJournalByDate == NoYes::Yes)
+                    {
+                        while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                    && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                        {
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                        {
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                            join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                    {
+                        if(!conFind(ARFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            //if already file num exists for effective transdate, it will select existing record
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    if(supportMultiCompany)
+                    {
+                        // If Multicompany is enabled check whether the file in exists on ARCreateSendCompany
+                        changecompany(sks_EFT_Setup.ARCreateSendCompany)
+                        {
+                            while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                    && sks_EFTAP_FileSkip.EffectiveDate == offset
+                            {
+                                if(setExistingFile())
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                    && sks_EFTAP_FileSkip.EffectiveDate == offset
+                        {
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                && sks_EFTAP_FileSkip.EffectiveDate == offset
+                    {
+                        if(conFind(ARFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    if(supportMultiCompany)
+                    {
+                        // If Multicompany is enabled check whether the file in exists on ARCreateSendCompany
+                        changecompany(sks_EFT_Setup.ARCreateSendCompany)
+                        {
+                            while select * from sks_EFTAP_FileSkip
+                                    where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                        && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                        && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                            {
+                                if(setExistingFile())
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                    && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                        {
+                            if(setExistingFile())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_EFT_FormatId
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::AR
+                                && sks_EFTAP_FileSkip.EffectiveDate == offset
+                            join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                    {
+                        if(conFind(ARFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if(lSKS_EFTAP_File)
+            {
+                locFileCreated = true;
+            }
+            else
+            {
+                locFileCreated = false;
+            }
+            //IHB end
+
+
+            if(!locFileCreated && (ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.ARCreateSendLater == NoYes::Yes)) //FDD-10590
+            {
+                if(supportMultiCompany && ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    // If createSendMultiCompany is enabled create the file in APCreateSendCompany
+                    changecompany(sks_EFT_Setup.ARCreateSendCompany)
+                    {
+                        select locSKS_EFT_FileFormat
+                        where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+                        ttsbegin;
+                        lSKS_EFTAP_File = null;
+                        lSKS_EFTAP_File.create(SKS_EFT_Module::AR,false,false,locSKS_EFT_FileFormat);
+                        lSKS_EFTAP_File.FormatGroup =  SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatId).FormatGroup; //Bug 10228
+                        lSKS_EFTAP_File.FileStatus = SKS_EFT_FileStatus::NotProcessed;//11060
+                        lSKS_EFTAP_File.AdvEmail= NoYes::Yes;//11060
+                        lSKS_EFTAP_File.insert();
+                        ttscommit;
+                    }
+                }
+                else
+                {
+                    select locSKS_EFT_FileFormat
+                        where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_EFT_FormatId;
+                    ttsbegin;
+                    lSKS_EFTAP_File.create(SKS_EFT_Module::AR,false,false,locSKS_EFT_FileFormat);
+                    lSKS_EFTAP_File.FormatGroup =  SKS_EFT_FileFormat::find(mPaymMode.SKS_EFT_FormatId).FormatGroup; //Bug 10228
+                    lSKS_EFTAP_File.FileStatus = SKS_EFT_FileStatus::NotProcessed;//11060
+                    lSKS_EFTAP_File.AdvEmail= NoYes::Yes;//11060
+                    lSKS_EFTAP_File.insert();
+                    ttscommit;
+                }
+            }
+            //SKS_FDD_11060 <--
+
+
+            if ((sksSpecSummary.SelectByPaymentDate == NoYes::Yes || sksFileFormat.PayDateIsEffDate == NoYes::Yes)
+                && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select TransDate, PaymSpec
+                    from mtransGroup
+                    group by TransDate, PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.TransDate == mTransSummary.TransDate
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_ARPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_ARPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                    {
+                        if ((sksFileFormat.SplitJournalByDate == NoYes::Yes || ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes ||
+                            sks_EFT_Setup.ARCreateSendLater == NoYes::Yes) && lSKS_EFTAP_File)
+                        {
+                            updateEffectiveDate();
+                        }
+
+                        buildTrans(mtrans.TransDate, mtrans.PaymSpec, sksSpecSummary.FilterSeparateFile, sksSpecSummary.SelectByPaymentDate, sksSpecSummary.SamePaymentDate, sksFileFormat.PayDateIsEffDate);
+                    }
+                }
+
+            }
+            else if ((sksSpecSummary.SelectByPaymentDate == NoYes::Yes || sksFileFormat.PayDateIsEffDate == NoYes::Yes)
+                && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                //While
+                select TransDate
+                    from mtransGroup
+                    group by TransDate
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.TransDate == mTransSummary.TransDate
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_ARPmtSelectionRecId == 0;
+                //{
+                resetCount();
+                While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_ARPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                {
+                    if ((sksFileFormat.SplitJournalByDate == NoYes::Yes || ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes ||
+                            sks_EFT_Setup.ARCreateSendLater == NoYes::Yes) && lSKS_EFTAP_File)
+                    {
+                        updateEffectiveDate();
+                    }
+                    buildTrans(mtrans.TransDate, '', SKSSpecSummary.FilterSeparateFile, SKSSpecSummary.SelectByPaymentDate, SKSSpecSummary.SamePaymentDate, sksFileFormat.PayDateIsEffDate);
+                }
+                //}
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select PaymSpec
+                    from mtransGroup
+                    group by PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_ARPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.SKS_EFT_ARPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                    {
+                        buildTrans(DateNull(), mtrans.PaymSpec, sksSpecSummary.FilterSeparateFile, sksSpecSummary.SelectByPaymentDate, sksSpecSummary.SamePaymentDate, sksFileFormat.PayDateIsEffDate);
+                    }
+                }
+
+            }
+
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                resetCount();
+                While select forupdate *
+                    from mtrans
+                    where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                        && mtrans.PaymMode == mTransSummary.PaymMode
+                        && mtrans.PaymSpec == mTransSummary.PaymSpec
+                        && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtrans.SKS_EFT_ARPmtSelectionRecId == 0
+                        && mTrans.TransactionType != LedgerTransType::Fee
+                {
+                    if (sksFileFormat.SplitJournalByDate == NoYes::Yes && lSKS_EFTAP_File)
+                    {
+                        updateEffectiveDate();
+                    }
+                    buildTrans(DateNull(), '', SKSSpecSummary.FilterSeparateFile, SKSSpecSummary.SelectByPaymentDate, SKSSpecSummary.SamePaymentDate, sksFileFormat.PayDateIsEffDate);
+                }
+            }
+
+            if(rejectedLines)
+            {
+                ledgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::PartiallyTransferred;
+            }
+
+            //SKS_FDD_11060
+            if(cnt > 0)
+            {
+                if(preFileNbr != '' && preFileNbr !=  lSKS_EFTAP_File.FileNbr)
+                {
+                    messagePrinted = false;
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    if(conFind(ARFileNumberCon, lSKS_EFTAP_File.FileNbr) == 0)//Checks to make sure file number isn't duplicate
+                    {
+                        ARFileNumberCon += lSKS_EFTAP_File.FileNbr;//Add file number to the container
+                    }
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.ARCreateSendLater == NoYes::Yes) //Bug 10759
+                {
+                    if(supportMultiCompany  && ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                    {
+                        changecompany(sks_EFT_Setup.ARCreateSendCompany)
+                        {
+                            SKS_EFT_Processing::AutoCreateAndSend(lSKS_EFTAP_File, ledgerJournalTable, SKS_EFT_Module::AR, supportMultiCompany);
+                        }
+                    }
+                    else
+                    {
+                        SKS_EFT_Processing::AutoCreateAndSend(lSKS_EFTAP_File, ledgerJournalTable, SKS_EFT_Module::AR);
+                    }
+                }
+
+                if(!messagePrinted)
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.ARCreateSendLater == NoYes::Yes)
+                    {
+                        if(locFileCreated)
+                        {
+                            info(strFmt("@SKS:SKGAddPaymentToEFT", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId));
+                        }
+                        else
+                        {
+                            
+                            info(strFmt("@SKS3066", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId)); //FDD-10590
+                        }
+                        messagePrinted = true;
+                    }
+                }
+                preFileNbr = lSKS_EFTAP_File.FileNbr;
+
+                filenumber += lSKS_EFTAP_File.FileNbr;
+            }
+        }
+
+        //if(preFileNbr)
+        int i;
+        SKS_EFT_FileNbr         sendFileNbr;
+        SKS_EFT_FileNbr         prevFileNbr;
+
+        for (i = 1 ; i <= conLen(filenumber) ; i++)
+        {
+            // Prints the content of a container.
+            sendFileNbr = conPeek(filenumber, i);
+
+            SKS_EFTAP_File locSKS_EFTAP_File = SKS_EFTAP_File::find(sendFileNbr, SKS_EFT_Module::AR);
+
+            if(prevFileNbr != locSKS_EFTAP_File.FileNbr)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    if(ledgerJournalTable.SKS_EFT_JournalState != SKS_EFT_JournalState::Errors)
+                    {
+                        SKS_AutoProcessDD processDD = new SKS_AutoProcessDD();
+
+                        SKS_EFT_Setup eFT_Setup = SKS_EFT_Setup::find();
+
+                        if(eFT_Setup.AutoAdvEmail)
+                        {
+                            processDD.sendAdvEmail(locSKS_EFTAP_File);
+                        }
+                    }
+                }
+            }
+
+            prevFileNbr = locSKS_EFTAP_File.FileNbr;
+        }
+        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+        {
+            lSKS_EFT_Processing = new SKS_EFT_Processing();
+            For(int iter = 1; iter <= conLen(ARFileNumberCon); iter++)
+            {
+                lSKS_EFT_Processing.APARrocess_EFT(conPeek(ARFileNumberCon, iter),
+                                                    SKS_PP_NextActionDisplay::CreateSendFile,
+                                                    false,
+                                                    SKS_EFT_Module::AR,
+                                                    null,
+                                                    false,
+                                                    true);//SKS_Bug_11847
+                if(lSKS_EFT_Processing.getReturnMsg() != '')
+                {
+                    error("@SKS3756");
+                }
+            }
+        }
+        return lSKS_EFTAP_File.FileNbr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncEFTRecords</Name>
+				<Source><![CDATA[
+    static str SyncEFTRecords(boolean _create, LedgerJournalTable ledgerJournalTable)
+    {
+        str returnMessage;
+
+
+
+        if(ledgerJournalTable.JournalType == LedgerJournalType::Payment)
+        {
+            if(appl.ttsLevel() > 0 && ledgerJournalTable.SKS_EFT_AutoCreate && _create)
+            {
+                throw error("@SKS:SKGCreateAndSendNowTTSLevel");
+            }
+
+            returnMessage = SKS_Table_LedgerJournalTable::SyncAPEFTRecords(_create, ledgerJournalTable);
+        }
+        else if(ledgerJournalTable.JournalType == LedgerJournalType::CustPayment)
+        {
+            if(appl.ttsLevel() > 0 && ledgerJournalTable.SKS_EFT_AutoCreate && _create)
+            {
+                throw error("@SKS:SKGCreateAndSendNowTTSLevel");
+            }
+
+            if(SKS_Table_LedgerJournalTable::checkCustReimbursement(ledgerJournalTable))
+            {
+                returnMessage = SKS_Table_LedgerJournalTable::SyncCNPEFTRecords(_create, ledgerJournalTable);
+            }
+            else
+            {
+                returnMessage = SKS_Table_LedgerJournalTable::SyncAREFTRecords(_create, ledgerJournalTable);
+            }
+        }
+        else if(ledgerJournalTable.JournalType == LedgerJournalType::Daily)
+        {
+            if(appl.ttsLevel() > 0 && ledgerJournalTable.SKS_EFT_AutoCreate && _create)
+            {
+                throw error("@SKS:SKGCreateAndSendNowTTSLevel");
+            }
+
+            returnMessage = SKS_Table_LedgerJournalTable::SyncBTBEFTRecords(_create, ledgerJournalTable);
+        }
+
+        return returnMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncFXAllRecords</Name>
+				<Source><![CDATA[
+    private static void SyncFXAllRecords(LedgerJournalTrans _LedgerJournalTrans, SKS_EFT_Bank _SKS_EFT_Bank)
+    {
+        SKS_FXA_Details locSKS_FXA_Details;
+        VendTable locVendTable;
+        BankAccountTable locBankAccountTable;
+        SpecTrans       SpecTrans;
+        boolean locUpdate = false;
+
+        locSKS_FXA_Details = SKS_FXA_Details::findByLedgerJournalTransRecid(_LedgerJournalTrans.RecId);
+        //if it existed, we will be updating the old version, else we leave the locUpdate false and create a new records
+        if(locSKS_FXA_Details)
+        {
+            locUpdate = true;
+        }
+        //Find the vendor
+        locVendTable = VendTable::findByLedgerDimension(_LedgerJournalTrans.LedgerDimension);
+        //set the vendor field value
+        locSKS_FXA_Details.VendAccount = locVendTable.AccountNum;
+        locSKS_FXA_Details.LedgerJournalTransRecid = _LedgerJournalTrans.RecId;
+        Select firstonly CurrencyCode from locBankAccountTable where locBankAccountTable.AccountID == _SKS_EFT_Bank.BankAccountId;
+        if(locBankAccountTable.CurrencyCode != _LedgerJournalTrans.CurrencyCode)
+        {
+            locSKS_FXA_Details.CurrencyPairISO = SKS_FXA_CurrencyPairsTable::findCurrencyPair(currency::currencyCodeISO(_LedgerJournalTrans.CurrencyCode),
+                                                            currency::currencyCodeISO(locBankAccountTable.CurrencyCode));
+            locSKS_FXA_Details.SKS_FXA_BuySell = SKS_FXA_BuySell::Buy;
+        }
+        else
+        {
+            locSKS_FXA_Details.CurrencyPairISO = SKS_FXA_CurrencyPairsTable::findCurrencyPair(currency::currencyCodeISO(_LedgerJournalTrans.CurrencyCode),
+                                                            currency::currencyCodeISO(locVendTable.Currency));
+            locSKS_FXA_Details.SKS_FXA_BuySell = SKS_FXA_BuySell::Sell;
+        }
+
+        if(locSKS_FXA_Details.CurrencyPairISO == '' )
+        {
+            if (locSKS_FXA_Details.SKS_FXA_BuySell == SKS_FXA_BuySell::Buy)
+            {
+                sks_eft_journalValidate::errorLog(strFmt("@SKS3594",locBankAccountTable.CurrencyCode, _LedgerJournalTrans.CurrencyCode), _LedgerJournalTrans, true);
+            }
+            else
+            {
+                sks_eft_journalValidate::errorLog(strFmt("@SKS3594",locVendTable.Currency, _LedgerJournalTrans.CurrencyCode), _LedgerJournalTrans, true);
+            }
+            Throw Exception::Error;
+        }
+
+        select firstonly SpecCompany, SpecRecId, SpecTableId, Code from SpecTrans
+                where SpecTrans.SpecCompany == _LedgerJournalTrans.dataAreaId
+                    && SpecTrans.SpecRecId == _LedgerJournalTrans.RecId
+                    && SpecTrans.SpecTableId == _LedgerJournalTrans.TableId
+                    && SpecTrans.code != _LedgerJournalTrans.currencycode;
+
+        if(SpecTrans)
+        {
+            sks_eft_journalValidate::errorLog(strFmt("@SKS3723", SpecTrans.Code, _LedgerJournalTrans.CurrencyCode), _LedgerJournalTrans, true);
+            Throw Exception::Error;
+        }
+
+        if(_LedgerJournalTrans.AmountCurDebit != 0)
+        {
+            locSKS_FXA_Details.Amount = _LedgerJournalTrans.AmountCurDebit;
+        }
+        else
+        {
+            locSKS_FXA_Details.Amount = _LedgerJournalTrans.AmountCurCredit * -1;
+        }
+        locSKS_FXA_Details.DealtCurrency = currency::currencyCodeISO(_LedgerJournalTrans.CurrencyCode);
+        locSKS_FXA_Details.ValueDate = _LedgerJournalTrans.TransDate;
+        locSKS_FXA_Details.VendAccount = locVendTable.AccountNum;
+        if(locUpdate)
+        {
+            locSKS_FXA_Details.update();
+        }
+        else
+        {
+            locSKS_FXA_Details.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>LedgerJournalTable_onDeleted</Name>
+				<Source><![CDATA[
+    //9536
+    /// <summary>
+    /// Deleteting payment request journal header
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    [DataEventHandler(tableStr(LedgerJournalTable), DataEventType::Deleted)]
+    public static void LedgerJournalTable_onDeleted(Common sender, DataEventArgs e)
+    {
+        LedgerJournalTable  ledgerJournalTable = sender;
+        SKS_EFTAP_VendPmtSubmitLegerJournalTable vendPmtSubmitLegerJournalTable;
+
+        while select crosscompany vendPmtSubmitLegerJournalTable
+            where vendPmtSubmitLegerJournalTable.ReferenceJournalnum == ledgerJournalTable.Journalnum
+        {
+
+            if(vendPmtSubmitLegerJournalTable)
+            {
+                changecompany(vendPmtSubmitLegerJournalTable.SKS_EFTAP_SubmitCompany)
+                {
+                    ttsbegin;
+                    SKS_EFTAP_VendPmtSubmitLegerJournalTable vendPmtSubmitLegerJournalTableDel;
+                    vendPmtSubmitLegerJournalTableDel = vendPmtSubmitLegerJournalTable;
+                    vendPmtSubmitLegerJournalTableDel.selectForUpdate(true);
+                    vendPmtSubmitLegerJournalTableDel.delete();
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>iterateSplitJournal</Name>
+				<Source><![CDATA[
+    //SKS_FDD_11060 -->
+    /// <summary>
+    /// Iterating the customer payment journal(which was splitted)
+    /// </summary>
+    /// <param name="_splitJournalTableMap"></param>
+    /// <param name="_ledgerJournalTableOrigin"></param>
+    public static void iterateSplitJournal(Map _splitJournalTableMap, LedgerJournalTable _ledgerJournalTableOrigin)
+    {
+        LedgerJournalTable               ledgerJournalTableSplit, ledgerJournalTableMap;
+        SKS_DD_CustVendPaymExceptionList custVendPaymExceptionListLoc;
+        MapIterator                      splitMapIterator = new MapIterator(_splitJournalTableMap);
+        SKS_EFT_Setup lSKS_EFT_Setup = SKS_EFT_Setup::find();
+        while(splitMapIterator.more())
+        {
+            ledgerJournalTableMap = splitMapIterator.key();
+
+            LedgerJournalTable ledgerJournalTableOrig;
+
+            select forupdate ledgerJournalTableSplit where ledgerJournalTableSplit.RecId == ledgerJournalTableMap.RecId;
+            if(ledgerJournalTableSplit.RecId)
+            {
+                buf2Buf(ledgerJournalTableSplit, ledgerJournalTableOrig);
+
+                ledgerJournalTableSplit.SKS_EFT_AutoCreate = _ledgerJournalTableOrigin.SKS_EFT_AutoCreate;
+                SKS_EFT_ARJournalValidate::validateSet(ledgerJournalTableSplit, false,true,lSKS_EFT_Setup.DDFormatValidJournal,lSKS_EFT_Setup.DDFormatValidMultiThread);
+                select firstonly RecId from custVendPaymExceptionListLoc
+                            where custVendPaymExceptionListLoc.JournalId == ledgerJournalTableSplit.JournalNum &&
+                                    custVendPaymExceptionListLoc.ErrorWarning == SKS_DD_ErrorWarning::Error;
+                if (!custVendPaymExceptionListLoc.RecId)
+                {
+                    ledgerJournalTableSplit.SKS_EFT_JournalState = SKS_EFT_JournalState::Transferred;
+
+                }
+                else
+                {
+                    ledgerJournalTableSplit.SKS_EFT_JournalState = SKS_EFT_JournalState::Errors;
+                }
+                // print the journal count message
+                info(strFmt(splitMapIterator.value()));
+                ttsbegin;
+                ledgerJournalTableSplit.doUpdate();
+                ttscommit;
+
+                // <18343>
+                SKS_Table_LedgerJournalTable::CreateAndSend(ledgerJournalTableOrig, ledgerJournalTableSplit);
+            }
+            splitMapIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncBTBEFTRecords</Name>
+				<Source><![CDATA[
+    //SKS_FDD_11060 <--
+
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","The mTrans buffer is shared with local methods which do execute updates on it.")]
+    private server static SKS_EFT_FileNbr SyncBTBEFTRecords(boolean _create, LedgerJournalTable ledgerJournalTable)
+    {
+        // This routine creates/deletes the EFT records for use by SK-Ebanking.
+        // This is called whenever a Payment Journal is identified as ready to be transmitted to the bank.
+        LedgerJournalTrans mTransSummary;
+        LedgerJournalTrans mTransGroup;
+        LedgerJournalTrans mTrans;
+        SKS_EFTAP_File lSKS_EFTAP_File;
+        SKS_EFT_FileFormat locSKS_EFT_FileFormat, fileFormatSelect, sksFileFormat;
+        
+        //VendPaymModeTable mPaymMode;
+        SKS_BTB_PaymModeTable mPaymMode;
+        //Bug 10228 -->
+        //SKS_EFT_FormatGroup formatGroupLoc; //formatGroupLocLast since it was not used for any process
+        //BUG 10228 <--
+
+        //IHB SKS 9536 start
+        SKS_EFT_Processing lSKS_EFT_Processing;
+        SKS_EFT_FileNbr    preFileNbr;
+        boolean messagePrinted = false;
+        //IHB SKS 9536 end
+        container BTBFileNumberCon;
+        boolean rejectedLines = false;
+        boolean locFileCreated = false;
+        int cnt = 0;
+
+        SKS_EFT_FileFormatPaymSpec sksSpecSummary;
+        SKS_EFT_FilePmtSelection mPmtSelection;
+        //SKS_EFT_Bank gSKS_EFT_Bank;
+        //SKS_EFTBTB_Bank gSKS_EFT_Bank;
+        SKS_EFT_Setup    sks_EFT_Setup = SKS_EFT_Setup::find(); //Bug 10759
+        //SKS_FDD_10590 -->
+        //DataAreaId       paymJournalCompany = curExt();
+        //boolean          supportMultiCompany;
+        //boolean          createSendMultiCompany = sks_EFT_Setup.APCreateSendCompany && sks_EFT_Setup.APCreateSendCompany != paymJournalCompany ? true : false;
+        //container        multiCompanies = SKS_EB_VirtualCompany::getEFT_APMultiCompanies();
+        //SKS_FDD_10590 <--
+        //SKS_Bugs_11845 -->
+        SKS_EFTAP_File          sks_EFTAP_FileSkip;
+        SKS_EFT_Processing      sks_eft_processingBTB =  new SKS_EFT_Processing();
+        str                     errors;
+        str returnMessage;
+        //SKS_Bugs_11845 <--
+
+
+        // function to insert the Payment Selections
+        void buildTrans(TransDate _transDate, PaymSpec _paymSpec, NoYes _FilterSeparateFile, NoYes _SelectByPaymentDate, NoYes _SamePaymentDate, NoYes _payDateIsEffDate)
+        {
+            SKS_EFT_FilePmtSelection pmtSelectionExists;
+            BankAccountTable bankAccountTable;
+            SKS_EFT_FileFormat lSKS_EFT_FileFormat;
+
+            ttsbegin;
+            if(mTrans.PaymentStatus == CustVendPaymStatus::Rejected)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    error("@SKS3064");
+                    Throw Exception::Error;
+                }
+                rejectedLines = true;
+            }
+            else
+            {
+                bankAccountTable = BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension);
+                //if(gSKS_EFT_Bank.BankAccountId != bankAccountTable.AccountID
+                //    || gSKS_EFT_Bank.PaymMode != mPaymMode.PaymMode)
+                //{
+                //    select firstOnly BankAccountID, PaymMode from gSKS_EFT_Bank
+                //        where gSKS_EFT_Bank.BankAccountId == bankAccountTable.AccountID
+                //        && gSKS_EFT_Bank.PaymMode == mTransSummary.PaymMode;
+                //}
+                //if(gSKS_EFT_Bank.FXAEnabled == NoYes::Yes)
+                //{
+                //    mPmtSelection.FXAProcessing = NoYes::Yes;
+                //}
+                //else
+                //{
+                //    mPmtSelection.FXAProcessing = NoYes::No;
+                //}
+                mPmtSelection.PaymMode = mtransSummary.PaymMode;
+                mPmtSelection.PmtCount += 1;
+                mPmtSelection.PmtTotal += mtrans.calcDebitMST();
+                mPmtSelection.PmtTotal += mtrans.calcCreditMST();
+                mPmtSelection.Module = SKS_EFT_Module::BTB;
+                mPmtSelection.PmtJournalNum = ledgerJournalTable.JournalNum;
+                mPmtSelection.PmtBankAccountId = bankAccountTable.AccountID;
+                mPmtSelection.PmtDate = _transDate;
+                mPmtSelection.PaymSpec = _paymSpec;
+                mPmtSelection.PaymSpecSeparateFile = _FilterSeparateFile;
+                //mPmtSelection.PaymSpecSameDate = _SamePaymentDate;
+                //mPmtSelection.PaymSpecByDate = _SelectByPaymentDate;
+                mPmtSelection.Company = mtransSummary.DataAreaId; //SKS_FDD_10590
+                mPmtSelection.PrimaryFormat = NoYes::No; // Primary format is determined later
+                //Get Format Group
+                select FormatGroup, FormatId from lSKS_EFT_FileFormat where lSKS_EFT_FileFormat.FormatId == mPaymMode.FormatId;
+                mPmtSelection.FormatId = mPaymMode.FormatId;
+                mPmtSelection.FormatGroup = lSKS_EFT_FileFormat.FormatGroup;
+
+                //Update settings for Payment Date is Effective Date checkbox
+                if(_payDateIsEffDate)
+                {
+                    mPmtSelection.PaymSpecSameDate = NoYes::Yes;
+                    mPmtSelection.PaymSpecByDate = NoYes::Yes;
+                }
+                else
+                {
+                    mPmtSelection.PaymSpecSameDate = _SamePaymentDate;
+                    mPmtSelection.PaymSpecByDate = _SelectByPaymentDate;
+                }
+
+                if(mPmtSelection.PmtCount == 1) // If first, deteremine if record exists or if new should be created
+                {
+                    cnt++;
+                    select forupdate pmtSelectionExists where pmtSelectionExists.PmtJournalNum == ledgerJournalTable.JournalNum
+                        && pmtSelectionExists.PmtBankAccountId == bankAccountTable.AccountID
+                        && pmtSelectionExists.PaymMode == mtransSummary.PaymMode
+                        && pmtSelectionExists.PmtDate == _transDate
+                        && pmtSelectionExists.PaymSpec == _paymSpec;
+
+
+                    if(pmtSelectionExists && pmtSelectionExists.FileRecId == lSKS_EFTAP_File.RecId)
+                    {
+                        pmtSelectionExists.PmtCount += 1;
+                        pmtSelectionExists.PmtTotal += mtrans.calcDebitMST();
+                        pmtSelectionExists.PmtTotal += mtrans.calcCreditMST();
+                        pmtSelectionExists.update();
+                        mPmtSelection = pmtSelectionExists;
+                    }
+                    else
+                    {
+                        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes  || sks_EFT_Setup.BTBCreateSendLater == NoYes::Yes) //Bug 10759
+                        {
+                            mPmtSelection.FileRecId = lSKS_EFTAP_File.RecId;
+                        }
+                        mPmtSelection.insert();
+                    }
+                }
+                else
+                {
+                    mPmtSelection.update();
+                }
+                mTrans.SKS_EFT_BTBPmtSelectionRecId = mPmtSelection.RecId;
+                mTrans.update();
+
+                ttscommit;
+
+                //if(gSKS_EFT_Bank.FXAEnabled == NoYes::Yes)
+                //{
+                //    SKS_Table_LedgerJournalTable::SyncFXAllRecords(mTrans, gSKS_EFT_Bank);
+                //}
+            }
+        }
+
+        // function to reset line totals.
+        void resetCount()
+        {
+            mPmtSelection.PmtCount = 0;
+            mPmtSelection.PmtTotal = 0;
+        }
+
+        //IHB  SKS 9536 start
+        void updateEffectiveDate()
+        {
+            select locSKS_EFT_FileFormat
+                    where locSKS_EFT_FileFormat.FormatId == mPaymMode.FormatId;
+
+            ttsbegin;
+            lSKS_EFTAP_File.EffectiveDate = mtrans.TransDate;
+            
+            //10590
+            lSKS_EFTAP_File.selectForUpdate(true);
+            lSKS_EFTAP_File.update();
+            
+            ttscommit;
+        }
+        //IHB  SKS 9536 end
+
+        boolean setExistingFile()
+        {
+            boolean ret = false;
+
+            errors = sks_eft_processingBTB.CheckUserSelectionBTB(sks_EFTAP_FileSkip.RecId,
+                                                                0,
+                                                                true,
+                                                                sks_eft_processingBTB,
+                                                                mTransSummary.DataAreaId,
+                                                                mtransSummary.OffsetLedgerDimension,
+                                                                mtransSummary.PaymMode,
+                                                                mtransSummary.PaymSpec,
+                                                                mtransSummary.TransDate);
+
+            if(errors != '')
+            {
+                error(errors);
+                Throw Exception::Error;
+            }
+            else if(errors == '' && sks_eft_processingBTB.parmIgnoreFile())
+            {
+                sks_eft_processingBTB.parmIgnoreFile(false);
+            }
+            else
+            {
+                lSKS_EFTAP_File = sks_EFTAP_FileSkip;
+                ret = true;
+            }
+
+            return ret;
+        }
+
+        // Main routine
+        if (!_create)
+        {
+            ttsbegin;
+
+            while select forupdate mTrans
+            join mPmtSelection
+                where mTrans.SKS_EFT_BTBPmtSelectionRecId == mPmtSelection.RecId &&
+                mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum
+            {
+                mTrans.SKS_EFT_BTBPmtSelectionRecId = 0;
+                mTrans.update();
+            }
+
+            delete_from mPmtSelection where mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum;
+
+            ttscommit;
+            return '';
+        }
+
+        While
+            select
+                  PaymMode
+                , OffsetLedgerDimension
+                , PaymSpec
+                , TransDate
+            from mTransSummary
+            where mTransSummary.JournalNum == ledgerJournalTable.JournalNum
+                  && mTransSummary.SKS_EFT_BTBPmtSelectionRecId == 0
+            join
+                  FormatId,
+                  TransferType
+            from mPaymMode
+            where mPaymMode.PaymMode == mTransSummary.PaymMode
+            join
+                  FormatGroup
+                , BTBPayDateIsEffDate
+            from fileFormatSelect
+            where fileFormatSelect.FormatId == mPaymMode.FormatId
+            join
+                  maxof(SelectByPaymentDate)
+                , maxof(FilterSeparateFile)
+                , maxof(SamePaymentDate)
+            from sksSpecSummary
+            group by
+                  fileFormatSelect.EffectiveDateMethod
+                , fileFormatSelect.BTBDateOffset
+                , fileFormatSelect.FormatGroup
+                , mPaymMode.FormatId
+                , mTransSummary.PaymMode
+                , mTransSummary.TransDate
+                , mTransSummary.PaymSpec
+                , mTransSummary.OffsetLedgerDimension
+                , mPaymMode.TransferType
+            where sksSpecSummary.FormatId == mPaymMode.FormatId
+                  && sksSpecSummary.PaymSpec == mTransSummary.PaymSpec
+        {
+            lSKS_EFTAP_File = null;
+            sks_EFTAP_FileSkip = null;
+
+            select BTBPayDateIsEffDate from sksFileFormat where sksFileFormat.FormatId == mPaymMode.FormatId;
+
+            SKS_EFTBTB_Bank lSKS_EFTBTB_Bank = SKS_EFTBTB_Bank::findByCompany(mTransSummary.company(),
+                                                                            BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                            mTransSummary.PaymMode);
+
+            date offset = SKS_EFT_Processing::GetOffsetDate(fileFormatSelect.BTBDateOffset,
+                                                            mTransSummary.TransDate,
+                                                            lSKS_EFTBTB_Bank.BankHolidayGroupId);
+
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    
+                    while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                    && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                    {
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                    {
+                        if(!conFind(BTBFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.FormatId
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                    && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                    {
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.FormatId
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                            join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                    {
+                        if(!conFind(BTBFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            //if already file num exists for effective transdate, it will select existing record
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    while select * from sks_EFTAP_FileSkip
+                        where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                            && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                            && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                            && sks_EFTAP_FileSkip.EffectiveDate == offset
+                            && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                    {
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                    {
+                        if(conFind(BTBFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::No)
+                {
+                    while select * from sks_EFTAP_FileSkip
+                                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.FormatId
+                                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                    && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                    && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                    {
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    while select * from sks_EFTAP_FileSkip
+                            where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.FormatId
+                                && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::BTB
+                                && sks_EFTAP_FileSkip.EffectiveDate == offset
+                                && sks_EFTAP_FileSkip.TransferDirection == mPaymMode.TransferType
+                            join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                                && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                    {
+                        if(conFind(BTBFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                        {
+                            continue;
+                        }
+
+                        if(setExistingFile())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+
+            if(lSKS_EFTAP_File)
+            {
+                locFileCreated = true;
+            }
+            else
+            {
+                locFileCreated = false;
+            }
+            //IHB end
+
+
+            if(!locFileCreated && (ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.BTBCreateSendLater == NoYes::Yes))
+            {
+                // SKS_FDD_10590 -->
+                select locSKS_EFT_FileFormat where locSKS_EFT_FileFormat.FormatId == mPaymMode.FormatId;
+
+                ttsbegin;
+                lSKS_EFTAP_File.create(SKS_EFT_Module::BTB,false,false,locSKS_EFT_FileFormat);
+                lSKS_EFTAP_File.FormatGroup =  SKS_EFT_FileFormat::find(mPaymMode.FormatId).FormatGroup; //Bug 10228
+                lSKS_EFTAP_File.FileStatus = SKS_EFT_FileStatus::NotProcessed;//11060
+                lSKS_EFTAP_File.insert();
+                ttscommit;
+                //Bug 10759
+            }
+
+            if ((sksSpecSummary.SelectByPaymentDate == NoYes::Yes || sksFileFormat.BTBPayDateIsEffDate == NoYes::Yes)
+                && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select TransDate, PaymSpec
+                    from mtransGroup
+                    group by TransDate, PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.TransDate == mTransSummary.TransDate
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_BTBPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_BTBPmtSelectionRecId == 0
+                    {
+                        //if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.BTBAutoCreate == NoYes::Yes) && lSKS_EFTAP_File) //FDD-10590
+                        if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes ||
+                            sks_EFT_Setup.BTBCreateSendLater == NoYes::Yes) && lSKS_EFTAP_File)
+
+                        {
+                            updateEffectiveDate(); //IHB SKS 9536
+                        }
+
+                        buildTrans(mtrans.TransDate,
+                                    mtrans.PaymSpec,
+                                    sksSpecSummary.FilterSeparateFile,
+                                    sksSpecSummary.SelectByPaymentDate,
+                                    sksSpecSummary.SamePaymentDate,
+                                    sksFileFormat.BTBPayDateIsEffDate);
+                    }
+                }
+
+            }
+            else if ((sksSpecSummary.SelectByPaymentDate == NoYes::Yes || sksFileFormat.BTBPayDateIsEffDate == NoYes::Yes)
+                && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                //IHB SKS 9536
+                select TransDate
+                from mtransGroup
+                group by TransDate
+                where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                    && mtransGroup.PaymMode == mTransSummary.PaymMode
+                    && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                    && mtransGroup.TransDate == mTransSummary.TransDate
+                    && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                    && mtransGroup.SKS_EFT_BTBPmtSelectionRecId == 0;
+
+                resetCount();
+                While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_BTBPmtSelectionRecId == 0
+                {
+                    if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.BTBCreateSendLater == NoYes::Yes) && lSKS_EFTAP_File) //FDD-10590
+                    {
+                        updateEffectiveDate(); //IHB SKS 9536
+                    }
+
+                    buildTrans(mtrans.TransDate,
+                                    '',
+                                    SKSSpecSummary.FilterSeparateFile,
+                                    SKSSpecSummary.SelectByPaymentDate,
+                                    SKSSpecSummary.SamePaymentDate,
+                                    sksFileFormat.BTBPayDateIsEffDate);
+                }
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select PaymSpec
+                    from mtransGroup
+                    //group by TransDate, PaymSpec
+                    group by PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_BTBPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.SKS_EFT_BTBPmtSelectionRecId == 0
+                    {
+                        buildTrans(DateNull(),
+                                    mtrans.PaymSpec,
+                                    sksSpecSummary.FilterSeparateFile,
+                                    sksSpecSummary.SelectByPaymentDate,
+                                    sksSpecSummary.SamePaymentDate,
+                                    sksFileFormat.BTBPayDateIsEffDate);
+                    }
+                }
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                resetCount();
+                while select forupdate *
+                    from mtrans
+                    where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                        && mtrans.PaymMode == mTransSummary.PaymMode
+                        && mtrans.PaymSpec == mTransSummary.PaymSpec
+                        && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                    && mtrans.SKS_EFT_BTBPmtSelectionRecId == 0
+                {
+                    buildTrans(DateNull(),
+                                    '',
+                                    SKSSpecSummary.FilterSeparateFile,
+                                    SKSSpecSummary.SelectByPaymentDate,
+                                    SKSSpecSummary.SamePaymentDate,
+                                    sksFileFormat.BTBPayDateIsEffDate);
+                }
+            }
+
+
+            if(rejectedLines)
+            {
+                ledgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::PartiallyTransferred;
+            }
+
+            //IHB  SKS 9536 start
+            if(cnt > 0)
+            {
+                if(preFileNbr != '' && preFileNbr !=  lSKS_EFTAP_File.FileNbr)
+                {
+                    messagePrinted = false;
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    if(conFind(BTBFileNumberCon, lSKS_EFTAP_File.FileNbr) == 0)//Checks to make sure file number isn't duplicate
+                    {
+                        BTBFileNumberCon += lSKS_EFTAP_File.FileNbr;//Add file number to the container
+                    }
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.BTBCreateSendLater == NoYes::Yes) //Bug 10759
+                {
+                    SKS_EFT_Processing::AutoCreateAndSend(lSKS_EFTAP_File, ledgerJournalTable, SKS_EFT_Module::BTB);
+                }
+                //Bug 10759
+
+                if(!messagePrinted)
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.BTBCreateSendLater == NoYes::Yes) //Bug 10759
+                    {
+                        if(locFileCreated)
+                        {
+                            info(strFmt("@SKS:SKGBTBTransferToBTB", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId));
+                        }
+                        else
+                        {
+                            info(strFmt("@SKS:SKGBTBFileCreated", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId)); //FDD-10590
+                        }
+                        messagePrinted = true;
+                    }
+                    //Bug 10759
+                }
+                preFileNbr = lSKS_EFTAP_File.FileNbr;
+            }
+            //IHB  SKS 9536 end
+        }
+
+        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+        {
+            lSKS_EFT_Processing = new SKS_EFT_Processing();
+            For(int iter = 1; iter <= conLen(BTBFileNumberCon); iter++)
+            {
+                lSKS_EFT_Processing.APARrocess_EFT(conPeek(BTBFileNumberCon, iter),
+                                                    SKS_PP_NextActionDisplay::CreateSendFile,
+                                                    false,
+                                                    SKS_EFT_Module::BTB,
+                                                    null,
+                                                    false,
+                                                    true);//SKS_Bug_11847
+                if(lSKS_EFT_Processing.getReturnMsg() != '')
+                {
+                    returnMessage = lSKS_EFT_Processing.getReturnMsg();
+                    error("@SKS:SKGBTBBankTransferError");
+                }
+            }
+        }
+
+        return lSKS_EFTAP_File.FileNbr;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncCNPEFTRecords</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","The mTrans buffer is shared with local methods which do execute updates on it.")]
+    private server static str SyncCNPEFTRecords(boolean _create, LedgerJournalTable ledgerJournalTable)
+    {
+        // This routine creates/deletes the EFT records for use by SK-Ebanking.
+        // This is called whenever a Payment Journal is identified as ready to be transmitted to the bank.
+        LedgerJournalTrans mTransSummary;
+        LedgerJournalTrans mTransGroup;
+        LedgerJournalTrans mTrans;
+        SKS_EFTAP_File lSKS_EFTAP_File;
+        SKS_EFT_FileFormat locSKS_EFT_FileFormat, fileFormatSelect;
+        CustPaymModeTable mPaymMode;
+        //Bug 10228 -->
+        SKS_EFT_FormatGroup formatGroupLoc; //formatGroupLocLast since it was not used for any process
+        //BUG 10228 <--
+
+        //IHB SKS 9536 start
+        SKS_EFT_Processing lSKS_EFT_Processing;
+        SKS_EFT_FileNbr    preFileNbr;
+        boolean messagePrinted = false;
+        //IHB SKS 9536 end
+        container CNPFileNumberCon;
+        boolean rejectedLines = false;
+        boolean locFileCreated = false;
+        boolean          supportMultipleEffecticeDates;
+        int cnt = 0;
+
+        SKS_EFT_FileFormatPaymSpec sksSpecSummary;
+        SKS_EFT_FilePmtSelection mPmtSelection;
+        SKS_EFTCNP_Bank gSKS_EFTcnp_Bank;
+        SKS_EFT_Setup    sks_EFT_Setup = SKS_EFT_Setup::find(); //Bug 10759
+        //SKS_FDD_10590 -->
+        DataAreaId       paymJournalCompany = curExt();
+        //boolean          supportMultiCompany;
+        //boolean          createSendMultiCompany = sks_EFT_Setup.APCreateSendCompany && sks_EFT_Setup.APCreateSendCompany != paymJournalCompany ? true : false;
+        //container        multiCompanies = SKS_EB_VirtualCompany::getEFT_APMultiCompanies();
+        //SKS_FDD_10590 <--
+        //SKS_Bugs_11845 -->
+        SKS_EFTAP_File          sks_EFTAP_FileSkip;
+        SKS_EFT_Processing      sks_eft_processingCNP =  new SKS_EFT_Processing();
+        str                     errors;
+        str returnMessage;
+        //SKS_Bugs_11845 <--
+
+
+        // function to insert the Payment Selections
+        void buildTrans(TransDate _transDate, PaymSpec _paymSpec, NoYes _FilterSeparateFile, NoYes _SelectByPaymentDate, NoYes _SamePaymentDate)
+        {
+            SKS_EFT_FilePmtSelection pmtSelectionExists;
+            BankAccountTable bankAccountTable;
+            SKS_EFT_FileFormat lSKS_EFT_FileFormat;
+
+            ttsbegin;
+            if(mTrans.PaymentStatus == CustVendPaymStatus::Rejected)
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    error("@SKS3064");
+                    Throw Exception::Error;
+                }
+                rejectedLines = true;
+            }
+            else
+            {
+                bankAccountTable = BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension);
+                if(gSKS_EFTcnp_Bank.BankAccountId != bankAccountTable.AccountID
+                    || gSKS_EFTcnp_Bank.PaymMode != mPaymMode.PaymMode)
+                {
+                    select firstOnly BankAccountID, PaymMode from gSKS_EFTcnp_Bank
+                        where gSKS_EFTcnp_Bank.BankAccountId == bankAccountTable.AccountID
+                        && gSKS_EFTcnp_Bank.PaymMode == mTransSummary.PaymMode;
+                }
+                mPmtSelection.FXAProcessing = NoYes::No;
+
+                mPmtSelection.PaymMode = mtransSummary.PaymMode;
+                mPmtSelection.PmtCount += 1;
+                mPmtSelection.PmtTotal += mtrans.calcDebitMST();
+                mPmtSelection.PmtTotal -= mtrans.calcCreditMST();
+                mPmtSelection.Module = SKS_EFT_Module::CNP;
+                mPmtSelection.PmtJournalNum = ledgerJournalTable.JournalNum;
+                mPmtSelection.PmtBankAccountId = bankAccountTable.AccountID;
+                mPmtSelection.PmtDate = _transDate;
+                mPmtSelection.PaymSpec = _paymSpec;
+                mPmtSelection.PaymSpecSeparateFile = _FilterSeparateFile;
+                mPmtSelection.PaymSpecSameDate = _SamePaymentDate;
+                mPmtSelection.PaymSpecByDate = _SelectByPaymentDate;
+                mPmtSelection.Company = mtransSummary.DataAreaId; //SKS_FDD_10590
+                mPmtSelection.PrimaryFormat = NoYes::No; // Primary format is determined later
+                //Get Format Group
+                select FormatGroup, FormatId from lSKS_EFT_FileFormat where lSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_CNP_FormatId;
+                mPmtSelection.FormatId = mPaymMode.SKS_CNP_FormatId;
+                mPmtSelection.FormatGroup = lSKS_EFT_FileFormat.FormatGroup;
+
+                SKS_EFT_FileFormat sKS_EFT_FileFormat_1;
+
+                select firstonly sKS_EFT_FileFormat_1
+                    where sKS_EFT_FileFormat_1.FormatId == mPaymMode.SKS_CNP_FormatId;
+
+                SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_CNP_FormatId, mTrans.PaymSpec);
+
+                SKS_EFTCNP_Bank lSKS_EFT_Bank = SKS_EFTCNP_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset;
+
+                if(sKS_EFT_FileFormat_1.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::PaymSpecOffset)
+                {
+                    offset = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.EffectiveDateOffset,
+                                                                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                lSKS_EFT_Bank.BankHolidayGroupId);
+
+                    mPmtSelection.EffectiveDate = offset;
+                }
+
+                if(mPmtSelection.PmtCount == 1) // If first, deteremine if record exists or if new should be created
+                {
+                    cnt++;
+                    if(sKS_EFT_FileFormat_1.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::PaymSpecOffset)
+                    {
+                        select firstonly forupdate pmtSelectionExists where pmtSelectionExists.PmtJournalNum == ledgerJournalTable.JournalNum
+                            && pmtSelectionExists.PmtBankAccountId == bankAccountTable.AccountID
+                            && pmtSelectionExists.PaymMode == mtransSummary.PaymMode
+                            && pmtSelectionExists.PmtDate == _transDate
+                            && pmtSelectionExists.PaymSpec == _paymSpec  // SKS_Bug_10221
+                        && pmtSelectionExists.EffectiveDate == mPmtSelection.EffectiveDate;
+                    }
+                    else
+                    {
+                        select firstonly forupdate pmtSelectionExists where pmtSelectionExists.PmtJournalNum == ledgerJournalTable.JournalNum
+                            && pmtSelectionExists.PmtBankAccountId == bankAccountTable.AccountID
+                            && pmtSelectionExists.PaymMode == mtransSummary.PaymMode
+                            && pmtSelectionExists.PmtDate == _transDate
+                            && pmtSelectionExists.PaymSpec == _paymSpec; // SKS_Bug_10221
+                    }
+
+                    if(pmtSelectionExists && pmtSelectionExists.FileRecId == lSKS_EFTAP_File.RecId)
+                    {
+                        pmtSelectionExists.PmtCount += 1;
+                        pmtSelectionExists.PmtTotal += mtrans.calcDebitMST();
+                        pmtSelectionExists.PmtTotal -= mtrans.calcCreditMST();
+                        pmtSelectionExists.update();
+                        mPmtSelection = pmtSelectionExists;
+                    }
+                    else
+                    {
+                        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes  || sks_EFT_Setup.CNPCreateSendLater == NoYes::Yes) //Bug 10759
+                        {
+                            mPmtSelection.FileRecId = lSKS_EFTAP_File.RecId;
+                        }
+                        mPmtSelection.insert();
+                    }
+                }
+                else
+                {
+                    mPmtSelection.update();
+                }
+                mTrans.SKS_EFT_CNPPmtSelectionRecId = mPmtSelection.RecId;
+                mTrans.update();
+
+                ttscommit;
+            }
+        }
+
+        // function to reset line totals.
+        void resetCount()
+        {
+            mPmtSelection.PmtCount = 0;
+            mPmtSelection.PmtTotal = 0;
+        }
+
+        //IHB  SKS 9536 start
+        void updateEffectiveDate()
+        {
+            select locSKS_EFT_FileFormat
+                    where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_CNP_FormatId;
+
+            ttsbegin;
+            if(locSKS_EFT_FileFormat.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::FormatOffset)
+            {
+                lSKS_EFTAP_File.EffectiveDate = mtrans.TransDate;
+            }
+            else
+            {
+                lSKS_EFTAP_File.EffectiveDate = dateNull();
+            }
+            //10590
+            changecompany(lSKS_EFTAP_File.DataAreaId)
+            {
+                lSKS_EFTAP_File.selectForUpdate(true);
+                lSKS_EFTAP_File.update();
+            }
+            ttscommit;
+        }
+        //IHB  SKS 9536 end
+
+        boolean setExistingFile()
+        {
+            boolean ret = false;
+            //TODO
+            /*errors = sks_eft_processingCNP.CheckUserSelectionAP(sks_EFTAP_FileSkip.RecId,
+                                                                0,
+                                                                multiCompanies,
+                                                                true,
+                                                                sks_eft_processingAP,
+                                                                mTransSummary.DataAreaId,
+                                                                mtransSummary.OffsetLedgerDimension,
+                                                                mtransSummary.PaymMode,
+                                                                mtransSummary.PaymSpec,
+                                                                mtransSummary.TransDate);*/
+
+            if(errors != '')
+            {
+                error(errors);
+                Throw Exception::Error;
+            }
+            else if(errors == '' && sks_eft_processingCNP.parmIgnoreFile())
+            {
+                sks_eft_processingCNP.parmIgnoreFile(false);
+            }
+            else
+            {
+                lSKS_EFTAP_File = sks_EFTAP_FileSkip;
+                ret = true;
+            }
+
+            return ret;
+        }
+
+        void selectFileDateNoSpecNo()
+        {
+            if(fileFormatSelect.EffectiveDateMethod != SKS_EFT_EffectiveDateMethod::PaymSpecOffset ||
+               (fileFormatSelect.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::PaymSpecOffset &&
+                supportMultipleEffecticeDates))
+            {
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes
+                                && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                SKS_EFT_FileFormatPaymSpec lSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(mTransSummary.company(), mPaymMode.SKS_CNP_FormatId, mTransSummary.PaymSpec);
+
+                SKS_EFTCNP_Bank lSKS_EFT_Bank = SKS_EFTCNP_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset = SKS_EFT_Processing::GetOffsetDate(lSKS_EFT_FileFormatPaymSpec.EffectiveDateOffset,
+                                                                        DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+                                                                        lSKS_EFT_Bank.BankHolidayGroupId);
+
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                        && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.EffectiveDate == offset
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        void selectFileDateNoSpecYes()
+        {
+            SKS_EFT_FilePmtSelection paymentSelection;
+
+            while
+                select * from sks_EFTAP_FileSkip
+                where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_CNP_FormatId
+                    && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                    && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                    && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+            {
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes
+                            && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                {
+                    continue;
+                }
+
+                if(setExistingFile())
+                {
+                    break;
+                }
+            }
+        }
+
+        void selectFileDateYesSpecNo()
+        {
+            if(fileFormatSelect.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::FormatOffset)
+            {
+                SKS_EFTAR_Bank lSKS_EFT_Bank = SKS_EFTAR_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset = SKS_EFT_Processing::GetOffsetDate(fileFormatSelect.EffectiveDateOffset,
+                                                                        mTransSummary.TransDate,
+                                                                        lSKS_EFT_Bank.BankHolidayGroupId);
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.EffectiveDate == offset
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(sks_EFTAP_FileSkip.EffectiveDate == offset && setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                SKS_EFT_FilePmtSelection paymentSelection;
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatGroup ==  fileFormatSelect.FormatGroup
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.PmtDate == mTransSummary.TransDate
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        void selectFileDateYesSpecYes()
+        {
+            SKS_EFT_FilePmtSelection paymentSelection;
+
+            if(fileFormatSelect.EffectiveDateMethod == SKS_EFT_EffectiveDateMethod::FormatOffset)
+            {
+                SKS_EFTAR_Bank lSKS_EFT_Bank = SKS_EFTAR_Bank::findByCompany(mTransSummary.company(),
+                                                                                BankAccountTable::findByLedgerDimension(mtransSummary.OffsetLedgerDimension).AccountID,
+                                                                                mTransSummary.PaymMode);
+                date offset = SKS_EFT_Processing::GetOffsetDate(fileFormatSelect.EffectiveDateOffset,
+                                                                        mTransSummary.TransDate,
+                                                                        lSKS_EFT_Bank.BankHolidayGroupId);
+
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_CNP_FormatId
+                        && sks_EFTAP_FileSkip.EffectiveDate == offset
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(sks_EFTAP_FileSkip.EffectiveDate == offset && setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                while
+                    select * from sks_EFTAP_FileSkip
+                    where sks_EFTAP_FileSkip.FormatId ==  mPaymMode.SKS_CNP_FormatId
+                        && sks_EFTAP_FileSkip.FileStatus == SKS_EFT_FileStatus::NotProcessed
+                        && sks_EFTAP_FileSkip.FXAProcessing == NoYes::No
+                    && sks_EFTAP_FileSkip.EFTFileType == SKS_EFT_Module::CNP
+                    join paymentSelection where paymentSelection.FileRecId == sks_EFTAP_FileSkip.RecId
+                        && paymentSelection.PmtDate == mTransSummary.TransDate
+                        && paymentSelection.PaymSpec == mTransSummary.PaymSpec
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes:: Yes
+                                && !conFind(CNPFileNumberCon,sks_EFTAP_FileSkip.FileNbr))
+                    {
+                        continue;
+                    }
+
+                    if(setExistingFile())
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Main routine
+        if (!_create)
+        {
+            ttsbegin;
+
+            //SKS_Table_LedgerJournalTable::RemoveFXAllRecords(ledgerJournalTable.JournalNum);
+            while select forupdate mTrans
+            join mPmtSelection
+                where mTrans.SKS_EFT_CNPPmtSelectionRecId == mPmtSelection.RecId &&
+                mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum
+            {
+                mTrans.SKS_EFT_CNPPmtSelectionRecId = 0;
+                mTrans.update();
+            }
+
+            delete_from mPmtSelection where mPmtSelection.PmtJournalNum == ledgerJournalTable.JournalNum;
+
+            ttscommit;
+            return '';
+        }
+
+        While
+        select
+            PaymMode
+            , OffsetLedgerDimension
+            , PaymSpec
+            , TransDate
+        from mTransSummary
+        where mTransSummary.JournalNum == ledgerJournalTable.JournalNum
+                && mTransSummary.SKS_EFT_CNPPmtSelectionRecId == 0
+            && mTransSummary.TransactionType != LedgerTransType::Fee
+        join
+                SKS_CNP_FormatId
+        from mPaymMode
+        where mPaymMode.PaymMode == mTransSummary.PaymMode
+        join
+            FormatGroup
+            , EffectiveDateMethod
+            , EffectiveDateOffset
+        from fileFormatSelect
+        where fileFormatSelect.FormatId == mPaymMode.SKS_CNP_FormatId
+        join
+            maxof(SelectByPaymentDate)
+            , maxof(FilterSeparateFile)
+            , maxof(SamePaymentDate)
+            , EffectiveDateOffset
+        from sksSpecSummary
+        group by
+            fileFormatSelect.EffectiveDateMethod
+            , fileFormatSelect.EffectiveDateOffset
+            , fileFormatSelect.FormatGroup
+            , mPaymMode.SKS_CNP_FormatId
+            , mTransSummary.PaymMode
+            , mTransSummary.TransDate
+            , mTransSummary.PaymSpec
+            , mTransSummary.OffsetLedgerDimension
+        where sksSpecSummary.FormatId == mPaymMode.SKS_CNP_FormatId
+            && sksSpecSummary.PaymSpec == mTransSummary.PaymSpec
+        {
+            lSKS_EFTAP_File = null;
+            sks_EFTAP_FileSkip = null;
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                selectFileDateNoSpecNo();
+            }
+
+            // SKS_FDD_10383-->
+            if (SKS_EFT_FileFormat::find(mPaymMode.SKS_CNP_FormatId).SupportsMultipleEffectiveDates == NoYes::Yes)
+            {
+                supportMultipleEffecticeDates = true;
+            }
+            // SKS_FDD_10383<---
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                selectFileDateNoSpecYes();
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                selectFileDateYesSpecNo();
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                selectFileDateYesSpecYes();
+            }
+
+            if(lSKS_EFTAP_File)
+            {
+                locFileCreated = true;
+            }
+            else
+            {
+                locFileCreated = false;
+            }
+            //IHB end
+
+
+            if(!locFileCreated && (ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.CNPCreateSendLater == NoYes::Yes))
+            {
+                select locSKS_EFT_FileFormat where locSKS_EFT_FileFormat.FormatId == mPaymMode.SKS_CNP_FormatId;
+
+                ttsbegin;
+                lSKS_EFTAP_File.create(SKS_EFT_Module::CNP,false,false,locSKS_EFT_FileFormat);
+                lSKS_EFTAP_File.FormatGroup =  SKS_EFT_FileFormat::find(mPaymMode.SKS_CNP_FormatId).FormatGroup; //Bug 10228
+                lSKS_EFTAP_File.insert();
+                ttscommit;
+                //Bug 10759
+            }
+
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select TransDate, PaymSpec
+                    from mtransGroup
+                    group by TransDate, PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.TransDate == mTransSummary.TransDate
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_CNPPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_CNPPmtSelectionRecId == 0
+                        && mTrans.TransactionType != LedgerTransType::Fee
+                    {
+                        if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.CNPCreateSendLater == NoYes::Yes) && lSKS_EFTAP_File) //FDD-10590
+                        {
+                            updateEffectiveDate(); //IHB SKS 9536
+                        }
+
+                        buildTrans(mtrans.TransDate,
+                                    mtrans.PaymSpec,
+                                    sksSpecSummary.FilterSeparateFile,
+                                    sksSpecSummary.SelectByPaymentDate,
+                                    sksSpecSummary.SamePaymentDate);
+                    }
+                }
+
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::Yes && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                //IHB SKS 9536
+                select TransDate
+                from mtransGroup
+                group by TransDate
+                where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                    && mtransGroup.PaymMode == mTransSummary.PaymMode
+                    && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                    && mtransGroup.TransDate == mTransSummary.TransDate
+                    && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                    && mtransGroup.SKS_EFT_CNPPmtSelectionRecId == 0;
+
+                resetCount();
+                While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransSummary.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.TransDate == mtransGroup.TransDate
+                            && mtrans.SKS_EFT_CNPPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                {
+                    if ((ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.CNPCreateSendLater == NoYes::Yes) && lSKS_EFTAP_File) //FDD-10590
+                    {
+                        updateEffectiveDate(); //IHB SKS 9536
+                    }
+
+                    buildTrans(mtrans.TransDate,
+                                    '',
+                                    SKSSpecSummary.FilterSeparateFile,
+                                    SKSSpecSummary.SelectByPaymentDate,
+                                    SKSSpecSummary.SamePaymentDate);
+                }
+            }
+            else if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::Yes)
+            {
+                While select PaymSpec
+                    from mtransGroup
+                    group by PaymSpec
+                    where mTransGroup.JournalNum == ledgerJournalTable.JournalNum
+                        && mtransGroup.PaymMode == mTransSummary.PaymMode
+                        && mtransGroup.PaymSpec == mTransSummary.PaymSpec
+                        && mtransGroup.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtransGroup.SKS_EFT_CNPPmtSelectionRecId == 0
+                {
+                    resetCount();
+                    While select forupdate *
+                        from mtrans
+                        where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                            && mtrans.PaymMode == mTransSummary.PaymMode
+                            && mtrans.PaymSpec == mTransGroup.PaymSpec
+                            && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                            && mtrans.SKS_EFT_CNPPmtSelectionRecId == 0
+                            && mTrans.TransactionType != LedgerTransType::Fee
+                    {
+                        buildTrans(DateNull(),
+                                    mtrans.PaymSpec,
+                                    sksSpecSummary.FilterSeparateFile,
+                                    sksSpecSummary.SelectByPaymentDate,
+                                    sksSpecSummary.SamePaymentDate);
+                    }
+                }
+            }
+            if (sksSpecSummary.SelectByPaymentDate == NoYes::No && sksSpecSummary.FilterSeparateFile == NoYes::No)
+            {
+                resetCount();
+                While select forupdate *
+                    from mtrans
+                    where mTrans.JournalNum == ledgerJournalTable.JournalNum
+                        && mtrans.PaymMode == mTransSummary.PaymMode
+                        && mtrans.PaymSpec == mTransSummary.PaymSpec
+                        && mtrans.OffsetLedgerDimension == mTransSummary.OffsetLedgerDimension
+                        && mtrans.SKS_EFT_CNPPmtSelectionRecId == 0
+                        && mTrans.TransactionType != LedgerTransType::Fee
+                {
+                    buildTrans(DateNull(),
+                                    '',
+                                    SKSSpecSummary.FilterSeparateFile,
+                                    SKSSpecSummary.SelectByPaymentDate,
+                                    SKSSpecSummary.SamePaymentDate);
+                }
+            }
+
+
+            if(rejectedLines)
+            {
+                ledgerJournalTable.SKS_EFT_JournalState = SKS_EFT_JournalState::PartiallyTransferred;
+            }
+
+            //IHB  SKS 9536 start
+            if(cnt > 0)
+            {
+                if(preFileNbr != '' && preFileNbr !=  lSKS_EFTAP_File.FileNbr)
+                {
+                    messagePrinted = false;
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+                {
+                    if(conFind(CNPFileNumberCon, lSKS_EFTAP_File.FileNbr) == 0)//Checks to make sure file number isn't duplicate
+                    {
+                        CNPFileNumberCon += lSKS_EFTAP_File.FileNbr;//Add file number to the container
+                    }
+                }
+
+                if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.CNPCreateSendLater == NoYes::Yes) //Bug 10759
+                {
+                    SKS_EFT_Processing::AutoCreateAndSend(lSKS_EFTAP_File, ledgerJournalTable, SKS_EFT_Module::CNP);
+                }
+                //Bug 10759
+
+                if(!messagePrinted)
+                {
+                    if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes || sks_EFT_Setup.CNPCreateSendLater == NoYes::Yes) //Bug 10759
+                    {
+                        if(locFileCreated)
+                        {
+                            info(strFmt("@SKS:SKGAddPaymentToEFT", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId));
+                        }
+                        else
+                        {
+                            info(strFmt("@SKS3066", lSKS_EFTAP_File.FileNbr, lSKS_EFTAP_File.DataAreaId)); //FDD-10590
+                        }
+                        messagePrinted = true;
+                    }
+                    //Bug 10759
+                }
+                preFileNbr = lSKS_EFTAP_File.FileNbr;
+            }
+            //IHB  SKS 9536 end
+        }
+
+        if(ledgerJournalTable.SKS_EFT_AutoCreate == NoYes::Yes)
+        {
+            lSKS_EFT_Processing = new SKS_EFT_Processing();
+            For(int iter = 1; iter <= conLen(CNPFileNumberCon); iter++)
+            {
+                lSKS_EFT_Processing.APARrocess_EFT(conPeek(CNPFileNumberCon, iter),
+                                                    SKS_PP_NextActionDisplay::CreateSendFile,
+                                                    false,
+                                                    SKS_EFT_Module::CNP,
+                                                    null,
+                                                    false,
+                                                    true);//SKS_Bug_11847
+                if(lSKS_EFT_Processing.getReturnMsg() != '')
+                {
+                    returnMessage = lSKS_EFT_Processing.getReturnMsg();
+                    error("@SKS3756");
+                }
+            }
+        }
+
+        return returnMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkCustReimbursement</Name>
+				<Source><![CDATA[
+    public static boolean checkCustReimbursement(LedgerJournalTable _LedgerJournalTable)
+    {
+        return LedgerJournalName::find(_LedgerJournalTable.JournalName).SKS_CNP_CustReimbursementJournal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkBTBTransferJournal</Name>
+				<Source><![CDATA[
+    public static boolean checkBTBTransferJournal(LedgerJournalTable _LedgerJournalTable)
+    {
+        return LedgerJournalName::find(_LedgerJournalTable.JournalName).SKS_BTB_BankTransferJournal;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

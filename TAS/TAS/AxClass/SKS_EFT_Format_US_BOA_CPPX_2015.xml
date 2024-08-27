@@ -1,0 +1,426 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_Format_US_BOA_CPPX_2015</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// SKS_EFT_Format_US_BOA_CPPX_2015 extends SKS_EFT_Format
+/// </summary>
+class SKS_EFT_Format_US_BOA_CPPX_2015 extends SKS_EFT_Format
+{
+   // BOA Comprehensive Payables and Paymode - X
+   // 2015 version
+    
+    #define.FormatVersion('20220722')
+    #define.Separator('|')
+    #define.CheckStandard('CHK-S')
+    #define.PAYMODEX('ACH')
+    #define.EPAY('EPY')
+
+    int mPaymentCount;
+    int mRemittanceCount;
+    str mLocationID;
+    Amount mPaymentAmount;
+    BankAccountTable mBankAccountTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getFormatVersion</Name>
+				<Source><![CDATA[
+    protected str getFormatVersion()
+    {
+        return #FormatVersion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatStructure</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Necessary to allow the processing of every invoice(inner loop) for every relevant parent file detail record(outer loop)")]
+    protected void formatStructure()
+    {
+        SKS_EFT_FileDetail invSKS_EFT_FileDetail;
+        LedgerJournalTrans lLedgerJournalTrans;
+        boolean firstRec = true;
+        ;
+    
+        while(mSKS_EFT_FileDetail)
+        {
+            // Get SKS_EFT_Bank
+            this.getSKS_EFT_Bank();
+    
+            if(mBankAccountTable.AccountID != mSKS_EFT_FileDetail.BankAccountId)
+            {
+                // Get Bank Account Table
+                mBankAccountTable = BankAccountTable::find(mSKS_EFT_FileDetail.BankAccountId);
+            }
+    
+            // Get RemittanceAddress
+            this.getRemittanceAddress(true);
+    
+            // Get Location id
+            this.getLocationID();
+    
+            // Get SKS_EFT_VendorPaym
+            this.getSKS_EFT_VendorPaym();
+    
+            // Get SKS_EFT_FileFormatPaymSpec
+            this.getSKS_EFT_FileFormatPaymSpec();
+    
+            //Payment Data
+            this.rec_PM();
+    
+            //Remittance Data
+            while select invSKS_EFT_FileDetail where invSKS_EFT_FileDetail.RecordSummaryRecId == mSKS_EFT_FileDetail.RecId
+            {
+                //Get Buyer ID
+                lLedgerJournalTrans = null;
+                select crossCompany PaymId from lLedgerJournalTrans where lLedgerJournalTrans.VendTransId == invSKS_EFT_FileDetail.VendTransRecId;
+                this.rec_REM(invSKS_EFT_FileDetail, lLedgerJournalTrans);
+            }
+            next mSKS_EFT_FileDetail;
+        }
+    
+        //Control total Data
+        this.rec_CD();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>get_POInfo</Name>
+				<Source><![CDATA[
+    private str get_POInfo(SKS_EFT_FileDetail _invSKS_EFT_FileDetail)
+    {
+        VendInvoiceJour vendInvoiceJour;
+        Container companyInfo;
+        str PONum = '';
+        ;
+    
+        companyInfo += _invSKS_EFT_FileDetail.InvoiceCompany;
+    
+        // See if PO exists
+        if(conPeek(companyInfo, 1) != '')
+        {
+            select firstOnly crossCompany:companyInfo PurchId, InvoiceAccount, InvoiceDate, InvoiceId from vendInvoiceJour where
+                vendInvoiceJour.InvoiceAccount == _invSKS_EFT_FileDetail.AccountNum &&
+                vendInvoiceJour.InvoiceDate == _invSKS_EFT_FileDetail.InvoiceDate &&
+                vendInvoiceJour.InvoiceId == _invSKS_EFT_FileDetail.InvoiceNumber &&
+                vendInvoiceJour.PurchId != '';
+    
+            if(vendInvoiceJour)
+            {
+                PONum = vendInvoiceJour.PurchId;
+    
+            }
+        }
+        return this.CharacterReplacement(PONum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalPaymentNotes</Name>
+				<Source><![CDATA[
+    private str getJournalPaymentNotes()
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+    
+        select PaymentNotes from ledgerJournalTrans where
+            ledgerJournalTrans.RecId == mSKS_EFT_FileDetail.PaymentLineRecId;
+    
+        return this.CharacterReplacement(ledgerJournalTrans.PaymentNotes);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLocationID</Name>
+				<Source><![CDATA[
+    private void getLocationID()
+    {
+        LedgerJournalTrans      lLedgerJournalTrans;
+        LogisticsLocation       lLogisticsLocation;
+    
+        if(mSKS_EFT_FileDetail.PaymentLineRecId != 0)
+        {
+            select RemittanceLocation from lLedgerJournalTrans where lLedgerJournalTrans.RecId == mSKS_EFT_FileDetail.PaymentLineRecId;
+            lLogisticsLocation = LogisticsLocation::find(lLedgerJournalTrans.RemittanceLocation);
+    
+            mLocationID = lLogisticsLocation.LocationId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_CD</Name>
+				<Source><![CDATA[
+    boolean rec_CD()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //Each Field separated by pipe Delimiter
+        //Nbr   Description
+        // 1    Record type
+        // 2    Total Payment Amount
+        // 3    Total Number of Payments
+        // 4    Total Number of Remittances
+        //------------------------------------------------------------------------------------------------------
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+    
+        // 1    Record type
+        sb.Append(this.wrapField('C'));
+    
+        // 2    Total Payment Amount
+        sb.Append(this.wrapField(num2str(-1*mPaymentAmount,0,2,1,0)));
+    
+        // 3    Total Number of Payments
+        sb.Append(this.wrapField(int2str(mPaymentCount)));
+    
+        // 4    Total Number of Remittances
+        sb.Append(this.wrapField(int2str(mRemittanceCount), false));
+    
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_PM</Name>
+				<Source><![CDATA[
+    boolean rec_PM()
+    {
+        //------------------------------------------------------------------------------------------------------
+        //Each Field separated by pipe delimiter
+        //Nbr   Description
+        // 1    Record type
+        // 2    Payment type
+        // 3    Disbursing (i.e. your) Paymode-X Account ID
+        // 4    Disbursing Routing Transit Number
+        // 5    Disbursing Bank Account Number
+        // 6    Collecting (i.e. your vendor's) Paymode-X Account ID
+        // 7    Payment Reference Number
+        // 8    Payment Amount
+        // 9    Vendor Number
+        //10    Vendor Site/Remit Code
+        //11    Vendor Name
+        //12    Vendor Address Line 1
+        //13    Vendor Address Line 2
+        //14    Vendor Address Line 3
+        //15    Vendor City
+        //16    Vendor State
+        //17    Vendor Zip
+        //18    Vendor Country
+        //19    Divert Code
+        //------------------------------------------------------------------------------------------------------
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        mPaymentCount++;
+    
+        // 1    Record type
+        sb.Append(this.wrapField('P'));
+    
+        // 2    Payment type
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #CheckStandard:
+                sb.Append(this.wrapField('CHK'));
+                break;
+            case #PAYMODEX:
+                sb.Append(this.wrapField('ACH'));
+                break;
+            case #EPAY:
+                sb.Append(this.wrapField('EPY'));
+                break;
+        }
+    
+        // 3    Disbursing (i.e. your) Paymode-X Account ID
+        sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('PaymodexId', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank))));
+    
+        // 4    Disbursing Routing Transit Number
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankTransit, true, 9));
+    
+        // 5    Disbursing Bank Account Number
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankAcct, true, 17));
+    
+        // 6    Collecting (i.e. your vendor's) Paymode-X Account ID
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #PAYMODEX:
+            case #EPAY:
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CollctngPaymodexId', mSKS_EFT_FileDetail.RecId))));
+                break;
+            default:
+                 sb.Append(this.wrapField(''));
+                break;
+        }
+    
+        // 7    Payment Reference Number
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.PaymentReference)));
+    
+        // 8    Payment Amount
+        mPaymentAmount += mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur;
+        sb.Append(this.wrapField(num2str(-1 * mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,0)));
+    
+        // 9    Vendor Number
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.AccountNum));
+    
+        //10    Vendor Site/Remit Code
+        sb.Append(this.wrapField(mLocationID));
+    
+        //11    Vendor Name
+        sb.Append(this.wrapField(mRemittanceName));
+    
+        //12    Vendor Address Line 1
+        sb.Append(this.wrapField(mRemittanceAdrLine1));
+    
+        //13    Vendor Address Line 2
+        sb.Append(this.wrapField(mRemittanceAdrLine2));
+    
+        //14    Vendor Address Line 3
+        sb.Append(this.wrapField(strReplace(this.getJournalPaymentNotes(), '\n', ' ')));
+    
+        //15    Vendor City
+        sb.Append(this.wrapField(mRemittanceCity));
+    
+        //16    Vendor State
+        sb.Append(this.wrapField(mRemittanceState));
+    
+        //17    Vendor Zip
+        sb.Append(this.wrapField(mRemittanceZipCode));
+    
+        //18    Vendor Country
+        str countryName = LogisticsAddressCountryRegion::findByISOCode(this.getLogisticsAddressCountryISO(mRemittanceCountryRegionId)).displayName();
+        sb.Append(this.wrapField(this.CharacterReplacement(countryName)));
+
+        //19    Divert Code
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #CheckStandard)
+        {
+            if(SKS_EFT_Format::getCodelookupvalue('DivertCode', mSKS_EFT_FileDetail.RecId) == 'Yes')
+            {
+                sb.Append(this.wrapField('YES', false));
+            }
+            else
+            {
+                sb.Append(this.wrapField('NO', false));
+            }
+        }
+        else
+        {
+            sb.Append(this.wrapField('', false));
+        }
+    
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_REM</Name>
+				<Source><![CDATA[
+    boolean rec_REM(SKS_EFT_FileDetail _invSKS_EFT_FileDetail, LedgerJournalTrans _LedgerJournalTrans)
+    {
+        //------------------------------------------------------------------------------------------------------
+        //Each Field separated by pipe Delimiter
+        //Nbr   Description
+        // 1    Record type
+        // 2    Payment Refernce Number
+        // 3    Invoice Number
+        // 4    Invoice Date
+        // 5    Paid Invoice Amount
+        // 6    Original Invoice Amount
+        // 7    Discount Amount
+        // 8    Discount Percentage
+        // 9    Buyer Account Number
+        //10    Comment
+        //11    Voucher Number
+        //12    Purchase Order Number
+        //13    Contract Number
+        //14    Tax Amount
+        //15    Tax Rate
+        //------------------------------------------------------------------------------------------------------
+        System.Text.StringBuilder   sb = new System.Text.StringBuilder();
+        mRemittanceCount++;
+    
+        // 1    Record type
+        sb.Append(this.wrapField('R'));
+    
+        // 2    Payment Refernce Number
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.PaymentReference)));
+    
+        // 3    Invoice Number
+        sb.Append(this.wrapField(_invSKS_EFT_FileDetail.InvoiceNumber));
+    
+        // 4    Invoice Date
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(_invSKS_EFT_FileDetail.InvoiceDate)));
+    
+        // 5    Paid Invoice Amount
+        sb.Append(this.wrapField(num2str(-1*_invSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,0)));
+    
+        // 6    Original Invoice Amount
+        sb.Append(this.wrapField(num2str(-1 * (_invSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur + _invSKS_EFT_FileDetail.InvoiceDiscAmountPmtCur),0,2,1,0)));
+    
+        // 7    Discount Amount
+        sb.Append(this.wrapField(num2str(-1*_invSKS_EFT_FileDetail.InvoiceDiscAmountPmtCur,0,2,1,0)));
+    
+        // 8    Discount Percentage
+        sb.Append(this.wrapField(''));
+    
+        // 9    Buyer Account Number (Payment ID)
+        sb.Append(this.wrapField(_LedgerJournalTrans.PaymId));
+    
+        //10    Comment
+        sb.Append(this.wrapField(this.CharacterReplacement(_invSKS_EFT_FileDetail.InvoiceTransactionTxt)));
+    
+        //11    Voucher Number
+        sb.Append(this.wrapField(''));
+    
+        //12    Purchase Order Number
+        sb.Append(this.wrapField(this.get_POInfo(_invSKS_EFT_FileDetail)));
+    
+        //13    Contract Number
+        sb.Append(this.wrapField(''));
+    
+        //14    Tax Amount
+        sb.Append(this.wrapField(''));
+    
+        //15    Tax Rate
+        sb.Append(this.wrapField('', false));
+    
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wrapField</Name>
+				<Source><![CDATA[
+    private str wrapField(str _field = '', boolean _addSeparator = true, int _fieldLength = 0)
+    {
+        str text;
+        ;
+        if(_fieldLength > 0)
+        {
+            text = subStr(_field, 1, _fieldLength);
+        }
+        else
+        {
+            text = _field;
+        }
+        if(_addSeparator)
+        {
+            text += #Separator;
+        }
+        return text;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

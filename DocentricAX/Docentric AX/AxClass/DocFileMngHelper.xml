@@ -1,0 +1,1008 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocFileMngHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class DocFileMngHelper
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>sendFileToUser</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Takes a stream, puts it into temp storage and redirects the user to that file to cause it to be downloaded by the user's browser.
+    /// </summary>
+    /// <param name = "_stream">The stream of the file.</param>
+    /// <param name = "_fileName">The file name of the stream.</param>
+    /// <param name = "_contentType">The MIME type of the file, e.g., "image/jpeg".</param>
+    /// <param name = "_fileExtension">The extension of the file, e.g., ".txt".</param>
+    /// <param name = "_metaData">Additional information associated with the file.</param>
+    /// <param name = "_fileUploadStrategyClassName">The name of the class strategy to upload the file to storage.</param>
+    /// <param name = "_downloadOnly">The name of the class strategy to upload the file to storage.</param>
+    /// <param name = "_openInNewTab">Should file be open in the new browser tab</param>
+    /// <param name = "_showExitWarning">Should exit the current browser tab without warning</param>
+    public static void sendFileToUser(System.IO.MemoryStream _stream, str _fileName,
+                                      str _contentType = '', str _fileExtension = '', str _metaData = '',
+                                      ClassName _fileUploadStrategyClassName = classStr(DocFileUploadTemporaryStorageStrategy),
+                                      boolean _downloadOnly = true, boolean _openInNewTab = false, boolean _showExitWarning = false)
+    {
+        if (DocConstantGlobal::isOnPremEnvironment())
+        {
+            // On-Premises environment: Except file content and filename, all other parameters are ignored.
+            DocFileMngHelper::sendFileToUserOnPrem(_stream, _fileName);
+        }
+        else // Cloud environment.
+        {
+            // Save file to temporary blob storage and get the temporary link to download the file.
+            str downloadUrl = DocFileMngHelper::sendFileToTempStorage(_stream, _fileName, _contentType, _fileExtension, _metaData, _fileUploadStrategyClassName, _downloadOnly);
+            if (downloadUrl != '')
+            {
+                Browser br = new Browser();
+                br.navigate(downloadUrl, _openInNewTab, _showExitWarning);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendFileToUserOnPrem</Name>
+				<Source><![CDATA[
+    public static void sendFileToUserOnPrem(System.IO.MemoryStream _stream, str _fileName)
+    {
+        if (_stream == null || !_fileName)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _stream/_fileName are not set');
+        }
+
+        /***  Download file with Docentric On Premise Download Control  ***/
+        try
+        {
+            str downloadingFileContentBase64String = DocGlobalHelper::convertToBase64String(_stream.ToArray());
+
+            Array items = new Array(Types::String);
+            items.value(1, _fileName);
+            items.value(2, downloadingFileContentBase64String);
+
+            FormRun formRun;
+            Args args = new Args();
+            args.name(formStr(DocentricFileDownloadOnPrem));
+            args.parmObject(items);
+
+            formRun = ClassFactory.formRunClass(args);
+            formRun.init();
+            formRun.run();
+            formRun.wait(true);
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX:DownloadFileError", _fileName), true, funcName(), false, DocConstantDiagnostics::ErrFileDownloadOnPrem);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendFileToTempStorage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Send file to temp Azure blob storage.
+    /// </summary>
+    /// <param name = "_stream">The stream of the file.</param>
+    /// <param name = "_fileName">The file name of the stream.</param>
+    /// <param name = "_contentType">The MIME type of the file, e.g., "image/jpeg".</param>
+    /// <param name = "_fileExtension">The extension of the file, e.g., ".txt".</param>
+    /// <param name = "_metaData">Additional information associated with the file.</param>
+    /// <param name = "_fileUploadStrategyClassName">The name of the class strategy to upload the file to storage.</param>
+    /// <param name = "_downloadOnly">The name of the class strategy to upload the file to storage.</param>
+    /// <returns>Url to download the file from temp storage, if the file has been successfully uploaded. Otherwise returns empty string.</returns>
+    public static str sendFileToTempStorage(System.IO.MemoryStream _stream, str _fileName,
+                                            str _contentType = '', str _fileExtension = '', str _metaData = '',
+                                            ClassName _fileUploadStrategyClassName = classstr(DocFileUploadTemporaryStorageStrategy),
+                                            boolean _downloadOnly = true)
+    {
+        if (_stream == null || !_fileName)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _stream/_fileName are not set');
+        }
+
+        FileUploadTemporaryStorageResult fileUploadResult;
+        str downloadUrl = '';
+        try
+        {
+            fileUploadResult = DocFileMngHelper::SendFileToTempStore_GetResult(_stream, _fileName, _contentType, _fileExtension, _metaData, _fileUploadStrategyClassName);
+            if (fileUploadResult != null && fileUploadResult.getUploadStatus())
+            {
+                downloadUrl = fileUploadResult.getDownloadUrl(_downloadOnly);
+                if (downloadUrl == '')
+                {
+                    throw Exception::Error;
+                }
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleWarning("@ApplicationPlatform:FileUploadFailed");
+        }
+            
+        return downloadUrl;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SendFileToTempStore_GetResult</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns a <c>FileUploadTemporaryStorageResult</c> instance that has information about file in temp storage, passed in as a paramter.
+    /// </summary>
+    /// <param name = "_stream">The stream of the file.</param>
+    /// <param name = "_fileName">The file name of the stream.</param>
+    /// <param name = "_contentType">The MIME type of the file, e.g., "image/jpeg".</param>
+    /// <param name = "_fileExtension">The extension of the file, e.g., ".txt".</param>
+    /// <param name = "_metaData">Additional information associated with the file.</param>
+    /// <param name = "_fileUploadStrategyClassName">The name of the class strategy to upload the file to storage.</param>
+    /// <returns>Instance of a <c>FileUploadTemporaryStorageResult</c> that has relevant information about uploaded file. Null if upload failed.</returns>
+    public static FileUploadTemporaryStorageResult SendFileToTempStore_GetResult(System.IO.MemoryStream _stream, str _fileName,
+                                                                                 str _contentType = '', str _fileExtension = '', str _metaData = '',
+                                                                                 ClassName _fileUploadStrategyClassName = classStr(DocFileUploadTemporaryStorageStrategy))
+    {
+        SysDictClass uploadStrategyDicClass;
+        DocFileUploadTemporaryStorageStrategy fileUploadStrategy;
+        FileUploadTemporaryStorageResult fileUploadResult = null;
+        str contentType;
+        ClassName fileUploadStrategyClassName;
+
+        if (_stream == null || !_fileName)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameters _stream/_fileName are not set');
+        }
+
+        contentType = _contentType;
+        if (!contentType)
+        {
+            contentType = DocFileMngHelper::getMimeType(_fileName);
+        }
+
+        fileUploadStrategyClassName = _fileUploadStrategyClassName;
+        if (!fileUploadStrategyClassName)
+        {
+            fileUploadStrategyClassName = classStr(DocFileUploadTemporaryStorageStrategy);
+        }
+
+        try
+        {
+            uploadStrategyDicClass = new SysDictClass(className2Id(fileUploadStrategyClassName));
+            if (uploadStrategyDicClass != null)
+            {
+                fileUploadStrategy = uploadStrategyDicClass.makeObject() as DocFileUploadTemporaryStorageStrategy;
+            }
+            if (fileUploadStrategy == null)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt('The file upload strategy class (%1) cannot be instanced', fileUploadStrategyClassName));
+            }
+
+            fileUploadResult = fileUploadStrategy.uploadFile(_stream, _fileName, contentType, _fileExtension, _metaData);
+            if (_stream.CanSeek)
+            {
+                _stream.Seek(0, System.IO.SeekOrigin::Begin);
+            }
+
+            if (fileUploadResult == null || !fileUploadResult.getUploadStatus())
+            {
+                DocGlobalHelper::handleWarning("@ApplicationPlatform:FileUploadFailed");
+            }
+        }
+        catch(Exception::Error)
+        {
+            DocGlobalHelper::handleWarning("@ApplicationPlatform:FileUploadFailed");
+        }
+
+        return fileUploadResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMimeType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates mime type from the extension of the given filename .
+    /// </summary>
+    /// <param name = "_fileName">Only filename including file extension</param>
+    /// <returns>Mime type</returns>
+    public static str getMimeType(str _fileName)
+    {
+        str contentType;
+
+        if (_fileName)
+        {
+            if (DocFileMngHelper::getFileExtension(_fileName) == DocConstantFile::FileExtDdsp)
+            {
+                contentType = DocConstantFile::MimeTypeDdsp;
+            }
+            else if (DocFileMngHelper::getFileExtension(_fileName) == DocConstantFile::DocentricLicenseExt)
+            {
+                contentType = DocConstantFile::MimeTypeDocentricLicense;
+            }
+            else
+            {
+                contentType = System.Web.MimeMapping::GetMimeMapping(_fileName);
+            }
+        }
+
+        return contentType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryGetMemoryStreamFromFileUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Takes a URL pointing to the file, and then returns the stream.
+    /// </summary>
+    /// <param name = "_fileUrl">A URL pointing to the file.</param>
+    /// <returns>The stream of the file.</returns>
+    public static System.IO.Stream tryGetMemoryStreamFromFileUrl(str _fileUrl)
+    {
+        System.IO.MemoryStream memStream = null;        
+
+        if (_fileUrl == '')
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _fileUrl is not set');
+        }
+
+        InteropPermission perm = new InteropPermission(InteropKind::ClrInterop);
+        perm.assert();
+
+        try
+        {
+            using (System.Net.WebClient webClient = new System.Net.WebClient())
+            {
+                memStream = new System.IO.MemoryStream(webClient.DownloadData(_fileUrl));
+            }
+        }
+        catch(Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrError('', "@ApplicationPlatform:DownloadFailed");
+        }
+        catch(Exception::Internal)
+        {
+            DocGlobalHelper::handleClrError('', "@ApplicationPlatform:DownloadFailed");
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@ApplicationPlatform:DownloadFailed");
+        }
+        finally
+        {
+            CodeAccessPermission::revertAssert();
+        }
+
+        return memStream;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileNameWithExtension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the file name with extension from specified full file name.
+    /// </summary>
+    /// <param name = "_fullFileName">Full file name</param>
+    /// <returns>File name with extension</returns>
+    public static Filename getFileNameWithExtension(Filename _fullFileName)
+    {
+        Filename filePath, fileName, fileType;
+    
+        [filePath, fileName, fileType] = Global::fileNameSplit(_fullFileName);
+    
+        return fileName + fileType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileNameWithoutExtension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the file name without extension from specified full file name.
+    /// </summary>
+    /// <param name = "_fullFileName">Full file name</param>
+    /// <returns>File name without extension</returns>
+    public static Filename getFileNameWithoutExtension(Filename _fullFileName)
+    {
+        Filename filePath, fileName, fileType;
+    
+        [filePath, fileName, fileType] = Global::fileNameSplit(_fullFileName);
+    
+        return fileName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileExtension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the file extension from specified full file name.
+    /// </summary>
+    /// <param name = "_fullFileName">Full file name</param>
+    /// <returns>File extension</returns>
+    public static Filename getFileExtension(Filename _fullFileName)
+    {
+        if (!_fullFileName)
+        {
+            return '';
+        }
+
+        Filename filePath, fileName, fileType;
+    
+        [filePath, fileName, fileType] = Global::fileNameSplit(_fullFileName);
+    
+        fileType = subStr(fileType, 2, strLen(fileType) - 1);
+        return fileType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFileExtensionWithDot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the file extension with the dot from specified full file name.
+    /// </summary>
+    /// <param name = "_fullFileName">Full file name</param>
+    /// <returns>File extension with the dot</returns>
+    public static Filename getFileExtensionWithDot(Filename _fullFileName)
+    {
+        if (!_fullFileName)
+        {
+            return '';
+        }
+
+        Filename filePath, fileName, fileType;
+    
+        [filePath, fileName, fileType] = Global::fileNameSplit(_fullFileName);
+    
+        return fileType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fileFormat2str</Name>
+				<Source><![CDATA[
+    public static str fileFormat2str(DocFileFormat _fileFormat)
+    {
+        switch (_fileFormat)
+        {
+            case DocFileFormat::CSV:
+                return DocConstantFile::FileExtCsv;
+
+            case DocFileFormat::DOCX:
+                return DocConstantFile::FileExtDocx;
+
+            case DocFileFormat::DOC:
+                return DocConstantFile::FileExtDoc;
+
+            case DocFileFormat::EMF:
+                return DocConstantFile::FileExtEmf;
+
+            case DocFileFormat::HTML4_0:
+                return DocConstantFile::FileExtHtml;
+
+            case DocFileFormat::MHTML:
+                return DocConstantFile::FileExtMhtmlLong;
+
+            case DocFileFormat::PDF:
+                return DocConstantFile::FileExtPdf;
+                
+            case DocFileFormat::XLSX:
+                return DocConstantFile::FileExtXlsx;
+
+            case DocFileFormat::XML:
+                return DocConstantFile::FileExtXml;
+
+            case DocFileFormat::XPS:
+                return DocConstantFile::FileExtXps;
+
+            case DocFileFormat::TIFF:
+                return DocConstantFile::FileExtTiff;
+
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported file format %1', _fileFormat));
+        }
+    
+        // Should never happen.
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertToFileExtensionStr</Name>
+				<Source><![CDATA[
+    public static Filename convertToFileExtensionStr(DocOutputFileFormat _outputFileFormat)
+    {
+        Filename fileExtension;
+    
+        switch (_outputFileFormat)
+        {
+            case DocOutputFileFormat::DOCX:
+                fileExtension = DocConstantFile::FileExtDocx;
+                break;
+    
+            case DocOutputFileFormat::PDF:
+                fileExtension = DocConstantFile::FileExtPdf;
+                break;
+    
+            //case DocOutputFileFormat::PDFA:
+            //    fileExtension = DocConstantFile::FileExtPdfa;
+            //    break;
+    
+            case DocOutputFileFormat::XPS:
+                fileExtension = DocConstantFile::FileExtXps;
+                break;
+    
+            //case DocOutputFileFormat::MHTML:
+            //    fileExtension = DocConstantFile::FileExtMhtml;
+            //    break;
+    
+            case DocOutputFileFormat::XML:
+                fileExtension = DocConstantFile::FileExtXml;
+                break;
+    
+            case DocOutputFileFormat::TIFF:
+                fileExtension = DocConstantFile::FileExtTiff;
+                break;
+
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported file format %1', _outputFileFormat));
+        }
+    
+        return fileExtension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertOutputFileFormatToFileFormatEnum</Name>
+				<Source><![CDATA[
+    public static DocFileFormat convertOutputFileFormatToFileFormatEnum(DocOutputFileFormat _outputFileFormat)
+    {
+        switch (_outputFileFormat)
+        {
+            case DocOutputFileFormat::DOCX:
+                return DocFileFormat::DOCX;
+    
+            case DocOutputFileFormat::PDF:
+                return DocFileFormat::PDF;
+    
+            //case DocOutputFileFormat::PDFA:
+            //    return DocFileFormat::PDFA;
+    
+            case DocOutputFileFormat::XPS:
+                return DocFileFormat::XPS;
+    
+            //case DocOutputFileFormat::MHTML:
+            //    return DocFileFormat::MHTML;
+    
+            case DocOutputFileFormat::XML:
+                return DocFileFormat::XML;
+
+            case DocOutputFileFormat::TIFF:
+                return DocFileFormat::TIFF;
+    
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported output file format %1', _outputFileFormat));
+        }
+
+        return DocFileFormat::Unknown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertSrsFileFormatToFileExtensionStr</Name>
+				<Source><![CDATA[
+    public static Filename convertSrsFileFormatToFileExtensionStr(SRSReportFileFormat _srsFileFormat)
+    {
+        Filename fileExtension;
+    
+        switch (_srsFileFormat)
+        {
+            case SRSReportFileFormat::CSV:
+                fileExtension = DocConstantFile::FileExtCsv;
+                break;
+    
+            case SRSReportFileFormat::Excel:
+                fileExtension = DocConstantFile::FileExtXlsx;
+                break;
+    
+            case SRSReportFileFormat::HTML4_0:
+                fileExtension = DocConstantFile::FileExtHtml;
+                break;
+    
+            case SRSReportFileFormat::Image:
+                fileExtension = DocConstantFile::FileExtTiff;
+                break;
+    
+            case SRSReportFileFormat::MHTML:
+                fileExtension = DocConstantFile::FileExtMhtmlLong;
+                break;
+    
+            case SRSReportFileFormat::PDF:
+                fileExtension = DocConstantFile::FileExtPdf;
+                break;
+    
+            case SRSReportFileFormat::XML:
+                fileExtension = DocConstantFile::FileExtXml;
+                break;
+
+            case 7: // SRSReportFileFormat::Word:
+                fileExtension = DocConstantFile::FileExtDoc;
+                break;
+
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported file format %1', _srsFileFormat));
+        }
+    
+        return fileExtension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isFileWordDocument</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given filename is a filename of a Word document.
+    /// </summary>
+    /// <param name = "_fileName">Only filename</param>
+    /// <returns>Returns true if the filename has 'docx' extension</returns>
+    public static boolean isFileWordDocument(str _fileName)
+    {
+        if (_fileName == '')
+        {
+            return false;
+        }
+
+        str fileExtension = DocFileMngHelper::getFileExtension(_fileName);
+        if (fileExtension == DocConstantFile::FileExtDocx)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isFileFont</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given filename is a filename of a font (TTF, TTC or OTF).
+    /// </summary>
+    /// <param name = "_fileName">Only filename</param>
+    /// <returns>Returns true if the filename has 'ttf', 'ttc' or 'otf' extension</returns>
+    public static boolean isFileFont(str _fileName)
+    {
+        if (_fileName == '')
+        {
+            return false;
+        }
+
+        str fileExtension = DocFileMngHelper::getFileExtension(_fileName);
+        
+        if (fileExtension == DocConstantFile::FileExtTTF ||
+            fileExtension == DocConstantFile::FileExtOTF ||
+            fileExtension == DocConstantFile::FileExtTTC)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSupportedFontStream</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the given stream is a supported font (TTF, TTC, OTF)
+    /// </summary>
+    /// <param name = "_fontStream">Font stream</param>
+    /// <returns>Returs true if this is a supported font stream</returns>
+    public static boolean isSupportedFontStream(System.IO.Stream _fontStream)
+    {
+        boolean isSupportedFont = false;
+
+        if (_fontStream != null)
+        {
+            // We need to check if we need to reset the position of stream to the begining.
+            if (_fontStream.Position > 0)
+            {
+                _fontStream.Position = 0;
+            }
+
+            // Now we need to check if we support this file stream
+            isSupportedFont = Docentric.AX.Fonts.DocFontManager::IsValidFont(_fontStream);
+        }
+
+        return isSupportedFont;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertToFileLookupFilter</Name>
+				<Source><![CDATA[
+    public static container convertToFileLookupFilter(DocOutputFileFormat _outputFileFormat)
+    {
+        container fileLookupFilter;
+        // File lookup filters.
+        container fileLookupFilterDocx  = ['Word Document', '*.docx'];
+        container fileLookupFilterPdf   = ['PDF', '*.pdf'];
+        //container fileLookupFilterPdfa  = ['PDF', '*.pdf'];
+        container fileLookupFilterXps   = ['XPS Document', '*.xps'];
+        container fileLookupFilterXml   = ['XML Files', '*.xml'];
+        //container fileLookupFilterMhtml = ['Single File Web Page', '*.mht;*.mhtml'];
+        container fileLookupFilterTiff  = ['TIFF', '*.tiff;*.tif'];
+    
+        switch (_outputFileFormat)
+        {
+            case DocOutputFileFormat::DOCX:
+                fileLookupFilter = fileLookupFilterDocx;
+                break;
+    
+            case DocOutputFileFormat::PDF:
+                fileLookupFilter = fileLookupFilterPdf;
+                break;
+    
+            //case DocOutputFileFormat::PDFA:
+            //    fileLookupFilter = fileLookupFilterPdfa;
+            //    break;
+    
+            case DocOutputFileFormat::XPS:
+                fileLookupFilter = fileLookupFilterXps;
+                break;
+    
+            //case DocOutputFileFormat::MHTML:
+            //    fileLookupFilter = fileLookupFilterMhtml;
+            //    break;
+    
+            case DocOutputFileFormat::XML:
+                fileLookupFilter = fileLookupFilterXml;
+                break;
+
+            case DocOutputFileFormat::TIFF:
+                fileLookupFilter = fileLookupFilterTiff;
+                break;
+    
+            default:
+                DocGlobalHelper::handleException(funcName(), strFmt('Unsupported file format %1', _outputFileFormat));
+        }
+    
+        return fileLookupFilter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTempFileNameAsGuid</Name>
+				<Source><![CDATA[
+    public static Filename getTempFileNameAsGuid()
+    {
+        Filename tempFileNameAsGuid;
+    
+        tempFileNameAsGuid =  DocConstantFile::TmpGuidFilenamePrefix + DocConstantFile::FilenameUndescore +
+            DocGlobalHelper::guid2strWithoutBraces(newGuid()) +
+            DocConstantFile::FileExtensionDelimiter + DocConstantFile::FileExtTmp;
+    
+        return tempFileNameAsGuid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidFilePath</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given file path is valid.
+    /// </summary>
+    /// <param name="_filePath">File path without the file name.</param>
+    /// <returns>True if the given file path is valid.</returns>
+    public static boolean isValidFilePath(Filename _filePath)
+    {
+        System.Char[]                           invalidCharactersArray;
+        int                                     indexOfArray = 0;
+        int                                     lenOfFilePath;
+        str                                     regex  = '[a-zA-Z0-9]+';
+        System.String                           strInvalidChars;
+        System.String                           filePathChar;
+        str                                     filePath;
+    
+    
+        if (_filePath == '')
+        {
+            return true;
+        }
+    
+        // Check if the file path contains invalid path characters.
+        invalidCharactersArray = System.IO.Path::GetInvalidPathChars();
+    
+        filePath = System.Text.RegularExpressions.Regex::Replace(_filePath, regex, '');
+        lenOfFilePath = strlen(filePath);
+    
+        strInvalidChars = new System.String(invalidCharactersArray);
+        while (indexOfArray < lenOfFilePath)
+        {
+            filePathChar = substr(filePath, indexOfArray, 1);
+            if (strInvalidChars.Contains(filePathChar))
+            {
+                return false;
+            }
+            indexOfArray++;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isUncFilePath</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the specified file path is UNC file path.
+    /// </summary>
+    /// <param name = "_filePath">File path</param>
+    /// <returns>True if the file path is UNC file path; otherwise false</returns>
+    public static boolean isUncFilePath(str _filePath)
+    {
+        if(!_filePath)
+        {
+            return false;
+        }
+
+        System.Uri uri = null;
+        if(!System.Uri::TryCreate(_filePath, System.UriKind::Absolute, byref uri))
+        {
+            return false;
+        }
+
+        return uri.IsUnc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidFullFilename</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given full file name is valid.
+    /// </summary>
+    /// <param name="_fullFilename">Full file name.</param>
+    /// <returns>True if the given full file name is valid.</returns>
+    public static boolean isValidFullFilename(Filename _fullFilename)
+    {
+        boolean     isValidFullFilename;
+        str         onlyFilename, fileExt, filePath;
+    
+    
+        if (_fullFilename == '')
+        {
+            return true;
+        }
+    
+        [onlyFilename, fileExt, filePath] = Docu::splitFilename(_fullFilename);
+    
+        if (onlyFilename == '' && filePath == '')
+        {
+            return true;
+        }
+        else if (onlyFilename == '' && filePath != '')
+        {
+            isValidFullFilename = DocFileMngHelper::isValidFilePath(filePath);
+        }
+        else if (onlyFilename != '' && filePath == '')
+        {
+            isValidFullFilename = DocFileMngHelper::isValidOnlyFilename(onlyFilename);
+        }
+        else // if (onlyFilename != '' && filePath != '')
+        {
+            isValidFullFilename = DocFileMngHelper::isValidOnlyFilename(onlyFilename) &&
+                                  DocFileMngHelper::isValidFilePath(filePath);
+        }
+    
+        return isValidFullFilename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidOnlyFilename</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given file name (only file name) is valid.
+    /// </summary>
+    /// <param name="_onlyFilename">Only file name, without path and extension.</param>
+    /// <returns>True if the given file name is valid.</returns>
+    public static boolean isValidOnlyFilename(Filename _onlyFilename)
+    {
+        System.Char[]                           invalidCharactersArray;
+        int                                     indexOfArray = 1;
+        int                                     lenOfFilename;
+        str                                     regex  = '[a-zA-Z0-9]+';
+        System.String                           strInvalidChars;
+        System.String                           fileNameChar;
+        Filename                                onlyFilename;
+
+        invalidCharactersArray = System.IO.Path::GetInvalidFileNameChars();
+
+        onlyFilename = System.Text.RegularExpressions.Regex::Replace(_onlyFilename,regex,'');
+        lenOfFilename = strlen(onlyFilename);
+
+        strInvalidChars = new System.String(invalidCharactersArray);
+
+        while (indexOfArray <= lenOfFilename)
+        {
+            fileNameChar = substr(onlyFilename, indexOfArray,1);
+            if (strInvalidChars.Contains(fileNameChar))
+            {
+                return false;
+            }
+            indexOfArray++;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>replaceFileExtension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Replaces file extension in the specified file name with the new file extension. 
+    /// </summary>
+    /// <param name = "_fileName">Input file name</param>
+    /// <param name = "_newFileExtension">New file extension</param>
+    /// <returns>File name with new file extension</returns>
+    public static Filename replaceFileExtension(Filename _fileName, Filename _newFileExtension)
+    {
+        container filenameContainer;
+        Filename  newFilename;
+    
+    
+        filenameContainer = Docu::splitFilename(_fileName);
+        newFilename = conpeek(filenameContainer, 3) + conpeek(filenameContainer, 1) +
+            DocConstantFile::FileExtensionDelimiter + _newFileExtension;
+    
+        return newFilename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>replaceInvalidCharsForFileName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Replace invalid characters in the given file name.
+    /// </summary>
+    /// <param name="_fileName">Input file name.</param>
+    /// <returns>File name with replaced invalidate charaters with a '_' character.</returns>
+    public static str replaceInvalidCharsForFileName(str _fileName)
+    {
+        System.Char[]   invalidCharactersArray;
+        System.Char     invalidCharacterFromArray;
+        str             invalidCharacterFromArrayEscaped;
+        str             outputFilename;
+        str             invalidFileNameChars;
+        int             indexOfChar = 0;
+        int             invalidCount = 0;
+        str             replacement = '_';
+        System.Text.RegularExpressions.Regex regexRemove;
+        #define.LeftSquareBracket('[')
+        #define.RightSquareBracket(']')
+    
+        invalidCharactersArray = System.IO.Path::GetInvalidFileNameChars();
+        invalidCount = invalidCharactersArray.get_Count();
+    
+        while(indexOfChar < invalidCount)
+        {
+            invalidCharacterFromArray = invalidCharactersArray.GetValue(indexOfChar);
+            invalidCharacterFromArrayEscaped = System.Text.RegularExpressions.Regex::Escape(invalidCharacterFromArray.ToString());
+            invalidFileNameChars = invalidFileNameChars + invalidCharacterFromArrayEscaped;
+            indexOfChar++;
+        }
+    
+        regexRemove = new System.Text.RegularExpressions.Regex(#LeftSquareBracket+invalidFileNameChars+#RightSquareBracket);
+        outputFilename = regexRemove.Replace(_fileName, replacement);
+    
+        return outputFilename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addUrlDelimiter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Appends the url delimiter to the end of the input string,
+    /// if this doesn't end with it already.
+    /// </summary>
+    /// <param name = "_url">Input string representing a valid URL.</param>
+    /// <returns>Given string with appended url delimiter if needed.</returns>
+    public static str addUrlDelimiter(str _url)
+    {
+        str url = _url;
+
+        if (url != '' && !strEndsWith(url, DocConstantFile::UrlDelimiter))
+        {
+            url = url + DocConstantFile::UrlDelimiter;
+        }
+
+        return url;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitFilename</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Splits the specified file name into a file path, a file name only and a file extension.
+    /// </summary>
+    /// <param name = "_filename">Input file name</param>
+    /// <returns>A container with split filename in the form [filename only, file extension, file path]</returns>
+    public static container splitFilename(Filename _filename)
+    {
+        const str LabelPlaceholderRegexStr = '(@[a-zA-Z0-9]\\w*:[a-zA-Z0-9]\\w*@)';  // Regex format for label placeholders (e.g. @AccountsPayable:AddPurchaseOrder@)
+        const str Colon = ':';  // Path delimiter in a filename
+        const str Pipe = '|';   // Substitute character for a colon character
+
+        // Check whether filename contains label placeholders (e.g. @DOC_LABEL:Amount@)
+        if (!System.Text.RegularExpressions.Regex::IsMatch(_filename, LabelPlaceholderRegexStr))
+        {
+            // If not, we split the filename immedialtely
+            return Docu::splitFilename(_filename);
+        }
+
+        // If so, we must first replace a colon in all label placeholders in the 
+        // filename with a replacement character, then split the changed filename
+        // and replace a replacement character with a colon at the end.
+        System.Text.RegularExpressions.Regex regex = new System.Text.RegularExpressions.Regex(LabelPlaceholderRegexStr);
+       
+        System.String[] subStrings = regex.Split(_filename);
+        System.Collections.IEnumerator subStringsEnum = subStrings.GetEnumerator();
+        
+        str filename = '';
+        while (subStringsEnum.MoveNext())
+        {
+            str subString = subStringsEnum.Current;
+            if (System.Text.RegularExpressions.Regex::IsMatch(subString, LabelPlaceholderRegexStr))
+            {
+                subString = strReplace(subString, Colon, Pipe);
+            }
+            filename += subString;
+        }
+
+        container splitedFilename = Docu::splitFilename(filename);
+
+        return conPoke(splitedFilename, 1, 
+                            strReplace(conPeek(splitedFilename, 1), Pipe, Colon),
+                            strReplace(conPeek(splitedFilename, 2), Pipe, Colon),
+                            strReplace(conPeek(splitedFilename, 3), Pipe, Colon));
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CustVendVoucher_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(classStr(CustVendVoucher))]
+final class SKS_CustVendVoucher_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>post</Name>
+				<Source><![CDATA[
+    public void post(LedgerVoucher _ledgerPostingJournal,
+        CustVendTrans _custVendTrans,
+        NoYes _approval,
+        UnknownNoYes _euroTriangulation,
+        boolean _withHoldTaxType,
+        boolean _useSubLedger)
+    {
+        CustPaymModeTable custPaymModeTable;
+        CustDirectDebitMandate custDirectDebitMandate;
+        CustTable custTableDirectDebit;
+        LedgerJournalTrans ledgerJournalTransLoc;
+        DataAreaId  mandateCompany;
+        CustAccount mandateCustAccount;
+
+        if (common.TableId == tableNum(LedgerJournalTrans))
+        {
+            ledgerJournalTransLoc = common as LedgerJournalTrans;
+        }
+
+        // 21347
+        // find the correct mandate customer and the company through marked invoices
+        if (ledgerJournalTransLoc)
+        {
+            SpecTrans specTrans = SpecTrans::findBySpec(ledgerJournalTransLoc.DataAreaId, ledgerJournalTransLoc.TableId, ledgerJournalTransLoc.RecId);
+            if (specTrans
+                && specTrans.RefCompany != curExt()
+                && specTrans.RefTableId == tableNum(CustTransOpen))
+            {
+                mandateCompany = specTrans.RefCompany;
+
+                changecompany(specTrans.RefCompany)
+                {
+                    mandateCustAccount = CustTransOpen::find(specTrans.RefRecId).AccountNum;
+                }
+            }
+        }
+        
+        next post(_ledgerPostingJournal,
+                 _custVendTrans,
+                 _approval,
+                 _euroTriangulation,
+                 _withHoldTaxType,
+                 _useSubLedger);
+
+        
+
+        if (!this.postingProfileSettlement()
+            && (_custVendTrans.AmountCur || _custVendTrans.AmountMST)
+            && ledgerJournalTransLoc.RecId)
+        {
+            LedgerJournalTable  ledgerJournalTable  = ledgerJournalTransLoc.ledgerJournalTable();
+            LedgerJournalType   journalType         = ledgerJournalTable.JournalType;
+
+            // if this is a sub-journal, finds the parent to check type
+            if (ledgerJournalTable.OriginalJournalNum)
+            {
+                changeCompany(ledgerJournalTable.OriginalCompany)
+                {
+                    journalType = LedgerJournalTable::find(ledgerJournalTable.OriginalJournalNum).JournalType;
+                }
+            }
+
+            if (journalType == LedgerJournalType::CustPayment)
+            {
+                custPaymModeTable = custPaymModeTable::find(ledgerJournalTransLoc.PaymMode);
+
+                if (custPaymModeTable.PaymentType == CustPaymentType::ElectronicPayment
+                    && custPaymModeTable.SKS_EFT_PaymMode)
+                {
+                    if (!mandateCompany)
+                    {
+                        mandateCompany      = _custVendTrans.company();
+                        mandateCustAccount  = _custVendTrans.AccountNum;
+                    }
+
+                    changecompany(mandateCompany)
+                    {
+                        ttsBegin;
+                        select forUpdate UsageCount, IsFirst, RecId, MandateReference, Status from custDirectDebitMandate
+                            join custTableDirectDebit
+                                where custTableDirectDebit.DefaultDirectDebitMandate == custDirectDebitMandate.RecId &&
+                                    custTableDirectDebit.AccountNum == mandateCustAccount;
+
+                        if (custDirectDebitMandate)
+                        {
+                            custDirectDebitMandate.UsageCount += 1;
+                            if (custDirectDebitMandate.UsageCount > 0)  // Mandate should be active and ISFirst should change to false at 1
+                            {
+                                custDirectDebitMandate.IsFirst = false;
+                                custDirectDebitMandate.Status = CustMandateStatus::Active;
+                            }
+                            else
+                            {
+                                custDirectDebitMandate.Status = CustMandateStatus::Modified;
+                            }
+                            custDirectDebitMandate.update();
+                        }
+                        ttsCommit;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_AutoSettlementMCMD</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Do auto-settlement using "Multiple credit to mulitple debit"
+/// </summary>
+class SKS_LB_AutoSettlementMCMD
+{
+    CustTable                   custTable;
+    SKS_LB_AutoSettlementSetup  autoSettlementSetup;
+    SKS_LB_AutoSettlementRules  autoSettlementRules;
+    CustVendOpenTransManager    settleManager;
+    SpecTransManager            specTransManager_AutoSettlement;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_LB_AutoSettlementMCMD construct(CustTable _custTable, SKS_LB_AutoSettlementSetup _autoSettlement, SKS_LB_AutoSettlementRules _autosettlementRules)
+    {
+        SKS_LB_AutoSettlementMCMD autoSettlementMCMD;
+
+        autoSettlementMCMD = new SKS_LB_AutoSettlementMCMD(_custTable, _autoSettlement, _autosettlementRules);
+
+        return autoSettlementMCMD;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(CustTable _custTable, SKS_LB_AutoSettlementSetup _autoSettlement, SKS_LB_AutoSettlementRules _autosettlementRules)
+    {
+        custTable           = _custTable;
+        autoSettlementSetup = _autoSettlement;
+        autoSettlementRules = _autosettlementRules;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processAutoSettlementMCMD</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Auto-settlement process for the "Multiple credit to mulitple debit"
+    /// </summary>
+    [SuppressBPWarning('BPErrorSelectUsingFirstOnly', 'The buffer is used in next statement or in a datasource query loop.')]
+    public void processAutoSettlementMCMD()
+    {
+        CustTransOpen custTransOpenDebit, custTransOpenCredit;
+
+        container           debitCon;
+        container           creditCon;
+
+        boolean canGetNextDebitTrans, canSettle;
+        boolean isFirstIteration, isDebitEmpty;
+        boolean skipFutureTransCheck;
+        Amount  totalCreditAmount, totalDebitAmount;
+
+        SKS_LB_AutoSettlementHelper autoSettlementHelper = SKS_LB_AutoSettlementHelper::construct(custTable);
+
+        //Credit open transactions
+        if (autoSettlementSetup.IncludeFutureTrans)
+        {
+            select custTransOpenCredit
+                order by custTransOpenCredit.DueDate
+                where custTransOpenCredit.AccountNum == custTable.AccountNum
+                && custTransOpenCredit.AmountCur < 0.0;
+        }
+        else
+        {
+            select custTransOpenCredit
+                order by custTransOpenCredit.DueDate
+                where custTransOpenCredit.AccountNum == custTable.AccountNum
+                && custTransOpenCredit.AmountCur < 0.0
+                && custTransOpenCredit.DueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            
+            skipFutureTransCheck = true;
+        }
+
+        while (custTransOpenCredit)
+        {
+            if (!autoSettlementHelper.validateParameterConstraint(custTransOpenCredit, autoSettlementRules.SettlementTypeId, skipFutureTransCheck))
+            {
+                next custTransOpenCredit;
+                continue;
+            }
+            creditCon += custTransOpenCredit.RecId;
+
+            totalCreditAmount += abs(custTransOpenCredit.AmountCur);
+                        
+            canGetNextDebitTrans = false;
+            canSettle = false;
+
+            // Only process the debit transaction when below condition met.
+            if (totalCreditAmount != totalDebitAmount && totalCreditAmount > totalDebitAmount)
+            {
+                canGetNextDebitTrans = true;
+            }
+
+            // If the amounts are equal directly proceed with the settlement
+            if (totalCreditAmount == totaldebitamount)
+            {
+                canSettle  = true;
+            }
+
+            if (!canSettle && isDebitEmpty && totalCreditAmount > totalDebitAmount)
+            {
+                break;
+            }
+
+            if (canGetNextDebitTrans)
+            {
+                if (!isFirstIteration)
+                {
+                    if (autoSettlementSetup.IncludeFutureTrans)
+                    {
+                        select custTransOpenDebit
+                            order by custTransOpenDebit.DueDate
+                            where custTransOpenDebit.AccountNum == custTable.AccountNum
+                            && custTransOpenDebit.AmountCur > 0.0;
+                    }
+                    else
+                    {
+                        select custTransOpenDebit
+                            order by custTransOpenDebit.DueDate
+                            where custTransOpenDebit.AccountNum == custTable.AccountNum
+                            && custTransOpenDebit.AmountCur > 0.0
+                            && custTransOpenDebit.DueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                        
+                        skipFutureTransCheck = true;
+                    }
+
+                    if (custTransOpenDebit)
+                    {
+                        if (autoSettlementHelper.validateParameterConstraint(custTransOpenDebit, autoSettlementRules.SettlementTypeId, skipFutureTransCheck))
+                        {
+                            debitCon += custTransOpenDebit.RecId;
+                            totalDebitAmount += autoSettlementHelper.getSettlementCashDiscountAmount(autoSettlementRules.Discount, custTransOpenCredit.TransDate, custTransOpenDebit);
+                        
+                            if (totalDebitAmount == totalCreditAmount || this.isWithInTolerance(totalCreditAmount, totalDebitAmount))
+                            {
+                                canSettle = true;
+                            }
+                        }
+                        isFirstIteration = true;
+                    }
+                    else
+                    {
+                        break; // Exist the process, as if no open debit transaction found in 1st iteration.
+                    }
+                }
+
+                if (!canSettle)
+                {
+                    while (totalDebitAmount < totalCreditAmount)
+                    {
+                        next custTransOpenDebit; //Get next credit record
+
+                        if (!custTransOpenDebit)
+                        {
+                            isDebitEmpty = true;
+                            break;
+                        }
+
+                        if (autoSettlementHelper.validateParameterConstraint(custTransOpenDebit, autoSettlementRules.SettlementTypeId, skipFutureTransCheck))
+                        {
+                            totalDebitAmount += autoSettlementHelper.getSettlementCashDiscountAmount(autoSettlementRules.Discount, custTransOpenCredit.TransDate, custTransOpenDebit);
+                            debitCon += custTransOpenDebit.RecId;
+
+                            if (totalDebitAmount == totalCreditAmount || this.isWithInTolerance(totalCreditAmount, totalDebitAmount))
+                            {
+                                canSettle = true;
+                                break;
+                            }
+
+                            if (!canSettle && totalDebitAmount > totalCreditAmount)
+                            {
+                                break;
+                            }
+                        }                        
+                    }// End while
+                }
+            }
+
+            // Mark and settle the transactions
+            if (canSettle)
+            {
+                settleManager = autoSettlementHelper.parmCustVendOpenTransManager();
+
+                int i=1, j =1;
+                CustTransOpen custTransOpenDebitLoc, custTransOpenCreditLoc;
+
+                while (i <= conLen(debitCon))
+                {
+                    custTransOpenDebitLoc =  CustTransOpen::find(conPeek(debitCon, i));
+
+                    if (custTransOpenDebitLoc)
+                    {
+                        //Mark debit transaction
+                        settleManager.updateTransMarked(custTransOpenDebitLoc, true);
+                        autoSettlementHelper.updateSettleAmount(custTransOpenDebitLoc, custTransOpenDebitLoc.AmountCur,
+                                                                                autoSettlementRules.Discount, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));// settle with amount value
+                    }
+                    i++;
+                }
+
+                while (j <= conLen(creditCon))
+                {
+                    custTransOpenCreditLoc =  CustTransOpen::find(conPeek(creditCon, j));
+
+                    if (custTransOpenCreditLoc)
+                    {
+                        //Mark credit transaction
+                        settleManager.updateTransMarked(custTransOpenCreditLoc, true);
+                        autoSettlementHelper.updateSettleAmount(custTransOpenCreditLoc, custTransOpenCreditLoc.AmountCur, autoSettlementRules.Discount, dateNull()); // settling with amount value
+                    }
+                    j++;
+                }
+                //Do settlement
+                using (SKS_LB_AutoSettlementContext autoContext = new SKS_LB_AutoSettlementContext())
+                {
+                    autoContext.isAutoSettlementCustom =  true;
+
+                    settleManager.settleMarkedTrans();
+                }
+
+                //Reset the flags and variables once settled
+                debitCon    = conNull();
+                creditCon   = conNull();
+                totalCreditAmount = 0.0;
+                totalDebitAmount  = 0.0;
+                canSettle = false;
+                canGetNextDebitTrans = false;
+                isFirstIteration = false;
+                isDebitEmpty = false;
+
+            }// ENDIF -- settlement end
+
+            next  custTransOpenCredit;
+
+        }// end of credit transaction loop
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isWithInTolerance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check the tolerance
+    /// </summary>
+    /// <param name = "_creditAmount"> Credit amount to check </param>
+    /// <param name = "_debitAmount"> debit amount to check </param>
+    /// <returns> returns true if amount difference is within the threshold or zero otherwise; false </returns>
+    public boolean isWithInTolerance(AmountCur _creditAmount, AmountCur _debitAmount)
+    {
+        boolean checkOK;
+
+        AmountCur diffAmount = abs(_debitAmount - _creditAmount);
+        
+        if (autoSettlementRules.Tolerance)
+        {
+            if (diffAmount != 0  && diffAmount > CustParameters::find().MaxMSTOverUnder)
+            {
+                checkOK = false;
+            }
+            else
+            {
+                checkOK = true;
+            }
+        }
+
+        return checkOK;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

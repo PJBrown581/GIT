@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_DD_InboundFormat</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// DD inbound format
+/// </summary>
+abstract class SKS_DD_InboundFormat
+{
+    str mErrorText;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getFormatId</Name>
+				<Source><![CDATA[
+    public str getFormatId(str _filename, boolean _serverPath, SKS_BF_BankIntType _sks_BF_BankIntType)
+    {
+        throw error(Error::missingOverload(funcname()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorText</Name>
+				<Source><![CDATA[
+    public str getErrorText()
+    {
+        return mErrorText;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFile</Name>
+				<Source><![CDATA[
+    public boolean getFile(str _filename, boolean _serverPath, SKS_BF_BankIntType _sks_BF_BankIntType)
+    {
+        throw error(Error::missingOverload(funcname()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setMandateStatus</Name>
+				<Source><![CDATA[
+    public void setMandateStatus(CustAccount _custAccount, 
+                                    SKS_EB_BankRegisterStatus _bankRegisterStatus,
+                                    SKS_EB_DateTime _effectiveDate,
+                                    SKS_EB_DateTime _endDate,
+                                    CustMandateId _custMandateId,
+                                    SKS_EB_MandateType _custMandateScheme)
+    {
+        CustDirectDebitMandate	locCustDirectDebitMandate;
+        CustTable				locCustTable;
+
+        locCustTable = CustTable::find(_custAccount);
+
+        if(locCustTable)
+        {
+            //Bug 11063
+            select firstonly locCustDirectDebitMandate
+                where locCustDirectDebitMandate.MandateReference == _custMandateId;
+
+            if(!locCustDirectDebitMandate) //Bug 11063
+            {
+                // should have only one record at a time for a customer with sent status
+                select firstonly locCustDirectDebitMandate
+                        where locCustDirectDebitMandate.CustAccount == _custAccount
+                        && locCustDirectDebitMandate.SKS_EB_BankRegisterStatus == SKS_EB_BankRegisterStatus::Sent;
+            }
+
+            ttsbegin;
+
+            if(_bankRegisterStatus == SKS_EB_BankRegisterStatus ::Accepted)
+            {
+                locCustDirectDebitMandate.SKS_EB_BankRegisterStatus = SKS_EB_BankRegisterStatus::Accepted;
+                locCustDirectDebitMandate.SKS_EB_MandateAutoStatus = SKS_EB_MandateAutoStatus::Completed;
+                locCustDirectDebitMandate.SKS_EB_AutoStatusDate = DateTimeUtil::getSystemDateTime();
+                locCustDirectDebitMandate.SKS_EB_RegisterStatusDate = _effectiveDate;
+                locCustDirectDebitMandate.Status = CustMandateStatus::New;
+                if(_custMandateScheme == SKS_EB_MandateType::Betalings && _custMandateId)
+                {
+                    locCustDirectDebitMandate.MandateReference = _custMandateId;
+                } 
+                locCustDirectDebitMandate.Status = CustMandateStatus::New;
+                locCustDirectDebitMandate.SignatureDate = DateTimeUtil::date(_effectiveDate);
+                locCustDirectDebitMandate.SignatureLocation = LogisticsPostalAddress::findRecId(locCustDirectDebitMandate.CustomerAddress).City;
+                if(DateTimeUtil::date(_endDate) == datenull() && locCustDirectDebitMandate.SignatureDate != dateNull()) //Bug 11028
+                {
+                    locCustDirectDebitMandate.ExpirationDate = dateMthFwd(locCustDirectDebitMandate.SignatureDate, CustParameters::find().MandateDefaultExpirationMonths) - 1;
+                }
+                else
+                {
+                    locCustDirectDebitMandate.ExpirationDate = DateTimeUtil::date(_endDate);
+                }
+            }
+            else if(_bankRegisterStatus == SKS_EB_BankRegisterStatus::Rejected)
+            {
+                locCustDirectDebitMandate.SKS_EB_BankRegisterStatus = SKS_EB_BankRegisterStatus::Rejected;
+                locCustDirectDebitMandate.SKS_EB_MandateAutoStatus = SKS_EB_MandateAutoStatus::Completed;
+                locCustDirectDebitMandate.SKS_EB_AutoStatusDate = DateTimeUtil::getSystemDateTime();
+                locCustDirectDebitMandate.SKS_EB_RegisterStatusDate = _endDate;
+                locCustDirectDebitMandate.CancellationDate = DateTimeUtil::date(_endDate);
+                locCustDirectDebitMandate.Status = CustMandateStatus::Canceled;
+            }
+
+            if(locCustDirectDebitMandate.RecId)
+            {
+                locCustDirectDebitMandate.selectForUpdate(true);
+                locCustDirectDebitMandate.update();
+
+                if(locCustDirectDebitMandate.Status == CustMandateStatus::New && !locCustDirectDebitMandate.BankAccount)
+                {
+                    SKS_EB_CustDirectDebitMandateEventHandler::updateCustTableRecords(locCustDirectDebitMandate);
+
+                    CustTable lCusttable;
+
+                    select firstonly lCusttable where lCusttable.AccountNum == locCustDirectDebitMandate.CustAccount;
+
+                    ttsbegin;
+                    locCustDirectDebitMandate.selectForUpdate(true);
+                    locCustDirectDebitMandate.BankAccount = lCusttable.BankAccount;
+                    locCustDirectDebitMandate.doupdate();
+                    ttscommit;
+                }
+            }
+            else 
+            {
+                if(_bankRegisterStatus ==SKS_EB_BankRegisterStatus::Accepted)
+                {
+                    locCustDirectDebitMandate.CustAccount = _custAccount;
+                    locCustDirectDebitMandate.BankAccount = locCustTable.BankAccount;
+                    locCustDirectDebitMandate.SKS_EB_MandateType = _custMandateScheme;
+                    locCustDirectDebitMandate.MandatePaymentType = CustMandatePaymentType::Recurring;
+                    locCustDirectDebitMandate.SKS_EB_AutoType = SKS_EB_AutoType::Email;
+					//Bug 11070 -->
+                    locCustDirectDebitMandate.CustomerAddress = DirParty::primaryPostalAddress(locCustTable.Party).RecId;
+                    locCustDirectDebitMandate.SignatureLocation = LogisticsPostalAddress::findRecId(locCustDirectDebitMandate.CustomerAddress).City;
+                    locCustDirectDebitMandate.IsFirst = true;
+                    //Bug 11070 <--
+                    locCustDirectDebitMandate.Status = CustMandateStatus::New;
+                    locCustDirectDebitMandate.insert();
+
+                    if(!locCustDirectDebitMandate.BankAccount)
+                    {
+                        SKS_EB_CustDirectDebitMandateEventHandler::updateCustTableRecords_OnInsert(locCustDirectDebitMandate);
+
+                        CustTable lCusttable;
+
+                        select firstonly lCusttable where lCusttable.AccountNum == locCustDirectDebitMandate.CustAccount;
+
+                        ttsbegin;
+                        locCustDirectDebitMandate.selectForUpdate(true);
+                        locCustDirectDebitMandate.BankAccount = lCusttable.BankAccount;
+                        locCustDirectDebitMandate.doupdate();
+                        ttscommit;
+                    }
+                }
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,3739 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>SKS_CCR_StatementReconciliationTrans</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+[Form]
+public class SKS_CCR_StatementReconciliationTrans extends FormRun
+
+{
+    SKS_LB_JournalAR                    mainFileAR;
+    DimensionDynamicAccountController   dimAccountController;
+    Name                                mainAccountDimAttrName;
+    RecId                               currentMainAccountId;
+    MainAccountRecId                    previousMainAccountId;
+    SKS_CCR_BankTran                    bankTran;
+    SKS_CCR_BankTran                    tmpContainer_BankTran;
+    SKS_BR_BankAcctStmt                 gSKS_BR_BankAcctStmt;
+    BankAccountStatement                locBankAccountStatement;
+    SKS_BR_BankReconciliationTrans      sKS_BR_BankReconciliationTrans;
+    SKS_CCR_NextAvailBankTran           locSKS_CCR_NextAvailBankTran;
+    [FormObservable]
+    RefRecId                            bankTransRecId;
+    SKS_CCR_BankTran                     bankTranVoucher;//TFS 7335
+    SKS_BR_GLProcessing_Transactionform locSKS_BR_GLProcessing_TransactionForm;
+    int                                 lineNumber;
+    PmfTableLookupExtended              invoicelookup;
+    BankAccountStatement                bankAccountStatement;
+    Amountcur                           origTranAmount;
+    FormDataSource                      callingFormDataSource;
+    int                                 origPosition;
+    int                                 nextPosition;
+    Voucher                             voucherLoc;// TFS 7335
+    FormDataSource                      callingFormDataSourceBankAcctStmt;
+    [FormObservable]
+    SKS_BR_ManualReconciliationID       myGuid;//GUID refactor
+    MainAccountRecId                    currentMainAccount;
+    MainAccountRecId                    previousMainAccount;
+    DimensionAttributeRecId             mainAccountDimAttr;
+    
+    #SKS_Global //GUID refactor
+
+
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>close</Name>
+				<Source><![CDATA[
+    public void close()
+    {
+        SKS_CCR_BankTran locBankTranSelect;
+
+        select crosscompany locBankTranSelect where locBankTranSelect.RecId == bankTransRecId;
+
+        changecompany(locBankTranSelect.company())
+        {
+            this.updateBankRecTran(locBankTranSelect);
+            super();
+            this.refreshCallerForm(nextPosition);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBankRecTran</Name>
+				<Source><![CDATA[
+    private void updateBankRecTran(SKS_CCR_BankTran _BankTranSelect)
+    {
+        SKS_CCR_BankTran locBankTransFind, SKS_CCR_BankTranUpdate;
+        SKS_LB_JournalARApplic  sKS_LB_JournalARApplicFind;
+        BankAccountTrans locAccountTrans;
+
+        // If no matching Bank transaction(s), remove guid from SKS_CCR_BankTran record
+        if (_BankTranSelect.ManualReconciliationID != emptyGuid())
+        {
+            select firstonly RecId from locAccountTrans where locAccountTrans.SKS_CCR_ManualReconciliationID == _BankTranSelect.ManualReconciliationID;
+            if (locAccountTrans.RecId == 0)
+            {
+                ttsbegin;
+                _BankTranSelect.selectForUpdate(true);
+                _BankTranSelect.ManualReconciliationID = emptyGuid();
+                _BankTranSelect.doUpdate();
+                ttscommit;
+            }
+        }
+
+        element.unmarkInUse(bankTransRecId);
+
+        if (_BankTranSelect.Matched == NoYes::No)
+        {
+            SKS_BR_GLProcessing::colorImportedTransaction(bankTransRecId);// TFS 7351
+        }
+
+        // 8764 CR -->
+        if(_BankTranSelect.GLMatchOrCreate   == SKS_CCR_GLMatchOrCreate::Manual)
+        {
+            select  count(RecId) from sKS_LB_JournalARApplicFind where sKS_LB_JournalARApplicFind.SKS_CCR_BankTran == _BankTranSelect.RecId;
+            if(sKS_LB_JournalARApplic.RecId == 0)
+            {
+                select firstonly crosscompany locBankTransFind
+                        where locBankTransFind.RecId           == bankTransRecId &&
+                            locBankTransFind.GLMatchOrCreate   == SKS_CCR_GLMatchOrCreate::Manual;
+
+                if(locBankTransFind && locBankTransFind.GLCreationCompany)
+                {
+                    select firstonly forupdate AccountId,CustAccount,CustCompany from SKS_CCR_BankTranUpdate
+                            where SKS_CCR_BankTranUpdate.RecId   == locBankTransFind.RecId;
+                    ttsbegin;
+                    SKS_CCR_BankTranUpdate.CustAccount = '';
+                    SKS_CCR_BankTranUpdate.CustCompany = locBankTransFind.GLCreationCompany;
+                    SKS_CCR_BankTranUpdate.doUpdate();
+                    ttscommit;
+                }
+            }
+            else
+            {
+                select firstonly sKS_LB_JournalARApplicFind
+                        where sKS_LB_JournalARApplicFind.SKS_CCR_BankTran == _BankTranSelect.RecId &&
+                            sKS_LB_JournalARApplicFind.AccountType == LedgerJournalACType::Cust;
+                if(sKS_LB_JournalARApplicFind)
+                {
+                    SKS_LB_JournalARApplic::customerBankTransUpdate(sKS_LB_JournalARApplicFind);
+                }
+            }
+        }
+        // 8764 CR <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>bookRefresh</Name>
+				<Source><![CDATA[
+    public void bookRefresh()
+    {
+        SKS_LB_JournalARApplic_ds.research(true);
+        SKS_LB_JournalARApplic_ds.refresh();
+        SKS_CCR_BankTran_ds.research(true); // Bug 7333 - refresh of Bank Sum and Difference amounts
+        SKS_CCR_BankTran_ds.refresh();
+        BankAccountTrans_ds.research(true);
+        BankAccountTrans_ds.refresh();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>bookRefreshAlreadyMarked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// To refresh the caller data source and retain the record postion after already marked form is closed
+    /// </summary>
+    // 8778 CR
+    public void bookRefreshAlreadyMarked(int _position)
+    {
+        SKS_LB_JournalARApplic_ds.research();
+        SKS_LB_JournalARApplic_ds.active();
+        SKS_LB_JournalARApplic_ds.setPosition(_position);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enableButtons</Name>
+				<Source><![CDATA[
+    public void enableButtons(NoYes _enabled = false)
+    {
+        SKS_CCR_BankTran_ds.allowEdit(_enabled);
+        BankAccountTrans_ds.allowEdit(_enabled);
+        SKS_LB_JournalARApplic_ds.allowEdit(_enabled);
+        SKS_LB_JournalARApplic_ds.allowCreate(_enabled);
+        SKS_LB_JournalARApplic_ds.allowDelete(_enabled);
+        TemplateButtongroup.enabled(_enabled);
+        AccountDimensionButtongroup.enabled(_enabled);
+        InquiriesButtongroup.enabled(_enabled);
+        SKS_BR_VATTaxForm.enabled(_enabled); //CR-8793
+        SelectMarked.enabled(BankAccountTrans_ds.allowEdit());
+        SelectAll.enabled(BankAccountTrans_ds.allowEdit());
+        DeselectAll.enabled(BankAccountTrans_ds.allowEdit());
+        SplitTrans.enabled(BankAccountTrans_ds.allowEdit());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enablePostBtn</Name>
+				<Source><![CDATA[
+    Public void enablePostBtn()
+    {
+        if(SKS_CCR_BankTran_ds.bankSum() != 0 && SKS_CCR_BankTran_ds.difference() == 0 && !sKS_BR_BankReconciliationTrans.parmMatched())
+        {
+            postbtn.enabled(true);
+        }
+        else
+        {
+            postbtn.enabled(false);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNextRecordInGrid</Name>
+				<Source><![CDATA[
+    public void getNextRecordInGrid()
+    {
+        SKS_CCR_NextAvailBankTran   sKS_CCR_NextAvailBankTran;
+        SKS_CCR_NextAvailBankTran   sKS_CCR_NextAvailBankTranAvail; //SKS CR 9729
+        boolean                     nextFound;
+        int i ;
+        RefRecId                    prevRecId = bankTransRecId;
+        SKS_CCR_BankTran            SKS_CCR_BankTranLoc;// TFS 7335
+        BankAccountStatement        accountStatement;
+
+        SKS_CCR_BankTran_ds.reread();
+
+        changecompany(SKS_CCR_BankTran_ds.cursor().company())
+        {
+            element.updateBankRecTran(SKS_CCR_BankTran_ds.cursor());
+        }
+
+        select firstonly sKS_CCR_NextAvailBankTranAvail       //SKS CR 9729
+            where sKS_CCR_NextAvailBankTranAvail.SKS_CCR_BankTranRecid == bankTransRecId;  //SKS CR 9729
+
+        nextPosition = origPosition;
+
+        //if selected record is lastone close the form
+        if(sKS_CCR_NextAvailBankTranAvail.LineNumber == lineNumber-1)    //SKS CR 9729
+        {
+            element.close();
+        }
+
+        if (sKS_CCR_NextAvailBankTranAvail)
+        {
+            for (i =1;i<LineNumber;i++)
+            {
+                sKS_CCR_NextAvailBankTran = SKS_CCR_NextAvailBankTran::findByLineNumber(sKS_CCR_NextAvailBankTranAvail.LineNumber+i);  //SKS CR 9729
+                if (sKS_CCR_NextAvailBankTran)
+                {
+                    if(sKS_CCR_NextAvailBankTran.Matched == NoYes::No && sKS_CCR_NextAvailBankTran.Inuse == NoYes::No)
+                    {
+                        Company.text(sKS_CCR_NextAvailBankTran.SKS_CCR_BankTranCompany);
+                        BankAccount.text(sKS_CCR_NextAvailBankTran.AccountId);
+                        StatementDate.dateValue(sKS_BR_BankReconciliationTrans.parmTransDate());
+                        StatementNumber.text(sKS_CCR_NextAvailBankTran.AccountStatementNum);
+                        ImportBankNumber.text(sKS_CCR_NextAvailBankTran.BAnkNum);
+                        ImportCustNumber.text(sKS_CCR_NextAvailBankTran.BankCustomerNum);
+                        ImportTransType.text(sKS_BR_BankReconciliationTrans.parmImportTranType());
+                        CustCompany.text(sKS_CCR_NextAvailBankTran.CustCompany);
+                        Customer.text(sKS_CCR_NextAvailBankTran.CustAccount);
+                        Currency.text(sKS_BR_BankReconciliationTrans.parmcurrency());
+
+                        paymentamount.realValue(sKS_CCR_NextAvailBankTran.TranAmount);
+                        bankTransRecId = sKS_CCR_NextAvailBankTran.SKS_CCR_BankTranRecid;
+
+                        BankTransSum.realValue(0);
+                        Difference.realValue(0);
+                        nextFound = true;
+                        nextPosition++;
+                        // TFS 7335 -->
+                        select firstonly crosscompany
+                            ManualReconciliationID
+                            , Matched
+                            , ImportedStatementNum
+                            , ImportedStatementDate
+                            , TransCurrency
+                        from SKS_CCR_BankTranLoc
+                        where SKS_CCR_BankTranLoc.RecId == bankTransRecId; //7653
+                        if(SKS_CCR_BankTranLoc.ManualReconciliationID != emptyGuid())
+                        {
+                            myGuid = SKS_CCR_BankTranLoc.ManualReconciliationID;
+                            sKS_BR_BankReconciliationTrans.parmTransGuid(myGuid);
+                        }
+                        else
+                        {
+                            myGuid = newGuid();
+                            sKS_BR_BankReconciliationTrans.parmTransGuid(myGuid); // 8289
+                        }
+                        changecompany(SKS_CCR_BankTranLoc.company()) //7653
+                        {
+                            SKS_BR_GLProcessing_Transactionform::updateBankTranSettlement(myGuid, SKS_CCR_BankTranLoc.AccountId);// 7446
+                        }
+                        sKS_BR_BankReconciliationTrans.parmMatched(SKS_CCR_BankTranLoc.Matched);
+                        sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum(SKS_CCR_BankTranLoc.ImportedStatementNum);
+                        sKS_BR_BankReconciliationTrans.parmTransDate(SKS_CCR_BankTranLoc.ImportedStatementDate);
+
+                        changecompany(sKS_CCR_NextAvailBankTran.SKS_CCR_BankTranCompany)
+                        {
+                            select firstonly CurrencyCode from accountStatement
+                                where accountStatement.AccountStatementNum == sKS_CCR_NextAvailBankTran.AccountStatementNum;
+                        }
+
+                        if (SKS_CCR_BankTranLoc.TransCurrency == accountStatement.CurrencyCode)
+                        {
+                            sKS_BR_BankReconciliationTrans.parmcurrency(accountStatement.CurrencyCode);
+                        }
+                        else
+                        {
+                            sKS_BR_BankReconciliationTrans.parmcurrency(SKS_CCR_BankTranLoc.TransCurrency);
+                        }
+
+                        BankAccountTrans_ds.executeQuery();
+
+                        // TFS 7335 <--
+                        break;
+                    }
+                }
+            }
+        }
+
+        if(bankAccountStatement.ReconcileDate == dateNull())
+        {
+            element.unmarkInUse(prevRecId);
+            element.markInUse(bankTransRecId);
+
+        }
+
+        SKS_LB_JournalARApplic_ds.refresh();
+        element.enableButtons(true);
+
+        //if no next record found close the form
+        if(!nextFound)
+        {
+            element.close();
+        }
+        SKS_CCR_BankTran_ds.executeQuery();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning('BPCheckSQLQueryInInit','Refactoring data access loop can be moved to class to avoid performance bottleneck.But it require more efforts and may impact funtionality related to bank transations and related objects.')]   //TAS_CAR
+    public void init()
+    {
+        lineNumber = 1;
+        mainAccountDimAttr = DimensionAttribute::getWellKnownDimensionAttribute(DimensionAttributeType::MainAccount);
+        RecordInsertList    nextAvailBankTranRecordInsertList = new  RecordInsertList(tableNum(SKS_CCR_NextAvailBankTran));      //TAS_CAR
+
+        super();
+
+
+        locSKS_BR_GLProcessing_TransactionForm = new SKS_BR_GLProcessing_Transactionform();
+
+        if (element.args().parmObject())
+        {
+            sKS_BR_BankReconciliationTrans = element.args().parmObject();
+            Company.text(sKS_BR_BankReconciliationTrans.parmDataAreaId());
+            BankAccount.text(sKS_BR_BankReconciliationTrans.parmCompanyBankAccountId());
+            StatementDate.dateValue(sKS_BR_BankReconciliationTrans.parmTransDate());
+            StatementNumber.text(sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum());
+            ImportBankNumber.text(sKS_BR_BankReconciliationTrans.parmSKS_BR_BankNum());
+            ImportCustNumber.text(sKS_BR_BankReconciliationTrans.parmSKS_BR_BankCustomerNum());
+            ImportTransType.text(sKS_BR_BankReconciliationTrans.parmImportTranType());
+            CustCompany.text(sKS_BR_BankReconciliationTrans.parmSelectableDataArea());
+            Customer.text(sKS_BR_BankReconciliationTrans.parmCustAccount());
+            Currency.text(sKS_BR_BankReconciliationTrans.parmcurrency());
+
+            bankTran.RecId  = sKS_BR_BankReconciliationTrans.parmRecId();
+            bankTransRecId  = bankTran.RecId;
+            // if there is a match already, should get the same guid, otherwise create new guid
+            if (sKS_BR_BankReconciliationTrans.parmTransGuid() != emptyGuid())
+            {
+                myGuid = sKS_BR_BankReconciliationTrans.parmTransGuid();
+            }
+            else
+            {
+                myGuid = newGuid();
+                sKS_BR_BankReconciliationTrans.parmTransGuid(myGuid);
+            }
+
+            select firstonly Voucher from bankTranVoucher
+                where bankTranVoucher.RecId == bankTransRecId;
+            voucherLoc      = bankTranVoucher.Voucher;//TFS 7335
+        }
+
+        select ReconcileDate from bankAccountStatement
+            where bankAccountStatement.AccountStatementNum == sKS_BR_BankReconciliationTrans.parmBankAccountStatementNum();
+        if(bankAccountStatement.ReconcileDate == dateNull())
+        {
+            element.markInUse(bankTransRecId); // //SKS_BR_BlockInUse
+        }
+
+        callingFormDataSource = sKS_BR_BankReconciliationTrans.parmformDatasource();
+        origPosition          = callingFormDataSource.getPosition();
+        callingFormDataSourceBankAcctStmt = sKS_BR_BankReconciliationTrans.parmformDatasourceBankAcctStmt();
+
+        delete_from locSKS_CCR_NextAvailBankTran;
+        //SKS CR 9729 -->
+        FormDataSource bankTran_ds = sKS_BR_BankReconciliationTrans.parmformDatasource();
+
+        for (tmpContainer_BankTran = bankTran_ds.getFirst() ? bankTran_ds.getFirst() : bankTran_ds.cursor();
+        tmpContainer_BankTran;
+        tmpContainer_BankTran = bankTran_ds.getNext())
+        //SKS CR 9729 <--
+        {
+            locSKS_CCR_NextAvailBankTran.LineNumber = LineNumber;
+            locSKS_CCR_NextAvailBankTran.AccountId = tmpContainer_BankTran.AccountId;
+            locSKS_CCR_NextAvailBankTran.AccountStatementNum = tmpContainer_BankTran.AccountStatementNum;
+            locSKS_CCR_NextAvailBankTran.BankNum = tmpContainer_BankTran.BankNum;
+            locSKS_CCR_NextAvailBankTran.TranAmount = tmpContainer_BankTran.TranCurrencyAmount;
+            locSKS_CCR_NextAvailBankTran.TranDate = tmpContainer_BankTran.TranDate;
+            locSKS_CCR_NextAvailBankTran.CustAccount = tmpContainer_BankTran.CustAccount;
+            locSKS_CCR_NextAvailBankTran.CustCompany = tmpContainer_BankTran.CustCompany;
+            locSKS_CCR_NextAvailBankTran.SKS_CCR_BankTranCompany = tmpContainer_BankTran.dataareaid;
+            locSKS_CCR_NextAvailBankTran.BankCustomerNum = tmpContainer_BankTran.BankCustomerNum;
+            locSKS_CCR_NextAvailBankTran.SKS_CCR_BankTranRecid = tmpContainer_BankTran.RecId;
+            locSKS_CCR_NextAvailBankTran.Matched = tmpContainer_BankTran.Matched;
+            locSKS_CCR_NextAvailBankTran.InUse = tmpContainer_BankTran.InUse;
+            nextAvailBankTranRecordInsertList.add(locSKS_CCR_NextAvailBankTran);     //TAS_CAR
+            lineNumber++;
+        }
+        nextAvailBankTranRecordInsertList.insertDatabase();                     //TAS_CAR
+        if(sKS_BR_BankReconciliationTrans.parmMatched() == NoYes::Yes)
+        {
+            postbtn.enabled(false);
+            this.enableButtons(false);
+
+            BankTransSum.realValue(SKS_CCR_BankTran_ds.bankSum());
+            difference.realValue(SKS_CCR_BankTran_ds.difference());
+        }
+        else
+        {
+            this.enableButtons(true);
+
+            BankTransSum.realvalue(SKS_CCR_BankTran_ds.bankSum());
+            difference.realvalue(SKS_CCR_BankTran_ds.difference());
+            this.enablePostBtn();
+        }
+       // SKS_LB_JournalARApplic_SKS_AccountType.enter(); // 7440
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markInUse</Name>
+				<Source><![CDATA[
+    //SKS_BR_BlockInUse
+    public void markInUse(RefRecId _bankTran)
+    {
+        SKS_CCR_BankTran bankTranLoc;
+
+        select firstonly bankTranLoc where bankTranLoc.RecId == _bankTran;
+
+        if(bankTranLoc)
+        {
+            ttsBegin;
+            bankTranLoc.reread();
+            bankTranLoc.selectForUpdate(true);
+            bankTranLoc.markUserPrivate();
+            bankTranLoc.update();
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>refreshCallerForm</Name>
+				<Source><![CDATA[
+    Public void refreshCallerForm(int _position)
+    {
+        int newPosition = _position;
+
+        if (callingFormDataSource)
+        {
+            if (newPosition == 0)
+            {
+                newPosition = origPosition;
+            }
+
+            callingFormDataSource.refresh();
+            callingFormDataSource.reread();
+            callingFormDataSource.rereadReferenceDataSources();
+            callingFormDataSource.research(true);
+            callingFormDataSource.setPosition(newPosition);
+        }
+        if (callingFormDataSourceBankAcctStmt)
+        {
+            callingFormDataSourceBankAcctStmt.reread();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unmarkInUse</Name>
+				<Source><![CDATA[
+    //SKS_BR_BlockInUse
+    public void unmarkInUse(RefRecId _bankTran)
+    {
+        SKS_CCR_BankTran bankTranLoc;
+
+        select firstonly bankTranLoc where bankTranLoc.RecId == _bankTran;
+
+        if(bankTranLoc)
+        {
+            ttsBegin;
+            bankTranLoc.reread();
+            bankTranLoc.selectForUpdate(true);
+            bankTranLoc.unMarkUserPrivate();
+            bankTranLoc.update();
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFullSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// 7363
+    /// </summary>
+    public void updateFullSettlement(boolean _isfullSettlement = false, boolean  _isRemoveSettlement = false)
+    {
+        SKS_LB_JournalARApplic   sKS_LB_JournalARApplicLoc;
+        SKS_LB_JournalARApplic   sKS_LB_JournalARApplicUpdate;
+        MultiSelectionHelper     selectionHelper = MultiSelectionHelper::construct();
+        container                selectedRecords;
+        int                      recordPos;
+        int                      position; // 7475
+
+        selectionHelper.parmDataSource(sKS_LB_JournalARApplic_DS);
+        sKS_LB_JournalARApplicLoc = selectionHelper.getFirst();
+
+        recordPos = 1;
+        while (sKS_LB_JournalARApplicLoc)
+        {
+            select firstonly forupdate sKS_LB_JournalARApplicUpdate
+                where sKS_LB_JournalARApplicUpdate.RecId == sKS_LB_JournalARApplicLoc.RecId
+                    && sKS_LB_JournalARApplicLoc.displayInvoiceBalance() != 0
+                    && sKS_LB_JournalARApplicUpdate.AlreadyMarked == NoYes::No; // 7446
+
+            if(sKS_LB_JournalARApplicUpdate.RecId)
+            {
+                selectedRecords = conIns(selectedRecords,recordPos,sKS_LB_JournalARApplicUpdate.RecId);
+                recordPos ++;
+                ttsbegin;
+                if(_isfullSettlement)
+                {
+                    sKS_LB_JournalARApplicUpdate.FullSettlement = NoYes::Yes;
+                    sKS_LB_JournalARApplicUpdate.Status = SKS_BR_Status::Full;
+                    sKS_LB_JournalARApplicUpdate.modifiedField(fieldNum(SKS_LB_JournalARApplic, FullSettlement));
+                }
+                if(_isRemoveSettlement)
+                {
+                    sKS_LB_JournalARApplicUpdate.FullSettlement = NoYes::No;
+                    sKS_LB_JournalARApplicUpdate.Status = SKS_BR_Status::None;
+                    sKS_LB_JournalARApplicUpdate.modifiedField(fieldNum(SKS_LB_JournalARApplic, FullSettlement));
+                }
+                sKS_LB_JournalARApplicUpdate.doUpdate();
+                ttscommit;
+            }
+            sKS_LB_JournalARApplicLoc = selectionHelper.getNext();
+        }
+        position = SKS_LB_journalARApplic_ds.getPosition(); // 7475
+        SKS_CCR_BankTran_ds.refresh();
+        SKS_CCR_BankTran_ds.reread();
+        SKS_LB_journalARApplic_ds.research();
+        SKS_LB_journalARApplic_ds.setPosition(position); // 7475
+        for(int i = 1; i<= conLen(selectedRecords); i++)
+        {
+            SKS_LB_journalARApplic_ds.positionToRecord(SKS_LB_journalARApplic::find(conPeek(selectedRecords, i)));
+            SKS_LB_journalARApplic_ds.mark(true);
+        }
+        //7653 -->
+        BankTransSum.realValue(SKS_CCR_BankTran_ds.bankSum());
+        Difference.realValue(SKS_CCR_BankTran_ds.difference());
+        if(SKS_CCR_BankTran_ds.bankSum() != 0 && SKS_CCR_BankTran_ds.difference() == 0)
+        {
+            PostBtn.enabled(true);
+        }
+        else
+        {
+            PostBtn.enabled(false);
+        }
+        //7653 <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSegmentChangedForPrimaryAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public RecId onSegmentChangedForPrimaryAccount(
+        SegmentedEntryControl           _segmentedEntryControl,
+        DimensionControlSegment         _dimensionControlSegment,
+        RecId                           _currentMainAccountId,
+        SKS_LB_JournalARApplic          _sKS_LB_JournalARApplic,
+        RefRecId                        _bankTransRecId)
+    {
+        RecId                           updatedMainAccountId;
+        RecId                           mainAccountId;
+        LedgerJournalTable              ledgerJournalTableLocal;
+        Map                             headerDimensionSpecifiers;
+        Map                             dimensionSpecifiers;
+        SKS_CCR_BankTran                 locBanKTran;
+        MainAccountLegalEntity          mainAccountLegalEntity;
+        RefRecId                        legalEntity = CompanyInfo::findDataArea(_sKS_LB_JournalARApplic.CustTransDataAreaId).RecId;
+
+        select firstonly crosscompany RecId, JournalName from locBanKTran
+            where locBanKTran.RecId == _bankTransRecId;
+
+        mainAccountId = MainAccount::findByMainAccountId(_dimensionControlSegment.parmValue()).RecId;
+
+        mainAccountLegalEntity = MainAccountLegalEntity::findByMainAccountLegalEntity(mainAccountId, legalEntity);
+
+        updatedMainAccountId = _currentMainAccountId;
+
+        changecompany(_segmentedEntryControl.parmDataAreaId())
+        {
+            if (_dimensionControlSegment.parmDimensionAttribute().RecId == DimensionAttribute::getWellKnownDimensionAttribute(DimensionAttributeType::MainAccount))
+            {
+                mainAccountId = _dimensionControlSegment.parmDimensionAttributeValue().EntityInstance;
+                if ((mainAccountId != 0) && (_currentMainAccountId != mainAccountId))
+                {
+                    updatedMainAccountId = mainAccountId;
+                    headerDimensionSpecifiers = null;
+
+                    if (_sKS_LB_JournalARApplic.CustTransDataAreaId == locBanKTran.company() && mainAccountLegalEntity.DefaultDimension != 0)
+                    {
+                        headerDimensionSpecifiers = LedgerDimensionDefaultingEngine::getDefaultDimensionSpecifiers(mainAccountLegalEntity.DefaultDimension);
+                    }
+                    else if (_sKS_LB_JournalARApplic.CustTransDataAreaId != locBanKTran.company() || mainAccountLegalEntity.DefaultDimension == 0)
+                    {
+                        LedgerInterCompany::findCompanyPair(_sKS_LB_JournalARApplic.CustTransDataAreaId, ledgerJournalTableLocal.Company());
+                        DimensionDefault journalHeaderDefaultDimensions = ledgerJournalName::find(locBanKTran.JournalName).DefaultDimension;
+                        headerDimensionSpecifiers = LedgerDimensionDefaultingEngine::getDefaultDimensionSpecifiers(journalHeaderDefaultDimensions);
+                    }
+                    dimensionSpecifiers = element.addMainAccountDimensionValues(mainAccountId, headerDimensionSpecifiers);
+
+                    if (dimensionSpecifiers)
+                    {
+                        _segmentedEntryControl.setDimensionSpecifiers(dimensionSpecifiers, false);
+                    }
+                }
+                else if (mainAccountId == 0)
+                {
+                    updatedMainAccountId = 0;
+                }
+            }
+        }
+
+        return updatedMainAccountId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addMainAccountDimensionValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    public Map addMainAccountDimensionValues(RecId _mainAccountId, Map _preceedingDimensionSpecifiers)
+    {
+        MainAccountLegalEntity          mainAccountLegalEntity;
+        Map                             dimensionSpecifiers;
+        Map                             mainAccountDimensionSpecifiers;
+
+        mainAccountLegalEntity = MainAccountLegalEntity::findByMainAccountLegalEntity(_mainAccountId, CompanyInfo::current());
+        if (mainAccountLegalEntity.DefaultDimension)
+        {
+            mainAccountDimensionSpecifiers = LedgerDimensionDefaultingEngine::getDefaultDimensionSpecifiers(mainAccountLegalEntity.DefaultDimension);
+            if (_preceedingDimensionSpecifiers)
+            {
+                dimensionSpecifiers = LedgerDimensionDefaultingEngine::addDimensionSpecifiers(_preceedingDimensionSpecifiers, mainAccountDimensionSpecifiers);
+            }
+            else
+            {
+                dimensionSpecifiers = mainAccountDimensionSpecifiers;
+            }
+        }
+        else
+        {
+            dimensionSpecifiers = _preceedingDimensionSpecifiers;
+        }
+
+        return dimensionSpecifiers;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enableApplyTolerance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CR-8779
+    /// </summary>
+    public void enableApplyTolerance()
+    {
+        CustParameters              custParameters;
+        SKS_LB_JournalARApplic      locJournalARApplic;
+        VendParameters              vendParameters; // CR-9480
+
+        // CR-9480 -->
+        // If both customer and vendor is exist in new journal line then tolerance will apply based on customer parameter setup.
+        select firstonly RecId, AccountType from locJournalARApplic
+            order by AccountType
+                where locJournalARApplic.SKS_CCR_BankTran     == sKS_BR_BankReconciliationTrans.parmRecId()
+                    && (locJournalARApplic.AccountType       == LedgerJournalACType::Cust
+                    || locJournalARApplic.AccountType        == LedgerJournalACType::Vend)
+                    && locJournalARApplic.TransactionAmount  != 0;
+
+        if(locJournalARApplic.AccountType == LedgerJournalACType::Cust)
+        {
+            select firstonly MaxMSTDiff, MaxMSTOverUnder from custParameters;
+        }
+        else
+        {
+            select firstonly MaxMSTDiff, MaxMSTOverUnder from vendParameters;
+        }
+        // CR-9480 <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVATTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// update VAT tax data
+    /// </summary>
+    /// CR-8793
+    public void updateVATTax()
+    {
+        if(SKS_LB_JournalARApplic.LedgerDimension && SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Ledger)
+        {
+            MainAccountLegalEntity mainAccountLegalEntity;
+            MainAccount mainAccount;
+
+            changecompany(SKS_LB_JournalARApplic.CustTransDataAreaId)
+            {
+                mainAccount = LedgerDimensionFacade::getMainAccountFromLedgerDimension(SKS_LB_JournalARApplic.LedgerDimension);
+            }
+            mainAccountLegalEntity = MainAccountLegalEntity::findByMainAccountLegalEntity(mainAccount.RecId, CompanyInfo::findDataArea(SKS_LB_JournalARApplic.CustTransDataAreaId).RecId);
+
+            if(SKS_LB_JournalARApplic.TaxGroup == '')
+            {
+                SKS_LB_JournalARApplic.TaxGroup = mainAccountLegalEntity.TaxGroup;
+            }
+            if(SKS_LB_JournalARApplic.TaxItemGroup == '')
+            {
+                if(mainAccountLegalEntity.TaxItemGroup == '')
+                {
+                    changecompany(SKS_LB_JournalARApplic.CustTransDataAreaId)
+                    {
+                        SKS_LB_JournalARApplic.TaxItemGroup = TaxParameters::find().TaxItemGroup;
+                    }
+                }
+                else
+                {
+                    SKS_LB_JournalARApplic.TaxItemGroup = mainAccountLegalEntity.TaxItemGroup;
+                }
+            }
+        }
+        else
+        {
+            SKS_LB_JournalARApplic.TaxGroup = '';
+            SKS_LB_JournalARApplic.TaxItemGroup = '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enableVATTaxButton</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CR-8793
+    /// </summary>
+    public void enableVATTaxButton()
+    {
+        if(SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Ledger)
+        {
+            SKS_BR_VATTaxForm.enabled(true);
+        }
+        else
+        {
+            SKS_BR_VATTaxForm.enabled(false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>BankTranAccountNumRefresh</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    private void BankTranAccountNumRefresh(RefRecId _BankTranRecid)
+    {
+        //8764 CR -->
+        SKS_LB_JournalARApplic  sKS_LB_JournalARApplicFind;
+        SKS_CCR_BankTran         locBankTransFind;
+        //8764 CR <--
+
+        select  count(RecId) from sKS_LB_JournalARApplicFind where sKS_LB_JournalARApplicFind.SKS_CCR_BankTran == _BankTranRecid;
+        if(sKS_LB_JournalARApplic.RecId == 0)
+        {
+            ttsbegin;
+            select firstonly forupdate crosscompany  locBankTransFind
+                        where locBankTransFind.RecId           == bankTransRecId &&                           
+                            locBankTransFind.GLMatchOrCreate   == SKS_CCR_GLMatchOrCreate::Manual;
+            if(locBankTransFind && locBankTransFind.GLCreationCompany)
+            {
+                changecompany(locBankTransFind.company())
+                {
+                    locBankTransFind.CustAccount = '';
+                    locBankTransFind.CustCompany = locBankTransFind.GLCreationCompany;
+                    locBankTransFind.Update();
+                }
+            }
+            ttscommit;
+        }
+        else
+        {
+            select sKS_LB_JournalARApplicFind
+                        where sKS_LB_JournalARApplicFind.SKS_CCR_BankTran == _BankTranRecid &&
+                            sKS_LB_JournalARApplicFind.AccountType == LedgerJournalACType::Cust;
+            if(sKS_LB_JournalARApplicFind)
+            {
+                SKS_LB_JournalARApplic::customerBankTransUpdate(sKS_LB_JournalARApplicFind);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SelectBankAccountTrans</Name>
+				<Source><![CDATA[
+    private void SelectBankAccountTrans(NoYes _select)
+    {
+        if (_select)
+        {
+            if (BankAccountTrans.SKS_CCR_ManualReconciliationID != myGuid && BankAccountTrans.SKS_CCR_ManualReconciliationID != emptyGuid())
+            {
+                BankAccountTrans.SKS_CCR_IsSelected = NoYes::No;
+                throw error("@SKS4337");
+            }
+
+            BankAccountTrans.SKS_CCR_IsSelected = NoYes::Yes;
+            BankAccountTrans.SKS_CCR_ManualReconciliationID = myGuid;
+            BankAccountTrans.SKS_CCR_AlreadyMarked = NoYes::Yes;
+
+            if (SKS_CCR_BankTran.ManualReconciliationID == emptyGuid())
+            {
+                ttsbegin;
+                SKS_CCR_BankTran.selectForUpdate(true);
+                SKS_CCR_BankTran.ManualReconciliationID = myGuid;
+                SKS_CCR_BankTran.update();
+                ttscommit;
+            }
+
+        }
+        else
+        {
+            if (BankAccountTrans.SKS_CCR_ManualReconciliationID != myGuid && BankAccountTrans.SKS_CCR_ManualReconciliationID != emptyGuid())
+            {
+                throw error("@SKS4337");
+            }
+
+            BankAccountTrans.SKS_CCR_IsSelected = NoYes::No;
+            BankAccountTrans.SKS_CCR_AlreadyMarked = NoYes::No;
+            BankAccountTrans.SKS_CCR_BankTranRecId = 0;
+            BankAccountTrans.SKS_CCR_ManualReconciliationID = emptyGuid();
+        }
+
+        BankAccountTrans.update();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="">
+			<DataSource>
+				<Name>SKS_CCR_BankTran</Name>
+				<Methods>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        public void executeQuery()
+        {
+            SKS_CCR_BankTran_ds.query().dataSourceTable(tableNum(SKS_CCR_BankTran)).clearRanges();
+            SKS_CCR_BankTran_ds.query().dataSourceTable(tableNum(SKS_CCR_BankTran)).addRange(fieldNum(SKS_CCR_BankTran,RecId)).value(int642str(bankTransRecId));
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>bankSum</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Calculates bank summary amount.
+        /// </summary>
+        /// <returns>Returns summary amount</returns>
+        Display amountcur bankSum()
+        {
+            BankAccountTrans            accountTrans;
+            SKS_LB_JournalARApplic      journalARApplic;
+
+            select crosscompany sum(BankTransAmountCur) from accountTrans
+                where accountTrans.SKS_CCR_ManualReconciliationID == myGuid; //7653
+            // If not posted /matched, do not get amount from journalARAppli table
+            if(!sKS_BR_BankReconciliationTrans.parmMatched() || accountTrans.BankTransAmountCur == 0)// 7352
+            {
+                select crosscompany sum(TransactionAmount) from journalARApplic
+                    where journalARApplic.SKS_CCR_BankTran == bankTransRecId; //7653
+            }
+
+            return accountTrans.BankTransAmountCur + journalARApplic.TransactionAmount;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>difference</Name>
+						<Source><![CDATA[
+        Display amountcur difference()
+        {
+            return PaymentAmount.realValue() - SKS_CCR_BankTran_ds.bankSum();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+
+            ret = super();
+
+            BankTransSum.update();
+            Difference.update();
+            element.enablePostBtn();
+
+            if (SKS_CCR_BankTran.TransCurrency == SKS_CCR_BankTran.getOrigStatementCurrency())
+            {
+                StatementAmount.visible(true);
+                PaymentAmount.visible(false);
+                SKS_CCR_BankTran_TransCurrency.visible(false);
+                Currency.label("@SYS333999");
+            }
+            else
+            {
+                SKS_CCR_BankTran_TransCurrency.visible(true);
+                PaymentAmount.visible(true);
+                StatementAmount.visible(false);
+                Currency.label('Bank currency');
+            }
+            
+           // SKS_LB_JournalARApplic_SKS_AccountType.enter(); // 7440
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields />
+			</DataSource>
+			<DataSource>
+				<Name>BankAccountTrans</Name>
+				<Methods>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        public void executeQuery()
+        {
+            QueryBuildDataSource bankAccountTransQBDS = BankAccountTrans_ds.query().dataSourceTable(tablenum(BankAccountTrans));
+            QueryBuildRange queryBuildRangeCurrencyCode;
+            bankAccountTransQBDS.clearRanges();
+            bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,AccountId)).value(sKS_BR_BankReconciliationTrans.parmCompanyBankAccountId());
+
+            if(sKS_BR_BankReconciliationTrans.parmMatched() == NoYes::Yes)
+            {
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,SKS_CCR_ManualReconciliationID)).value(queryValue(myGuid));
+            }
+            else
+            {
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,included)).value(enum2str(NoYes::No));               
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,AccountStatement)).value('');
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,Cancel)).value(enum2str(NoYes::No));
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,Reconciled)).value(enum2str(NoYes::No));
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans, SKS_CCR_ManualReconciliationID)).value(strFmt('((%1 == "%2") || (%1 == "%3"))',
+                        fieldStr(BankAccountTrans, SKS_CCR_ManualReconciliationID),
+                        guid2Str(myguid),
+                        guid2Str(emptyGuid())));
+                queryBuildRangeCurrencyCode = bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans,BankTransCurrencyCode));
+                queryBuildRangeCurrencyCode.value(strFmt('((%1 == "%2"))',
+                        fieldStr(BankAccountTrans, BankTransCurrencyCode),
+                        sKS_BR_BankReconciliationTrans.parmcurrency()));
+                queryBuildRangeCurrencyCode.status(RangeStatus::Locked);
+               
+                bankAccountTransQBDS.addRange(fieldNum(BankAccountTrans, SKS_CCR_IsCurrencyAdjustment)).value(strFmt('(%1 != "%2")',
+                        fieldStr(BankAccountTrans, SKS_CCR_IsCurrencyAdjustment),
+                        NoYes::No));
+                
+            }
+
+            BankAccountTrans_ds.query().addCompanyRange(SKS_CCR_BankTran.DataAreaId); //8609
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>init</Name>
+						<Source><![CDATA[
+        public void init()
+        {
+            QueryBuildDataSource        qbdsAccountTrans;
+
+            super();
+
+            qbdsAccountTrans = this.query().dataSourceTable(tableNum(BankAccountTrans));
+            qbdsAccountTrans.addRange(fieldnum(BankAccountTrans, Reconciled)).value(queryvalue(Noyes::No));
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+
+            ret = super();
+         //   SKS_LB_JournalARApplic_SKS_AccountType.enter(); // 7440
+
+            if(BankAccountTrans.Reconciled == NoYes::No )
+            {
+                SplitTrans.enabled(true);
+            }
+            else
+            {
+                SplitTrans.enabled(false);
+            }
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>SKS_CCR_IsSelected</DataField>
+						<Methods>
+							<Method>
+								<Name>modified</Name>
+								<Source><![CDATA[
+            public void modified()
+            {
+                super();
+
+                element.SelectBankAccountTrans(BankAccountTrans.SKS_CCR_IsSelected);
+
+                element.bookRefresh();
+
+                element.enablePostBtn();
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+			<DataSource>
+				<Name>SKS_LB_JournalARApplic</Name>
+				<Methods>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+
+            ret = super();
+
+            SKS_BR_InvoiceInquiry.enabled(SKS_LB_JournalARApplic.Invoice != ''?true:false);
+            SKS_LB_JournalARApplic_SKS_Account.parmDataAreaId(SKS_LB_JournalARApplic.CustTransDataAreaId);//Bug#7255
+           // SKS_LB_JournalARApplic_SKS_AccountType.enter(); // 7440
+            if (SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Ledger)
+            {
+                currentMainAccountId = MainAccount::getMainAccountRecIdFromLedgerDimension(SKS_LB_JournalARApplic.LedgerDimension);
+                previousMainAccountId = currentMainAccountId;
+            }
+            else
+            {
+                currentMainAccountId = 0;
+                previousMainAccountId = 0;
+            }
+            //Sks_Bug_7535 --->
+            //9657 CR -->
+            boolean isOpenTransaction = false;
+            str defaultTrxDescription = '';
+            if(SKS_LB_JournalARApplic.CustTransOpenRecId || SKS_LB_JournalARApplic.VendTransOpenRecId)
+            {
+                isOpenTransaction = true;
+                defaultTrxDescription = SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Cust ? SKS_PP_Setup::find().CustPaymentsDescription : SKS_PP_Setup::find().VendPaymentsDescription;
+            }
+            //9657 CR <--
+            if(SKS_LB_JournalARApplic.Invoice == '' && !(isOpenTransaction && SKS_LB_JournalARApplic.Description == defaultTrxDescription)/*9657 CR*/)
+            {
+                SKS_LB_JournalARApplic_Description.enabled(true);
+            }
+            else
+            {
+                SKS_LB_JournalARApplic_Description.enabled(false);
+            }
+            //Sks_Bug_7535 <---
+            // 7655 -->
+            // CR-8793 -->
+            if(sKS_BR_BankReconciliationTrans.parmMatched() == NoYes::No)
+            {
+                AccountDimensionButtongroup.enabled(false);
+                /*  SKS_FDD_13903 -Commented the below code since its not used for CCR
+               // CR-8793 <--
+                if (SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Bank)  // 7626 // CR-9480
+                {
+                    AccountDimensionButtongroup.enabled(true);
+                    SKS_LB_JournalARApplic_SKS_Invoice.enabled(false);
+                    DiscAmount.enabled(false);
+                    editDiscountTakenPercent.enabled(false);
+                }
+                else if (SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Cust || SKS_LB_JournalARApplic.AccountType == LedgerJournalACType::Vend) // CR-9480
+                {
+                    AccountDimensionButtongroup.enabled(true);
+                    SKS_LB_JournalARApplic_SKS_Invoice.enabled(true);
+                    SKS_LB_JournalARApplic_SKS_Invoice.allowEdit(true);
+                    DiscAmount.enabled(true);
+                    editDiscountTakenPercent.enabled(true);
+                }
+                else
+                {*/
+                    //AccountDimensionButtongroup.enabled(false);
+                   /* SKS_LB_JournalARApplic_SKS_Invoice.enabled(false);
+                    DiscAmount.enabled(false);
+                    editDiscountTakenPercent.enabled(false);*/
+                    // CR-8793 -->
+               // }
+            }
+            else
+            {
+                element.enableButtons(false);
+            }
+            // CR-8793 <--
+            // 7655 <--
+            element.enableVATTaxButton(); // CR-8793
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>write</Name>
+						<Source><![CDATA[
+        public void write()
+        {
+            DimensionAttributeValueCombination  dAVC;
+            SKS_LB_JournalARApplic             journalARApplic;
+
+            // 7572 -->
+            if(SKS_LB_JournalARApplic.DefaultDimension == 0) //8655
+            {
+                select firstonly DisplayValue from dAVC
+                        where dAVC.RecId == SKS_LB_JournalARApplic.LedgerDimension;
+
+                SKS_LB_JournalARApplic.DefaultDimension = SKS_LB_JournalARApplic::getAccountDefaultDimension(dAVC.DisplayValue,SKS_LB_JournalARApplic.CustTransDataAreaId,SKS_LB_JournalARApplic.AccountType);
+            }
+            // 7572 <--
+            
+            if(SKS_LB_JournalARApplic.DefaultBankDimension == 0) // 8655
+            {
+                SKS_LB_JournalARApplic.DefaultBankDimension = SKS_LB_JournalARApplic::getDefaultBankAccount_CCR(SKS_LB_JournalARApplic.findSKS_CCR_BankTran()); //8655
+            }
+
+            if (!SKS_LB_JournalARApplic.RecId)
+            {
+                BankTransSum.realValue(SKS_CCR_BankTran_ds.bankSum());
+                Difference.realValue(SKS_CCR_BankTran_ds.difference());
+            }
+            else
+            {
+                select firstonly TransactionAmount,RecId from journalARApplic
+                    where journalARApplic.RecId == SKS_LB_JournalARApplic.RecId;
+
+                if (origTranAmount!= SKS_LB_JournalARApplic.TransactionAmount)
+                {
+                    BankTransSum.realValue(SKS_CCR_BankTran_ds.bankSum());
+                    Difference.realValue(SKS_CCR_BankTran_ds.difference());
+                }
+            }
+
+            element.updateVATTax();// CR-8793
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>initValue</Name>
+						<Source><![CDATA[
+        public void initValue()
+        {
+
+            super();
+
+            if (CustCompany.valueStr())
+            {
+                SKS_LB_JournalARApplic.CustTransDataAreaId = SKS_CCR_BankTran.CustCompany;
+            }
+            else
+            {
+                //SKS_LB_JournalARApplic.CustTransDataAreaId = BankAccountTable::find(sKS_BR_BankReconciliationTrans.parmCompanyBankAccountId()).dataAreaId;
+                SKS_LB_JournalARApplic.CustTransDataAreaId = SKS_CCR_BankTran.company();   //SKS_VSTS_14397
+            }
+            SKS_CCR_BankTran.reread(); // SKS_Bug_9628
+            //SKS_Bug 9414: New lines should not be created with a customer selected
+            if (SKS_CCR_BankTran.CustAccount && SKS_CCR_BankTran.CustCompany)//SKS_Bug_8692
+            {
+                //SKS_Bug_8692 -->
+                changecompany(SKS_CCR_BankTran.CustCompany)
+                {
+                    SKS_LB_JournalARApplic.LedgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(SKS_CCR_BankTran.CustAccount, LedgerJournalACType::Cust);
+                }
+                //SKS_Bug_8692 <--
+            }
+
+            SKS_LB_JournalARApplic.AccountType = LedgerJournalACType::Ledger;// SKS_FDD_13903
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>delete</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Delete record
+        /// </summary>
+        public void delete()
+        {
+            super();
+
+            // Last index will be 0 on the last record of Delete for current line
+            // or on the last line of mutli-select delete.
+            if(SKS_LB_JournalARApplic_ds.recordsMarked().lastIndex() == 0)
+            {
+                SKS_CCR_BankTran_ds.refresh();
+                element.BankTranAccountNumRefresh(SKS_LB_JournalARApplic.SKS_CCR_BankTran);
+                BankTransSum.realValue(SKS_CCR_BankTran_ds.bankSum());
+                Difference.realValue(SKS_CCR_BankTran_ds.difference());
+                SKS_LB_JournalARApplic_ds.research(true);
+                SKS_CCR_BankTran_ds.research(true);// TFS 7264
+            }
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// 7446
+        /// </summary>
+        public void executeQuery()
+        {
+           // SKS_LB_JournalARApplic_ds.query().dataSourceTable(tableNum(DimensionAttributeValueCombination)).clearDynalinks();
+          //  SKS_LB_JournalARApplic_ds.query().dataSourceTable(tableNum(DimensionAttributeValueCombination)).clearRanges();
+
+            this.query().dataSourceName(identifierStr(SKS_LB_JournalARApplic)).addSortField(fieldNum(SKS_LB_JournalARApplic, RecId),SortOrder::Ascending);//8764 CR
+            this.query().dataSourceName(identifierStr(SKS_LB_JournalARApplic)).addSortField(fieldNum(SKS_LB_JournalARApplic, InvoiceDate),SortOrder::Ascending); //7486
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>UpdateStatus</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Updates the status.
+        /// </summary>
+        public void UpdateStatus()
+        {
+            if((SKS_LB_JournalARApplic.TransactionAmount + SKS_LB_JournalARApplic.discApplyAmount) != 0 )
+            {
+                if((SKS_LB_JournalARApplic.TransactionAmount + SKS_LB_JournalARApplic.discApplyAmount + CustParameters::findByCompany(curext()).MaxMSTOverUnder) >= CustTransOpen::find(sks_lb_journalarapplic.custTransOpenRecid).amountCur)//Write to include tolerance
+                {
+                    SKS_LB_JournalARApplic.status = SKS_BR_Status::Full;
+                }
+                else
+                {
+                    SKS_LB_JournalARApplic.status = SKS_BR_Status::partial;
+                }
+            }
+            else
+            {
+                SKS_LB_JournalARApplic.status = SKS_BR_Status::None;//Set status to none
+            }
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>validateWrite</Name>
+						<Source><![CDATA[
+        public boolean validateWrite()
+        {
+            boolean ret;
+        
+            ret = super();
+            
+            SKS_CCR_GLMaintenance  locSKS_CCR_GLMaintenance;
+            SKS_PP_Setup  locSKS_PP_SetUp;
+
+            select firstonly locSKS_PP_SetUp;
+
+            if(locSKS_PP_SetUp.CCRGLAccountRestriction)
+            {
+                MainAccountNum accnum = LedgerDimensionFacade::getMainAccountFromLedgerDimension(SKS_LB_JournalARApplic_SKS_Account.value()).MainAccountId;
+
+                select firstonly CrossCompany: [Company.text()]  locSKS_CCR_GLMaintenance where locSKS_CCR_GLMaintenance.MainAccountNum == accnum;
+
+                if(!locSKS_CCR_GLMaintenance && SKS_LB_JournalARApplic.LedgerDimension != 0)
+                {
+                    error(strFmt("@SKS:SKGCCRGLAccntValidation", accnum));
+                    return false;
+                }
+            }
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>create</Name>
+						<Source><![CDATA[
+        public void create(boolean _append = false)
+        {
+
+            super(_append);
+
+            SKS_LB_JournalARApplic_SKS_Account.parmPostingType(LedgerPostingType::LedgerJournal);
+            SKS_LB_JournalARApplic_SKS_Account.value(0);
+            SKS_LB_JournalARApplic.LedgerDimension = 0;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>LedgerDimension</DataField>
+						<Methods>
+							<Method>
+								<Name>modified</Name>
+								<Source><![CDATA[
+            /// <summary>
+            /// Runs required logic on modification of main account field.
+            /// </summary>
+            /// <remarks>
+            /// Validates whether the current reason code is appropriate for the new main account
+            /// selected. If not, the reason code and comment fields are cleared.
+            /// </remarks>
+            public void modified()
+            {
+                LedgerJournalACType     ledgerJournalACType;
+                boolean                 hasAccountChanged;
+                SKS_PP_Bank             sKS_PP_Bank; // SKS_10238 CR
+
+                if (
+                    SKS_LB_JournalARApplic.AccountType == ledgerJournalACType::Ledger)
+                {
+                    hasAccountChanged = currentMainAccountId != previousMainAccountId;
+
+                    previousMainAccountId = currentMainAccountId;
+                }
+                else
+                {
+                    // force a non-ledger account change because there are no dimensions
+                    hasAccountChanged = true;
+                }
+
+                if (hasAccountChanged)
+                {
+
+                    //This call needs to be made to update the RemittanceLocation reference group field which is modified in the ledgerJournalEngine.accountNumModified() method.
+                    SKS_LB_JournalARApplic_ds.rereadReferenceDataSources();
+
+                }
+
+                SKS_LB_JournalARApplic_ds.refresh();
+
+
+                if (this.getValue())
+                {
+                    ledgerJournalACType = SKS_LB_JournalARApplic_ds.object(fieldNum(SKS_LB_JournalARApplic, AccountType)).getValue();
+
+
+                }
+                SKS_LB_JournalARApplic_ds.rereadReferenceDataSources();
+                // SKS_10238 CR -->
+                if(SKS_LB_JournalARApplic.AccountType == ledgerJournalACType::Bank &&
+                    SKS_LB_JournalARApplic.LedgerDimension)
+                {
+                    sKS_PP_Bank = SKS_PP_Bank::findIHBBank(LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(SKS_LB_JournalARApplic.LedgerDimension), SKS_LB_JournalARApplic.CustTransDataAreaId);
+                    if(sKS_PP_Bank)
+                    {
+                        SKS_LB_JournalARApplic.IHBIntercoCompany = sKS_PP_Bank.SKS_IHBLinkedinhousebankcompany;
+                    }
+                    else
+                    {
+                        SKS_LB_JournalARApplic.IHBIntercoCompany = '';
+                    }
+                }
+                else
+                {
+                    SKS_LB_JournalARApplic.IHBIntercoCompany = '';
+                }
+                SKS_LB_JournalARApplic.IHBIntercoLedgerDimension = 0;
+                // SKS_10238 CR <--
+                SKS_LB_JournalARApplic.TransactionAmount = SKS_CCR_BankTran_ds.difference();
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+		</DataSources>
+		<DataControls xmlns="">
+			<Control>
+				<Name>PostBtn</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            SKS_CCR_GLProcessing_transactionform locSKS_CCR_GLProcessing;
+            boolean                             isPosted;
+            boolean                             isMapped = true;
+
+            super();
+
+            locSKS_CCR_GLProcessing = new SKS_CCR_GLProcessing_transactionform();
+            
+            ttsbegin;   //TFS 7361
+            if(sKS_BR_BankReconciliationTrans.parmDataAreaId() != '') // 10248 -->
+            {
+                changecompany(sKS_BR_BankReconciliationTrans.parmDataAreaId())
+                {
+                    isMapped = locSKS_CCR_GLProcessing.MatchExistingBankTransactions(sKS_BR_BankReconciliationTrans);
+                }
+            }
+            // <-- 10248
+            isPosted = locSKS_CCR_GLProcessing.PostGL(bankTransRecId, sKS_BR_BankReconciliationTrans);
+            if(isMapped && isPosted)
+            {
+                ttscommit; //TFS 7361
+                element.unmarkInUse(bankTransRecId); //SKS_BR_BlockInUse
+                element.getNextRecordInGrid();
+            }
+            else
+            {
+                ttsabort; //TFS 7361
+            }
+            element.dataSource().reread();
+            element.dataSource().refresh();
+            element.dataSource().research(true);
+            SKS_CCR_BankTran_ds.reread();
+            SKS_CCR_BankTran_ds.refresh();
+            SKS_CCR_BankTran_ds.research(true);
+
+            BankAccountTrans_ds.reread();
+            BankAccountTrans_ds.refresh();
+            BankAccountTrans_ds.research(true);
+
+            element.refreshCallerForm(origPosition);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>NextAvailableBtn</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            super();
+
+            element.getNextRecordInGrid();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>BankTrans</Name>
+				<Type>TabPage</Type>
+				<Methods>
+					<Method>
+						<Name>expand</Name>
+						<Source><![CDATA[
+        public void expand()
+        {
+            super();
+           // SKS_LB_JournalARApplic_SKS_AccountType.enter(); // 7440
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SelectMarked</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            for (BankAccountTrans = BankAccountTrans_ds.getFirst(true); BankAccountTrans; BankAccountTrans = BankAccountTrans_ds.getNext())
+            {
+                element.SelectBankAccountTrans(NoYes::Yes);
+            }
+
+            element.bookRefresh();
+            BankAccountTrans = BankAccountTrans_ds.getFirst();
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SelectAll</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            for (BankAccountTrans = BankAccountTrans_ds.getFirst(); BankAccountTrans; BankAccountTrans = BankAccountTrans_ds.getNext())
+            {
+                element.SelectBankAccountTrans(NoYes::Yes);
+            }
+
+            element.bookRefresh();
+            BankAccountTrans = BankAccountTrans_ds.getFirst();
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>DeselectAll</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            for (BankAccountTrans = BankAccountTrans_ds.getFirst(); BankAccountTrans; BankAccountTrans = BankAccountTrans_ds.getNext())
+            {
+                element.SelectBankAccountTrans(NoYes::No);
+            }
+
+            element.bookRefresh();
+            BankAccountTrans = BankAccountTrans_ds.getFirst();
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SplitTrans</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            Args args;
+            FormRun formRun;
+
+            args = new Args();
+
+            // Run Reassign Payments form
+            args.name(formstr(SKS_BR_SplitTrans) );
+            args.record(BankAccountTrans);
+            args.caller(this);
+            formRun = classFactory.formRunClass(Args);
+            formRun.init();
+            formRun.run();
+            formRun.wait(True); // Modal
+
+            super();
+
+            BankAccountTrans_ds.research();
+            element.bookRefresh();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>BankAccountTrans_IsSelected</Name>
+				<Type>CheckBox</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            super();
+            if (difference.realValue()==0)
+            {
+                postbtn.enabled(true);
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SaveTemplate</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            Args    args;
+
+            args = new Args();
+            args.record(SKS_LB_JournalARApplic);
+            args.parm("@SKS4296");
+            SKS_BR_JournalTemplateCopyPeriodic::main(args);
+
+            SKS_LB_JournalARApplic_ds.research();
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>AccountDimension</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        public void clicked()
+        {
+            FormRun formRun;
+            MenuFunction menuFunction;
+            Args args;
+
+            // Launch the Dimension form modally, this form will change the default dimension field on the record
+            menuFunction = new MenuFunction(this.menuitemname(), this.menuItemType());
+            args = new Args();
+            args.record(SKS_LB_JournalARApplic);
+            formRun = menuFunction.create(args);
+            formRun.run();
+            formRun.wait(true);
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SKS_LB_JournalARApplic_SKS_AccountType</Name>
+				<Type>ComboBox</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+
+            ret = super();
+            ;
+            element.enableVATTaxButton();
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SKS_LB_JournalARApplic_SKS_Account</Name>
+				<Type>SegmentedEntry</Type>
+				<Methods>
+					<Method>
+						<Name>checkUseCustomLookup</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Checks use custom lookup.
+        /// </summary>
+        /// <param name = "_accountTypeEnumValue">Account type enum value</param>
+        /// <param name = "_secondaryAccountTypeEnumValue">Secondary account type enum value</param>
+        /// <returns>Returns status</returns>
+        public boolean checkUseCustomLookup(int _accountTypeEnumValue, int _secondaryAccountTypeEnumValue)
+        {
+            boolean ret;
+
+            ret = super(_accountTypeEnumValue, _secondaryAccountTypeEnumValue);
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>updateUseCustomLookup</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Updates use custom lookup
+        /// </summary>
+        public void updateUseCustomLookup()
+        {
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+
+            ret = super();
+
+            // SKS_LB_JournalARApplic.TransactionAmount = 0; //CR-8779
+            SKS_LB_JournalARApplic.TransactionAmount = SKS_CCR_BankTran_ds.difference();
+            TransactionAmount.modified();// CR-8779
+            element.updateVATTax();// CR-8793
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>onSegmentChanged</Name>
+						<Source><![CDATA[
+        public void onSegmentChanged(DimensionControlSegment _segment)
+        {
+            if (_segment.parmDimensionAttribute().RecId == mainAccountDimAttr)
+            {
+                previousMainAccountId = currentMainAccountId;
+            }
+
+            super(_segment);
+
+            currentMainAccountId = element.onSegmentChangedForPrimaryAccount(SKS_LB_JournalARApplic_SKS_Account,_segment,currentMainAccount,SKS_LB_JournalARApplic,bankTransRecId);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>initialize</Name>
+						<Source><![CDATA[
+        protected void initialize()
+        {
+            boolean skipDimLookupMethod = true;
+            SysGlobalCache globalCache;
+
+            globalCache = ClassFactory.globalCache();
+            globalCache.set(curuserid(), 'SKS_DimensionDynamicAccountController', skipDimLookupMethod);
+
+            SKS_LB_JournalARApplic_SKS_Account.value(0);
+            SKS_LB_JournalARApplic.LedgerDimension = 0;
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>lookupReference</Name>
+						<Source><![CDATA[
+        public Common lookupReference()
+        {
+            Common ret;
+          
+            ret = super();
+
+            boolean skipDimLookupMethod = true;
+            SysGlobalCache globalCache;
+
+            globalCache = ClassFactory.globalCache();
+            skipDimLookupMethod = globalCache.get(curuserid(), 'SKS_DimensionDynamicAccountController', skipDimLookupMethod);
+            if(skipDimLookupMethod)
+            {
+                globalcache.remove(curuserid(), 'SKS_DimensionDynamicAccountController');
+            }
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>TransactionAmount</Name>
+				<Type>Real</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+            int     position; // 7446
+            origTranAmount = SKS_LB_JournalARApplic.TransactionAmount;
+
+            ret = super();
+            SKS_LB_JournalARApplic_ds.write();
+
+            SKS_CCR_BankTran_ds.refresh();
+            BankTransSum.update();
+            Difference.update();
+            position = SKS_LB_journalARApplic_ds.getPosition();// 7446
+            SKS_LB_journalARApplic_ds.refresh();
+            SKS_LB_journalARApplic_ds.setPosition(position);// 7446
+            //7653-->
+            BankTransSum.realValue(SKS_CCR_BankTran_ds.bankSum());
+            Difference.realValue(SKS_CCR_BankTran_ds.difference());
+            if(SKS_CCR_BankTran_ds.bankSum() != 0 && SKS_CCR_BankTran_ds.difference() == 0)
+            {
+                PostBtn.enabled(true);
+            }
+            else
+            {
+                PostBtn.enabled(false);
+            }
+            //7653 <--
+            SKS_LB_journalARApplic_ds.updatestatus();
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>SKS_LB_JournalARApplic_CustTransDataAreaId</Name>
+				<Type>String</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Modify the <c>SKS_LB_JournalARApplic</c> table based on custTransDataAreaId
+        /// </summary>
+        /// <returns>Return true</returns>
+        public boolean modified()
+        {
+            boolean ret;
+
+            ret = super();
+
+            SKS_LB_JournalARApplic_SKS_Account.parmDataAreaId(SKS_LB_JournalARApplic.CustTransDataAreaId);
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources>
+		<AxFormDataSource xmlns="">
+			<Name>SKS_CCR_BankTran</Name>
+			<Table>SKS_CCR_BankTran</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>AccountId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AccountStatementDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AccountStatementNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AuthorizationCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankCustomerNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankTranIntermRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankTranRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankTranType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BaseAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BookNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CardNumber</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CCRHeaderRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CommissionAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreateGL</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CreditCardType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustAccount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustCompany</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustomerRuleStep</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustRemitAnalysisRule</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DefaultDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>EbankRecMatchingRuleGroupId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ExchangeAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>FileDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Filename</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>FileTranType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>GLCreationCompany</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>GLMappingRuleGroupId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>GLMatchOrCreate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ImportedStatementDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ImportedStatementNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ImportTransCurrency</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IntermMatch</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IntermPaymentJournalNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>InUse</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>InUseBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IVAAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>JournalName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LedgerJournalRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LineNumInFile</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ManualReconciliationID</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchConfidence</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchDefaultRule</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Matched</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchedType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchIndicator</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchingRuleGroupActionStep</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchingRuleGroupId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MatchStep</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>MultipleMatches</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>OrigBankVoucher</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>OriginalStatementRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ParsedValue</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ParseRuleId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PaymentJournalNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PaymentMatch</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PurchaseAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RemitenceSettlementActionStep</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReteivaAmountNeg</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReteivaAmountPos</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RevVoucher</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SessionId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SessionLoginDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SettlementAction</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SettlementType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TaxRetentionAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TerminalCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TranAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TranCurrencyAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TranDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TranDescription</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TranDescriptionUser</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TransactionFeesAmt</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TypeOfMovement</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>UniqueCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>UserBlockId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ValueDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Voucher</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>VoucherReceiptNumber</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<CrossCompanyAutoQuery>Yes</CrossCompanyAutoQuery>
+			<AllowDelete>No</AllowDelete>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+		<AxFormDataSource xmlns="">
+			<Name>BankAccountTrans</Name>
+			<Table>BankAccountTrans</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>AccountId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AccountingCurrencyAmountCorrect_RU</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AccountStatement</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AccountStatementDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AcknowledgementDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AmountCorrect</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AmountCur</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AmountMST</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AmountReportingCurrency</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankPaymentRegistrationNum_LV</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankTransAmountCur</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankTransCurrencyCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankTransType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Cancel</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CancelPending</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CentralBankPurposeCode_LV</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CentralBankPurposeText_LV</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ChequeNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CorrespondentCountry_LV</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>createdBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>createdDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CurrencyCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>dataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DefaultDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DepositNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Included</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LedgerDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LedgerTransType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Manual</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PaymentMode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PaymReference</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReasonRefRecID</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Reconciled</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RefRecId_RU</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportingCurrencyAmountCorrect_RU</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ReportingCurrencyAmount_RU</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_AlreadyMarked</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_BankTranRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_IntermMatch</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_IsSelected</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_ManualReconciliationID</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_MarkedFromReconcileStatement</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_AlreadyMarked</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_BankTranRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_IntermMatch</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_IsSelected</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_ManualReconciliationID</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_MarkedFromReconcileStatement</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_EFTAP_InboundRefNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_IHB_AppropriationCalculated</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_IHB_InterestCalculated</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_IHB_StatementDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_IHB_StatementNumber</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_IHB_ValueDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SourceRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SourceTableId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TaxGroup</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TaxItemGroup</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TransDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Txt</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Voucher</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<CrossCompanyAutoQuery>Yes</CrossCompanyAutoQuery>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+		<AxFormDataSource xmlns="">
+			<Name>SKS_LB_JournalARApplic</Name>
+			<Table>SKS_LB_JournalARApplic</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<AllowEdit>No</AllowEdit>
+					<DataField>AccountType</DataField>
+					<Enabled>No</Enabled>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AlreadyMarked</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AltInvLookupRef</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AltInvLookupType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ApplyDiscount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AutoCRAutoRev</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AutoCROffsetLedgerDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AutoRevLedgerDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>AutoRevOffsetLedgerDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankRecCustPostingProfile</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankRecPrepayment</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BRGJPostingDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>createdBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>createdDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustTransDataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustTransOpenRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CustTransRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DefaultBankDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DefaultDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Description</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DiscApplyAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>DiscountTakenPercent</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>FileRecord</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>FullSettlement</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IHBIntercoAccountType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IHBIntercoCompany</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IHBIntercoLedgerDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>IHB_InterestRepayment</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Invoice</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>InvoiceDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>InvoiceDueDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LBInvoice</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LedgerDimension</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>modifiedBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>modifiedDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RevReasonCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SettleAmountCur</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_BR_BankTran</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_CCR_BankTran</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SKS_LB_JournalARRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<AllowEdit>No</AllowEdit>
+					<DataField>Status</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TaxGroup</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TaxItemGroup</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TrackingInvoices</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TransactionAmount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>VendTransOpenRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>VendTransRecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>WriteOff</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>WriteOffId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<CrossCompanyAutoQuery>Yes</CrossCompanyAutoQuery>
+			<JoinSource>SKS_CCR_BankTran</JoinSource>
+			<LinkType>Active</LinkType>
+			<InsertAtEnd>No</InsertAtEnd>
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+	</DataSources>
+	<Design>
+		<Caption xmlns="">@SKS4284</Caption>
+		<Pattern xmlns="">Custom</Pattern>
+		<ViewEditMode xmlns="">Edit</ViewEditMode>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormTabControl">
+				<Name>Tab</Name>
+				<AlignControl>No</AlignControl>
+				<ElementPosition>1073741823</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<Type>Tab</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>Header</Name>
+						<ElementPosition>715827882</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>TabPage</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormActionPaneControl">
+								<Name>ActionPane</Name>
+								<ElementPosition>1073741822</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>SizeToAvailable</HeightMode>
+								<Type>ActionPane</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormActionPaneTabControl">
+										<Name>ActionPaneTab</Name>
+										<ElementPosition>1431655764</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>ActionPaneTab</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>ButtonGroup</Name>
+												<ElementPosition>1073741822</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>SizeToAvailable</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormButtonControl">
+														<Name>PostBtn</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<ElementPosition>1431655764</ElementPosition>
+														<Enabled>No</Enabled>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>SizeToAvailable</HeightMode>
+														<HelpText>@SKS4329</HelpText>
+														<Type>Button</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>SizeToAvailable</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<Text>@SYS41360</Text>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+												<Columns>2</Columns>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>NextAvailableButtonGroup</Name>
+												<AutoDeclaration>Yes</AutoDeclaration>
+												<ElementPosition>1610612733</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>SizeToAvailable</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormButtonControl">
+														<Name>NextAvailableBtn</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<ElementPosition>1431655764</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>SizeToAvailable</HeightMode>
+														<HelpText>@SKS4327</HelpText>
+														<Type>Button</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>SizeToAvailable</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<Text>@SKS4304</Text>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+												<Columns>2</Columns>
+											</AxFormControl>
+										</Controls>
+										<AlignChild>No</AlignChild>
+										<AlignChildren>No</AlignChildren>
+										<ArrangeMethod>Vertical</ArrangeMethod>
+									</AxFormControl>
+								</Controls>
+								<AlignChild>No</AlignChild>
+								<AlignChildren>No</AlignChildren>
+								<ArrangeMethod>Vertical</ArrangeMethod>
+								<Style>Strip</Style>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGridControl">
+								<Name>Grid</Name>
+								<ElementPosition>1610612733</ElementPosition>
+								<Enabled>No</Enabled>
+								<FilterExpression>%1</FilterExpression>
+								<Height>100</Height>
+								<HeightMode>Manual</HeightMode>
+								<Type>Grid</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>StatementAmount</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>252645134</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>TranAmount</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4412</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>PaymentAmount</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>252645134</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>TranCurrencyAmount</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>Import currency amount</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_CCR_BankTran_TransCurrency</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>TransCurrency</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>Import currency</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>BankTransSum</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>378967701</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<CacheDataMethod>Yes</CacheDataMethod>
+										<DataMethod>bankSum</DataMethod>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4308</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>Difference</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>505290268</ElementPosition>
+										<Enabled>No</Enabled>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<CacheDataMethod>Yes</CacheDataMethod>
+										<DataMethod>difference</DataMethod>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4312</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>Company</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>631612835</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>dataAreaId</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4411</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccount</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>757935402</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>AccountId</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4319</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>Currency</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>884257969</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataMethod>getOrigStatementCurrency</DataMethod>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>Bank currency</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>StatementDate</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1010580536</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Date</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ImportedStatementDate</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS3108</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>StatementNumber</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1136903103</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ImportedStatementNum</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS3106</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>ImportBankNumber</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1263225670</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>BankNum</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS521</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>ImportCustNumber</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1389548237</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>BankCustomerNum</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS2259</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>ImportTransType</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1515870804</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>FileTranType</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS518</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>CustCompany</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1642193371</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CustCompany</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4310</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>Customer</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1768515938</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CustAccount</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+										<Label>@SKS4311</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_BR_BankTran_PaymentJournalNum</Name>
+										<ElementPosition>1894838505</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<Visible>No</Visible>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>PaymentJournalNum</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_BR_BankTran_Voucher</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>2021161072</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>Voucher</DataField>
+										<DataSource>SKS_CCR_BankTran</DataSource>
+									</AxFormControl>
+								</Controls>
+								<DataSource>SKS_CCR_BankTran</DataSource>
+							</AxFormControl>
+						</Controls>
+						<Caption>@SKS4299</Caption>
+						<Scrollbars>Auto</Scrollbars>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>BankTrans</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1073741823</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>SizeToAvailable</HeightMode>
+						<Type>TabPage</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormActionPaneControl">
+								<Name>ActionPane1</Name>
+								<ElementPosition>1073741822</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>SizeToAvailable</HeightMode>
+								<Type>ActionPane</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormActionPaneTabControl">
+										<Name>ActionPaneTab1</Name>
+										<ElementPosition>1431655764</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>ActionPaneTab</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>ButtonGroup1</Name>
+												<ElementPosition>1431655764</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>Auto</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>Auto</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormMenuFunctionButtonControl">
+														<Name>LedgerTransVoucher</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<ElementPosition>1431655764</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>Auto</HeightMode>
+														<Type>MenuFunctionButton</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>Auto</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<DataSource>BankAccountTrans</DataSource>
+														<MenuItemName>LedgerTransVoucher1</MenuItemName>
+														<Text>@SKS4033</Text>
+													</AxFormControl>
+													<AxFormControl xmlns=""
+														i:type="AxFormButtonControl">
+														<Name>SelectMarked</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<Type>Button</Type>
+														<FormControlExtension
+															i:nil="true" />
+														<Text>@SKS:SKGSelectMarked</Text>
+													</AxFormControl>
+													<AxFormControl xmlns=""
+														i:type="AxFormButtonControl">
+														<Name>SelectAll</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<Type>Button</Type>
+														<FormControlExtension
+															i:nil="true" />
+														<Text>@SYS63238</Text>
+													</AxFormControl>
+													<AxFormControl xmlns=""
+														i:type="AxFormButtonControl">
+														<Name>DeselectAll</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<Type>Button</Type>
+														<FormControlExtension
+															i:nil="true" />
+														<Text>@SYS128826</Text>
+													</AxFormControl>
+													<AxFormControl xmlns=""
+														i:type="AxFormButtonControl">
+														<Name>SplitTrans</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<HelpText>@SKS6759</HelpText>
+														<Type>Button</Type>
+														<FormControlExtension
+															i:nil="true" />
+														<Text>@SKS6758</Text>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+											</AxFormControl>
+										</Controls>
+										<AlignChild>No</AlignChild>
+										<AlignChildren>No</AlignChildren>
+										<ArrangeMethod>Vertical</ArrangeMethod>
+									</AxFormControl>
+								</Controls>
+								<AlignChild>No</AlignChild>
+								<AlignChildren>No</AlignChildren>
+								<ArrangeMethod>Vertical</ArrangeMethod>
+								<Style>Strip</Style>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGridControl">
+								<Name>Grid1</Name>
+								<ElementPosition>1610612733</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<Height>200</Height>
+								<HeightMode>Manual</HeightMode>
+								<Type>Grid</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>BankAccountTrans_IsSelected</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>306783378</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>CheckBox</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<BackgroundColor>WindowBackground</BackgroundColor>
+										<DataField>SKS_CCR_IsSelected</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+										<Label>@SKS4335</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormCheckBoxControl">
+										<Name>BankAccountTrans_Included</Name>
+										<ElementPosition>613566756</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>CheckBox</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<Visible>No</Visible>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<BackgroundColor>WindowBackground</BackgroundColor>
+										<DataField>Included</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_BankTransType</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>766958445</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>BankTransType</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>BankAccountTrans_TransDate</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>920350134</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Date</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>TransDate</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_Txt</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>1073741823</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>Txt</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_CurrencyCode</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CurrencyCode</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>BankAccountTrans_AmountCur</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1227133512</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<HelpText>@SKS:SKGStmtReconTransTransAmtHelpText</HelpText>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>AmountCur</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+										<Label>@SYS53245</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_BankTransCurrencyCode</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>BankTransCurrencyCode</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>BankAccountTrans_BankTransAmountCur</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>1380525201</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<HelpText>@SKS:SKGStmtReconTransBankAmtHelpText</HelpText>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>BankTransAmountCur</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+										<Label>Amount in transaction currency</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_Voucher</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>1533916890</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>Voucher</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_DepositNum</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>1687308579</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>DepositNum</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_ChequeNum</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>1840700268</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>ChequeNum</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_PaymReference</Name>
+										<AllowEdit>No</AllowEdit>
+										<ElementPosition>1994091957</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>PaymReference</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>BankAccountTrans_SKS_EFTAP_InboundRefNum</Name>
+										<AllowEdit>No</AllowEdit>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>SKS_EFTAP_InboundRefNum</DataField>
+										<DataSource>BankAccountTrans</DataSource>
+									</AxFormControl>
+								</Controls>
+								<DataSource>BankAccountTrans</DataSource>
+							</AxFormControl>
+						</Controls>
+						<Caption>@SKS4307</Caption>
+						<Scrollbars>Auto</Scrollbars>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>NewJournal</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1789569705</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>SizeToAvailable</HeightMode>
+						<Type>TabPage</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormActionPaneControl">
+								<Name>ActionPane3</Name>
+								<ElementPosition>1073741822</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>SizeToAvailable</HeightMode>
+								<Type>ActionPane</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormActionPaneTabControl">
+										<Name>ActionPaneTab3</Name>
+										<ElementPosition>1431655764</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>ActionPaneTab</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<Controls>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>NewDeleteGroup</Name>
+												<ElementPosition>536870910</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>Auto</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>Auto</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormCommandButtonControl">
+														<Name>NewButton</Name>
+														<ElementPosition>1073741822</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>Auto</HeightMode>
+														<Type>CommandButton</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>Auto</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<ButtonDisplay>TextWithImageLeft</ButtonDisplay>
+														<Command>New</Command>
+														<NormalImage>New</NormalImage>
+														<Primary>Yes</Primary>
+													</AxFormControl>
+													<AxFormControl xmlns=""
+														i:type="AxFormCommandButtonControl">
+														<Name>DeleteButton</Name>
+														<ElementPosition>1610612733</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>Auto</HeightMode>
+														<Type>CommandButton</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>Auto</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<ButtonDisplay>TextWithImageLeft</ButtonDisplay>
+														<Command>DeleteRecord</Command>
+														<NeedsRecord>Yes</NeedsRecord>
+														<NormalImage>Delete</NormalImage>
+														<Primary>Yes</Primary>
+														<SaveRecord>No</SaveRecord>
+														<Text>@sys14425</Text>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>TemplateButtongroup</Name>
+												<AutoDeclaration>Yes</AutoDeclaration>
+												<ElementPosition>1073741820</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>SizeToAvailable</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormMenuButtonControl">
+														<Name>MenuButton</Name>
+														<ElementPosition>1431655764</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>Auto</HeightMode>
+														<Type>MenuButton</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>Auto</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<Controls>
+															<AxFormControl xmlns=""
+																i:type="AxFormMenuFunctionButtonControl">
+																<Name>SKS_BR_ApplyTemplate</Name>
+																<Type>MenuFunctionButton</Type>
+																<FormControlExtension
+																	i:nil="true" />
+																<DataSource>SKS_CCR_BankTran</DataSource>
+																<MenuItemName>SKS_BR_ApplyTemplate</MenuItemName>
+															</AxFormControl>
+															<AxFormControl xmlns=""
+																i:type="AxFormButtonControl">
+																<Name>SaveTemplate</Name>
+																<ElementPosition>1610612733</ElementPosition>
+																<FilterExpression>%1</FilterExpression>
+																<HeightMode>SizeToAvailable</HeightMode>
+																<HelpText>@SKS4296</HelpText>
+																<Type>Button</Type>
+																<VerticalSpacing>-1</VerticalSpacing>
+																<WidthMode>SizeToAvailable</WidthMode>
+																<FormControlExtension
+																	i:nil="true" />
+																<Text>@SKS4296</Text>
+															</AxFormControl>
+														</Controls>
+														<Text>@SKS4300</Text>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>AccountDimensionButtongroup</Name>
+												<AutoDeclaration>Yes</AutoDeclaration>
+												<ElementPosition>1342177275</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>SizeToAvailable</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormMenuFunctionButtonControl">
+														<Name>AccountDimension</Name>
+														<ElementPosition>1431655764</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>SizeToAvailable</HeightMode>
+														<Type>MenuFunctionButton</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>SizeToAvailable</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<MenuItemName>SKS_BR_BankAccountTransDimension</MenuItemName>
+														<NeedsRecord>Yes</NeedsRecord>
+														<Text>@SKS4398</Text>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>InquiriesButtongroup</Name>
+												<AutoDeclaration>Yes</AutoDeclaration>
+												<ElementPosition>1879048185</ElementPosition>
+												<FilterExpression>%1</FilterExpression>
+												<HeightMode>SizeToAvailable</HeightMode>
+												<Type>ButtonGroup</Type>
+												<VerticalSpacing>-1</VerticalSpacing>
+												<WidthMode>SizeToAvailable</WidthMode>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormMenuFunctionButtonControl">
+														<Name>SKS_BR_InvoiceInquiry</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<ElementPosition>1431655764</ElementPosition>
+														<FilterExpression>%1</FilterExpression>
+														<HeightMode>Auto</HeightMode>
+														<Type>MenuFunctionButton</Type>
+														<VerticalSpacing>-1</VerticalSpacing>
+														<WidthMode>Auto</WidthMode>
+														<FormControlExtension
+															i:nil="true" />
+														<MenuItemName>SKS_BR_InvoiceInquiry</MenuItemName>
+														<NeedsRecord>Yes</NeedsRecord>
+													</AxFormControl>
+												</Controls>
+												<ArrangeMethod>Vertical</ArrangeMethod>
+											</AxFormControl>
+											<AxFormControl xmlns=""
+												i:type="AxFormButtonGroupControl">
+												<Name>VATTaxButtonGroup</Name>
+												<Type>ButtonGroup</Type>
+												<FormControlExtension
+													i:nil="true" />
+												<Controls>
+													<AxFormControl xmlns=""
+														i:type="AxFormMenuFunctionButtonControl">
+														<Name>SKS_BR_VATTaxForm</Name>
+														<AutoDeclaration>Yes</AutoDeclaration>
+														<Type>MenuFunctionButton</Type>
+														<FormControlExtension
+															i:nil="true" />
+														<DataSource>SKS_LB_JournalARApplic</DataSource>
+														<MenuItemName>SKS_BR_VATTaxForm</MenuItemName>
+														<NeedsRecord>Yes</NeedsRecord>
+													</AxFormControl>
+												</Controls>
+											</AxFormControl>
+										</Controls>
+										<AlignChild>No</AlignChild>
+										<AlignChildren>No</AlignChildren>
+										<ArrangeMethod>Vertical</ArrangeMethod>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+									</AxFormControl>
+								</Controls>
+								<AlignChild>No</AlignChild>
+								<AlignChildren>No</AlignChildren>
+								<ArrangeMethod>Vertical</ArrangeMethod>
+								<Style>Strip</Style>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGridControl">
+								<Name>Grid3</Name>
+								<ElementPosition>1610612733</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<Height>250</Height>
+								<HeightMode>Manual</HeightMode>
+								<Type>Grid</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>SKS_LB_JournalARApplic_SKS_AccountType</Name>
+										<ElementPosition>373475416</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>ComboBox</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>AccountType</DataField>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+										<Items />
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormSegmentedEntryControl">
+										<Name>SKS_LB_JournalARApplic_SKS_Account</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>466844270</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>SegmentedEntry</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension>
+											<Name>SegmentedEntryControl</Name>
+											<ExtensionComponents />
+											<ExtensionProperties>
+												<AxFormControlExtensionProperty>
+													<Name>parmControllerClassName</Name>
+													<Type>String</Type>
+													<TypeName>str</TypeName>
+													<Value>SKS_DimensionDynamicAccountController</Value>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmIsDefaultAccount</Name>
+													<Type>Enum</Type>
+													<TypeName>boolean</TypeName>
+													<Value>False</Value>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmValidateBlockedForManualEntry</Name>
+													<Type>Enum</Type>
+													<TypeName>NoYes</TypeName>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmLockMainAccountSegment</Name>
+													<Type>Enum</Type>
+													<TypeName>NoYes</TypeName>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmPostingType</Name>
+													<Type>Enum</Type>
+													<TypeName>LedgerPostingType</TypeName>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmIncludeTotalAccounts</Name>
+													<Type>Enum</Type>
+													<TypeName>NoYes</TypeName>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmIncludeFinancialAccounts</Name>
+													<Type>Enum</Type>
+													<TypeName>NoYes</TypeName>
+												</AxFormControlExtensionProperty>
+												<AxFormControlExtensionProperty>
+													<Name>parmAccountTypeEnumName</Name>
+													<Type>String</Type>
+													<Value>AccountType</Value>
+												</AxFormControlExtensionProperty>
+											</ExtensionProperties>
+										</FormControlExtension>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+										<ReferenceField>LedgerDimension</ReferenceField>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>AccountName</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>560213124</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<CacheDataMethod>Yes</CacheDataMethod>
+										<DataMethod>accountName</DataMethod>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_LB_JournalARApplic_Description</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>Description</DataField>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormRealControl">
+										<Name>TransactionAmount</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>1400532810</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>Real</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>TransactionAmount</DataField>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+										<Label>@SKS4295</Label>
+										<NoOfDecimals>-1</NoOfDecimals>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>SKS_LB_JournalARApplic_CustTransDataAreaId</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<ElementPosition>280106562</ElementPosition>
+										<FilterExpression>%1</FilterExpression>
+										<HeightMode>Auto</HeightMode>
+										<Type>String</Type>
+										<VerticalSpacing>-1</VerticalSpacing>
+										<WidthMode>Auto</WidthMode>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>CustTransDataAreaId</DataField>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+										<Label>@SKS4411</Label>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>SKS_LB_JournalARApplic_BRGJPostingDate</Name>
+										<Type>Date</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>BRGJPostingDate</DataField>
+										<DataSource>SKS_LB_JournalARApplic</DataSource>
+									</AxFormControl>
+								</Controls>
+								<DataSource>SKS_LB_JournalARApplic</DataSource>
+							</AxFormControl>
+						</Controls>
+						<Caption>@SKS4303</Caption>
+						<Scrollbars>Auto</Scrollbars>
+					</AxFormControl>
+				</Controls>
+				<AlignChild>No</AlignChild>
+				<ArrangeMethod>Vertical</ArrangeMethod>
+				<Scrollbars>Yes</Scrollbars>
+				<Style>FastTabs</Style>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

@@ -1,0 +1,555 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_MCRPaymentService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <b>SKS_CC_MCRPaymentService</b> class contains functions for an external eCommerce
+/// site to integrate with a D365 Call Center sales order for a PayFabric Connector.
+/// </summary>
+using Retail=Microsoft.Dynamics.Retail;
+using RetailConst=Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants;
+
+class SKS_CC_MCRPaymentService
+{
+    CreditCardProcessors activeCreditCardProcessor;
+    DataAreaId company;
+    SalesId salesId;
+    SalesTable salesTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_MCRPaymentService construct()
+    {
+        return new SKS_CC_MCRPaymentService();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RunService</Name>
+				<Source><![CDATA[
+    public static boolean RunService(SKS_CC_MCRPaymentsContract _paymentsContract)
+    {
+        SKS_CC_MCRPaymentService paymentsService = SKS_CC_MCRPaymentService::construct();        
+
+        boolean success = paymentsService.run(_paymentsContract);
+
+        return success;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public boolean run(SKS_CC_MCRPaymentsContract _paymentsContract)
+    {
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        company = _paymentsContract.parmDataAreaId();
+        salesId = _paymentsContract.parmSalesId();
+        if (!company || !salesId || !_paymentsContract)
+        {
+            throw error(Error::missingParameter(null));
+        }
+
+        if (!CompanyInfo::findDataArea(company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", company));
+        }
+
+        changecompany(company)
+        {
+            salesTable = SalesTable::find(salesId);
+            if (!salesTable)
+            {
+                throw error(strFmt("@SKS:SKGCCSalesOrderNbrSpecifiedNotValid", salesId));
+            }
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }
+
+            activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+            CreditCardPaymentCardTokenize cardTokenize = CreditCardPaymentCardTokenize::construct();
+            cardTokenize.init(activeCreditCardProcessor.Name);
+
+            List processedPayments, unprocessedPayments;
+            processedPayments = _paymentsContract.getProcessedPayments();
+            unprocessedPayments = _paymentsContract.getUnprocessedPayments();
+
+            ttsbegin;
+            ListEnumerator leProcessedPayments = processedPayments.getEnumerator();
+            while (leProcessedPayments.moveNext())
+            {
+                SKS_CC_MCRPaymentContract paymentContract = leProcessedPayments.current();
+                if (!paymentContract)
+                {
+                    throw error(strFmt("@SKS:SKGCCPaymentContractNotSpecifiedErrorMsg", salesTable.SalesId));
+                }
+                
+                this.createProcessedPayment(paymentContract);                
+            }
+
+            ListEnumerator leUnprocessedPayments = unprocessedPayments.getEnumerator();
+            while (leUnprocessedPayments.moveNext())
+            {
+                SKS_CC_MCRPaymentContract paymentContract = leUnprocessedPayments.current();
+                if (!paymentContract)
+                {
+                    throw error(strFmt("@SKS:SKGCCPaymentContractNotSpecifiedErrorMsg", salesTable.SalesId));
+                }
+
+                this.createUnprocessedPayment(paymentContract);
+            }
+            ttscommit;
+        }
+        
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createProcessedPayment</Name>
+				<Source><![CDATA[
+    protected void createProcessedPayment(SKS_CC_MCRPaymentContract _paymentContract)
+    {
+        str payFabricTransactionKey;
+        payFabricTransactionKey = _paymentContract.parmPayFabricTransactionKey();
+        if (!payFabricTransactionKey)
+        {
+            throw error(strFmt("@SKS:SKGCCPFTransKeyNotSpecifiedErrorMsg", salesTable.SalesId));
+        }
+
+        MCRRetailStoreTenderTypeId tenderTypeId = _paymentContract.parmTenderTypeId();
+        if (!_paymentContract.parmTenderTypeId())
+        {
+            throw error(strFmt("@SKS:SKGCCPaymMethodNotSpecifiedErrorMsg", salesTable.SalesId));
+        }
+
+        SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(salesTable.InvoiceAccount);
+        pfWalletHandler.setPayFabricCustomerNbr();        
+
+        SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();
+
+        Retail.PaymentSDK.Portable.Response response = eCommIntHandler.getPayFabricTrans(payFabricTransactionKey);
+        CreditCardPaymentErrors errors = CreditCardPaymentErrors::fromPaymentErrors(response.get_Errors());
+
+        if (errors.count() != 0)
+        {
+            throw error(strFmt("@SKS:SKGCCGetPFTxnErrMsg", payFabricTransactionKey, '\n', strReplace(errors.toString(), '\n', '; ')));
+        }
+                
+        boolean isPrePay;
+        Retail.PaymentSDK.Portable.PaymentProperty[] responseProperties = response.get_Properties();
+                
+        if (responseProperties != null)
+        {
+            Retail.PaymentSDK.Portable.PaymentProperty captureResponseProperty;
+
+            captureResponseProperty = CreditCardConnectorSetup::findPropertyByName(
+                        responseProperties,
+                        Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_CaptureResponse(),
+                        Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_Properties());
+
+            if (captureResponseProperty)
+            {
+                isPrePay = true;
+            }
+        }
+
+        CreditCardProviderAuthorizationResult authResult;
+        CreditCardProviderCaptureResult captureResult;
+        CreditCardUniqueCardId cardTokenFromPF;
+        AmountCur paymentAmount;
+
+        if (isPrePay)
+        {
+            captureResult = eCommIntHandler.getPayFabricCaptureTrans(payFabricTransactionKey, response);
+            if (captureResult)
+            {
+                cardTokenFromPF = captureResult.parmCreditCardUniqueCardId();
+            }
+
+            paymentAmount = captureResult.parmTransactionAmount();
+        }
+        else
+        {
+            authResult = eCommIntHandler.getPayFabricPreAuthTrans(payFabricTransactionKey, response);
+            if (authResult)
+            {
+                cardTokenFromPF = authResult.parmCreditCardUniqueCardId();
+            }
+
+            paymentAmount = authResult.parmTransactionAmount();
+        }
+
+        if (paymentAmount <= 0)
+        {
+            throw error(strFmt("@SKS:SKGCCZeroPaymAmtErrorMsg", payFabricTransactionKey, salesTable.SalesId));
+        }
+
+        if (!cardTokenFromPF)
+        {
+            throw error(strFmt("@SKS:SKGCCPFCardTokenNotFound", payFabricTransactionKey, salesTable.SalesId));
+        }
+
+        CreditCardCust creditCardCust = this.createUpdateCreditCardCust(cardTokenFromPF);
+
+        eCommIntHandler.parmCreditCardCust(creditCardCust);
+        CreditCardPaymentProperties requestProp = eCommIntHandler.getRequestProperties();
+        str requestXmlStr = requestProp.toXmlString();
+        
+        MCRCustPaymTable mcrCustPaymTable = this.createMCRCustPaymTable(
+            _paymentContract,
+            creditCardCust,
+            paymentAmount,
+            isPrePay,
+            true);
+
+        if (isPrePay)
+        {
+            CreditCardAuthTrans creditCardAuthTransApproval = CreditCard::sKS_CC_recordCapture(
+                captureResult,
+                null,
+                '',
+                activeCreditCardProcessor.RecId,
+                true,
+                true,
+                "@SKS:SKGCCECommIntGetTransDescMsg",
+                requestXmlStr,
+                false,
+                mcrCustPaymTable,
+                null);
+
+            LedgerJournalNameId journalName = _paymentContract.parmLedgerJournalNameId();
+            if (!journalName)
+            {
+                LedgerJournalName ledgerJournalName;
+                select firstonly RecId, JournalName from ledgerJournalName
+                            where ledgerJournalName.JournalType == LedgerJournalType::CustPayment;
+
+                if (ledgerJournalName.RecId)
+                {
+                    journalName = ledgerJournalName.JournalName;
+                }
+            }
+
+            this.postMCRCustPaymTableToLedgerJournal(
+                mcrCustPaymTable,
+                salesTable,
+                journalName);
+        }
+        else
+        {
+            CreditCard::sKS_CC_RecordAuthorization(
+                authResult,
+                salesTable,
+                activeCreditCardProcessor.RecId,
+                true,
+                "@SKS:SKGCCECommIntGetTransDescMsg",
+                requestXmlStr,
+                false,
+                mcrCustPaymTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUnprocessedPayment</Name>
+				<Source><![CDATA[
+    protected void createUnprocessedPayment(SKS_CC_MCRPaymentContract _paymentContract)
+    {
+        MCRRetailStoreTenderTypeId tenderTypeId = _paymentContract.parmTenderTypeId();
+        if (!tenderTypeId)
+        {
+            throw error(strFmt("@SKS:SKGCCPaymMethodNotSpecifiedErrorMsg", salesTable.SalesId));
+        }
+
+        CreditCardUniqueCardId cardTokenFromPF = _paymentContract.parmPayFabricCardToken();
+        if (!cardTokenFromPF)
+        {
+            throw error(strFmt("@SKS:SKGCCPFCardTokenNotSpecifiedErrorMsg", salesTable.SalesId));
+        }
+                
+        AmountCur unprocessedAmount = _paymentContract.parmUnprocessedTransAmount();
+        if (unprocessedAmount <= 0)
+        {
+            throw error(strFmt("@SKS:SKGCCInvalidUnprocessedAmtErrMsg", salesTable.SalesId));
+        }
+
+        CreditCardCust creditCardCust = this.createUpdateCreditCardCust(cardTokenFromPF);
+
+        MCRCustPaymTable mcrCustPaymTable = this.createMCRCustPaymTable(
+            _paymentContract,
+            creditCardCust,
+            unprocessedAmount,
+            false,
+            false);        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUpdateCreditCardCust</Name>
+				<Source><![CDATA[
+    protected CreditCardCust createUpdateCreditCardCust(CreditCardUniqueCardId _cardTokenFromPF)
+    {
+        SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(salesTable.InvoiceAccount);
+        pfWalletHandler.setPayFabricCustomerNbr();
+                
+        str curReadWalletResponseXmlString = pfWalletHandler.readPayFabricWallet(_cardTokenFromPF, '');
+        if (!curReadWalletResponseXmlString)
+        {
+            throw error(strFmt("@SKS:SKGCCPFCreditCardNotFoundFromToken", _cardTokenFromPF, salesTable.InvoiceAccount, salesTable.SalesId));
+        }
+
+        CreditCardCust creditCardCust = CreditCardCust::findByUniqueCardId(_cardTokenFromPF);
+        if (creditCardCust)
+        {
+            creditCardCust = SKS_CC_PayFabricWalletHandler::updateCreditCardFromPayFabricResponse(curReadWalletResponseXmlString, creditCardCust.RecId, creditCardCust.CardNumber);
+        }
+        else
+        {
+            creditCardCust = CreditCard::addCreditCard(curReadWalletResponseXmlString, salesTable.InvoiceAccount, activeCreditCardProcessor.RecId);
+        }
+
+        if (!creditCardCust)
+        {
+            throw error(strFmt("@SKS:SKGCCPFCreditCardNotFoundOrCreatedFromToken", _cardTokenFromPF, salesTable.InvoiceAccount, salesTable.SalesId));
+        }
+
+        if (creditCardCust.CustAccount != salesTable.InvoiceAccount)
+        {
+            throw error(strFmt("@SKS:SKGCCPFCardTokenSpecifiedCustNotValid", _cardTokenFromPF, salesTable.InvoiceAccount, creditCardCust.CustAccount));
+        }
+
+        return creditCardCust;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMCRCustPaymTable</Name>
+				<Source><![CDATA[
+    protected MCRCustPaymTable createMCRCustPaymTable(
+        SKS_CC_MCRPaymentContract _paymentContract,
+        CreditCardCust _creditCardCust,
+        AmountCur _amount,
+        boolean _isPrePay,
+        boolean _isProcessPayment = false)
+    {
+        MCRCustPaymTable mcrCustPaymTable;
+        mcrCustPaymTable.clear();
+        mcrCustPaymTable.Channel = salesTable.retailSalesTable().RetailChannel;
+
+        CurrencyCode currencyCode = _paymentContract.parmCurrencyCode();
+        if (currencyCode)
+        {
+            mcrCustPaymTable.CurrencyCode = currencyCode;
+        }
+        else
+        {
+            mcrCustPaymTable.CurrencyCode = salesTable.CurrencyCode;
+        }
+
+        mcrCustPaymTable.TenderTypeId = _paymentContract.parmTenderTypeId();
+        mcrCustPaymTable.RefTableId = salesTable.TableId;
+        mcrCustPaymTable.RefRecId = salesTable.RecId;
+        mcrCustPaymTable.IsPrepay = _isPrePay;
+
+        mcrCustPaymTable.PaymInfoRecId = _creditCardCust.RecId;
+        mcrCustPaymTable.PaymInfoTableId = _creditCardCust.TableId;
+
+        RetailStoreCardTypeId cardTypeId = _paymentContract.parmCardTypeId();
+        if (cardTypeId)
+        {
+            mcrCustPaymTable.CardTypeId = cardTypeId;
+        }
+        else
+        {
+            mcrCustPaymTable.CardTypeId = _creditCardCust.CreditCardTypeName;
+        }
+
+        mcrCustPaymTable.CustAccount = salesTable.InvoiceAccount;
+        mcrCustPaymTable.CustPaymType = MCRCustPaymTable::getMCRTypeFromTender(
+            mcrCustPaymTable.TenderTypeId,
+            mcrCustPaymTable.Channel,
+            mcrCustPaymTable.CardTypeId);
+
+        mcrCustPaymTable.Amount = CurrencyExchange::round(_amount, mcrCustPaymTable.CurrencyCode);        
+
+        if (_isProcessPayment)
+        {
+            if (_isPrePay)
+            {
+                mcrCustPaymTable.Status = MCRCustPaymStatus::Paid;
+                mcrCustPaymTable.PostedAmount =  mcrCustPaymTable.Amount;
+            }
+            else
+            {
+                mcrCustPaymTable.Status = MCRCustPaymStatus::Authorized;
+            }               
+
+        }
+        else
+        {
+            mcrCustPaymTable.Status = MCRCustPaymStatus::NotSubmitted;
+        }
+
+        mcrCustPaymTable.insert();
+
+        return mcrCustPaymTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postMCRCustPaymTableToLedgerJournal</Name>
+				<Source><![CDATA[
+    protected void postMCRCustPaymTableToLedgerJournal(
+        MCRCustPaymTable _mcrCustPaymTable,
+        SalesTable _salesTable,
+        LedgerJournalNameId _journalName = '')
+    {
+        LedgerJournalACType             offsetType;
+        LedgerDimensionDefaultAccount   offsetAccount;
+        
+        [offsetType, offsetAccount] = this.getMCRPaymAccount(_mcrCustPaymTable);
+
+        MCRLedgerJournal mcrLedgerJournal = MCRLedgerJournal::construct(LedgerJournalType::CustPayment, _journalName);
+        mcrLedgerJournal.parmPaymReference(_salesTable.SalesId);
+        
+        if (_salesTable.DefaultDimension)
+        {
+            mcrLedgerJournal.parmDefaultDimension(_salesTable.DefaultDimension);
+        }
+        else
+        {
+            mcrLedgerJournal.parmDefaultDimension(RetailChannelTable::findByRecId(_mcrCustPaymTable.Channel).DefaultDimension);
+        }
+        
+        mcrLedgerJournal.parmPrePayment(true);
+      
+        LedgerJournalTable ledgerJournalTable = mcrLedgerJournal.createLedgerJournalTable();
+        if (!ledgerJournalTable)
+        {
+            throw error(strFmt("@SKS:SKGCCPaymJourCreateErrorMsg", _salesTable.SalesId));
+        }
+
+        mcrLedgerJournal.parmLedgerJournalTable(ledgerJournalTable);
+
+        CustPostingProfile postingProfileVal;
+
+        MCRCustPaymTotals mcrCustPaymTotals = MCRCustPaymTotals::construct(_mcrCustPaymTable.RefTableId, _mcrCustPaymTable.RefRecId);
+        if (mcrCustPaymTotals)
+        {
+            postingProfileVal = mcrCustPaymTotals.getPostingProfile(true);
+        }
+
+        if (!postingProfileVal)
+        {
+            postingProfileVal = CustParameters::find().PostingProfile;
+        }
+
+        mcrLedgerJournal.parmPostingProfile(postingProfileVal);
+
+        if (offsetType == LedgerJournalACType::Ledger)
+        {
+            mcrLedgerJournal.parmledgerOffsetAccount(
+                MCRAssistantLedgerDimension::mergeAccountAndDimension(
+                    LedgerDimensionFacade::getMainAccountRecIdFromLedgerDimension(offsetAccount), mcrLedgerJournal.parmDefaultDimension()));
+        }
+        else
+        {
+            mcrLedgerJournal.parmledgerOffsetAccount(offsetAccount);
+        }
+        mcrLedgerJournal.parmLedgerOffsetAccountType(offsetType);
+        mcrLedgerJournal.parmOffsetDefaultDimension(mcrLedgerJournal.parmDefaultDimension());
+        mcrLedgerJournal.parmAccountNum(_mcrCustPaymTable.CustAccount);
+        mcrLedgerJournal.parmBankTransType(RetailStoreTenderTypeTable::find(_mcrCustPaymTable.Channel, _mcrCustPaymTable.TenderTypeId).bankTransactionType);
+        
+        Num paymOrderId = _mcrCustPaymTable.displayOrderID();
+        CurrencyCode currency = _mcrCustPaymTable.getCurrency();
+        ExchRate exchRate = ExchangeRateHelper::exchRate(currency);
+
+        if (CustParameters::find().TaxOnPrepayment)
+        {
+            mcrLedgerJournal.parmTaxGroup(_salesTable.TaxGroup);
+            mcrLedgerJournal.parmTaxItemGroup(TaxParameters::find().TaxItemGroup);
+        }
+
+        mcrLedgerJournal.parmExchRate(exchRate);
+        mcrLedgerJournal.parmCurrencyCode(currency);
+        mcrLedgerJournal.parmTransDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+        mcrLedgerJournal.parmTransTxt(strFmt("@MCR10835", paymOrderId, enum2str(_mcrCustPaymTable.CustPaymType)));
+        mcrLedgerJournal.parmMCRPaymOrderID(paymOrderId);
+        mcrLedgerJournal.parmMCRRefPaymID(_mcrCustPaymTable.RecId);
+        mcrLedgerJournal.parmTransactionType(LedgerTransType::Payment);
+
+        LedgerJournalTrans ledgerJournalTransOut = mcrLedgerJournal.createLedgerJournalTrans(_mcrCustPaymTable.Amount, 0);
+        if (!ledgerJournalTransOut)
+        {
+            throw error(strFmt("@SKS:SKGCCPaymJourLineCreateErrorMsg", _salesTable.SalesId));
+        }
+        
+        ledgerJournalTable.reread();
+        ledgerJournalTransOut.reread();
+        mcrLedgerJournal.post();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMCRPaymAccount</Name>
+				<Source><![CDATA[
+    protected container getMCRPaymAccount(MCRCustPaymTable _mcrCustPaymTable)
+    {
+        RetailStoreTenderTypeTable      retailStoreTenderTypeTable;
+        LedgerJournalACType             offsetType;
+        LedgerDimensionDefaultAccount   offsetAccount;
+
+        retailStoreTenderTypeTable = RetailStoreTenderTypeTable::find(_mcrCustPaymTable.Channel, _mcrCustPaymTable.TenderTypeId);
+
+        if (retailStoreTenderTypeTable)
+        {
+            switch (retailStoreTenderTypeTable.AccountType)
+            {
+                case RetailLedgerBank::Bank:
+                    offsetType = LedgerJournalACType::Bank;
+                    break;
+                case RetailLedgerBank::Ledger:
+                    offsetType = LedgerJournalACType::Ledger;
+                    break;
+            }
+            offsetAccount = retailStoreTenderTypeTable.LedgerDimension;
+        }
+        else
+        {
+            throw error(strFmt("@MCR40426",enum2str(_mcrCustPaymTable.CustPaymType)));
+        }
+
+        return [offsetType, offsetAccount];
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

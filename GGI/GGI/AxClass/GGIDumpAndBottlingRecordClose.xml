@@ -1,0 +1,312 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIDumpAndBottlingRecordClose</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>GGIDumpAndBottlingRecordClose</c> class handles the closing of a Dump and bottlinig record.
+/// </summary>
+public class GGIDumpAndBottlingRecordClose
+{
+    GGIDumpAndBottlingRecord    dbr;
+    boolean                     journalPosted;    
+    Qty                         adjustableQty;
+    Qty                         dbrWineGallonToQty;
+    InventQty                   onHandPhysInventQty;
+    InventTable                 inventTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static GGIDumpAndBottlingRecordClose construct()
+    {
+        return new GGIDumpAndBottlingRecordClose();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args _args)
+    {
+        GGIDumpAndBottlingRecord        dumpAndBottlingRecord;
+        GGIDumpAndBottlingRecordClose   dbrclose;
+        FormDataSource                  fdsCaller;
+        DialogButton                    dialogButton;
+        boolean                         tankGaugeReadingMissing;
+
+        if (_args.dataset() == tableNum(GGIDumpAndBottlingRecord))
+        {
+            dumpAndBottlingRecord   = _args.record();
+            fdsCaller               = FormDataUtil::getFormDataSource(dumpAndBottlingRecord);
+            dbrclose                = GGIDumpAndBottlingRecordClose::construct();
+                      
+
+            if (!dumpAndBottlingRecord.TankGaugingWineGallon)
+            {
+                tankGaugeReadingMissing = true;
+                dialogButton            = Box::yesNo("@GGI:TankGaugeWineGallonsError", DialogButton::Yes);
+            }
+
+            if (!tankGaugeReadingMissing || (tankGaugeReadingMissing && dialogButton == DialogButton::Yes))
+            {
+
+                dbrclose.parmDumpAndBottlingRecord(dumpAndBottlingRecord);
+                dbrclose.run();
+
+                fdsCaller.refresh();
+                fdsCaller.reread();
+                fdsCaller.research(true);
+
+                dumpAndBottlingRecord = GGIDumpAndBottlingRecord::find(dumpAndBottlingRecord.DBRId);
+
+                if (dumpAndBottlingRecord.Status == GGIDumpAndBottlingRecordStatus::Closed)
+                {
+                    info(strFmt("@GGI:DBRCloseMessasge", dumpAndBottlingRecord.DBRId));
+                }
+            }         
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDumpAndBottlingRecord</Name>
+				<Source><![CDATA[
+    public GGIDumpAndBottlingRecord parmDumpAndBottlingRecord(GGIDumpAndBottlingRecord _dbr)
+    {
+        dbr = _dbr;
+
+        return dbr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    private void run()
+    {
+        SIGProcedureProvider    procedure;
+        boolean                 canClose;
+        Dialog                  dialog = new Dialog("@GGI:DBRClosiingConfirm");
+
+        this.findAdjustableQty();
+
+        dialog.addText(strFmt("@GGI:DBRCloseTankWineGallons", dbr.TankGaugingWineGallon, dbrWineGallonToQty));
+        dialog.addText(strFmt("@GGI:PhysOnHandBalance", onHandPhysInventQty));
+        dialog.addText(strFmt("@GGI:QtyAdjusted", adjustableQty));
+
+        dialog.run();
+
+        if (dialog.closedOk())
+        {
+            //SIG - start
+            if (isConfigurationkeyEnabled(configurationkeynum(SIG)))           
+            {
+                procedure = GGIDBRClosingProcedure::newDBR(dbr);
+                if (procedure.signatureRequired())
+                {
+                    procedure.sign();
+                }
+            }
+            //SIG - end
+
+            if (inventTable && adjustableQty && procedure.isSigned())
+            {
+                this.createPostInvAdjJournal();
+
+                dbr = GGIDumpAndBottlingRecord::find(dbr.DBRId);
+
+                if (dbr.RecId != 0)
+                {
+                    this.transferBalanceToNewDBR();
+                }
+            }      
+        }     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPostInvAdjJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and posts an inventory adjustment jourrnal.
+    /// </summary>
+    public void createPostInvAdjJournal()
+    {
+        InventJournalTable              inventJournalTable;
+        InventJournalTrans              inventJournalTrans;
+        InventJournalName               inventJournalName;       
+        JournalCheckPost                journalCheckPost;
+        InventDim                       inventTransDim;
+        
+        inventTransDim = GGIDumpAndBottlingRecord::getLastTransactionForSiteLocation(dbr.WMSLocationId, dbr.InventSiteId, inventTable.ItemId).inventTrans().inventDim(); 
+
+        select firstonly inventJournalName
+            where inventJournalName.JournalNameId   == InventParameters::find().GGITankGaugeAdjJournalNameId; 
+
+        if (!inventJournalName)
+        {
+            throw error("@GGI:SelectTankAdjJournalError");
+            return;
+        }
+
+        try
+        {
+            ttsbegin;
+            inventJournalTable.clear();            
+            inventJournalTable.initFromInventJournalName(inventJournalName);
+            inventJournalTable.GGIDbrId = dbr.DBRId;
+            inventJournalTable.insert();           
+
+            inventJournalTrans.clear();
+            inventJournalTrans.initFromInventJournalTable(inventJournalTable);
+            inventJournalTrans.initFromInventTable(inventTable);
+            inventJournalTrans.InventDimId      = inventTransDim.InventDimId;
+            inventJournalTrans.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(inventTable.DefaultDimension, inventTransDim.inventSite().DefaultDimension);
+            inventJournalTrans.TransDate        = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            //inventJournalTrans.Qty              = adjustableQty;
+            inventJournalTrans.UnitQty          = adjustableQty;
+            inventJournalTrans.Unit             = 'LB';
+            inventJournalTrans.modifiedField(fieldNum(InventJournalTrans, UnitQty));
+            
+            inventJournalTrans.insert();
+   
+            journalCheckPost = InventJournalCheckPost::newPostJournal(inventJournalTable);
+
+            if (journalCheckPost.validate())
+            {
+                journalCheckPost.runOperation();
+
+                journalPosted = true;
+            }
+    
+            ttscommit;
+        }
+        catch(Exception::Error)
+        {
+            ttsbegin;
+            dbr = GGIDumpAndBottlingRecord::find(dbr.DBRId);
+            dbr.selectForUpdate(true);
+            dbr.ClosedByWorker  = 0;
+            dbr.Status          = GGIDumpAndBottlingRecordStatus::Open;
+            dbr.ClosedDate      = dateNull();
+            dbr.ClosedTime      = timeMax();
+            dbr.update();
+            ttscommit;
+
+            Info(infolog.text());
+            Error("@GGI:InvAdjJourrnalPostError");
+        }           
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findLastDBRitemId</Name>
+				<Source><![CDATA[
+    private ItemId findLastDBRitemId()
+    {
+        GGIDumpAndBottlingRecord lastDBR;
+
+        select firstonly lastDBR 
+            where lastDBR.TransferDBRId == dbr.DBRId ;
+
+        
+        GGIDumpAndBottlingLine  dbrLine;
+
+        select firstonly dbrLine
+            order by RecId desc
+            where dbrLine.DBRId == lastDBR.DBRId
+                && dbrLine.ItemId;
+
+        return dbrLine.ItemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findAdjustableQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the quantity to be adjusted.
+    /// </summary>
+    private void findAdjustableQty()
+    {
+        inventTable = InventTable::find(dbr.itemId());
+
+        if (!inventTable)
+        {
+            // curernt dbr may not have any lines. find the last line of previous dbr   
+            inventTable = InventTable::find(this.findLastDBRitemId());
+        }
+        if (!inventTable)
+        {
+            return;
+        }
+
+        TTBWineGALConversion    wineGallonConversion    = TTBWineGALConversion::find(dbr.TankGaugingProof); 
+        UnitOfMeasure           uom                     = UnitOfMeasure::findBySymbol(inventTable.inventUnitId());
+        TTBWineGallon           balanceWineGallon       = dbr.TankGaugingProof? (dbr.BalanceProofGallon * 100)/dbr.TankGaugingProof : 0;
+
+        onHandPhysInventQty = wineGallonConversion? balanceWineGallon/wineGallonConversion.WineGALEquivalent : 0;
+        dbrWineGallonToQty  = wineGallonConversion? dbr.TankGaugingWineGallon/wineGallonConversion.WineGALEquivalent : 0;
+        adjustableQty       = dbrWineGallonToQty - onHandPhysInventQty;
+        adjustableQty       = decRound(adjustableQty, uom.DecimalPrecision);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transferBalanceToNewDBR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Transfers the balance to a new DBR.
+    /// </summary>
+    private void transferBalanceToNewDBR()
+    {
+        GGIDumpAndBottlingRecord newDBR = dbr.TransferDBRId? GGIDumpAndBottlingRecord::find(dbr.TransferDBRId) : GGIDumpAndBottlingRecord::findCurrentForSiteLocation(dbr.InventSiteId, dbr.WMSLocationId);
+
+        if (!newDBR)
+        {
+            newDBR = GGIDumpAndBottlingRecord::createDBR(dbr.InventSiteId, dbr.WMSLocationId);
+        }
+             
+        ttsbegin;    
+        newDBR.selectForUpdate(true);
+        newDBR.BalanceProofGallon   = newDBR.balanceProofGallon() + dbr.TotalGaugingProofGallon;
+        newDBR.BalanceWineGallon    = newDBR.balanceWineGallon() + dbr.TankGaugingWineGallon;     
+        newDBR.TankGaugingProof     = newDBR.TankGaugingProof? newDBR.TankGaugingProof : dbr.TankGaugingProof;
+        newDBR.update();
+
+        if (!dbr.TransferDBRId)
+        {
+            dbr.selectForUpdate(true);
+            dbr.TransferDBRId = newDBR.DBRId;
+            dbr.update();
+        }        
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

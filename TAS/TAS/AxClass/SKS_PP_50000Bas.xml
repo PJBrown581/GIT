@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PP_50000Bas</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_PP_50000Bas
+{
+    SKS_PP_Bank SKS_PP_Bank;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>Build_Head_Trail</Name>
+				<Source><![CDATA[
+    //   ' Parms
+    //    '   FileType        I   FileType - EFT or PP file type
+    //    '   FormatID        I   FormatID
+    //    '   HeadTrailID     I   Header/Trailer ID
+    //    '   strHT           I   Header_Trailer code
+    //    '                       Headers - H,I,J,K
+    //    '                       Trailers - T,U,V,X
+    //    ' Returns
+    str Build_Head_Trail(SKS_PP_HeaderTrailerFileType _FileType, SKS_LB_FormatId _FormatID, SKS_PP_HeadTrailId _HeadTrailID, str 1 _strHT)
+    {
+        str returnval;
+
+        SKS_PP_HeaderTrailer SKS_PP_HeaderTrailer;
+
+        int ppenum;
+        DictEnum dict;
+        ;
+
+        dict = new DictEnum(enumNum(SKS_PP_HeaderTrailerType));
+
+        ppenum = dict.symbol2Value(_strHT);
+
+        Select firstonly * FROM        SKS_PP_HeaderTrailer
+          WHERE     SKS_PP_HeaderTrailer.FileType == _FileType
+              && SKS_PP_HeaderTrailer.FormatID == _FormatID
+              && SKS_PP_HeaderTrailer.HeadTrailID == _HeadTrailID
+              && SKS_PP_HeaderTrailer.HeaderTrailer == ppenum;
+
+        returnval = strrtrim(SKS_PP_HeaderTrailer.Value);
+
+        return returnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InsertMiscRecord</Name>
+				<Source><![CDATA[
+    //    '===============================================================================
+    //    ' Insert record into working table for Header/Trailer and Block Fill info
+    //    '
+    //    ' Parameters
+    //    '   HTBlock             I   Type of Record - H, T, B
+    //    '   RecInfo             I   Actual data to put in Value field
+    //    '
+    //    ' Returns
+    //    '
+    //    ' Notes
+    //    '===============================================================================
+    void InsertMiscRecord(str _Mode, str _FileType, str _HTBlock, str _RecInfo, int _SecOrder, SKS_PP_FileNbr gPPFileNbr)
+    {
+
+        SKS_PP_FileDetail bSKS_PP_FileDetail;
+        ;
+
+        bSKS_PP_FileDetail.FileNbr = gPPFileNbr;
+        //bSKS_PP_FileDetail.ComputerName = ;
+
+        if (_HTBlock == 'H')//header
+        {
+            bSKS_PP_FileDetail.RecSection = SKS_PP_RecSection::Header;
+        }
+        else //HTBlock == 'T' //trailer
+        {
+            bSKS_PP_FileDetail.RecSection = SKS_PP_RecSection::Trailer;
+        }
+
+        bSKS_PP_FileDetail.ValueString = _RecInfo;
+        bSKS_PP_FileDetail.FormatID = SKS_PP_Bank.PPFormatID;
+        bSKS_PP_FileDetail.KeepDelete = SKS_PP_FileStatus::FileCreated;
+
+        bSKS_PP_FileDetail.doInsert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PurgeBatches</Name>
+				<Source><![CDATA[
+    void PurgeBatches(SKS_PP_FileType Mode)
+    {
+        SKS_PP_Setup SKS_PP_Setup;
+        SKS_PP_File SKS_PP_File;
+        SKS_LB_Journal SKS_LB_Journal;
+        Date cutoffDate;
+        int nbrmonths;
+        Timezone tz = DateTimeUtil::getUserPreferredTimeZone();
+
+        select firstonly PPFilePeriodsRet, PPPurgeFiles, LBFilePeriodsRet, LBPurgeFiles from SKS_PP_Setup;
+
+        // Get Number of periods to retain from setup
+        if (Mode == SKS_PP_FileType::SKS_PositivePay && SKS_PP_Setup.PPPurgeFiles)
+        {
+            nbrmonths = SKS_PP_Setup.PPFilePeriodsRet;
+        }
+        else if (Mode == SKS_PP_FileType::SKS_LockBox && SKS_PP_Setup.LBPurgeFiles)
+        {
+            nbrmonths = SKS_PP_Setup.LBFilePeriodsRet;
+        }
+        else
+        {
+            return;
+        }
+
+        // Safeguard
+        if (nbrmonths < 2)
+        {
+            nbrmonths = 2;
+        }
+
+        // Determine Cutoff date
+        cutoffDate = DateTimeUtil::getToday(tz);
+        cutoffDate = dateMthFwd(cutoffDate, -nbrmonths);
+
+        if (Mode == SKS_PP_FileType::SKS_PositivePay)
+        {
+            //SKS_PP_FileDetail records are cascading deletes using DeleteActions on the table.
+            delete_from SKS_PP_File
+                where SKS_PP_File.TransmitDate < cutoffDate && SKS_PP_File.TransmitDate > mkDate(1,1,1900);
+        }
+        else if (Mode == SKS_PP_FileType::SKS_LockBox)
+        {
+            //SKS_LB_Journal records are cascading deletes using DeleteActions on the table.
+            delete_from SKS_LB_Journal
+                where SKS_LB_Journal.KeepDelete == SKS_LB_Status::Completed && SKS_LB_Journal.modifiedDateTime < datetobeginUtcDateTime(cutoffDate, tz);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>StreetToAddressLineArray</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method breaks an address with embedded newline characters into a array of one-line address strings broken up at the newlines.
+    ///     If a number of segments is supplied as a parameter, it will return up to that amount of address lines.
+    ///         If there are more newlines in the incoming street address then there are return segments requested, the last
+    ///         array segment will contain the remainder of the address with ", " replacing the newlines.
+    ///     If no second parameter is passed, the routine will progress through the address, adding return segments until the address
+    ///         string runs out.
+    /// </summary>
+    /// <param name="_street">
+    /// Logistics address street - complete with embeded new lines
+    /// </param>
+    /// <param name="_numberOfSegments">
+    /// Optional - Number of address segments to return
+    /// </param>
+    /// <returns>
+    /// Returns and Array of address line strings
+    /// </returns>
+
+    public static Array StreetToAddressLineArray(LogisticsAddressStreet _street, int _numberOfSegments = maxInt())
+    {
+        Array addressLineArray = new Array(Types::String);
+        int arrayCounter = 1;
+        // vvv 13299 vvv
+        boolean boolContainsCarriageReturns = strContains(_street, '\n'); //13299:  if there are no carriage returns, we'll srtrictly break on 35 chars and wrap...
+        //cont... If there is a carraige return, we'll be wrapping on the carraige return,
+        //cont...  and if the block is biggger then 35, some of it will be lost.  Only
+        //cont... the first 35 chars of each carriage return separted block will be preserved.
+        str locStreet = strLRTrim(_street);
+        // ^^^ 13299 ^^^
+
+        while (arrayCounter <= _numberOfSegments && strLen(locStreet) > 0)
+        {
+            if(strLen(strLRTrim(locStreet)) == 0)
+            {
+                break;
+            }
+
+            if(boolContainsCarriageReturns)
+            {
+                if (strContains(locStreet, '\n') && arrayCounter != _numberOfSegments )
+                {
+                    addressLineArray.value(arrayCounter,SKS_PP_StringFormats::strSub(locStreet,1,SKS_PP_StringFormats::strIndexOf(locStreet,'\n') - 1));
+                    locStreet = strLRTrim(SKS_PP_StringFormats::strSub(locStreet,SKS_PP_StringFormats::strIndexOf(locStreet,'\n') + 1));
+                    arrayCounter++;
+                }
+                else
+                {
+                    addressLineArray.value(arrayCounter,strreplace(locStreet,'\n',', '));
+                    break;
+                }
+            }
+            else
+            {
+                if(strLen(locStreet) > 35 && arrayCounter != _numberOfSegments)
+                {
+                    addressLineArray.value(arrayCounter,strLRTrim(SKS_PP_StringFormats::strSub(locStreet,1,35)));
+                    locStreet = strLRTrim(SKS_PP_StringFormats::strSub(locStreet,36));
+                    arrayCounter++;
+                }
+                else
+                {
+                    addressLineArray.value(arrayCounter,strLRTrim(locStreet));
+                    break;
+                }
+            }
+        }
+        return addressLineArray;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

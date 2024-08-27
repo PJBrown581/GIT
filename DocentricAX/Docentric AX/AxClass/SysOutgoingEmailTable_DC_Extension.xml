@@ -1,0 +1,523 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SysOutgoingEmailTable_DC_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.IO;
+using System.Net.Mail;
+
+/// <summary>
+/// The class SysOutgoingEmailTable_DC_Extension is an extension of the table SysOutgoingEmailTable.
+/// </summary>
+[ExtensionOf(tableStr(SysOutgoingEmailTable))]
+final class SysOutgoingEmailTable_DC_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>toMailMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an e-mail message.
+    /// </summary>
+    /// <param name = "_includeAdditionalMsgFields">Flag indicating whether to include the additional message fields</param>
+    /// <returns>E-mail message</returns>
+    public MailMessage toMailMessage(boolean _includeAdditionalMsgFields = true)
+    {
+        // Create a System.Net.Mail.MailMessage object as in the SysEmailDistributor class but using streams instead of temporary folders.
+        MailMessage mailMsg;
+
+        try
+        {                       
+            SysOutgoingEmailData outgoingEmailData;
+
+            // Build the mail message based on the current record.
+            SysMailerMessageBuilder messageBuilder = new SysMailerMessageBuilder();
+            messageBuilder.setFrom(this.Sender, this.SenderName).addTo(strReplace(this.Recipient, ',', ';'));
+
+            switch (this.Priority)
+            {
+                case eMailPriority::High:
+                    messageBuilder.setPriority(MailPriority::High);
+                    break;
+                case eMailPriority::Low:
+                    messageBuilder.setPriority(MailPriority::Low);
+                    break;
+                default:
+                    messageBuilder.setPriority(MailPriority::Normal);
+                    break;
+            }
+
+            messageBuilder.setSubject(this.Subject).setBody(this.Message);
+
+            // Add attachments and embedded images to the message.
+            while select outgoingEmailData index hint EmailDataIdx where outgoingEmailData.EmailItemId == this.EmailItemId
+            {
+                if (DocFileMngHelper::isValidOnlyFilename(outgoingEmailData.FileName))
+                {
+                    BinData binData = new BinData();
+
+                    binData.setData(outgoingEmailData.Data);
+                    
+                    MemoryStream stream = Binary::constructFromContainer(binData.getData()).getMemoryStream();
+
+                    if (outgoingEmailData.EmailDataType == SysEmailDataType::Embedded)
+                    {
+                        messageBuilder.addRelatedBodyPart(stream, int2str(outgoingEmailData.DataId));
+                    }
+                    else
+                    {
+                        messageBuilder.addAttachment(stream, outgoingEmailData.FileName + outgoingEmailData.FileExtension);
+                    }
+                }
+            }
+
+            mailMsg = messageBuilder.getMessage();
+            if (_includeAdditionalMsgFields)
+            {
+                str warningMsg = SysOutgoingEmailTable::updateMailMsgWithAdditionalFields_DC(mailMsg, this);
+                if (warningMsg)
+                {
+                    DocGlobalHelper::handleWarning(warningMsg);
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), "@DocentricAX2:ErrorCreatingEML");
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), "@DocentricAX2:ErrorCreatingEML");            
+        }
+
+        return mailMsg;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMailMsgWithAdditionalFields_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the e-mail message with additional fields.
+    /// </summary>
+    /// <param name = "_mailMsg">Email message</param>
+    /// <param name = "_outgoingEmailTable">The SysOutgoingEmailTable table buffer</param>
+    /// <returns>Empty string if the e-mail message was successfully updated; otherwise error message string</returns>
+    public static str updateMailMsgWithAdditionalFields_DC(System.Net.Mail.MailMessage _mailMsg, SysOutgoingEmailTable _outgoingEmailTable)
+    {
+        System.String[] ccList, bccList, replyToList;
+        System.Collections.IEnumerator le;
+        System.String ccAddressCurrent, bccAddressCurrent, replyToAddressCurrent;
+        System.Net.Mail.MailAddressCollection mailCCCollection, mailBCCCollection, mailReplyToCollection;
+        System.String ccRecipients = _outgoingEmailTable.EmailCc_DC;
+        System.String bccRecipients = _outgoingEmailTable.EmailBcc_DC;
+        System.String replyToRecipients = _outgoingEmailTable.EmailReplyTo_DC;
+        str bounceToAddress = _outgoingEmailTable.EmailBounceTo_DC;
+        str readReceiptAddress = _outgoingEmailTable.EmailReadReceiptAddress_DC;
+        DocEmailDeliveryReceiptCondition deliveryReceiptCondition = _outgoingEmailTable.EmailDeliveryReceiptCondition_DC;
+        System.Exception exception;
+        str errorMsg;
+
+        // Email address delimiters
+        System.String[] delimiters = new System.String[2]();
+        delimiters.SetValue(',', 0);
+        delimiters.SetValue(';', 1);
+        
+        try
+        {
+
+            // Make list of Cc recipients if exist.
+            boolean hasCcRecipients = false;
+            if (ccRecipients)
+            {
+                hasCcRecipients = true;
+                ccList = ccRecipients.Split(delimiters, System.StringSplitOptions::RemoveEmptyEntries);
+            }
+    
+            // Make list of Bcc recipients if exist.
+            boolean hasBccRecipients = false;
+            if (bccRecipients)
+            {
+                hasBccRecipients = true;
+                bccList = bccRecipients.Split(delimiters, System.StringSplitOptions::RemoveEmptyEntries);
+            }
+
+            // Make list of Reply-To addresses if exists.
+            boolean hasReplyToAddresses = false;
+            if (replyToRecipients)
+            {
+                hasReplyToAddresses = true;
+                replyToList = replyToRecipients.Split(delimiters, System.StringSplitOptions::RemoveEmptyEntries);
+            }
+
+            // Handle multiple Cc participants.
+            if (hasCcRecipients)
+            {
+                le = ccList.GetEnumerator();
+                mailCCCollection = _mailMsg.get_CC();
+                while (le.MoveNext())
+                {
+                    ccAddressCurrent = le.Current;
+                    if (!System.String::IsNullOrEmpty(ccAddressCurrent))
+                    {
+                        mailCCCollection.Add(ccAddressCurrent);
+                    }
+                }
+            }
+    
+            // Handle multiple Bcc participants.
+            if (hasBccRecipients)
+            {
+                le = bccList.GetEnumerator();
+                mailBCCCollection = _mailMsg.get_Bcc();
+                while (le.MoveNext())
+                {
+                    bccAddressCurrent = le.Current;
+                    if (!System.String::IsNullOrEmpty(bccAddressCurrent))
+                    {
+                        mailBCCCollection.Add(bccAddressCurrent);
+                    }
+                }
+            }
+
+            // Handle multiple Reply-to addresses
+            if (hasReplyToAddresses)
+            {
+                le = replyToList.GetEnumerator();
+                mailReplyToCollection = _mailMsg.get_ReplyToList();
+                while (le.MoveNext())
+                {
+                    replyToAddressCurrent = le.Current;
+                    if (!System.String::IsNullOrEmpty(replyToAddressCurrent))
+                    {
+                        mailReplyToCollection.Add(replyToAddressCurrent);
+                    }
+                }
+            }
+
+            // Handle Bounce-to address
+            if (bounceToAddress)
+            {
+                System.Net.Mail.MailAddress bounceToMailAddress = new System.Net.Mail.MailAddress(strLTrim(strRTrim(bounceToAddress)));
+                _mailMsg.set_Sender(bounceToMailAddress);
+            }
+
+            // Handle Read receipt address.
+            if (readReceiptAddress)
+            {
+                System.Collections.Specialized.NameValueCollection mailHeaders = _mailMsg.get_Headers();
+                mailHeaders.Add('Disposition-Notification-To', readReceiptAddress);
+            }
+
+            // Handle Delivery receipt notifications.
+            DocEmailMngHelper::setMailMessageDeliveryNotification(_mailMsg, deliveryReceiptCondition);
+        }
+
+        catch (exception)
+        {
+            // Get the most inner exception.
+            while (exception != null)
+            {
+                errorMsg = exception.get_Message();
+                exception = exception.get_InnerException();
+            }
+        }
+
+        if (errorMsg)
+        {
+            errorMsg = strFmt("@DocentricAX2:DistributorBatchAdditionalFieldsNotSet", errorMsg);
+        }
+        return errorMsg;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insert</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the current table buffer to the table.
+    /// </summary>
+    public void insert()
+    {
+        // Set the CompanyID_DC field for Organization email templates, and the Origin field for System email templates.
+        // Skip if this is not an outgoing email based on a System or Organization email template (e.g. this is an emailed report).
+        if (this.TemplateId)
+        {
+            if (this.IsSystemEmail)
+            {
+                // For System email templates, fill the Origin (Description) field,
+                // since it's not filled in the built-in SysEmailSystemTable::sendMail() method.
+                if (!this.Origin)
+                {
+                    this.Origin = SysEmailSystemTable::find(this.TemplateId).Description;
+                }
+            }
+            else
+            {
+                // For Organization email templates, set the CompanyId_DC field.
+                if (!this.CompanyId_DC)
+                {
+                    this.CompanyId_DC = curExt();
+                }
+            }
+        }
+
+        next insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertAttachment_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the provided file as the attachment (a new record in the SysOutgoingEmailData table) of this outgoing email (i.e. this record).
+    /// </summary>
+    /// <param name = "_fileName">Filename with file extension of the inserting file</param>
+    /// <param name = "_fileContent">File content of the inserting file provided as a container</param>
+    public void insertAttachment_DC(Filename _fileName, container _fileContent)
+    {
+        SysOutgoingEmailData    outgoingEmailData;
+        SysEmailDataId          newDataId;
+        FileNameType            fileExtension;
+
+
+        void validateParameters()
+        {
+            if (!this.EmailItemId)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Cannot insert an attachment of the SysOutgoingEmailTable record with EmailItemId = 0');
+            }
+
+            if (_fileContent == conNull())
+            {
+                DocGlobalHelper::handleException(funcName(), 'The inserting file content is not provided');
+            }
+
+            if (!DocFileMngHelper::isValidFullFilename(_fileName))
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX3:FilenameIsNotValidErrorMsg", _fileName));
+            }
+
+            fileExtension = DocFileMngHelper::getFileExtension(_fileName);
+            if (!fileExtension)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX3:FilenameWithoutExtensionErrorMsg", _fileName));
+            }
+            else if (!Docu::validateExtension(fileExtension))
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX3:UnallowedFileTypeErrorMsg", fileExtension));
+            }
+        }
+
+
+        validateParameters();
+
+        ttsbegin;
+        
+        select maxof(DataId) from outgoingEmailData
+                where outgoingEmailData.EmailItemId == this.EmailItemId
+                    && outgoingEmailData.EmailDataType == SysEmailDataType::Attachment;
+
+        newDataId = outgoingEmailData.DataId + 1;
+        outgoingEmailData.clear();
+        outgoingEmailData.EmailItemId = this.EmailItemId;
+        outgoingEmailData.DataId = newDataId;
+        outgoingEmailData.EmailDataType = SysEmailDataType::Attachment;
+        outgoingEmailData.FileExtension = '.' + fileExtension;
+        outgoingEmailData.FileName = _fileName;
+        outgoingEmailData.Data = _fileContent;
+        outgoingEmailData.insert();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertAttachmentFromDocuRef_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the file of the provided DocuRef record, if such exists, as the attachment
+    /// (a new record in the SysOutgoingEmailData table) of this outgoing email (i.e. this record).
+    /// </summary>
+    /// <param name = "_docuRef">Inserting DocuRef record</param>
+    /// <returns>False if the provided docuRef doesn't have the file attached; otherwise true.</returns>
+    public boolean insertAttachmentFromDocuRef_DC(DocuRef _docuRef)
+    {
+        SysOutgoingEmailData outgoingEmailData;
+        SysEmailDataId       newDataId;
+
+
+        void validateParameters()
+        {
+            if (!this.EmailItemId)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Cannot insert an attachment of the SysOutgoingEmailTable record with EmailItemId = 0');
+            }
+
+            if (!_docuRef)
+            {
+                DocGlobalHelper::handleException(funcName(), 'DocuRef record is not provided');
+            }
+        }
+
+        // Validate parameters.
+        validateParameters();
+        
+        // If the provided docuRef doesn't have Class which attaches files, it is Note or URL.
+        // In this case return false.
+        ClassId actionClassId = _docuRef.docuType().ActionClassId;
+        if (!SysDictClass::isEqualOrSuperclass(actionClassId, classNum(DocuActionFile)))
+        {
+            return false;
+        }
+
+        // Insert the file attached to docuRef into the SysOutgoingEmailData table.
+        ttsbegin;
+        
+        select maxof(DataId) from outgoingEmailData
+            where outgoingEmailData.EmailItemId == this.EmailItemId
+                && outgoingEmailData.EmailDataType == SysEmailDataType::Attachment;
+
+        newDataId = outgoingEmailData.DataId + 1;
+        outgoingEmailData.clear();
+        outgoingEmailData.EmailItemId = this.EmailItemId;
+        outgoingEmailData.DataId = newDataId;
+        outgoingEmailData.EmailDataType = SysEmailDataType::Attachment;
+        outgoingEmailData.FileExtension = '.' + _docuRef.fileType();
+        outgoingEmailData.FileName = DocFileMngHelper::replaceInvalidCharsForFileName(_docuRef.Name);
+        outgoingEmailData.Data = DocumentManagement::getAttachmentAsContainer(_docuRef);
+        outgoingEmailData.insert();
+
+        ttscommit;
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertAttachmentsFromCommon_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For the provided table record _commonTable insert all Attachments (DocuRef records), which are files,
+    /// as the attachments (new records in the SysOutgoingEmailData table) of this outgoing email (i.e. this record).
+    /// </summary>
+    /// <param name = "_commonTable">Table record for which the Attachments (DocuRef records) will be inserted</param>
+    public void insertAttachmentsFromCommon_DC(Common _commonTable)
+    {
+        DocuRef docuRef;
+
+        ttsbegin;
+
+        while select docuRef 
+              where docuRef.RefTableId == _commonTable.TableId &&
+                    docuRef.RefRecId == _commonTable.RecId &&
+                    docuRef.RefCompanyId == _commonTable.DataAreaId
+        {
+            this.insertAttachmentFromDocuRef_DC(docuRef);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTaggedAttachmentsFromCommon_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For the provided table record _commonTable, insert all Attachments (the DocuRef records),
+    /// which are files, which are active, language-neutral or in the provided language,
+    /// and which are tagged with all of the provided tags (_attachmentTags),
+    /// as the attachments (new records in the SysOutgoingEmailData table) of this outgoing email (i.e. this record).
+    /// </summary>
+    /// <param name = "_commonTable">Table record for which the Attachments (DocuRef records) will be inserted</param>
+    /// <param name = "_attachmentTags">Attachment tags separated by semicolons or commas</param>
+    /// <param name = "_languageId">Language ID</param>
+    public void insertTaggedAttachmentsFromCommon_DC(Common _commonTable, str _attachmentTags, LanguageId _languageId = '')
+    {
+        DocuRef docuRef;
+
+        ttsbegin;
+
+        while select docuRef
+              where docuRef.RefTableId == _commonTable.TableId &&
+                    docuRef.RefRecId == _commonTable.RecId &&
+                    docuRef.RefCompanyId == _commonTable.DataAreaId &&
+                   (docuRef.LanguageId_DC == '' || docuRef.LanguageId_DC == _languageId)
+        {
+            if (docuRef.active_DC() && 
+                DocGlobalHelper::containsTags(docuRef.Tags_DC, _attachmentTags, true))
+            {
+                this.insertAttachmentFromDocuRef_DC(docuRef);
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEmailStatusQueryRangeValue_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the SysEmailStatus query range value for the provided DocOutgoingEmailStatusFilter enum value.
+    /// </summary>
+    /// <param name = "_emailStatusFilter">The DocOutgoingEmailStatusFilter enum value</param>
+    /// <returns>The SysEmailStatus query range value</returns>
+    public static str getEmailStatusQueryRangeValue_DC(DocOutgoingEmailStatusFilter _emailStatusFilter)
+    {
+        str queryRangeValue = '';
+
+        switch (_emailStatusFilter)
+        {
+            case DocOutgoingEmailStatusFilter::Failed:
+                queryRangeValue = queryValue(SysEmailStatus::Failed);
+                break;
+            case DocOutgoingEmailStatusFilter::Sent:
+                queryRangeValue = queryValue(SysEmailStatus::Sent);
+                break;
+            case DocOutgoingEmailStatusFilter::Waiting:
+                queryRangeValue = strFmt('%1,%2,%3,%4', queryValue(SysEmailStatus::Unsent), queryValue(SysEmailStatus::SendAttempted), queryValue(SysEmailStatus::Executing), queryValue(SysEmailStatus::Suspended));
+                break;
+            case DocOutgoingEmailStatusFilter::Expired:
+                queryRangeValue = queryValue(SysEmailStatus::Expired);
+                break;
+        }
+
+        return queryRangeValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getStatusInfoDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// A display method for e-mail status.
+    /// </summary>
+    /// <returns>E-mail status</returns>
+    display SysEmailStatusInfoDetails getStatusInfoDetails()
+    {
+        SysEmailStatusInfoDetails statusInfoDetails = next getStatusInfoDetails();
+        switch (this.Status)
+        {
+            case SysEmailStatus::Expired:
+                return enum2Str(DocOutgoingEmailStatusFilter::Expired);
+        }
+
+        return statusInfoDetails;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

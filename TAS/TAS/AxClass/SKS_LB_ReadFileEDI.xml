@@ -1,0 +1,952 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_ReadFileEDI</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// ARES EDI read file class
+/// </summary>
+class SKS_LB_ReadFileEDI extends SKS_LB_ReadFile
+{
+    SKS_EB_FileHub fileHub;
+    TextStreamIO EDIFile;
+    List FieldFormatsListCheck, FieldFormatsListInvoice, FieldFormatsListInvoiceADX, FieldFormatsListPaymentADX, FieldFormatsList;
+    ListEnumerator fieldFormatsListEnumeratorCheck;
+    ListEnumerator fieldFormatsListEnumeratorInvoice;
+    ListEnumerator fieldFormatsListEnumeratorInvoiceADX;
+    ListEnumerator fieldFormatsListEnumeratorPaymentADX;
+    boolean ADXMapped, ADXENTMapped;
+    str curline;
+    PaymNote    gNote;
+    SKS_BF_BankIntType SKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+
+    #define.sRecordCodeCheckTran('BPR')//BPR
+    #define.sTrace('TRN')//TRN
+    #define.sNameBPR('N1')//N1BPR
+    #define.sReference('REF')//REFBPR
+    #define.sDate('DTM')//DTMBPR
+    #define.sRecordCodeFileHeader('ST')//ST
+    #define.sBatch('BAT')//BAT
+    #define.sRemittance('RMR')//RMR -invoice only
+    #define.sRefRemmittance('REF')//REFRMR - invoice only
+    #define.sRecordCodeFileTrailer('SE')//SE
+    #define.sBatchAmount('AMT')//EDI823 AMT segment within a BAT loop
+    #define.sBatchQuantity('QTY')//EDI823 QTY segment within a BAT loop
+    #define.sDepositNumber('DEP')//EDI 823 DEP segment within an ST loop
+    #define.sEntity('ENT')
+    #define.sAdjustment('ADX')
+    #define.sNote('NTE')
+    #define.sName('NM1')
+    #define.sItemData('IT1')
+
+    //Enum equivalents of strings
+    #define.RecordCodeCheckTran(0)//BPR
+    #define.Trace(1)//TRN
+    #define.NameBPR(2)//N1BPR
+    #define.Reference(3)//REFBPR
+    #define.DateBPR(4)//DTMBPR
+    #define.DateADX(11)//DTMBPR
+    #define.RecordCodeFileHeader(5)//ST
+    #define.Batch(6)//Bat
+    #define.Remittance(7)//RMR -invoice only
+    #define.RefRemmittance(8)//REFRMR - invoice only
+    #define.RecordCodeFileTrailer(19)//SE
+    #define.Note(10)//ENTADXNTE
+    #define.Name(12)//ENTNM1
+    #define.EntAdjustment(9)
+    #define.RMRAdjustment(13)
+    #define.RMRADXNote(14)
+    #define.RMRADXDate(15)
+    #define.NameInv(16)
+    #define.RMRADXItemData(17)
+    #define.ENTADXItemData(18)
+    #define.NTERMR(19)
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initFileHub</Name>
+				<Source><![CDATA[
+    private SKS_EB_FileHub initFileHub(SKS_EB_FileHub _fileHub = fileHub)
+    {
+        fileHub = _fileHub;
+
+        if(!fileHub)
+        {
+            SKS_EB_BankIntegOptWithNoLicense bankIntOption = SKS_EB_FileStorage::find().StorageOption_LB;
+
+            if(bankIntOption == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+            {
+                SKS_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+            }
+
+            fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType);
+
+            if (Fileformat.CodePage)
+            {
+                fileHub.parmEncoding(Fileformat.CodePage);
+            }
+        }
+      
+        return fileHub;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Close file
+    /// </summary>
+    public void closeFile()
+    {
+        EDIFile.finalize();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindBankAccountNumFormatDet</Name>
+				<Source><![CDATA[
+    private str FindBankAccountNumFormatDet(SKS_LB_EDISegment    _Segment)
+    {
+        switch(_Segment)
+        {
+            case SKS_LB_EDISegment::ADXENT:
+                return 'ADX';
+            case SKS_LB_EDISegment::ADXRMR:
+                return 'RMR';
+            case SKS_LB_EDISegment::BAT:
+                return 'BAT';
+            case SKS_LB_EDISegment::BPR:
+                return 'BPR';
+            case SKS_LB_EDISegment::DTMADXENT:
+                return 'DTM';
+            case SKS_LB_EDISegment::IT1ADXENT:
+                return 'IT1';
+            case SKS_LB_EDISegment::N1BPR:
+                return 'N1';
+            case SKS_LB_EDISegment::TRN:
+                return 'TRN';
+            case SKS_LB_EDISegment::ST:
+                return 'ST';
+            case SKS_LB_EDISegment::RMR:
+                return 'RMR';
+            case SKS_LB_EDISegment::REFBPR,
+                SKS_LB_EDISegment::REFRMR:
+                return 'REF';
+            default:
+                return 'BAT';//Default to batch header
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Get_Current_Line</Name>
+				<Source><![CDATA[
+    str Get_Current_Line()
+    {
+        ;
+    
+        return curline;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MappingSearch</Name>
+				<Source><![CDATA[
+    private void MappingSearch(SKS_LB_EDISegment segment, int occurrcount, container line, listenumerator FileFormatDetlist )
+    {
+        SKS_LB_FileFormatDet localSKS_LB_FileFormatDet;
+        str value;
+    
+        while (FileFormatDetlist.moveNext())
+        {
+            localSKS_LB_FileFormatDet = FileFormatDetlist.current();
+            if(segment == localSKS_LB_FileFormatDet.EDISegment && occurrcount == localSKS_LB_FileFormatDet.edioccurrence)
+            {
+                if(localSKS_LB_FileFormatDet.FieldType == SKS_LB_FieldType::Note && conLen(line) < localSKS_LB_FileFormatDet.EDIFieldNbr)
+                {
+                    value = '';
+                }
+                else
+                {
+                    value = conpeek(line, localSKS_LB_FileFormatDet.EDIFieldNbr);
+                }
+    
+                if(localSKS_LB_FileFormatDet.EDISegment == SKS_LB_EDISegment::NM1ENTPaym)
+                {
+                    if(gNote != '')//gNote gets blanked at after each ENT record. The only way it would not be blank here is multiple NM1 records within and ENT
+                    {
+                        gNote += ' ' + value;//Append the new note to the original note (NM1 + ":" + NM2)
+                        this.SetNoteHeader();//Overwrite the old Note (NM1) with the new note (NM1 + ":" + NM2)
+                    }
+                    else
+                    {
+                        gNote = value;
+                        this.SetNoteHeader();//Overwrite the entire contents of PaymNote with the new Note header
+                    }
+                }
+                else
+                {
+                    this.ReadOneField(value, localSKS_LB_FileFormatDet.FieldType);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    //Verify that the label is correct
+    void openFile(boolean _Relocation = false)
+    {
+        if(!fileHub)
+        {
+            fileHub = this.initFileHub();
+            this.initFileHub(fileHub);
+        }
+
+        fileHub.runFileInquire(Filename);
+        if(!_Relocation)
+        {
+            if(!fileHub.attrFileExists())
+            {
+                // The file %1 does not exist.
+                error(strfmt("@SYS62207", fileName));
+                return;
+            } 
+        }
+        fileHub.runFileLoad(Filename);
+        fileHub.StreamInit();
+
+        if (Fileformat.CodePage)
+        {
+            EDIFile = TextStreamIo::constructForRead(fileHub.StreamGet(), Fileformat.CodePage);
+        }
+        else
+        {
+            EDIFile = TextStreamIo::constructForRead(fileHub.StreamGet());
+        }
+
+        if (EDIFile == null || EDIFile.status() != IO_Status::Ok)
+        {
+            //file could not be opened
+            throw error (strfmt("@SYS19312", fileName));
+        }
+    
+        EDIFile.inFieldDelimiter(Fileformat.EDISeperator);
+    
+        if(Fileformat.EDITerminator == '')
+        {
+            EDIFile.inRecordDelimiter('\n');
+        }
+        else
+        {
+            EDIFile.inRecordDelimiter(Fileformat.EDITerminator);
+        }
+    
+        if(!_Relocation)
+        {
+            FieldFormatsListcheck = new List(Types::Record);
+            while select FieldFormat order by EDIOccurrence, FormatDetType asc
+                where FieldFormat.FormatID == FileFormat.FormatID && FieldFormat.FormatDetType == SKS_LB_formatdettype::MultiLineCheck
+            {
+                FieldFormatsListCheck.addEnd(FieldFormat);
+            }
+    
+            ADXMapped = false;
+            FieldFormatsListInvoice = new List(Types::Record);
+            while select FieldFormat order by EDIOccurrence, FormatDetType asc
+                where FieldFormat.FormatID == FileFormat.FormatID && FieldFormat.FormatDetType == SKS_LB_formatdettype::MultiLineInvoice
+            {
+                FieldFormatsListInvoice.addEnd(FieldFormat);
+            }
+    
+            FieldFormatsListInvoiceADX = new List(Types::Record);
+            while select FieldFormat order by EDIOccurrence, FormatDetType asc
+                where FieldFormat.FormatID == FileFormat.FormatID && FieldFormat.FormatDetType == SKS_LB_formatdettype::AdjInvLine
+            {
+                ADXMapped = true;
+                FieldFormatsListInvoiceADX.addEnd(FieldFormat);
+            }
+    
+            FieldFormatsListPaymentADX = new List(Types::Record);
+            while select FieldFormat order by EDIOccurrence, FormatDetType asc
+                where FieldFormat.FormatID == FileFormat.FormatID && FieldFormat.FormatDetType == SKS_LB_formatdettype::AdjPmtLine
+            {
+                FieldFormatsListPaymentADX.addEnd(FieldFormat);
+            }
+
+
+            // ADXENTMapped
+            select firstonly RecId from FieldFormat
+             where FieldFormat.FormatID == FileFormat.FormatID
+                && FieldFormat.EDISegment == SKS_LB_EDISegment::ADXENT
+                && FieldFormat.FieldType != SKS_LB_FieldType::DoNotImport;
+
+            ADXENTMapped = FieldFormat.RecId != 0;
+        }
+        select firstOnly BankAcctFieldFormat where BankAcctFieldFormat.formatid == Fileformat.FormatID && BankAcctFieldFormat.FieldType == SKS_LB_FieldType::LBBankAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Read_Line</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read line
+    /// </summary>
+    /// <param name = "DesiredLine">DesiredLine</param>
+    /// <returns>integer</returns>
+    int Read_Line( int DesiredLine )
+    {
+        container line2;
+        str lineStr;
+        int CurrentLine = 0;
+    
+        if (DesiredLine > 0 && EDIFile.status() == IO_status::Ok)
+        {
+            // Position on the desired line
+            CurrentLine = 0;
+            while (EDIFile.status() == IO_status::Ok && CurrentLine < DesiredLine)
+            {
+                line2 = EDIFile.read();
+                CurrentLine = CurrentLine + 1;
+            }
+    
+            if (EDIFile.status() != IO_status::Ok)
+            {
+                return 1;
+            }
+    
+            [lineStr] = line2;
+            curline = strrem(con2Str(line2), '\n\r');
+        }
+        else
+        {
+            return 1;
+        }
+    
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Read_Next</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read next
+    /// </summary>
+    /// <returns>integer</returns>
+    int Read_Next()
+    {
+        container line;
+        str lineStr;
+    
+    
+    
+        line = EDIFile.read();
+    
+        if (EDIFile.status() != IO_status::Ok)
+        {
+            return 1;
+        }
+    
+        [lineStr] = line;
+        curline = strrem(con2Str(line), '\n\r');
+    
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ReadFile</Name>
+				<Source><![CDATA[
+    TmpSKS_LB_Importing ReadFile()
+    {
+        Container line;
+        container loopRecTypes;
+        str lineStr, currRecord, value;
+        int fieldpos;
+        int TranHeadCnt; //ST count
+        int checkCnt; //BPR count
+        int InvCnt; //RMR count
+        int namebprCnt; //N1BPR
+        int batcnt; //BAT count
+        int datebprcnt; //DTM:BPR count
+        int refbprcnt; //REF:BPR count
+        int trnbprcnt; //TRN count
+        int refrmrcnt; //REF:RMR
+        int trantrailercnt; //SE count
+        int ENTADXNTEcnt; //ENT:ADX:NTE count
+        int DTMcnt; //ENT:ADX:DTM count
+        int NM1cnt; // ENT:ADX:NM1 count
+        int RMRNTEcnt; //RMR:ADX:NTE count
+        int RMRDTMcnt; //RMR:ADX:DTM count
+        int RMRNM1cnt; // RMR:ADX:NM1 count
+        int RMRIT1cnt; //RMR:ADX:IT1 count
+        int ENTIT1cnt; //ENT:ADX:IT1 count
+        int NTERMRCnt; //NTE:RMR count
+        int linecnt = 1;
+        int depnbr = 0;
+        int paymentrecid = 1;
+        TmpSKS_LB_Importing localSTImporting;
+        boolean ValidAcctPathcombo = false;
+        boolean TranHeaderFound = false;
+        boolean TranTrailerFound = false;
+        boolean CheckFound = false;
+        boolean InvoiceFound = false;
+        boolean BatchFound = false;
+        boolean depositFound = false;
+        boolean EntityFound = false;
+        boolean ENTADJFound = false;
+        boolean RMRADJFound = false;
+        boolean RemittanceFound = false;
+        SKS_PP_Setup    sks_pp_setup;
+        SKS_EB_FilePath         lbpath;
+        int InvLineNbr;
+        int64   InvRecID;
+        int64   TmpRecID;
+        real    PlaceholderAmt;
+    
+        loopRecTypes += [#sRecordCodeCheckTran];
+        loopRecTypes += [#sRemittance];
+        loopRecTypes += [#sEntity];
+
+		lbpath = System.IO.Path::GetDirectoryName(Filename);
+        fieldFormatsListEnumeratorCheck = FieldFormatsListCheck.getEnumerator();
+        fieldFormatsListEnumeratorInvoice = FieldFormatsListInvoice.getEnumerator();
+        fieldFormatsListEnumeratorInvoiceADX = FieldFormatsListInvoiceADX.getEnumerator();
+        fieldFormatsListEnumeratorPaymentADX = FieldFormatsListPaymentADX.getEnumerator();
+        select firstonly FFTPM from sks_pp_setup;
+    
+        ttsBegin;
+        line = EDIFile.read();
+        [lineStr] = line;
+        linestr = strrem(lineStr, '\n\r');
+        linestr = strLRTrim(lineStr);
+
+        while(EDIFile.status() == IO_status::Ok || (line != conNull() && EDIFile.status() == IO_Status::FileTooShort))
+        {
+            fieldpos = 1;
+    
+            fieldFormatsListEnumeratorCheck.reset();
+            fieldFormatsListEnumeratorInvoice.reset();
+            fieldFormatsListEnumeratorInvoiceADX.reset();
+            fieldFormatsListEnumeratorPaymentADX.reset();
+    
+            if( strLTrim(linestr) == #sRecordCodeFileHeader)
+            {
+                importing.clear();
+                TranHeadCnt++;
+                trantrailercnt = 0;
+    
+                this.mappingsearch(#RecordCodeFileHeader, TranHeadCnt, line, fieldFormatsListEnumeratorCheck);
+                buf2Buf(importing, localSTImporting);
+    
+                ValidAcctPathcombo = this.validatepathacctcombo(lbpath);
+                if(ValidAcctPathcombo)//Veify bank account will only work for EDI if bank account is mapped to ST record.
+                {
+                    tranheaderfound = true;
+                    TranTrailerFound = false;
+                }
+            }
+            else if(linestr == #sRecordCodeFileTrailer)
+            {
+                TranHeadCnt = 0;
+                trantrailercnt++;
+                trantrailerfound = true;
+                checkFound = false;
+                TranHeaderFound = false;
+            }
+    
+            if(TranHeaderFound && !TranTrailerFound)
+            {
+                if(Fileformat.FileType == SKS_LB_FileType::EDI820)//BatchFound is specific to EDI 823 for Bank count and bank totals
+                {
+                    if(linestr == #sRecordCodeCheckTran)//BPR -Check
+                    {
+                        checkCnt = 1;
+                        trnbprcnt = 0;
+                        namebprCnt = 0;
+                        datebprcnt = 0;
+                        batcnt = 0;
+                        refbprcnt = 0;
+                        NM1cnt = 0;
+                        ENTADXNTEcnt = 0;
+                        DTMcnt = 0;
+                        checkfound = true;
+                        invoicefound = false;
+                        EntityFound = false;
+                        currRecord = lineStr;
+    
+                        buf2Buf(localSTImporting, importing);
+                        paymentrecid = linecnt;
+                        invLineNbr = linecnt;
+    
+                        this.mappingsearch(#RecordCodeCheckTran, checkCnt, line, fieldFormatsListEnumeratorCheck);
+                        BatchFound = false;
+                    }
+                }
+                else
+                {
+                    if(linestr == #sBatch)
+                    {
+                        BatchFound = true;
+                        checkFound = false;
+                        depositFound = false;
+                        value = conpeek(line, 4);
+                        localSTImporting.Batchnum = Value;
+                    }
+                    else if(linestr == #sRecordCodeCheckTran)//BPR -Check
+                    {
+                        checkCnt = 1;
+                        trnbprcnt = 0;
+                        namebprCnt = 0;
+                        datebprcnt = 0;
+                        batcnt = 0;
+                        refbprcnt = 0;
+                        checkfound = true;
+                        invoicefound = false;
+                        EntityFound = false;
+                        paymentrecid = linecnt;
+                        invLinenbr = linecnt;
+                        currRecord = lineStr;
+    
+                        buf2Buf(localSTImporting, importing);
+                        this.mappingsearch(#RecordCodeCheckTran, checkCnt, line, fieldFormatsListEnumeratorCheck);
+                        BatchFound = false;
+                    }
+                    else if(linestr == #sDepositNumber)
+                    {
+                        depositfound = true;
+                        BatchFound = false;
+                        checkFound = false;
+                        depnbr++;
+                    }
+    
+                }
+    
+                if((BatchFound && !CheckFound) || depositFound)
+                {
+                    switch(lineStr)
+                    {
+                        case #sBatchAmount:
+                            value = conpeek(line, 3);
+                            localSTImporting.BankPmtTotal = str2num(value);
+                            break;
+    
+                        case #sBatchQuantity:
+                            value = conPeek(line, 2);
+    
+                            if(value == '42')
+                            {
+                                value = conPeek(line, 3);
+                                localSTImporting.BankPmtCnt = str2int(value);
+                            }
+                            break;
+                    }
+                }
+    
+                if(CheckFound && !InvoiceFound)
+                {
+                    switch(linestr)
+                    {
+                        Case #sTrace:
+                            trnbprcnt++;
+    
+                            this.mappingsearch(#Trace, trnbprcnt, line, fieldFormatsListEnumeratorCheck);
+    
+                            break;
+                        Case #sNameBPR:
+                            namebprCnt++;
+    
+                            this.mappingsearch(#NameBPR, namebprCnt, line, fieldFormatsListEnumeratorCheck);
+    
+                            break;
+                        Case #sReference:
+                            refbprcnt++;
+    
+                            this.mappingsearch(#Reference, refbprcnt, line, fieldFormatsListEnumeratorCheck);
+    
+                            break;
+                        case #sDate:
+                            datebprcnt++;
+    
+                            this.mappingsearch(#DateBPR, datebprcnt, line, fieldFormatsListEnumeratorCheck);
+    
+                            break;
+                        case #sBatch:
+                            batcnt++;
+    
+                            this.mappingsearch(#Batch, batcnt, line, fieldFormatsListEnumeratorCheck);
+    
+                            break;
+                        Case #sRemittance://RMR -Invoice
+                            RemittanceFound = true;
+                            InvoiceFound = true;
+                            EntityFound = false;
+                            InvCnt = 1;
+                            refrmrcnt = 0;
+                            RMRIT1cnt = 0;
+                            NTERMRCnt = 0;
+                            ENTADXNTEcnt = 0;
+                            InvLineNbr = linecnt;
+    
+                            this.mappingsearch(#Remittance, InvCnt, line, fieldFormatsListEnumeratorInvoice);
+                            currRecord = lineStr;
+                            break;
+                        case #sEntity:
+                            EntityFound = true;
+                            RMRADJFound = false;
+                            ENTADJFound = false;
+                            ENTADXNTEcnt = 0;
+                            DTMcnt = 0;
+                            NM1cnt = 0;
+                            NTERMRCnt = 0;
+                            gNote = '';
+                            currRecord = lineStr;
+                            break;
+                        case #sNote:
+                            if(ENTADJFound)
+                            {
+                                ENTADXNTEcnt++;
+                                this.mappingsearch(#Note, ENTADXNTEcnt, line, fieldFormatsListEnumeratorPaymentADX);
+                            }
+                            break;
+                        case #sName:
+                            if(EntityFound)
+                            {
+                                NM1cnt++;
+                                this.mappingsearch(#Name, NM1cnt, line, fieldFormatsListEnumeratorCheck);
+                            }
+                            break;
+                        case #sAdjustment:
+                            // 21139
+                            if (!ADXENTMapped
+                                && currRecord == #sEntity
+                                && !RemittanceFound)
+                            {
+                                break;
+                            }
+
+                            if(EntityFound)
+                            {
+                                ENTADJFound = true;
+                                InvCnt = 1;
+                                InvLineNbr = linecnt;
+                                this.mappingsearch(#EntAdjustment, InvCnt, line, fieldFormatsListEnumeratorPaymentADX);
+                                if(sks_pp_setup.FFTPM)
+                                {
+                                    importing.isDED = NoYes::Yes;
+                                }
+                                currRecord = lineStr;
+                                RMRNTEcnt = 0;
+                                RMRDTMcnt = 0;
+                                RMRNM1cnt = 0;
+                                NTERMRCnt = 0;
+                                ENTADXNTEcnt = 0;
+                            }
+                            break;
+                        case #sItemData:
+                            if(ENTADJFound)
+                            {
+                                ENTIT1cnt++;
+                                this.mappingsearch(#ENTADXItemData, ENTIT1cnt, line, fieldFormatsListEnumeratorPaymentADX);
+                            }
+                            break;
+                    }
+                }
+                else if(invoicefound)
+                {
+                    switch(linestr)
+                    {
+                        Case #sRemittance://RMR -Invoice
+                            RemittanceFound = true;
+                            InvoiceFound = true;
+                            RMRADJFound = false;
+                            ENTADJFound = false;
+                            EntityFound = false;
+                            InvCnt = 1;
+                            refrmrcnt = 0;
+                            RMRIT1cnt = 0;
+                            RMRNTEcnt = 0;
+                            NTERMRCnt = 0;
+                            InvLineNbr = linecnt;
+    
+                            this.mappingsearch(#Remittance, InvCnt, line, fieldFormatsListEnumeratorInvoice);
+                            currRecord = lineStr;
+                            break;
+    
+                        case #sRefRemmittance:
+                            if(!RMRADJFound)
+                            {
+                            refrmrcnt++;
+    
+                            this.mappingsearch(#RefRemmittance, refrmrcnt, line, fieldFormatsListEnumeratorInvoice);
+                            }
+                            break;
+                        case #sNote:
+                            if(RMRADJFound)
+                            {
+                                RMRNTEcnt++;
+                                this.mappingsearch(#RMRADXNote, RMRNTEcnt, line, fieldFormatsListEnumeratorInvoiceADX);
+                            }
+                            else
+                            {
+                                NTERMRCnt++;
+                                this.mappingsearch(#NTERMR, NTERMRCnt, line, fieldFormatsListEnumeratorInvoice);
+                            }
+                            break;
+                        case #sAdjustment:
+                            if(ADXMapped)
+                            {
+                                RMRADJFound = true;
+                                InvCnt = 1;
+                                RMRIT1cnt = 0;
+                                RMRNTEcnt = 0;
+                                NTERMRCnt = 0;
+                                ENTADXNTEcnt = 0;
+                                InvLineNbr = linecnt;
+                                this.mappingsearch(#RMRAdjustment, InvCnt, line, fieldFormatsListEnumeratorInvoiceADX);
+                                if(sks_pp_setup.FFTPM)
+                                {
+                                    importing.isDED = NoYes::Yes;
+                                }
+                                currRecord = lineStr;
+                            }
+                            break;
+                        case #sDate:
+                            if(RMRADJFound)
+                            {
+                                RMRDTMcnt++;
+                                this.mappingsearch(#DateADX, RMRDTMcnt, line, fieldFormatsListEnumeratorInvoiceADX);
+                            }
+                            break;
+                        case #sEntity:
+                            EntityFound = true;
+                            RMRADJFound = false;
+                            ENTADJFound = false;
+                            InvoiceFound = false;
+                            currRecord = lineStr;
+                            NM1cnt = 0;
+                            DTMcnt = 0;
+                            ENTADXNTEcnt = 0;
+                            NTERMRCnt = 0;
+                            gNote = '';
+                            break;
+                        case #sItemData:
+                            if(RMRADJFound)
+                            {
+                                RMRIT1cnt++;
+                                this.mappingsearch(#RMRADXItemData, RMRIT1cnt, line, fieldFormatsListEnumeratorInvoiceADX);
+                            }
+                            break;
+                    }
+                }
+            }
+    
+            line = EDIFile.read();
+            [linestr] = line;
+            linestr = strrem(lineStr, '\n\r');
+            linestr = strLRTrim(lineStr);
+            linecnt++;
+
+
+            // 21139
+            // If no BPR ADX:ENT segment mapping exists, ignore ADX:ENT lines in the file
+            if (!ADXENTMapped
+                && linestr == #sAdjustment
+                && currRecord == #sEntity
+                && !RemittanceFound
+                && CheckFound)
+            {
+                continue;
+            }
+
+    
+            if((
+                lineStr == #sRecordCodeCheckTran && CheckFound) //Next line is a check line, check already found
+                || (lineStr == #sRemittance && CheckFound && (InvoiceFound || ENTADJFound))//Next line is an invoice line, check already found, and an invoice or payment level adjustment already found
+                || (lineStr == #sRecordCodeFileTrailer && CheckFound) //Next line is a file trailer record, check already found. No remittance or adjustments found
+                || (lineStr == #sBatch && CheckFound && !depositFound) //Next line is a Batch line, check already found, deposit record has not been found
+                || (lineStr == #sDepositNumber && CheckFound) //Next line is a Deposit number line, check already found
+                || (lineStr == #sAdjustment && InvoiceFound && ADXMapped) //Next line is an adjustment line, invoice already found, adustments are mapped
+                || (linestr == #sEntity && (InvoiceFound || currRecord == 'ADX')) //Next line is an Entity line(ENT) and and invoice has been found or currently we are on or nested within an adjustment record
+                || (linestr == #sAdjustment && ENTADJFound && currRecord == 'ADX') //Next line is an adjustment line and and entity adjustment has been found and we are currently on or nested within and adjustment record
+                || (currRecord == 'BPR' || (currRecord == #sDepositNumber && CheckFound) || (currRecord == #sBatch && CheckFound) || (currRecord == #sEntity && CheckFound) && lineStr == #sAdjustment))//Essentially the only thing in the file is a check and adjustment records
+            {
+                importing.DepNbr = depnbr;
+                importing.FileLineNbrBegin = InvLineNbr;
+                importing.parentRecId = paymentrecid;
+                importing.FileDate = FileDate;
+                if(RMRADJFound)
+                {
+                    importing.insert();
+                    if(Fileformat.SettleAmtIncludesAdjAmt && CheckFound && InvoiceFound)
+                    {
+                        placeholderamt = importing.InvAmount;
+                        TmpRecId = importing.RecId;
+                        select forupdate firstonly importing where importing.recid == InvRecID;
+                        importing.InvAmount += placeholderamt * -1;
+                        importing.update();
+                        select firstOnly importing where importing.RecId == TmpRecID;
+                    }
+                }
+                else
+                {
+                    if(!((currRecord == #sEntity && CheckFound) && lineStr == #sAdjustment))
+                    {
+                        importing.insert();//Clear appropriate records
+                    }
+                }
+    
+                if(FileFormat.CombineADXRefNbr && importing.isDED == NoYes::Yes)
+                {
+                   SKS_LB_ReadFileEDI::TmpRecordCombineLikeAdx(importing);
+                }
+                //Only want to save the recid for RMR records
+                if(currRecord == 'RMR')
+                {
+                    InvRecID = importing.RecId;
+                }
+                if(gNote == '')
+                {
+                    importing.PaymNote = '';
+                }
+                else
+                {
+                    importing.PaymNote = gNote + ' ';
+                }
+                importing.isDED = NoYes::No;
+                importing.InvAmount = 0;
+                importing.InvoiceNumber = ' ';
+                importing.DiscAmount = 0;
+               
+                if (conFind(loopRecTypes, currRecord) && conFind(loopRecTypes, lineStr))
+                {
+                    importing.LBInvoice = '';
+                }
+            }
+        }
+        ttsCommit;
+    
+        return importing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RetrieveBankAccountNumberFromFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieve bank account number from file
+    /// </summary>
+    /// <returns>container</returns>
+    Container RetrieveBankAccountNumberFromFile()
+    {
+        str         RecordCode;
+        Container   line;
+        container   BankAcctCon;
+        str         lineStr;
+        str         AcctNum;
+        int         OccCount = 0;
+        boolean     Exit = false;
+        RecordCode = this.FindBankAccountNumFormatDet(BankAcctFieldFormat.EDISegment);
+        while(EDIFile.status() == IO_status::Ok && !Exit)
+        {
+            line = EDIFile.read();
+            [lineStr] = line;
+            linestr = strrem(lineStr, '\n\r');
+            linestr = strLRTrim(lineStr);
+            if(lineStr == RecordCode)
+            {
+                OccCount++;
+                if(OccCount == BankAcctFieldFormat.EDIOccurrence)
+                {
+                    AcctNum = conpeek(line, BankAcctFieldFormat.EDIFieldNbr);
+                    if(conFind(BankAcctCon, AcctNum) == 0)//Makes sure the account number is unique and not already in the container
+                    {
+                        BankAcctCon += AcctNum;
+                        Exit = !FileFormat.VerifyAcct ? true : false;
+                    }
+                    OccCount = 0;
+                }
+            }
+        }
+        return BankAcctCon;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SetNoteHeader</Name>
+				<Source><![CDATA[
+    void SetNoteHeader()
+    {
+        importing.PaymNote = gNote + ' ';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>TmpRecordCombineLikeAdx</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Combine like ADX records
+    /// </summary>
+    /// <param name = "Importing">Lockbox importing record</param>
+    public static void TmpRecordCombineLikeAdx(TmpSKS_LB_Importing     Importing)
+    {
+        RefRecId    TmpRecID;
+        refrecid  ParentRecid = importing.ParentRecid;
+        InvoiceID InvoiceID = importing.LBInvoice;
+        Amount InvAmount = importing.InvAmount;
+        refrecid recid = importing.RecId;
+        PaymNote Note = importing.PaymNote;
+    
+        if(InvoiceId != '')
+        {
+            //Select a separate TmpImporting record that is a deduction and shares the same parent recid and LBInvoice values
+            select forupdate firstOnly importing where importing.isDED == NoYes::Yes && importing.ParentRecid == ParentRecid && Importing.LBInvoice == InvoiceID && importing.RecId != recid;
+    
+            if(Importing)
+            {
+                //IF we find a separate record then combine the values from the original record into the one we just selected
+                ttsBegin;
+                Importing.InvAmount += InvAmount;
+                if(importing.PaymNote != '' && Note != '')
+                {
+                    importing.PaymNote += ' ' + Note;
+                }
+                Importing.update();
+                TmpRecId = importing.recid;//Update the old record and save off the record we combined the values into
+                select firstonly Importing where importing.recid == recid;//Reselect the original importing record. Its values have been combined into an older record so we can now delete it
+                Importing.delete();
+                ttsCommit;
+    
+                select firstonly Importing where importing.recid == TmpRecId;//Reselect the older record that the values were combined into so that we don't leave with an empty buffer
+            }
+            else
+            {
+                //We didn't find a record to combine the original record into so now we can reselect the original record so we don't leave with an empty buffer
+                select firstonly Importing where importing.recid == recid;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

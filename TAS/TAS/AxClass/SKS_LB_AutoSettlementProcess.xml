@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_AutoSettlementProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_LB_AutoSettlementProcess extends RunBaseBatch
+{
+    #OCCRetryCount
+    int fromCustAccount, toCustAccount;
+
+    Map         customerMap;
+    container   conCustTable;
+    int         procStartTime;
+    Counter     CustCnt;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        fromCustAccount,
+        toCustAccount,
+        conCustTable
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processAutoSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Start processing auto-settlement
+    /// </summary>
+    public void processAutoSettlement()
+    {
+        CustTable custTable;
+
+        Map custTableMap =  Map::create(conCustTable);
+
+        procStartTime = WinAPIServer::getTickCount();
+
+        while (fromCustAccount <= toCustAccount)
+        {
+            select firstonly crosscompany custTable
+                where custTable.RecId == custTableMap.lookup(fromCustAccount);
+
+            if (custTable)
+            {
+                changecompany(custTable.company())
+                {
+                    try
+                    {
+                        this.processSettleTrans(custTable);
+                        SKS_LB_AutoSettlementProcess::createAutoSettlementResultRecord(custTable);
+                        CustCnt++;
+                    }
+                    catch (Exception::Deadlock)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::Deadlock;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    catch (Exception::UpdateConflict)
+                    {
+                        if (appl.ttsLevel() == 0)
+                        {
+                            if (xSession::currentRetryCount() >= #RetryNum)
+                            {
+                                throw Exception::UpdateConflictNotRecovered;
+                            }
+                            else
+                            {
+                                retry;
+                            }
+                        }
+                        else
+                        {
+                            throw Exception::UpdateConflict;
+                        }
+                    }
+                    catch (Exception::DuplicateKeyException)
+                    {
+                        error(strFmt('@SKS:SKGErrorSettleInvoice', custTable.AccountNum));
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        error(strFmt('@SKS:SKGErrorSettleInvoice', custTable.AccountNum));
+                    }
+                    catch (Exception::Error)
+                    {
+                        error(strFmt('@SKS:SKGErrorSettleInvoice', custTable.AccountNum));
+                    }
+                }
+            }
+            fromCustAccount ++;
+        }
+
+        this.displayLogResults();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSettleTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// process the auto-settlement on various Auto-settlement type
+    /// </summary>
+    /// <param name = "_custTable"> custTable buffer </param>
+    public void processSettleTrans(CustTable _custTable)
+    {
+        SKS_LB_AutoSettlementSetup          autoSettlementSetup;
+        SKS_LB_AutoSettlementRules          autoSettlementRules;
+        CustTable                           custTable;
+
+        SKS_LB_AutoSettlementSCSD           autoSettlementSCSD;
+        SKS_LB_AutoSettlementSCMD           autoSettlementSCMD;
+        SKS_LB_AutoSettlementMCMD           autoSettlementMCMD;
+
+        custTable = _custTable;
+        changecompany(custTable.company())
+        {
+            select firstonly autoSettlementSetup
+                where autoSettlementSetup.company() == custTable.company();
+
+            while select autoSettlementRules
+                order by autoSettlementRules.Step asc
+                where autoSettlementRules.SKS_AS_RuleGroupTable == autoSettlementSetup.SKS_AS_RuleGroupTable
+            {
+                switch (autoSettlementRules.SettlementTypeId)
+                {
+                    case SKS_LB_AutoSettlementType::SingleCredit2SingleDebit:
+                        autoSettlementSCSD  = SKS_LB_AutoSettlementSCSD::construct(custTable, autoSettlementSetup, autoSettlementRules);
+                        autoSettlementSCSD.processAutoSettlementSCSD();
+                        break;
+
+                    case SKS_LB_AutoSettlementType::SingleCredit2MultipleeDebits:
+                        autoSettlementSCMD = SKS_LB_AutoSettlementSCMD::construct(custTable, autoSettlementSetup, autoSettlementRules);
+                        autoSettlementSCMD.processAutoSettlementSCMD();
+                        break;
+
+                    case SKS_LB_AutoSettlementType::MultipleCredit2MultipleDebits:
+                        autoSettlementMCMD = SKS_LB_AutoSettlementMCMD::construct(custTable, autoSettlementSetup, autoSettlementRules);
+                        autoSettlementMCMD.processAutoSettlementMCMD();
+                        break;
+
+                    case SKS_LB_AutoSettlementType::Custom:
+                        SKS_LB_AutoSettlementHelper autoSettlementHelper = SKS_LB_AutoSettlementHelper::construct(custTable);
+                        SKS_LB_AutoSettlementCustomParms autoSettlementCustomParms =  new SKS_LB_AutoSettlementCustomParms();
+
+                        autoSettlementCustomParms.parmCustTable(custTable);
+                        autoSettlementCustomParms.parmAutoSettlementHelper(autoSettlementHelper);
+                        autoSettlementCustomParms.parmAutoSettlementRules(autoSettlementRules);
+                        autoSettlementCustomParms.parmAutoSettlementSetup(autoSettlementSetup);
+
+                        ExecutePermission   executePerm;
+                        DictClass           dictClass;
+                        Object              object;
+
+                        executePerm = new ExecutePermission();
+                        executePerm.assert();
+                        dictClass = new DictClass(className2Id(autoSettlementRules.CustomParseClass));
+                        object = dictClass.makeObject();
+
+                        dictClass.callObject('autoSettlementCustom', object, autoSettlementCustomParms);
+                        CodeAccessPermission::revertAssert();
+                        break;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayLogResults</Name>
+				<Source><![CDATA[
+    public void displayLogResults()
+    {
+        info(strFmt('@SKS:SKGInvoiceSettleCustomer', CustCnt));
+
+        int procEndTime = WinAPIServer::getTickCount();
+        int procExecutionTime = (procEndTime-procStartTime) div 1000;
+        if (procExecutionTime)
+        {
+            str execTimeUnit = "@SKS:SKGCCSecondsProcUnit";
+            if (procExecutionTime > 180)
+            {
+                // Greater than 180 seconds then convert to minutes
+                procExecutionTime = any2Int(procExecutionTime / 60);
+                execTimeUnit = "@SKS:SKGCCMinutesProcUnit";
+            }
+            info(strFmt("@SKS:SKGCCProcElapsedTimeWithProcUnit", procExecutionTime, execTimeUnit));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCustomerMap</Name>
+				<Source><![CDATA[
+    public Map parmCustomerMap(Map _customerMap = customerMap)
+    {
+        customerMap = _customerMap;
+        return customerMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmFromCustAccount</Name>
+				<Source><![CDATA[
+    public int parmFromCustAccount(int _fromCustAccount)
+    {
+        fromCustAccount =  _fromCustAccount;
+        return fromCustAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmToCustAccount</Name>
+				<Source><![CDATA[
+    public int parmToCustAccount(int _toCustAccount)
+    {
+        toCustAccount =  _toCustAccount;
+        return toCustAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCustTransSettleRecords</Name>
+				<Source><![CDATA[
+    public container parmCustTransSettleRecords(container _conCustTable)
+    {
+        conCustTable =  _conCustTable;
+        return conCustTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Constructs an instance of the <c>SKS_LB_AutoSettlementProcess</c> class.
+    /// </summary>
+    /// <returns>
+    ///    An instance of the <c>SKS_LB_AutoSettlementProcess</c> class.
+    /// </returns>
+    public static SKS_LB_AutoSettlementProcess construct(int _fromCustAccount, int _toCustAccount, container _conCustTable)// Map _customerMap, container _conCustRec, container _coc)
+    {
+        SKS_LB_AutoSettlementProcess autoSettlementProcess;
+
+        autoSettlementProcess = new SKS_LB_AutoSettlementProcess();
+
+        autoSettlementProcess.parmFromCustAccount(_fromCustAccount);
+        autoSettlementProcess.parmToCustAccount(_toCustAccount);
+        autoSettlementProcess.parmCustTransSettleRecords(_conCustTable);
+
+        return autoSettlementProcess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drives the auto-settlement process for the provided customers.
+    /// </summary>
+    public void run()
+    {
+        this.processAutoSettlement();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAutoSettlementResultRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create auto settlement result record for each customer
+    /// </summary>
+    /// <param name = "_custTable"> Cust table buffer </param>
+    public static void createAutoSettlementResultRecord(CustTable _custTable)
+    {
+        SKS_LB_AutoSettleResult autoSettlementResult;
+
+        CustTransOpen custTransOpenCredit, custTransOpenDebit;
+
+        CustTransOpen openCreditOldDate, openDebitOldDate;
+
+        select sum(AmountCur) from custTransOpenCredit
+            order by custTransOpenCredit.DueDate asc
+            where custTransOpenCredit.AccountNum == _custTable.AccountNum
+            && custTransOpenCredit.AmountCur < 0;
+
+        select sum(AmountCur) from custTransOpenDebit
+            order by custTransOpenDebit.DueDate asc
+            where custTransOpenDebit.AccountNum == _custTable.AccountNum
+            && custTransOpenDebit.AmountCur > 0;
+
+
+        if (custTransOpenDebit.AmountCur || custTransOpenCredit.AmountCur)
+        {
+            select firstOnly DueDate from openCreditOldDate
+                order by openCreditOldDate.DueDate asc
+                where openCreditOldDate.AccountNum == _custTable.AccountNum
+                && openCreditOldDate.AmountCur < 0;
+
+            select firstOnly DueDate from openDebitOldDate
+                order by openDebitOldDate.DueDate asc
+                where openDebitOldDate.AccountNum == _custTable.AccountNum
+                && openDebitOldDate.AmountCur > 0;
+
+            autoSettlementResult.UnsettledCredit = custTransOpenCredit.AmountCur;
+            autoSettlementResult.UnsettledDebit = custTransOpenDebit.AmountCur;
+            autoSettlementResult.AccountNum = _custTable.AccountNum;
+            autoSettlementResult.Name = DirPartyTable::findRec(_custTable.Party).Name;
+            autoSettlementResult.ProcessingDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            autoSettlementResult.OldestCreditDate = openCreditOldDate.DueDate;
+            autoSettlementResult.OldestDebitDate =  openDebitOldDate.DueDate;
+            autoSettlementResult.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

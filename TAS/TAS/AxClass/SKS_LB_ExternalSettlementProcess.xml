@@ -1,0 +1,1234 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_ExternalSettlementProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_LB_ExternalSettlementProcess
+{
+    SKS_LB_JournalAR    MainFileAR;
+    SKS_LB_Journal      bSKS_LB_Journal;
+    SKS_PP_Setup        localPP_Setup;
+    SKS_LB_Logger       logger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ExternalSettlementProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// External settlement process
+    /// </summary>
+    /// <param name = "ExtSettleParms">parameter container</param>
+    public static void ExternalSettlementProcess(container ExtSettleParms)
+    {
+        SKS_LB_ExternalSettlementProcess SKS_LB_ExternalSettlementProcess = new SKS_LB_ExternalSettlementProcess();
+        SKS_LB_ExternalSettlementProcess.importExternalSettlements(conPeek(ExtSettleParms, 1), conPeek(ExtSettleParms, 2)
+            , conPeek(ExtSettleParms, 3), conPeek(ExtSettleParms, 4)
+            , conPeek(ExtSettleParms, 5), conPeek(ExtSettleParms, 6)
+            , conPeek(ExtSettleParms, 7), conPeek(ExtSettleParms, 8)
+            , conPeek(ExtSettleParms, 9));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importExternalSettlements</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method that imports the external settlements 
+    /// </summary>
+    /// <param name = "filename">file name</param>
+    /// <param name = "_MainFileAR">main file ar</param>
+    /// <param name = "_bSKS_LB_Journal">journal ar</param>
+    /// <param name = "_PP_Setup">TAS setup</param>
+    /// <param name = "validateCheckNumber">validate check number boolean</param>
+    /// <param name = "_AllowUnequalAmts">allowUnequalAmts boolean</param>
+    /// <param name = "_AnalyzeRemit">_AnalyzeRemit</param>
+    /// <param name = "_RemitData">_RemitData</param>
+    /// <param name = "_reimport">_reimport</param>
+    [SuppressBPWarning("Consider using the 'firstonly' keyword for select from 'arapplic' since additional data rows are unused here.", 'False positive')]
+    public void importExternalSettlements(Filename filename, SKS_LB_JournalAR _MainFileAR
+        , SKS_LB_Journal _bSKS_LB_Journal, SKS_PP_Setup _PP_Setup
+        , boolean validateCheckNumber, boolean _AllowUnequalAmts
+        , boolean _AnalyzeRemit = false, SKS_BR_NoteMemo _RemitData ='', boolean _reimport = false)
+    {
+        CustTrans               findCusttrans;
+        CustTrans               locCustTrans;
+        AmountCur               importTotalAmount;
+        boolean                 importDataError;
+        InvoiceId               m_InvcNbr;
+        CustTransOpen           findCusttransopen;
+        SKS_LB_JournalAR        local_JournalAR;
+        SKS_LB_JournalARApplic  arApplic;
+        SKS_LB_Depositor        lSKS_LB_Depositor;
+        TmpSKS_LB_Importing     tmp_LB_Importing;
+        SKS_LB_Importing        db_LB_Importing;
+        SKS_LB_FileFormat       rec_SKS_LB_FileFormat;
+        SKS_LB_ReadFileCSVExternal      cls_SKS_LB_ReadFileCSVExternal;
+        SKS_LB_ReadFileFixedExternal    cls_SKS_LB_ReadFileFixedExternal;
+        SKS_LB_Bank             SKS_LB_Bank;
+        SKS_LB_MatchParms       lMatchParms;
+        SKS_LB_InvoiceIDErr     lInvoiceIDErr;
+        SKS_LB_Process_IMPORTTEMP_Records  tmpImport = new SKS_LB_Process_IMPORTTEMP_Records();
+        SKS_LB_SecondaryMatch   SKS_LB_SecondaryMatch = new SKS_LB_SecondaryMatch();
+        int                     newPmtCount;
+        real                    maxToApply;
+        real                    reamainingMaxToApply;
+        AmountCur               ApplyAmountCur;
+        DiscAmountMst           DiscApplyAmt;
+        container               virtualCompanyCompanies;
+        SKS_LB_PaymentAmt       sks_lb_paymentAmt;
+        DimensionDefault        defaultDimension;
+        SKS_EB_FileRecord       l_fileRecordId;
+        CustTable               l_tmpCust;
+        DirPartyTable           l_dirPartyTable;
+        SKS_LB_Depositor        tmpSKS_LB_Depositor;
+        SKS_LB_AutoCreateCreditDebitGroup sks_lb_AutoCreateCreditDebitGroup;
+        SKS_LB_WriteoffDetails  SKS_LB_WriteOffDetails;
+        boolean                 AutoCreditCreated;
+        boolean                 SplitAR = false;
+        boolean                 existsInSettlement;
+        boolean                 sumLikeRef;
+        CustPaymSettlementManager   SettlementManager;
+        str                     pathfile;
+        TaxGroup                lTaxGroup;
+        boolean                 ret;
+        boolean                 recsFound;
+
+        select firstonly forupdate MainFileAR where MainFileAR.RecId == _MainFileAR.RecId;
+        select firstonly forupdate bSKS_LB_Journal where bSKS_LB_Journal.recid == _bSKS_LB_Journal.RecId;
+        localPP_Setup = _PP_Setup;
+
+        Void AutoCreditCreation(SKS_LB_JournalAR _JournalAR)
+        {
+            if(AutoCreditCreated && _JournalAR.WriteOff == NoYes::No)
+            {
+                _JournalAR.WriteOff = NoYes::Yes;
+
+                if(tmpSKS_LB_Depositor.AutoCRAutoRev)
+                {
+                    _JournalAR.AutoCRRev = NoYes::Yes;
+                }
+                else
+                {
+                    _JournalAR.AutoCRRev = NoYes::No;
+                }
+            }
+        }
+
+        void NextImportingRecord()
+        {
+            tmp_LB_importing.delete();
+            mainFileAR.reread();
+
+            if(_AnalyzeRemit)
+            {
+                next tmp_LB_Importing;
+                if(!tmp_LB_Importing)
+                {
+                    recsFound = false;
+                }
+            }
+            else
+            {
+                db_LB_Importing.delete();
+                next db_LB_Importing;
+                if(!db_LB_Importing)
+                {
+                    recsFound = false;
+                }
+                else
+                {
+                    tmp_LB_Importing = this.CopyImportingRecordToTmpTable(db_LB_Importing);
+                }
+            }
+        }
+
+
+        SKS_LB_Bank = SKS_LB_Bank::find(mainFileAR.BankAcct, mainFileAR.FormatID);
+
+        if(!_AnalyzeRemit)
+        {
+            // logger only initializes when "_AnalyzeRemit" is false
+            logger = SKS_LB_Logger::construct(_MainFileAR.RecId);
+
+            if(_reimport)
+            {
+                select * from db_LB_Importing where db_LB_Importing.ExternalJournalARRecord == MainFileAR.RecId;
+            }
+            else
+            {
+                pathfile = filename;
+                Select firstonly * from lSKS_LB_Depositor where lSKS_LB_Depositor.AccountNum == mainfileAR.CustAccount
+                && lSKS_LB_Depositor.CustomerCompany == mainFileAR.CustomerCompany;
+
+                Select firstonly rec_SKS_LB_FileFormat where rec_SKS_LB_FileFormat.FormatID == lSKS_LB_Depositor.LBExternalFormatId;
+
+                switch (rec_SKS_LB_FileFormat.FileType)
+                {
+                    case SKS_LB_FileType::TabDelimited:
+                    case SKS_LB_FileType::CSV:
+                        cls_SKS_LB_ReadFileCSVExternal =  new SKS_LB_ReadFileCSVExternal();
+                        If (rec_SKS_LB_FileFormat.FileType == SKS_LB_FileType::TabDelimited)
+                        {
+                            cls_SKS_LB_ReadFileCSVExternal.useTabDelimiter();
+                        }
+                        cls_SKS_LB_ReadFileCSVExternal.setFormatId(rec_SKS_LB_FileFormat.FormatID);
+                        cls_SKS_LB_ReadFileCSVExternal.setFileName(filename);
+                        cls_SKS_LB_ReadFileCSVExternal.openFile();
+                        cls_SKS_LB_ReadFileCSVExternal.GetSetExternalJournalARRecord(MainFileAR.RecId);
+                        db_LB_Importing = cls_SKS_LB_ReadFileCSVExternal.readExternalFile();
+                        cls_SKS_LB_ReadFileCSVExternal = null;
+                        break;
+                    case SKS_LB_FileType::FixedField:
+                        cls_SKS_LB_ReadFileFixedExternal = new SKS_LB_ReadFileFixedExternal();
+                        cls_SKS_LB_ReadFileFixedExternal.setFormatId(rec_SKS_LB_FileFormat.FormatID);
+                        cls_SKS_LB_ReadFileFixedExternal.setFileName(filename);
+                        cls_SKS_LB_ReadFileFixedExternal.openFile();
+                        cls_SKS_LB_ReadFileFixedExternal.GetSetExternalJournalARRecord(MainFileAR.RecId);
+                        db_LB_Importing = cls_SKS_LB_ReadFileFixedExternal.readExternalFile();
+                        cls_SKS_LB_ReadFileFixedExternal = null;
+                        break;
+                    default:
+                        logger.save("@SKS560"); //"Invalid format type for external settlements" message
+                        return;
+                }
+            }
+
+            if(db_LB_Importing)
+            {
+                recsFound = true;
+                if (validateCheckNumber)
+                {
+                    select firstonly db_LB_Importing where db_LB_Importing.CheckNumber != MainFileAR.ChkRefNbr && db_LB_Importing.ExternalJournalARRecord == MainFileAR.RecId;
+
+                    if (db_LB_Importing)
+                    {
+                        //Line %1: Check number in file does not match payment record.
+                        logger.saveInfo(strfmt("@SKS955", db_LB_Importing.FileLineNbrBegin), db_LB_Importing.InvoiceNumber, db_LB_Importing.InvAmount, db_LB_Importing.DiscAmount);
+                        importDataError = true;
+                    }
+                }
+
+                select sum(InvAmount) from db_LB_Importing;
+                if (mainfileAR.PmtAmountCur != db_LB_Importing.InvAmount)
+                {
+                    if(!_AllowUnequalAmts)
+                    {
+                        logger.save(strFmt("@SKS:SKSPaymAndInvAmountMistmatch", MainFileAR.PmtAmountCur, db_LB_Importing.InvAmount));
+                        return;
+                    }
+                }
+            }
+        }
+        else
+        {
+            SKS_LB_UnstructuredMatchContainers      UnstrMatchContainers = new SKS_LB_UnstructuredMatchContainers();
+            List                                    RemitTxtDataList = new List(Types::Class);
+            SKS_LB_UnstructuredRulesMatching        SKS_LB_UnstructuredRulesMatching = new  SKS_LB_UnstructuredRulesMatching();
+            SKS_LB_MatchingRules                    SKS_LB_MatchingRules;
+            int                                     Counter;
+            Container                               ConGoodInv, ConAmountCur;
+
+            select firstonly * from SKS_LB_MatchingRules
+                join sks_lb_bank where sks_lb_matchingRules.groupId == sks_lb_bank.matchingRulesGroupId
+                    && sks_lb_bank.LBformatid == bSKS_LB_Journal.formatId
+                    && sks_lb_bank.bankaccountId == bSKS_LB_Journal.bankAcct
+                    && sks_lb_matchingRules.lookupType == sks_lb_matchType::UnstrData;
+            RemitTxtDataList = SKS_LB_UnstructuredRulesMatching.ParseInvNumbers(_RemitData, sks_lb_matchingRules.unstrRuleId);
+            boolean allowSearchAcrossCompany = true;
+            if(SKS_LB_Bank.LBRestrictCrossCompanySearch)
+            {
+                allowSearchAcrossCompany = false;
+            }
+            UnstrMatchContainers = SKS_LB_UnstructuredRulesMatching.CycleValues(RemitTxtDataList, MainFileAR.CustAccount, sks_lb_matchingRules.IncludeDuplicateInvs, allowSearchAcrossCompany);
+            if(UnstrMatchContainers != Null)
+            {
+                ConGoodInv = UnstrMatchContainers.GoodInv();
+                ConAmountcur = UnstrMatchContainers.ConAmountCur();
+                For(Counter = 1; Counter <= conLen(ConGoodInv); Counter++)
+                {
+                    tmp_LB_Importing.RemitAnalyzeCTOrecid = ConPeek(ConGoodInv, counter);
+                    tmp_LB_Importing.InvAmount = ConPeek(ConAmountcur, counter);
+                    tmp_LB_Importing.CheckNumber = MainFileAR.ChkRefNbr;
+                    tmp_LB_Importing.insert();
+                    recsFound = true;
+                }
+            }
+        }
+
+        if (recsFound)
+        {
+            importTotalAmount   = 0;
+
+            if (importDataError)
+            {
+                //Error in import file.
+                if (logger)
+                {
+                    logger.save("@SKS956");
+                }
+                else
+                {
+                    error("@SKS956");
+                }
+                return;
+            }
+
+            virtualCompanyCompanies = SKS_LB_54000Bas::LBFindSharedServiceCompanies(SKS_LB_Bank);
+            newPmtCount = 0;
+            changeCompany(Mainfilear.company())
+            {
+                CompanyId   lcompany = findCusttransopen ? findCusttransopen.DataAreaId : mainFileAR.CustomerCompany;
+                settlementManager = SKS_LB_Process_Importtemp_records::constructSettlementManager(mainFileAR.PaymDate, bSKS_LB_Journal.CurrencyCode, bSKS_LB_Journal.ExchRate, lcompany, mainfilear.CustAccount);
+            }
+
+            if(_AnalyzeRemit)
+            {
+                select forupdate tmp_LB_Importing order by tmp_LB_Importing.RecId;
+            }
+            else
+            {
+                select forupdate db_LB_Importing order by db_LB_Importing.RecId where db_LB_Importing.ExternalJournalARRecord == MainFileAR.recid;
+                tmp_LB_Importing = this.CopyImportingRecordToTmpTable(db_LB_Importing);
+                //Method to copy record over to 
+            }
+
+            while(recsFound)
+            {
+                ttsbegin;
+                AutoCreditCreated = false;
+                tmpImport.SetAutoCreditCreated(AutoCreditCreated);
+                tmpImport.GetSetGlobalTmpJournal(bSKS_LB_Journal);
+                findCusttrans = null;
+                findCusttransopen = null;
+                ApplyAmountCur = tmp_LB_Importing.InvAmount;
+                DiscApplyAmt = tmp_LB_Importing.DiscAmount;
+                boolean markedByCheck = false;
+
+                if(_AnalyzeRemit)
+                {
+                    // Create new settlement records using apply amounts from file just imported.
+                    Select firstonly crosscompany:virtualCompanycompanies Invoice, DefaultDimension, AccountNum from findCusttrans
+                    order by findCusttrans.DueDate
+                        join findCusttransopen
+                            where findCusttransopen.RecId == tmp_LB_Importing.RemitAnalyzeCTOrecid
+                        && findCusttrans.RecId == findCusttransopen.RefRecId;
+                            
+                }
+                else
+                {
+                    // Create new settlement records using apply amounts from file just imported.
+                    Select firstonly crosscompany:virtualCompanycompanies Invoice, DefaultDimension, AccountNum from findCusttrans
+                    order by findCusttrans.DueDate
+                    where (findCusttrans.Invoice == tmp_LB_Importing.InvoiceNumber )
+                        join findCusttransopen
+                            where (findCusttrans.RecId == findCusttransopen.RefRecId)
+                            && (findCusttransopen.AccountNum == mainfileAR.CustAccount);
+                }
+                
+                //if not found, do secondary match lookup
+                if (!findCusttransopen || this.UseCustomMatching())
+                {
+                    tmp_LB_Importing = this.PreMatchCustomShell(tmp_LB_Importing, mainFileAR);
+                    lMatchParms = SKS_LB_SecondaryMatch.ReferenceMatch(mainfileAR.bankacct, mainFileAR.JournalId, mainFileAR.BatchNum, pathfile, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()), rec_SKS_LB_FileFormat.FormatID, virtualCompanycompanies, SKS_LB_Bank.MatchingRulesGroupId, tmp_LB_Importing);
+                    findCusttransopen = lMatchParms.matchTransOpen();
+                    lInvoiceIDErr = lMatchParms.invoiceIDErr();
+                    if(lMatchParms.StopMatch() == false)
+                    {
+                        if(findCusttransopen)
+                        {
+                            findCusttrans = findCusttransopen.custTrans();
+
+                            if(tmpImport.ReduceCreditWriteOffProcess(tmp_LB_Importing, findCusttransopen, localPP_Setup, findCusttrans, mainFileAR.PaymDate, virtualCompanyCompanies, mainfilear.FormatID,
+                                    mainFileAR.BankAcct, mainFileAR.Filename, mainFileAR.FileDate, bSKS_LB_Journal))
+                            {
+                                bSKS_LB_Journal = tmpImport.GetSetGlobalTmpJournal(bSKS_LB_Journal);
+                            }
+                        }
+                        else
+                        {
+                            if(tmp_LB_Importing.InvAmount < 0)
+                            {
+                                // Find SKS_LB_Depositor or Create if it doesn't exist
+                                tmpSKS_LB_Depositor = SKS_EFT_CustomerLoad::CreateFindCustomerRecord(mainFileAR.CustAccount, null, true, true, true, mainFileAR.CustomerCompany);
+
+                                select firstonly SKS_LB_WriteoffDetails order by SKS_LB_WriteoffDetails.ThresholdAmount asc
+                                where SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules == tmpSKS_LB_Depositor.WriteOffId
+                                    && SKS_LB_WriteoffDetails.ThresholdAmount > abs(tmp_LB_Importing.InvAmount)
+                                    && SKS_LB_WriteoffDetails.CustomerCompany == mainFileAR.CustomerCompany
+                                    && SKS_LB_WriteoffDetails.ThresholdAmount != 0 && sks_lb_writeoffdetails.AutoCR == NoYes::Yes;
+
+                                if(SKS_LB_WriteoffDetails.AutoCR == NoYes::Yes && localPP_SETUP.AutoCR)
+                                {
+                                    lTaxGroup = SKS_LB_Setup_AutoCRParms::find(sks_lb_writeoffdetails.CustomerCompany).TaxGroup;
+                                    changeCompany(mainFileAR.CustomerCompany)
+                                    {
+                                        sks_lb_AutoCreateCreditDebitGroup = new SKS_LB_AutoCreateCreditDebitGroup();
+                                        m_InvcNbr = sks_lb_AutoCreateCreditDebitGroup.AutoCreateCredit(CustTable::find(mainFileAR.CustAccount).InvoiceAccount, mainFileAR.CustAccount,
+                                        SKS_LB_WriteoffDetails.CRLedgerDimension, tmp_LB_Importing.InvAmount,
+                                        tmp_LB_Importing.InvoiceNumber, bSKS_LB_Journal.CurrencyCode, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+                                        sks_lb_writeoffdetails.CROffsetLedgerDimension, Mainfilear.PaymDate, lTaxGroup,
+                                        mainFileAR.MOP);
+
+                                        if(m_invcNbr)
+                                        {
+                                            AutoCreditCreated = true;
+                                            tmpImport.SetAutoCreditCreated(AutoCreditCreated);
+                                            findCusttrans = null;
+                                            findCusttransopen = null;
+                                            Select findCusttrans
+                                        where (findCusttrans.Invoice == m_invcNbr )
+                                        join  findCusttransopen
+                                        where (findCusttrans.RecId == findCusttransopen.RefRecId);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    if(localPP_Setup.FFTPM)
+                                    {
+                                        Global::buf2Buf(mainfileAR, local_JournalAr);
+                                        local_JournalAr.ActualSettleAmountCur =  0;
+                                        local_JournalAR.PmtAmountCur = tmpImport.FlintFoxFunction(localPP_Setup.FFTPM, tmp_LB_Importing.InvAmount);
+                                        local_JournalAR.PmtWasSplit = NoYes::No;
+                                        local_JournalAR.Invoice = tmp_lb_importing.InvoiceNumber;
+                                        local_JournalAR.LBInvoice = tmp_lb_importing.InvoiceNumber;
+                                        local_JournalAR.ParentJournalARID = mainFileAr.RecId;
+                                        local_JournalAR.DefaultDimension = defaultDimension;
+                                        local_JournalAR.FileRecord = 0;
+                                        local_JournalAR.isDED = NoYes::Yes;
+                                        local_JournalAR.FFDedCat = SKS_TPM_PaymentJournal::FindDeductionCategory(local_JournalAR.CustAccount, local_JournalAR.PmtAmountCur, local_JournalAR.company(), tmp_LB_Importing.TRMDeductionCategory, tmp_LB_Importing);
+                                        local_JournalAr.insert();
+
+                                        str msg = strfmt("@SKS6014", local_JournalAR.CustAccount);
+                                        if (logger)
+                                        {
+                                            logger.save(msg, tmp_LB_Importing);
+                                        }
+                                        else
+                                        {
+                                            info(msg);
+                                        }
+
+                                        newPmtCount += 1;
+
+                                        NextImportingRecord();
+                                        ttscommit;
+                                        continue;
+                                    }
+                                    else if(localPP_Setup.LBStandardDed)
+                                    {
+                                        local_JournalAR = this.CreateDEDFromExtSettle(local_JournalAR, tmp_LB_Importing);
+                                        newPmtCount += 1;
+
+                                        str msg = strfmt("@SKS6014", local_JournalAR.CustAccount);
+                                        if (logger)
+                                        {
+                                            logger.save(msg, tmp_LB_Importing);
+                                        }
+                                        else
+                                        {
+                                            info(msg);
+                                        }
+
+                                        NextImportingRecord();
+                                        ttscommit;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // if(lMatchParms.StopMatch() == false)
+                }
+                //  if (!findCusttransopen || this.UseCustomMatching())
+
+                if (findCustTransOpen)
+                {
+                    if (tmp_LB_Importing.InvAmount < 0 && !AutoCreditCreated && findCustTransOpen.AmountCur > 0)
+                    {
+                        str msg = strfmt("@SKS:SKGCreditNoteNotFound", tmp_LB_Importing.InvoiceNumber) + ' ' +  "@SKS927";
+                        if (logger)
+                        {
+                            logger.save(msg, tmp_LB_Importing);
+                        }
+                        else
+                        {
+                            error(msg);
+                        }                        
+                        
+                        NextImportingRecord();
+                        ttscommit;
+                        continue;
+                    }
+
+                    if(findCusttransopen.dataAreaId != mainFileAR.dataAreaId)
+                    {
+                        changeCompany(findCusttransopen.company())
+                        {
+                            settlementManager = SKS_LB_Process_Importtemp_records::constructSettlementManager(mainFileAR.PaymDate, bSKS_LB_Journal.CurrencyCode, bSKS_LB_Journal.ExchRate, findCusttransopen.dataAreaId, findCusttrans.AccountNum);
+                        }
+                    }
+                    Select firstonly forupdate arApplic
+                                where arApplic.CustTransOpenRecId == findcustTransOpen.RecId
+                            Join local_JournalAR
+                                where local_JournalAR.JournalId == mainfileAR.JournalId
+                                    && local_JournalAR.BatchNum == mainfileAR.BatchNum
+                                    && local_JournalAR.ChkRefNbr == mainfileAr.ChkRefNbr
+                                    && local_JournalAR.RecId == arApplic.SKS_LB_JournalARRecId;
+                    // if the settlement record already found in this Journal, if the settle amount is zero, delete and re-add,
+                    //else skip to the next settlemnent record
+                    if (arApplic)
+                    {
+                        if (arApplic.SettleAmountCur == 0)
+                        {
+                            arApplic.delete();
+                        }
+                        else
+                        {
+                            if(localPP_Setup.LBSumRefNum == NoYes::No)
+                            {
+                                arApplic = null;
+                                NextImportingRecord();
+                                ttscommit;
+                                continue;
+                            }
+                        }
+                    }
+
+                    existsInSettlement = this.checkExistingSettlement(findCustTransOpen,0,False, tmp_LB_Importing);
+                    sumLikeRef = localPP_Setup.LBSumRefNum;
+
+                    if (existsInSettlement && sumLikeRef && !SKS_LB_Bank.SepPaymByInv)
+                    {
+                        markedByCheck = SKS_LB_54000Bas::IsMarkedByCheck(findCustTransOpen.RecId, tmp_LB_Importing.CheckNumber, mainfileAR.JournalId, mainfileAR.ParentRecid, local_JournalAR.Batchnum);
+                    }
+
+                    if(!existsInSettlement || (sumLikeRef && markedByCheck))
+                    {
+                        sks_lb_paymentAmt = tmpImport.calculateMaxToApply(findCustTransOpen, bSKS_LB_Journal.CurrencyCode, bSKS_LB_Journal.ExchRate, mainfileAR.PaymDate,
+                                                localPP_Setup.LBAlwaysApplyDisc, DiscApplyAmt, tmp_LB_Importing.InvAmount, settlementManager);
+                        DiscApplyAmt = sks_lb_paymentAmt.DiscAmtToApply();
+                        maxToApply = sks_lb_paymentAmt.MaxToApply();
+
+                        if (maxToApply < 0)
+                        {
+                            if(ApplyAmountCur < maxToApply && localPP_Setup.LBRedSettleCRBal == NoYes::Yes)
+                            {
+                                if(localPP_Setup.LBWriteOffRuleCROverSettle == NoYes::Yes)
+                                {
+                                    if(tmpImport.ReduceCreditWriteOffProcess(tmp_LB_Importing, findCusttransopen, localPP_Setup, findCusttrans, mainFileAR.PaymDate, virtualCompanyCompanies, mainfilear.FormatID,
+                                        mainFileAR.BankAcct, mainFileAR.Filename, mainFileAR.FileDate, bSKS_LB_Journal))
+                                    {
+                                        MainFileAR.PmtAmountCur -= (abs(tmp_LB_Importing.invAmount) - abs(findCusttransopen.AmountCur)) * -1;
+                                        MainFileAR.write();
+                                        bSKS_LB_Journal = tmpImport.GetSetGlobalTmpJournal(bSKS_LB_Journal);
+                                    }
+                                }
+                                ApplyAmountCur = maxToApply;
+
+                                str msg = strfmt("@SKS3449", findCustTrans.Invoice, tmp_LB_Importing.InvAmount, ApplyAmountCur);
+                                if (logger)
+                                {
+                                    logger.save(msg, tmp_LB_Importing);
+                                }
+                                else
+                                {
+                                    info(msg);
+                                }
+                            }
+                            else if(ApplyAmountCur < maxToApply && localPP_Setup.LBRedSettleCRBal == NoYes::No && localPP_Setup.LBWriteOffRuleCROverSettle == NoYes::No)
+                            {
+                                var msg = strFmt("@SKS:SKGSettleAmtGreaterThanInvoiceAmt", findCusttrans.Invoice, ApplyAmountCur, maxToApply);
+                                if (logger)
+                                {
+                                    logger.save(msg, tmp_LB_Importing);
+                                }
+                                else
+                                {
+                                    info(msg);
+                                }
+
+                                NextImportingRecord();
+                                ttscommit;
+                                continue;
+                            }
+                        }
+
+                        //Applicable when LBSumRefNum is enabled
+                        reamainingMaxToApply = maxToApply - arApplic.SettleAmountCur;
+
+                        if (ApplyAmountCur > reamainingMaxToApply && localPP_Setup.LBRedSettleInvBal == NoYes::Yes)
+                        {
+                            str msg = strfmt("@SKS904", findCustTrans.Invoice, arApplic.SettleAmountCur + ApplyAmountCur, maxToApply);
+                            if (logger)
+                            {
+                                logger.save(msg, tmp_LB_Importing);
+                            }
+                            else
+                            {
+                                info(msg);
+                            }
+
+                            ApplyAmountCur = maxToApply;
+
+                        }
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+                        //else if(ApplyAmountCur > reamainingMaxToApply && localPP_Setup.LBRedSettleInvBal == NoYes::No)
+                        else if  ((!SpecTrans::existByRef(findCusttransopen.company(), findCusttransopen.TableId, findCusttransopen.RecId)) &&
+                                 (ApplyAmountCur > reamainingMaxToApply && localPP_Setup.LBRedSettleInvBal == NoYes::No))
+                        {
+                            str msg = strFmt("@SKS:SKGSettleAmtGreaterThanInvoiceAmt", findCusttrans.Invoice, ApplyAmountCur, reamainingMaxToApply);
+                            if (logger)
+                            {
+                                logger.save(msg, tmp_LB_Importing);
+                            }
+                            else
+                            {
+                                info(msg);
+                            }
+
+                            NextImportingRecord();
+                            ttscommit;
+                            continue;
+                        }
+
+                        // If already marked in customer payment journal
+                        if (SpecTrans::existByRef(findCusttransopen.company(), findCusttransopen.TableId, findCusttransopen.RecId))
+                        {
+                            Amount markedAmount = findCusttransopen.sksGetRemainingAmount();
+                            ApplyAmountCur = markedAmount;
+                        }
+                        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+                        if (DiscApplyAmt != tmp_LB_Importing.DiscAmount && tmp_LB_Importing.DiscAmount != 0)
+                        {
+                            //Invoice %1: Discount amount greater than discount allowed. Discount changed from %2 to %3.
+                            str msg = strfmt("@SKS905",findCustTrans.Invoice,  tmp_LB_Importing.DiscAmount, DiscApplyAmt);
+                            if (logger)
+                            {
+                                logger.save(msg, tmp_LB_Importing);
+                            }
+                            else
+                            {
+                                info(msg);
+                            }
+                        }
+
+                        l_tmpCust = null;
+                        l_tmpCust = CustTable::findByCompany(findCusttransopen.company(), findCusttransopen.AccountNum);
+
+                        defaultDimension = SKS_LB_Process_IMPORTTEMP_Records::LBDimensionMerge(localPP_Setup, findCusttrans.DefaultDimension, l_tmpCust.defaultdimension, SKS_LB_Bank.LBJournalName, findCusttransopen.company());
+
+                        if(SKS_LB_Bank.SepPaymByInv)
+                        {
+                            newPmtCount += this.ExternalSeparatePaym(SplitAR, MainfileAR, ApplyAmountCur, DiscApplyAmt, findCusttransopen, findCusttrans, defaultDimension, l_tmpCust.Party, tmpImport, tmp_LB_Importing);
+                            MainFileAR.write();
+                            SplitAR = true;
+                            NextImportingRecord();
+                            ttscommit;
+                            continue;
+                        }
+
+                        if(markedByCheck)
+                        {
+                            str msg = strFmt("@SKS2360", tmp_LB_Importing.InvAmount, tmp_LB_Importing.CheckNumber, tmp_LB_Importing.InvoiceNumber);
+                            if (logger)
+                            {
+                                logger.save(msg, tmp_LB_Importing);
+                            }
+                            else
+                            {
+                                info(msg);
+                            }
+                        }
+
+                        //If the found invoice belong to a different customer, need to move this settlement to a different JournalAr record.
+                        if (findCusttransopen.AccountNum != mainfileAR.CustAccount || l_tmpCust.Party != mainfileAR.Party || (mainFileAR.DefaultDimension != defaultDimension && (mainFileAR.DefaultDimension != 0 || mainFileAR.ActualSettleAmountCur !=0))
+                            || (_PP_Setup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany && MainFileAR.CustomerCompany != findCusttrans.company())
+                            )
+                        {
+                            // Look for and existing JournalAR record for the correct customer and check number
+                            //If a JournalAR record already exists for this customer and check number, add to it, else create a new one.
+                            if(_PP_Setup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany)
+                            {
+                                Select forupdate local_JournalAr
+                                    where (local_JournalAr.JournalId == mainfileAR.JournalId)
+                                        && (local_JournalAr.CustAccount == findCusttransopen.AccountNum)
+                                        && (local_JournalAr.ChkRefNbr == mainfileAR.ChkRefNbr)
+                                        && (local_JournalAR.Party == l_tmpCust.Party)
+                                        && (local_JournalAR.DefaultDimension == defaultDimension)
+                                        && local_JournalAR.CustomerCompany == findCusttrans.company()
+                                        && local_JournalAR.isDED == NoYes::No
+                                        && local_JournalAR.AresDed == NoYes::No;
+                            }
+                            else
+                            {
+                                Select forupdate local_JournalAr
+                                    where (local_JournalAr.JournalId == mainfileAR.JournalId)
+                                        && (local_JournalAr.CustAccount == findCusttransopen.AccountNum)
+                                        && (local_JournalAr.ChkRefNbr == mainfileAR.ChkRefNbr)
+                                        && (local_JournalAR.Party == l_tmpCust.Party)
+                                        && (local_JournalAR.DefaultDimension == defaultDimension)
+                                        && local_JournalAR.isDED == NoYes::No
+                                        && local_JournalAR.AresDed == NoYes::No;
+                            }
+
+                            If (local_JournalAr) //other invoices in this external settlement already went to this customer
+                            {
+                                //Copy local_JournalAr.FileRecord value
+                                l_fileRecordId = local_JournalAR.FileRecord;
+
+                                mainfileAR.PmtAmountCur -= ApplyAmountCur;
+                                mainFileAR.PmtWasSplit = NoYes::Yes;
+                                mainFileAR.write();//write changes to the original LB payment
+
+                                local_JournalAR.FileRecord = 0;
+                                tmpImport.InsertJournalARApplic(DiscApplyAmt, ApplyAmountCur, findCusttransopen.RecId, findcusttransopen.AmountCur, findcusttransopen.RefRecId, findcusttransopen.dataAreaId, local_JournalAr, findCusttrans.Invoice, SKS_LB_MatchType::InvoiceNumber);
+                                local_JournalAr.ActualSettleAmountCur += ApplyAmountCur;
+                                local_JournalAR.PmtAmountCur += ApplyAmountCur;
+                                local_JournalAR.PmtWasSplit = NoYes::Yes;
+                                local_JournalAR.FileRecord = l_fileRecordId;
+                                select count (recid) from arapplic where arApplic.SKS_LB_JournalARRecId == local_JournalAR.RecId;//This causes a false positive on the Best Practice. Unclear how to suppress as there is no moniker for this BP error
+                                if(arApplic.recid == 1)
+                                {
+                                    local_JournalAR.Invoice = arApplic.LBInvoice;
+                                }
+                                else if (arApplic.recid > 1)
+                                {
+                                    local_JournalAR.Invoice = '*';
+                                }
+                                else
+                                {
+                                    local_JournalAR.invoice = '';
+                                }
+
+                                AutoCreditCreation(local_JournalAR);
+
+                                local_JournalAr.update();
+                            }
+                            else //Make a JournalAR record for the new customer
+                            {
+                                Global::buf2Buf(mainfileAR, local_JournalAr);
+                                mainfileAR.PmtAmountCur -= ApplyAmountCur;
+                                mainFileAR.PmtWasSplit = NoYes::Yes;
+                                select count (recid) from arapplic where ARApplic.sks_lb_journalarrecid == mainFileAR.recid && arApplic.SettleAmountCur != 0;
+                                if(arApplic.RecId == 1)
+                                {
+                                    select lbinvoice, sks_lb_journalarrecid, CustTransRecID, CustTransdataareaid from arapplic join locCustTrans where ARApplic.sks_lb_journalarrecid == mainFileAR.recid && arApplic.SettleAmountCur != 0
+                                            && arApplic.CustTransRecId == locCustTrans.RecId && arApplic.CustTransdataareaid == locCustTrans.dataAreaId;
+                                    mainFileAR.invoice = locCustTrans.Invoice;
+                                }
+                                else if(arApplic.RecId > 1)
+                                {
+                                    mainFileAR.Invoice = '*';
+                                }
+                                else
+                                {
+                                    mainFileAR.invoice = '';
+                                }
+                                local_JournalAR.CustomerCompany = _PP_Setup.LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? findCusttransopen.company() : MainFileAR.CustomerCompany;
+                                local_JournalAR.Party = l_tmpCust.Party;
+
+                                l_dirPartyTable = DirPartyTable::findRec(l_tmpCust.Party);
+                                local_JournalAR.CustName = l_dirPartyTable.Name;
+
+                                local_JournalAr.ActualSettleAmountCur = ApplyAmountCur;
+                                local_JournalAR.PmtAmountCur = ApplyAmountCur;
+                                local_JournalAR.invoice = findCusttrans.Invoice;
+                                local_JournalAr.CustAccount = findCusttransopen.AccountNum;
+                                local_JournalAR.ParentJournalARID = mainFileAr.RecId;
+                                local_JournalAR.DefaultDimension = defaultDimension;
+                                local_JournalAR.FileRecord = 0;
+                                local_JournalAR.PmtWasSplit = NoYes::Yes;
+                                AutoCreditCreation(local_JournalAR);
+                                local_JournalAr.insert();
+                                mainFileAR.write();//write changes to the original LB payment
+                                // Payment was added for customer %1
+                                str msg = strfmt("@SKS959",findCustTrans.AccountNum);
+                                if (logger)
+                                {
+                                    logger.save(msg, tmp_LB_Importing);
+                                }
+                                else
+                                {
+                                    info(msg);
+                                }
+                                
+                                newPmtCount += 1;
+
+                                tmpImport.InsertJournalARApplic(DiscApplyAmt, ApplyAmountCur, findCusttransopen.RecId, findcusttransopen.AmountCur, findcusttransopen.RefRecId, findcusttransopen.dataAreaId, local_JournalAr, findCusttrans.Invoice, SKS_LB_MatchType::InvoiceNumber);
+
+                            }
+                        }
+                        else
+                        {
+                            l_fileRecordId = mainFileAR.FileRecord;
+                            mainFileAR.FileRecord = 0;
+
+                            tmpImport.InsertJournalARApplic(DiscApplyAmt, ApplyAmountCur, findCusttransopen.RecId, findCusttransopen.AmountCur, findCusttransopen.RefRecId, findCusttransopen.dataAreaId, mainfileAR, findCusttrans.Invoice, SKS_LB_MatchType::InvoiceNumber);
+
+                            if(mainFileAR.invoice == '')
+                            {
+                                mainFileAR.Invoice = findCusttrans.Invoice;
+                            }
+                            else if(mainFileAR.Invoice != '')
+                            {
+                                mainFileAR.Invoice = '*';
+                            }
+
+                            mainfileAR.ActualSettleAmountCur += ApplyAmountCur;
+                            mainFileAR.DefaultDimension = defaultDimension;
+                            mainFileAR.FileRecord = l_fileRecordId;
+                            AutoCreditCreation(mainFileAR);
+                            mainFileAR.write();//write changes to the original LB payment
+                        }
+                    }
+                    else
+                    {
+                        str msg = strfmt("@SKS958", findCustTrans.Invoice);
+                        if (logger)
+                        {
+                            logger.save(msg, tmp_LB_Importing);
+                        }
+                        else
+                        {
+                            info(msg);
+                        }
+                    }
+                }
+                // if (findCustTransOpen)
+                else
+                {
+                    //Extension point availability
+                    this.DisplayInvoiceErrors(lInvoiceIDErr, tmp_LB_Importing, ApplyAmountCur, MainFileAR);
+                }
+                
+                NextImportingRecord();
+
+                ttscommit;
+            }
+
+            ttsbegin;
+            // Reset remaining SKS_LB_JournalAR fields and write record
+            mainfileAR.DiscApplyAmt = 0;
+            mainfileAR.CustTransOpenRecId = 0;
+            mainfileAR.CustTransRecId = 0;
+            mainfileAR.write();
+
+            SKS_LB_54000Bas::adjustSettleByTolerance(bSKS_LB_Journal.JournalID, bSKS_LB_Journal.BatchNum, mainfileAR.RecId);
+            SKS_LB_54000Bas::ShortpayDeductionCreation(bSKS_LB_Journal.JournalID);
+
+            if (newPmtCount > 0)
+            {
+                bSKS_LB_Journal.batchpmtcnt += newPmtCount;
+                bSKS_LB_Journal.update();
+            }
+            else
+            {
+                ret = true;
+            }
+            ttscommit;
+        }
+        else
+        {
+            if(!_AnalyzeRemit)
+            {
+                logger.save("@SKS560"); //No valid records found
+            }
+        }
+
+        ttsbegin;
+        if(mainFileAR.PmtAmountCur == 0 && MainFileAR.invoice == '')
+        {
+            mainFileAR.delete();
+        }
+        else
+        {
+            mainfileAR.write();
+        }
+        ttscommit;
+
+        if (logger
+            && logger.getLogCounter())
+        {
+            error("@SKS:LBLogErrorMsg");
+        }
+
+        return;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DisplayInvoiceErrors</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Displays invoice errors
+    /// </summary>
+    /// <param name = "lInvoiceIDErr">lInvoiceIDErr</param>
+    /// <param name = "tmp_LB_Importing">tmp_LB_Importing</param>
+    /// <param name = "_ApplyAmountCur">_ApplyAmountCur</param>
+    /// <param name = "_MainFileAR">_MainFileAR</param>
+    public void DisplayInvoiceErrors(SKS_LB_InvoiceIdErr lInvoiceIDErr, TmpSKS_LB_Importing tmp_LB_Importing, AmountCur _ApplyAmountCur, SKS_LB_JournalAR _MainFileAR)
+    {
+        If (lInvoiceIDErr == SKS_LB_InvoiceIDErr::InvoiceNotFound)
+        {
+            //Invoice %1 not found. Settlement for amount %2 not imported.
+            str msg = strfmt("@SKS960", tmp_LB_importing.InvoiceNumber, _ApplyAmountCur);
+            if (logger)
+            {
+                logger.save(msg, tmp_LB_Importing);
+            }
+            else
+            {
+                info(msg);
+            }
+        }
+        else if(lInvoiceIDErr == SKS_LB_InvoiceIDErr::MultipleMatchesFound)
+        {
+            //Multiple matches found for Invoice %1. Settlement for amount %2 not imported.
+            str msg = strfmt("@SKS961", tmp_LB_importing.InvoiceNumber, _ApplyAmountCur);
+            if (logger)
+            {
+                logger.save(msg, tmp_LB_Importing);
+            }
+            else
+            {
+                info(msg);
+            }
+        }
+        return;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UseCustomMatching</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether or not to use custom matching
+    /// </summary>
+    /// <returns>boolean</returns>
+    public boolean UseCustomMatching()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkExistingSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CHecks to see if the settlement already exists
+    /// </summary>
+    /// <param name = "_custTransOpen">_custTransOpen</param>
+    /// <param name = "_recID">_recID</param>
+    /// <param name = "_displayMessage">_displayMessage</param>
+    /// <returns>boolean</returns>
+    public boolean checkExistingSettlement(CustTransOpen _custTransOpen, RecID _recID, boolean _displayMessage, TmpSKS_LB_Importing _tmp_LB_Importing)
+    {
+        CustPaymSettlementManager settlementManager;
+        SKS_LB_54000Bas sks_LB_54000Bas;
+        LedgerJournalTrans ledgerJournalTrans;
+        str journalNum;
+        boolean ret;
+        ;
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+        /*
+        changeCompany(_custTransOpen.dataAreaId)
+        {
+            sks_LB_54000Bas = SKS_LB_54000Bas::Construct();
+            ledgerJournalTrans = sks_LB_54000Bas.CreateTempLedgerJournalTrans(_custTransOpen.DueDate, bSKS_LB_Journal.CurrencyCode, bSKS_LB_Journal.ExchRate, _custTransOpen.dataAreaId, _custTransOpen.AccountNum);
+
+            settlementManager = CustPaymSettlementManager::construct(ledgerJournalTrans);
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+            //ret = settlementManager.SKS_lbIsAlreadyMarked(_custTransOpen, _recID);
+            ret = CustPaymSettlementManager::sks_isAlreadyMarked(_custTransOpen, _recID);
+            // SKS_19380_FlintfoxAresInvoiceApplicaiton
+        }
+        */
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+        // If marked in customer payment - allow to settle
+        if (!_custTransOpen.sksIsAmountFullyCovered())
+        {
+            return false;
+        }
+        // SKS_19380_FlintfoxAresInvoiceApplicaiton
+
+        if(ret && _displayMessage)
+        {
+            journalNum = settlementManager.SKS_getMarkedLB(_custTransOpen, _recID);
+            str msg;
+
+            if(journalNum != '')
+            {
+                msg = strFmt("@SKS6630", journalNum);
+            }
+            else
+            {
+                msg = "@SKS895";
+            }
+
+            if (logger)
+            {
+                logger.save(msg, _tmp_LB_Importing);
+            }
+            else
+            {
+                info(msg);
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PreMatchCustomShell</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Extension point
+    /// </summary>
+    /// <param name = "_Importing">_Importing</param>
+    /// <param name = "_MainFileAR">_MainFileAR</param>
+    /// <returns>TmpImporting record</returns>
+    public TmpSKS_LB_Importing PreMatchCustomShell(TmpSKS_LB_Importing _Importing, SKS_LB_JournalAR _MainFileAR)
+    {
+        return _Importing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateDEDFromExtSettle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// creates external settlement deductions
+    /// </summary>
+    /// <param name = "local_JournalAR">local_JournalAR</param>
+    /// <param name = "tmp_LB_Importing">tmp_LB_Importing</param>
+    /// <returns>Journal AR record</returns>
+    public SKS_LB_JournalAR CreateDEDFromExtSettle(SKS_LB_JournalAR local_JournalAR, TmpSKS_LB_Importing tmp_LB_Importing)
+    {
+        Global::buf2Buf(mainfileAR, local_JournalAr);
+        local_JournalAr.ActualSettleAmountCur =  0;
+        local_JournalAR.PmtAmountCur = abs(tmp_LB_Importing.InvAmount);
+        local_JournalAR.PmtWasSplit = NoYes::No;
+        local_JournalAR.Invoice = '';
+        local_JournalAR.LBInvoice = '';
+        local_JournalAR.ParentJournalARID = mainFileAr.RecId;
+        local_JournalAR.FileRecord = 0;
+        local_JournalAR.AresDed = NoYes::Yes;
+        local_JournalAr.insert();
+        
+        SKS_LB_Process_IMPORTTEMP_Records::CreateStandardDED(local_JournalAr.ParentJournalARID, local_JournalAr.RecId, local_JournalAr.PmtAmountCur, tmp_LB_Importing);
+        return local_JournalAR;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ExternalSeparatePaym</Name>
+				<Source><![CDATA[
+    private int ExternalSeparatePaym(boolean _SplitAR, SKS_LB_JournalAR  _MainFileAR, amountcur _ApplyAmount, amountcur _DiscApplyAmt, CustTransOpen    _CustTransOpen, CustTrans _CustTrans, DimensionDefault _DefaultDimension, DirPartyRecId CustParty, SKS_LB_Process_IMPORTTEMP_Records  tmpImport, TmpSKS_LB_Importing _tmpImporting)
+    {
+        SKS_LB_JournalAR    local_JournalAR;
+        DirPartyTable       l_DirPartyTable;
+        if(!_SplitAR && MainFileAR.invoice == '')
+        {
+            tmpImport.InsertJournalARApplic(_DiscApplyAmt, _ApplyAmount, _CustTransOpen.RecId, _CustTransOpen.AmountCur, _CustTransOpen.RefRecId, _CustTransOpen.dataAreaId, _MainFileAR, _CustTrans.Invoice, SKS_LB_MatchType::InvoiceNumber);
+            mainFileAR.Invoice = _Custtrans.Invoice;
+            mainfileAR.ActualSettleAmountCur += _ApplyAmount;
+            mainFileAR.DefaultDimension = _defaultDimension;
+            MainFileAR.CustomerCompany = SKS_PP_Setup::find().LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? _CustTrans.company() : MainFileAR.CustomerCompany;
+        }
+        else
+        {
+            Global::buf2Buf(mainfileAR, local_JournalAr);
+            if(mainfileAR.PmtAmountCur - _ApplyAmount < 0)
+            {
+                local_JournalAR.PmtAmountCur = 0;
+            }
+            else
+            {
+                mainfileAR.PmtAmountCur -= _ApplyAmount;
+                local_JournalAR.PmtAmountCur = _ApplyAmount;
+            }
+            mainFileAR.PmtWasSplit = NoYes::Yes;
+            local_JournalAR.CustomerCompany = SKS_PP_Setup::find().LBPaymentCompanyOption == SKS_LB_PaymentCompanyOption::InvoiceCompany ? _Custtransopen.company() : _MainFileAR.CustomerCompany;
+            local_JournalAR.Party = CustParty;
+
+            l_dirPartyTable = DirPartyTable::findRec(CustParty);
+            local_JournalAR.CustName = l_dirPartyTable.Name;
+
+            local_JournalAr.ActualSettleAmountCur = _ApplyAmount;
+
+            local_JournalAR.invoice = _Custtrans.Invoice;
+            local_JournalAr.CustAccount = _Custtransopen.AccountNum;
+            local_JournalAR.ParentJournalARID = mainFileAr.RecId;
+            local_JournalAR.DefaultDimension = _defaultDimension;
+            local_JournalAR.FileRecord = 0;
+            local_JournalAR.PmtWasSplit = NoYes::Yes;
+            local_JournalAR.insert();
+            // Payment was added for customer %1
+            str msg = strfmt("@SKS959", _Custtransopen.AccountNum);
+            if (logger)
+            {
+                logger.save(msg, _tmpImporting);
+            }
+            else
+            {
+                info(msg);
+            }
+
+            tmpImport.InsertJournalARApplic(_DiscApplyAmt, _ApplyAmount, _CustTransOpen.RecId, _CustTransOpen.AmountCur, _CustTransOpen.RefRecId, _CustTransOpen.dataAreaId, local_JournalAR, _CustTrans.Invoice, SKS_LB_MatchType::InvoiceNumber);
+
+        }
+        return 1;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RemitAnalyzeProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Remittance analysis process
+    /// </summary>
+    /// <param name = "ExtSettleParms">ExtSettleParms</param>
+    public static void RemitAnalyzeProcess(container ExtSettleParms)
+    {
+        SKS_BR_NoteMemo         RemitData = conPeek(ExtSettleParms,1);
+        SKS_LB_JournalAR        localFileAR = conPeek(ExtSettleParms,2);
+        SKS_LB_MatchingRules    SKS_LB_MatchingRules = conPeek(ExtSettleParms,5);
+        SKS_LB_Bank             SKS_LB_Bank;
+        int                     Counter;
+        Container               ConGoodInv, ConAmountCur;
+        TmpSKS_LB_Importing     rec_TmpSKS_LB_Importing;
+        SKS_LB_UnstructuredMatchContainers  UnstrMatchContainers = new SKS_LB_UnstructuredMatchContainers();
+        List                    RemitTxtDataList = new List(Types::Class);
+        SKS_LB_UnstructuredRulesMatching SKS_LB_UnstructuredRulesMatching = new  SKS_LB_UnstructuredRulesMatching();
+
+        RemitTxtDataList = SKS_LB_UnstructuredRulesMatching.ParseInvNumbers(RemitData, sks_lb_matchingRules.unstrRuleId);
+        boolean allowSearchAcrossCompany = true;
+        if(SKS_LB_Bank.LBRestrictCrossCompanySearch)
+        {
+            allowSearchAcrossCompany = false;
+        }
+
+        UnstrMatchContainers = SKS_LB_UnstructuredRulesMatching.CycleValues(RemitTxtDataList, localFileAR.CustAccount, sks_lb_matchingRules.IncludeDuplicateInvs, allowSearchAcrossCompany);
+
+        if(UnstrMatchContainers != Null)
+        {
+            ConGoodInv = UnstrMatchContainers.GoodInv();
+            ConAmountcur = UnstrMatchContainers.ConAmountCur();
+            For(Counter = 1; Counter <= conLen(ConGoodInv); Counter++)
+            {
+                rec_TmpSKS_LB_Importing.RemitAnalyzeCTOrecid = ConPeek(ConGoodInv, counter);
+                rec_TmpSKS_LB_Importing.InvAmount = ConPeek(ConAmountcur, counter);
+                rec_TmpSKS_LB_Importing.CheckNumber = localFileAR.ChkRefNbr;
+                rec_TmpSKS_LB_Importing.insert();
+            }
+        }
+
+        container ExternalParms;
+        ExternalParms += '';
+        ExternalParms += localFileAR;
+        ExternalParms += conPeek(ExtSettleParms, 3);
+        ExternalParms += conPeek(ExtSettleParms, 4);
+        ExternalParms += false;
+        ExternalParms += true;
+        ExternalParms += true;//boolean _AnalyzeRemit
+        ExternalParms += rec_TmpSKS_LB_Importing;
+
+        ttsbegin;
+        SKS_LB_ExternalSettlementProcess::ExternalSettlementProcess(ExternalParms);
+        ttscommit;
+
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CopyImportingRecordToTmpTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy the importing record to the tmptable
+    /// </summary>
+    /// <param name = "_dbimporting">_dbimporting</param>
+    /// <returns>tmpImporting record</returns>
+    public TmpSKS_LB_Importing CopyImportingRecordToTmpTable(SKS_LB_Importing _dbimporting)
+    {
+        TmpSKS_LB_Importing tmp_importing;
+        ttsbegin;
+        tmp_importing.AresDed = _dbimporting.AresDed;
+        tmp_importing.AutoCR = _dbimporting.AutoCR;
+        tmp_importing.AutoCRAutoRev = _dbimporting.AutoCRAutoRev;
+        tmp_importing.AutoCROffsetLedgerDimension = _dbimporting.AutoCROffsetLedgerDimension;
+        tmp_importing.AutoRevLedgerDimension = _dbimporting.AutoRevLedgerDimension;
+        tmp_importing.AutoRevOffsetLedgerDimension = _dbimporting.AutoRevOffsetLedgerDimension;
+        tmp_importing.BankPmtCnt = _dbimporting.BankPmtCnt;
+        tmp_importing.BankPmtTotal = _dbimporting.BankPmtTotal;
+        tmp_importing.BatchNum = _dbimporting.BatchNum;
+        tmp_importing.CheckAmount = _dbimporting.CheckAmount;
+        tmp_importing.CheckNumber = _dbimporting.CheckNumber;
+        tmp_importing.CustAccount = _dbimporting.CustAccount;
+        tmp_importing.CustBankAccountNum = _dbimporting.CustBankAccountNum;
+        tmp_importing.CustBankRegNum = _dbimporting.CustBankRegNum;
+        tmp_importing.CustName = _dbimporting.CustName;
+        tmp_importing.CustomerCompany = _dbimporting.CustomerCompany;
+        tmp_importing.DateDay =_dbimporting.DateDay;
+        tmp_importing.DateMonth = _dbimporting.DateMonth;
+        tmp_importing.DateYear = _dbimporting.DateYear;
+        tmp_importing.DepNbr = _dbimporting.DepNbr;
+        tmp_importing.Description = _dbimporting.Description;
+        tmp_importing.DiscAmount = _dbimporting.DiscAmount;
+        tmp_importing.ExternalJournalARRecord = _dbimporting.ExternalJournalARRecord;
+        tmp_importing.FeeValue = _dbimporting.FeeValue;
+        tmp_importing.FileDate = _dbimporting.FileDate;
+        tmp_importing.FileFormatId = _dbimporting.FileFormatId;
+        tmp_importing.FileLineNbrBegin = _dbimporting.FileLineNbrBegin;
+        tmp_importing.FileLineNbrEnd = _dbimporting.FileLineNbrEnd;
+        tmp_importing.FileName = _dbimporting.FileName;
+        tmp_importing.HeadDateDay = _dbimporting.HeadDateDay;
+        tmp_importing.HeadDateMonth = _dbimporting.HeadDateMonth;
+        tmp_importing.HeadDateYear = _dbimporting.HeadDateYear;
+        tmp_importing.ImageIdentifierBack = _dbimporting.ImageIdentifierBack;
+        tmp_importing.ImageIdentifierFront = _dbimporting.ImageIdentifierFront;
+        tmp_importing.InvAmount = _dbimporting.InvAmount;
+        tmp_importing.InvoiceNumber = _dbimporting.InvoiceNumber;
+        tmp_importing.InvSettleType = _dbimporting.InvSettleType;
+        tmp_importing.isDED = _dbimporting.isDED;
+        tmp_importing.LBBankAcctNum = _dbimporting.LBBankAcctNum;
+        tmp_importing.LBInvoice = _dbimporting.LBInvoice;
+        tmp_importing.OffsetDimension = _dbimporting.OffsetDimension;
+        tmp_importing.OffsetDimensionReference = _dbimporting.OffsetDimensionReference;
+        tmp_importing.ParentRecid = _dbimporting.ParentRecid;
+        tmp_importing.PaymNote = _dbimporting.PaymNote;
+        tmp_importing.PaymentMOP = _dbimporting.PaymentMOP;
+        tmp_importing.PaymentType = _dbimporting.PaymentType;
+        tmp_importing.prepayment = _dbimporting.prepayment;
+        tmp_importing.RemitAnalyzeCTOrecid = _dbimporting.RemitAnalyzeCTOrecid;
+        tmp_importing.RevReasonCode = _dbimporting.RevReasonCode;
+        tmp_importing.TAMDeductionType = _dbimporting.TAMDeductionType;
+        tmp_importing.TRMDeductionCategory = _dbimporting.TRMDeductionCategory;
+        tmp_importing.TrackingInvoices = _dbimporting.TrackingInvoices;
+        tmp_importing.insert();
+        ttscommit;
+
+        return tmp_importing;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

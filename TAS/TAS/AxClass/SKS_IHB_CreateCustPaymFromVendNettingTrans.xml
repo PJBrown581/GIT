@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_CreateCustPaymFromVendNettingTrans</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Creating records for inside customer
+/// </summary>
+class SKS_IHB_CreateCustPaymFromVendNettingTrans
+{
+    SKS_IHB_VendNettingImportJournalHelper  helper;
+    container                               recordContainer;
+    SKS_IHB_VendNettingFilesHeader          vendNettingFilesHeader;
+    SKS_PP_Bank                             ppBank;
+
+    Map jounralNumMap = new Map(Types::String, Types::String);
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_IHB_CreateCustPaymFromVendNettingTrans construct(SKS_IHB_VendNettingImportJournalHelper _helper, container _recordContainer)
+    {
+        SKS_IHB_CreateCustPaymFromVendNettingTrans custPaymFromTrans = new SKS_IHB_CreateCustPaymFromVendNettingTrans();
+
+        custPaymFromTrans.parmHelper(_helper);
+        custPaymFromTrans.parmRecordCon(_recordContainer);
+
+        return custPaymFromTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmHelper</Name>
+				<Source><![CDATA[
+    public SKS_IHB_VendNettingImportJournalHelper parmHelper(SKS_IHB_VendNettingImportJournalHelper _helper = helper)
+    {
+        helper = _helper;
+        return helper;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecordCon</Name>
+				<Source><![CDATA[
+    public container parmRecordCon(container _recordContainer = recordContainer)
+    {
+        recordContainer = _recordContainer;
+        return recordContainer;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Gl and customer intercompany journal creation and posting
+    /// </summary>
+    public void process()
+    {
+        LedgerJournalTable journalheaderGL;
+        boolean isJourPosted;
+
+        vendNettingFilesHeader = helper.parmVendNettingFilesHeader();
+
+        try
+        {
+            journalheaderGL = this.createGLJournal();
+
+            ttsbegin;        
+            if (journalheaderGL && journalheaderGL.numOfLines() > 0)
+            {
+                isJourPosted = helper.postGLForInsideCustomer(journalheaderGL);
+            }
+
+            if (isJourPosted == NoYes::Yes)
+            {
+                helper.parmGLJournalId(journalheaderGL.JournalNum);
+
+                Map jourNumMap = this.createCustPaymJournalFromLines();
+                helper.validateAndPostCustPaymJour(jourNumMap);
+            }
+            ttscommit;
+        }
+        catch (Exception::Error)
+        {
+            helper.insertErrorLog(vendNettingFilesHeader.FileId, infolog().text());
+            helper.insertJournalHistory(helper.parmErrorJournalId(), vendNettingFilesHeader.FileId, helper.parmError());
+            helper.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, true);
+            helper.updateHeaderErrorNotes(vendNettingFilesHeader, helper.parmError());
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createGLJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create GL journal
+    /// </summary>
+    /// <returns> returns created LedgerJournalTable </returns>
+    public LedgerJournalTable createGLJournal()
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingFileDetails;
+        NumberSeq               numberseq;
+        LedgerJournalName       ledgerJournalName;
+        Voucher                 voucher;
+        LedgerJournalTrans      transJour;
+        LedgerJournalEngine     ledgerJournalEngine;
+        RecordInsertList        journalTransList = new RecordInsertList(tableNum(LedgerJournalTrans));
+
+        LedgerJournalTable journalHeader = helper.createGLJournalHeader();
+        journalHeader.insert();
+        ledgerJournalName = LedgerJournalName::find(journalHeader.JournalName);
+
+        ttsbegin;
+        voucher = '';
+        if (ledgerJournalName.NewVoucher == NewVoucher::OneVoucher)
+        {
+            numberseq = NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence);
+            voucher   = numberseq.voucher();
+            numberseq.used();
+        }
+        else if (ledgerJournalName.NewVoucher == NewVoucher::BalanceSheet)
+        {
+            ledgerJournalEngine =  new LedgerJournalEngine();
+            ledgerJournalEngine.ledgerJournalTable(journalHeader);
+        }
+        ttscommit;
+
+        try
+        {
+            int i =1;
+
+            ttsbegin;
+            while (i <= conLen(recordContainer))
+            {                
+                select firstonly vendNettingFileDetails
+                    where vendNettingFileDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+                    && vendNettingFileDetails.RecId == conPeek(recordContainer, i);
+                    
+                if (helper.validateNettingLines(vendNettingFileDetails))
+                {
+                    transJour = helper.createRecord(journalHeader, vendNettingFileDetails, ledgerJournalEngine);
+                    journalTransList.add(transJour);
+                }
+                i++;
+            }
+
+            journalTransList.insertDatabase();
+            ttscommit;
+
+            if (journalHeader.numOfLines() > 0)
+            {
+                helper.insertJournalHistory(journalHeader.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourCreated);
+            }
+        }
+        catch(Exception::Error)
+        {
+            helper.insertErrorLog(vendNettingFilesHeader.FileId, infolog().text());
+            helper.insertJournalHistory(journalHeader.JournalNum, vendNettingFilesHeader.FileId, SKS_IHB_VendorNettingJournalAction::GenJourCreateFailed);
+            helper.updateVendNettingFilesheaderStatus(vendNettingFilesHeader, true);
+            helper.updateHeaderErrorNotes(vendNettingFilesHeader, SKS_IHB_VendorNettingJournalAction::GenJourCreateFailed);
+        }
+
+        return journalHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustPaymJournalFromLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create Customer payment/intercompany journal
+    /// </summary>
+    /// <returns> returns the customer payment journal map </returns>
+    public Map createCustPaymJournalFromLines()
+    {
+        SKS_IHB_VendNettingFileDetails vendNettingFileDetails;
+        LedgerJournalTable journalHeaderCustPaym;
+        CustTable       custTable;
+
+        int i =1;
+
+        while (i <= conLen(recordContainer))
+        {
+            select firstonly vendNettingFileDetails
+                    order by vendNettingFileDetails.CustomerCompany desc
+                    where vendNettingFileDetails.VendNettingHeaderRecid == vendNettingFilesHeader.RecId
+                    && vendNettingFileDetails.RecId == conPeek(recordContainer, i);
+
+            select firstonly crosscompany custTable
+            where custTable.AccountNum == vendNettingFileDetails.CustomerAccount
+                && custTable.DataAreaId == vendNettingFileDetails.CustomerCompany;
+            
+            select firstonly SKS_IHBLinkedinhousebankaccount from ppBank
+            where ppBank.BankAccountId == vendNettingFileDetails.CustIHBAccount
+                && ppBank.SKS_IHBLinkedinhousebankcompany == vendNettingFileDetails.CustomerCompany
+                && ppBank.DataAreaId == curExt();
+
+            helper.parmPPBank(ppBank);
+
+            changecompany(custTable.company())
+            {
+                journalHeaderCustPaym = LedgerJournalTable::find(this.findJournalIdForCompany(custTable.company()));
+
+                if (!journalHeaderCustPaym)
+                {
+                    journalHeaderCustPaym = helper.createCustPaymLedgerJournalTable();
+
+                    jounralNumMap.add(journalHeaderCustPaym.company(), journalHeaderCustPaym.JournalNum);
+                }
+
+                helper.createCustPaymJournalLine(journalHeaderCustPaym, vendNettingFileDetails, custTable);
+                
+            }
+            // End customer company context
+            i++;
+        }
+        //end while
+
+        return jounralNumMap;
+  
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findJournalIdForCompany</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the journal number for provided company from the Map
+    /// </summary>
+    /// <param name = "_customerCompany"> Company to search </param>
+    /// <returns> returns journal number associated with the company </returns>
+    public JournalId findJournalIdForCompany(DataAreaId _customerCompany)
+    {
+        JournalId journalId;
+        MapEnumerator mapEnumerator;
+
+        if (jounralNumMap.exists(_customerCompany))
+        {
+            mapEnumerator = jounralNumMap.getEnumerator();
+            
+            while(mapEnumerator.moveNext())
+            {
+                if (mapEnumerator.currentKey() == _customerCompany)
+                {
+                    journalId = mapEnumerator.currentValue();
+                }
+            }
+        }
+
+        return journalId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

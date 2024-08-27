@@ -1,0 +1,469 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_AutoSettlementHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Class to operate the auto-settlement process.
+/// </summary>
+class SKS_LB_AutoSettlementHelper
+{
+    CustVendOpenTransManager    settleManager;
+    public SpecTransManager     specTransManager_AutoSettlement;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_LB_AutoSettlementHelper construct(CustTable _custTable)
+    {
+        SKS_LB_AutoSettlementHelper helper;
+
+        helper = new SKS_LB_AutoSettlementHelper(_custTable);
+
+        return helper;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(Common _originator)
+    {
+        this.parmCustVendOpenTransManager(CustVendOpenTransManager::construct(_originator));
+
+        specTransManager_AutoSettlement = SpecTransManager::newRefTableId(_originator, tableNum(CustTransOpen), true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCustVendOpenTransManager</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set and get the CustVendOpenTransManager reference
+    /// </summary>
+    /// <param name = "_custVendOpenTransManager"> returns CustVendOpenTransManager reference </param>
+    /// <returns> returns CustVendOpenTransManager reference </returns>
+    public CustVendOpenTransManager parmCustVendOpenTransManager(CustVendOpenTransManager _custVendOpenTransManager = settleManager)
+    {
+        settleManager = _custVendOpenTransManager;
+
+        return settleManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSettlementCashDiscountAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the discount amount for the settlement calculation
+    /// </summary>
+    /// <param name = "_discount"> include/exclude discount from settlement calculation </param>
+    /// <param name = "_paymDate"> payment date </param>
+    /// <param name = "_custTransOpen"> customer open transaction </param>
+    /// <returns> returns cash discount amount </returns>
+    public Amount getSettlementCashDiscountAmount(boolean _discount, TransDate _paymDate, CustTransOpen _custTransOpen)
+    {
+        Amount debitAmount;
+
+        if (_discount)
+        {
+            Amount cashDiscount = this.determineCashDiscAmountToTake(_custTransOpen, _paymDate);
+            debitAmount = this.determineSettleAmountIncludingCashDiscount(_custTransOpen, cashDiscount);
+        }
+        else
+        {
+            // Exclude cash discount and determine settle amount
+            debitAmount = this.determineSettleAmountIncludingCashDiscount(_custTransOpen, 0.0);
+        }
+
+        return debitAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineCashDiscAmountToTake</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determine the cash discount amount to take
+    /// </summary>
+    /// <param name = "_custVendTransOpen"> customer open transaction </param>
+    /// <param name = "_paymentDate"> payment date </param>
+    /// <returns> returns cash discount amount </returns>
+    public CashDiscAmount determineCashDiscAmountToTake(CustVendTransOpen _custVendTransOpen, TransDate _paymentDate)
+    {
+        CashDiscAmount cashDiscAmountToTake;
+        CashDiscAmount fullCashDiscAmount;
+        CustVendCashDiscountHelper cashDiscountHelper;
+        CustTrans       custTrans;
+
+        select firstonly RecId, PaymMode from custTrans
+            where custTrans.RecId == _custVendTransOpen.RefRecId;
+
+        DiscGraceDays graceDays = CustPaymModeTable::discGraceDays(custTrans.PaymMode);
+
+        // Get the full discount amount and discount already taken
+        fullCashDiscAmount = this.findApplicableCashDisc_Server(_custVendTransOpen, _paymentDate, graceDays).CashDiscAmount;
+
+        cashDiscountHelper = CustVendCashDiscountHelper::construct(_custVendTransOpen);
+        cashDiscountHelper.parmFullCashDiscountForTier(fullCashDiscAmount);
+        cashDiscountHelper.parmDiscountDate(_paymentDate);
+        cashDiscountHelper.parmGraceDays(graceDays);
+        cashDiscountHelper.parmCashDiscountTaken(settleManager.getCashDiscAmountTaken(_custVendTransOpen));
+        cashDiscAmountToTake = cashDiscountHelper.determineCashDiscForOpenAmount();
+
+        return cashDiscAmountToTake;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSettleAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the amount to settle that is associated with the specified open transaction
+    /// record in the <c>SpecTrans</c> table and balances.
+    /// </summary>
+    /// <param name = "_custVendTransOpen"> The open transaction for which to update the settlement amount. </param>
+    /// <param name = "_updateSettleAmount"> The changed amount to settle. </param>
+    /// <param name = "_discount"> include/exclude discount from settlement calculation </param>
+    /// <param name = "_paymDate"> payment date </param>
+    public void updateSettleAmount(CustVendTransOpen _custVendTransOpen, AmountCur _updateSettleAmount, boolean _discount, TransDate _paymDate)
+    {
+        // If full settlement is mark, unmark the full settlement flag
+        if (settleManager.getFullSettlement(_custVendTransOpen))
+        {
+            settleManager.updateFullSettlement(_custVendTransOpen, NoYes::No);
+        }
+
+        if (settleManager.getTransMarked(_custVendTransOpen) == NoYes::Yes)
+        {
+            AmountCur settleAmount = this.calculateUpdatedAmountForSettlement(_custVendTransOpen, _updateSettleAmount, _paymDate);
+
+            CashDiscAmount cashDiscAmountToTake;
+
+            if (_discount)
+            {
+                cashDiscAmountToTake = this.determineCashDiscAmountToTake(_custVendTransOpen, _paymDate);
+            }
+            else
+            {
+                // Exclude cash discount and determine settleAmount
+                cashDiscAmountToTake = 0.0;
+            }
+
+            // The applicable discount was changed, update amounts
+            this.updateSettleDiscountAmounts(
+                _custVendTransOpen,
+                settleAmount,
+                cashDiscAmountToTake,
+                false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSettleDiscountAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines what amount to settle and what discount amount should be used to update the associated
+    /// record in the <c>SpecTrans</c> table and balances.
+    /// </summary>
+    /// <param name = "_custVendTransOpen"> The open transaction for which to update the settlement amount. </param>
+    /// <param name = "_settleAmount"> The changed amount to settle. </param>
+    /// <param name = "_discountAmount"> include/exclude discount from settlement calculation </param>
+    /// <param name = "_updateBalancesOnly">A Boolean value that indicates whether to only update the associated balances; optional. </param>
+    protected void updateSettleDiscountAmounts(
+        CustVendTransOpen _custVendTransOpen,
+        AmountCur _settleAmount,
+        AmountCur _discountAmount,
+        boolean _updateBalancesOnly = false)
+    {
+        AmountCur adjustedDiscount;
+        AmountCur settleAmount = _settleAmount;
+
+
+        AmountCur remainingUnmarkedAmount = specTransManager_AutoSettlement.findUnmarkedAmountForRef(
+            _custVendTransOpen.AmountCur,
+            _custVendTransOpen.company(),
+            _custVendTransOpen.TableId,
+            _custVendTransOpen.RecId);
+
+        if (!settleManager.getFullSettlement(_custVendTransOpen))
+        {
+            if (abs(settleAmount) < abs(remainingUnmarkedAmount - _discountAmount))
+            {
+                // assume partial payment and discount allowed on partial, so take discount
+                settleManager.updateAmounts(
+                    _custVendTransOpen,
+                    settleAmount, // specTrans balance amount
+                    // </GBR>
+                    settleAmount + _discountAmount, // amount to update balances
+                    _discountAmount, // amount of cash discount
+                    _updateBalancesOnly);
+            }
+            else if (abs(settleAmount) == abs(remainingUnmarkedAmount - _discountAmount))
+            {
+                // Settle amount is equal to the open trans amount less the discount - full discount is taken
+                settleManager.updateAmounts(
+                    _custVendTransOpen,
+                    remainingUnmarkedAmount - _discountAmount,
+                    remainingUnmarkedAmount,
+                    _discountAmount,
+                    _updateBalancesOnly);
+            }
+            else if (abs(settleAmount) > abs(remainingUnmarkedAmount - _discountAmount) && abs(settleAmount) < abs(remainingUnmarkedAmount))
+            {
+                // Settle amount is greater than the open trans amount less the discount - adjust the discount taken
+                adjustedDiscount = remainingUnmarkedAmount - settleAmount;
+
+                settleManager.updateAmounts(
+                    _custVendTransOpen,
+                    settleAmount,
+                    remainingUnmarkedAmount,
+                    adjustedDiscount,
+                    _updateBalancesOnly);
+            }
+            else
+            {
+                // Full open trans amount and discount amount are used
+                settleManager.updateAmounts(
+                    _custVendTransOpen,
+                    remainingUnmarkedAmount - _discountAmount,
+                    remainingUnmarkedAmount,
+                    _discountAmount,
+                    _updateBalancesOnly);
+            }
+        }
+        else
+        {
+            settleManager.updateAmounts(
+                _custVendTransOpen,
+                remainingUnmarkedAmount - _discountAmount,
+                remainingUnmarkedAmount,
+                _discountAmount,
+                _updateBalancesOnly);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateUpdatedAmountForSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the settlement amount for an open transaction given an updated settle amount.
+    /// </summary>
+    /// <param name = "_custVendTransOpen">The open transaction.</param>
+    /// <param name = "_newAmountForSettlement">The updated settle amount.</param>
+    /// <param name = "_paymDate"> payment date </param>
+    /// <returns>The new settlement amount.</returns>
+    public AmountCur calculateUpdatedAmountForSettlement(CustVendTransOpen _custVendTransOpen, AmountCur _newAmountForSettlement, 
+                                                                 TransDate _paymDate)
+    {
+        AmountCur settleAmount;
+
+        if (_newAmountForSettlement == 0)
+        {
+            // Get the amount from the SpecTrans
+            settleAmount = settleManager.getSettleAmount(_custVendTransOpen);
+        }
+        else
+        {
+            CustVendTransOpenData custVendTransOpenData = CustVendTransOpenData::construct(_custVendTransOpen);
+
+            // Round the entered amount
+            settleAmount = CurrencyExchange::round(_newAmountForSettlement, custVendTransOpenData.custVendTrans().CurrencyCode);
+
+            changecompany(_custVendTransOpen.company())
+            {
+                SpecTrans specTrans;// = specTransManager_AutoSettlement.findByRef(_custVendTransOpen.company(), _custVendTransOpen.TableId, _custVendTransOpen.RecId);
+
+                select firstonly specTrans
+                    where specTrans.RefCompany  == _custVendTransOpen.company()
+                    && specTrans.RefTableId     == _custVendTransOpen.TableId
+                    && specTrans.RefRecId       == _custVendTransOpen.Recid;
+
+                settleAmount = custVendTransOpenData.findSettlementAmount(
+                    _newAmountForSettlement,
+                    CustParameters::find().CashDisc,
+                    _paymDate,
+                    true,
+                    specTrans.Balance01,
+                    specTrans.CashDiscToTake);
+            }
+        }
+
+        return settleAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findApplicableCashDisc_Server</Name>
+				<Source><![CDATA[
+    private CustVendTransCashDisc findApplicableCashDisc_Server(CustVendTransOpen _custVendTransOpen,
+                                                                TransDate _discountDate,
+                                                                DiscGraceDays _graceDays)
+    {
+        CustVendTransCashDisc cashDiscTrans;
+        CustTrans custTrans;
+        boolean isCreditNote;
+
+        // Find applicable cash discount trans record - may be cross company
+        changecompany(_custVendTransOpen.company())
+        {
+            if (_custVendTransOpen.UseCashDisc == UseCashDisc::Normal ||
+                _custVendTransOpen.UseCashDisc == UseCashDisc::Always)
+            {
+                cashDiscTrans = CustTransCashDisc::findByUseCashDisc(tableNum(CustTransOpen),
+                                    _custVendTransOpen.RecId,
+                                    _custVendTransOpen.UseCashDisc,
+                                    _discountDate,
+                                    _graceDays);
+            }
+
+            custTrans = _custVendTransOpen.custTrans();
+            if (custTrans.RecId != 0)
+            {
+                isCreditNote = custTrans.isCreditNote();
+            }
+
+            if (_custVendTransOpen.UseCashDisc == UseCashDisc::Never
+                || cashDiscTrans.RecId == 0
+                || (isCreditNote == true && CustParameters::find().CashDiscForCreditNote == false))
+            {
+                // Get the Due record if UseCashDisc == Never or no cash discount record was found
+                cashDiscTrans = CustTransCashDisc::findDue(tableNum(CustTransOpen), _custVendTransOpen.RecId, false);
+            }
+        }
+
+        return cashDiscTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineSettleAmountIncludingCashDiscount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the settlement amount.
+    /// </summary>
+    /// <param name = "_custVendTransOpen">
+    /// The open transaction.
+    /// </param>
+    /// <param name = "_cashDiscAmount">
+    /// The available cash discount.
+    /// </param>
+    /// <returns>
+    /// The settlement amount.
+    /// </returns>
+    public AmountCur determineSettleAmountIncludingCashDiscount(
+        CustVendTransOpen   _custVendTransOpen,
+        CashDiscAmount      _cashDiscAmount)
+    {
+        AmountCur settleAmount;
+
+        if (_custVendTransOpen.TableId == tableNum(CustTransOpen) && this.isTransactionSettledByLine(_custVendTransOpen))
+        {
+            SpecTrans specTrans = specTransManager_AutoSettlement.findByRef(_custVendTransOpen.company(), _custVendTransOpen.TableId, _custVendTransOpen.RecId);
+
+            settleAmount = CustOpenTransLineManager::determineTotalSettledLineAmount(specTrans.RecId) - _cashDiscAmount;
+        }
+        else
+        {
+            settleAmount = specTransManager_AutoSettlement.findUnmarkedAmountForRef(
+                _custVendTransOpen.AmountCur,
+                _custVendTransOpen.company(),
+                _custVendTransOpen.TableId,
+                _custVendTransOpen.RecId) - _cashDiscAmount;
+        }
+
+        return settleAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTransactionSettledByLine</Name>
+				<Source><![CDATA[
+    public boolean isTransactionSettledByLine(CustTransOpen _custTransOpen)
+    {
+        if (CustParameters::find().MarkOpenInvoiceLine)
+        {
+            CustTransOpenLine custTransOpenLine;
+            CustTransMarkedOpenLine custTransMarkedOpenLine;
+
+            SpecTrans specTrans = specTransManager_AutoSettlement.findByRef(_custTransOpen.company(), tableNum(CustTransOpen), _custTransOpen.RecId);
+
+            select firstonly RecId from custTransMarkedOpenLine
+                where custTransMarkedOpenLine.SpecTrans == specTrans.RecId
+                exists join custTransOpenLine
+                    where custTransOpenLine.CustTransOpen == _custTransOpen.RecId
+                        && custTransOpenLine.RecId == custTransMarkedOpenLine.CustTransOpenLine;
+
+            return custTransMarkedOpenLine.RecId != 0;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateParameterConstraint</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate the customer open transactions.
+    /// </summary>
+    /// <param name = "_transOpenDebitCredit"> open transaction buffer </param>
+    /// <param name = "_autoSettlementType"> Type of auto-settle rules </param>
+    /// <param name = "_canskip"> skip validation if it is true </param>
+    /// <returns> returns true otherwise; false </returns>
+    public boolean validateParameterConstraint(CustTransOpen _transOpenDebitCredit, SKS_LB_AutoSettlementType _autoSettlementType, boolean _canskip = false)
+    {
+        boolean ret = true;
+        CustTrans       custTrans;
+
+        select firstonly RecId from custTrans
+            where custTrans.RecId == _transOpenDebitCredit.RefRecId;
+
+        if (_autoSettlementType != SKS_LB_AutoSettlementType::Custom)
+        {
+            SKS_LB_AutoSettlementSetup autoSettlementSetup;
+
+            select firstonly IncludeFutureTrans, IncludeDisputedTrans from  autoSettlementSetup;
+
+            // Future transaction
+            if (!_canskip)
+            {
+                if (ret && !autoSettlementSetup.IncludeFutureTrans
+                                && _transOpenDebitCredit.DueDate > DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+                {
+                    ret = false;
+                }
+            }
+
+            // Disputed transaction
+            if (ret && !autoSettlementSetup.IncludeDisputedTrans && CustDispute::findByCustTrans(custTrans.RecId).Status == CustVendDisputeStatus::Disputed)
+            {
+                ret = false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

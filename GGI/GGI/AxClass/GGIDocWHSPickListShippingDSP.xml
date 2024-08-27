@@ -1,0 +1,509 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIDocWHSPickListShippingDSP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>GGIDocWHSPickListShippingDSP</c> is used to populate additional fields on the WHSPickListShipping report
+/// </summary>
+class GGIDocWHSPickListShippingDSP extends DocDataSourceProviderSrsReporting
+{
+    /* Variables used for custom placeholders */
+    str         placeholderShipmentId, placeholderLoadId, placeholderOrderNumber, placeholderItemId;
+    boolean     isMultipleLoadIds;
+    boolean     isMultipleShipmentIds;
+    
+    #define.Separator  ('| ')
+    #define.ThirdParty                  ('Third-Party Billing')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public ClassDescription description()
+    {
+        return 'WHS Pick list shipping DSP';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetThirdPartyAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Returns address
+    /// </summary>
+    /// <param name = "_accountNum">
+    ///     Account number
+    /// </param>
+    /// <returns>
+    ///     Returns address
+    /// </returns>
+    LogisticsAddressing GetThirdPartyAddress(AccountNum _accountNum)
+    {
+        DirPartyPostalAddressView           dirPartyPostalAddrlocal;
+        DirPartyLocationRolesView           dirPartyLocationRoleslocal;
+        LogisticsLocationRole               logisticsLocRole;
+        DirPartyRecId                       party;
+
+        party = VendTable::find(_accountNum).Party;
+        
+        select firstOnly dirPartyPostalAddrlocal
+                exists join dirPartyLocationRoleslocal
+                    where dirPartyLocationRoleslocal.Location   == dirPartyPostalAddrlocal.Location
+                        && dirPartyLocationRoleslocal.Party     == party
+                exists join logisticsLocRole
+                    where logisticsLocRole.Name     == #ThirdParty
+                        && logisticsLocRole.RecId   == dirPartyLocationRoleslocal.LocationRole
+                        && logisticsLocRole.IsPostalAddress;
+
+        return dirPartyPostalAddrlocal.address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAdditionalDataFieldsForQueryRecord</Name>
+				<Source><![CDATA[
+    // This is an overridden method that enables you to add additional data to a report data source
+    // which is an AX query, without changing the query itself. You can also add display method
+    // to any of data source tables from the query.
+    protected void addAdditionalDataFieldsForQueryRecord(DocXmlRecord _addingRecord, Common _common, QueryBuildDataSource _qbds)
+    {
+        super(_addingRecord, _common, _qbds);
+
+        InventTable inventTable;
+
+        // Add the LineNum field in order to be used on the template for sorting purposes.
+        if (tableNum(WHSWorkLine) == _qbds.table())
+        {
+            _addingRecord.addField(fieldStr(WHSWorkLine, LineNum));
+            
+            //Add general notes to pick list shipping report per CR011
+            WHSWorkLine workLine = _common;
+            FreeNotesTable_IT notes;
+            SalesTable salesTable;
+            SalesLine salesLine;
+            LogisticsPostalAddress  logisticsAddress;
+            LogisticsLocation       logisticsLocation;
+            utcdatetime validFrom  = DateTimeUtil::minValue();
+            utcdatetime validTo    = DateTimeUtil::maxValue();
+            CustTable custTable;
+
+            //CR_14699_DDSP_WaveShippingPickingList - PJB 10182022
+            InventTrans inventTrans;
+            InventTransOrigin inventTransOrigin;
+            WHSWorkInventTrans whsWorkInventTrans;
+            InventDim inventDim;
+            //end CR_14699_DDSP_WaveShippingPickingList
+            
+            str advNotes;
+
+            salesTable = SalesTable::find(workLine.OrderNum);
+            custTable = custTable::find(salesTable.CustAccount);
+            inventTable = inventTable::find(workLine.ItemId);
+
+            placeholderItemId = inventTable.ItemId;
+                                
+            _addingRecord.addCalculatedField('LegacyItemId', inventTable.GGINAVLegacyItemId);
+            _addingRecord.addCalculatedField('Style', workLine.inventDim().InventStyleId);
+            _addingRecord.addCalculatedField('InventoryStatus', workLine.inventDim().InventStatusId);
+            if (salesTable)
+            {
+                select firstonly salesLine where salesLine.SalesId == salesTable.SalesId && salesLine.ItemId == inventTable.ItemId;
+                if(salesLine)
+                {
+                    int counter = 0;
+
+                    select firstonly inventTransOrigin
+                        join InventTrans
+                            where InventTrans.InventTransOrigin == inventTransOrigin.RecId
+                                && salesLine.SalesId == inventTransOrigin.ReferenceId
+                                && salesLine.ItemId == inventTable.ItemId
+                                && salesLine.InventTransId == inventTransOrigin.InventTransId
+                        join whsWorkInventTrans
+                            where whsWorkInventTrans.InventTransIdParent == inventTransOrigin.InventTransId
+                        join inventDim
+                            where inventDim.inventDimId == whsWorkInventTrans.InventDimIdFrom;
+                    if(whsWorkInventTrans && inventDim)
+                    {
+                        while select inventTransOrigin
+                        join InventTrans
+                            where InventTrans.InventTransOrigin == inventTransOrigin.RecId
+                                && salesLine.SalesId == inventTransOrigin.ReferenceId
+                                && salesLine.ItemId == inventTable.ItemId
+                                && salesLine.InventTransId == inventTransOrigin.InventTransId
+                        join whsWorkInventTrans
+                            where whsWorkInventTrans.InventTransIdParent == inventTransOrigin.InventTransId
+                        join inventDim
+                            where inventDim.inventDimId == whsWorkInventTrans.InventDimIdFrom
+                        {
+                            counter++;
+                            if(counter == 1)
+                            {
+                                _addingRecord.addCalculatedField('BatchId', inventDim.inventBatchId);
+                            }
+                            if(counter > 1)
+                            {
+                                _addingRecord.removeField('BatchId');
+                                _addingRecord.addCalculatedField('BatchId', "Multiple batches");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (salesTable)
+            {
+                while select text
+                    from notes
+                        where notes.ItemCode == TableGroupAll::GroupId
+                        && notes.module == ModuleCustVend::Cust
+                        && notes.GGIOnWavePickList == NoYes::Yes
+                        && notes.ItemRelation == inventTable.FreeNotesGroup_IT
+                        && notes.CustVendRelation == ''
+                        && notes.GGILogisticsLocationId == ''
+                {
+                    advNotes = advNotes + #Separator + notes.text;
+                }
+
+                while select text
+                    from notes
+                        where notes.ItemCode == TableGroupAll::GroupId
+                        && notes.module == ModuleCustVend::Cust
+                        && notes.GGIOnWavePickList == NoYes::Yes
+                        && notes.ItemRelation == inventTable.FreeNotesGroup_IT
+                        && notes.CustVendRelation == custTable.AccountNum
+                        && notes.GGILogisticsLocationId == ''
+                {
+                    advNotes = advNotes + #Separator + notes.text;
+                }
+
+                while select text
+                    from notes
+                        where notes.ItemRelation == workLine.Itemid
+                        && notes.GGIOnWavePickList == NoYes::Yes
+                        && notes.CustVendCode == TableGroupAll::Table
+                        && notes.GGILogisticsLocationId == ''
+                        && notes.CustVendRelation == custTable.AccountNum
+                {
+                    advNotes = advNotes + #Separator + notes.text;
+                }
+
+                while select text
+                    from notes
+                        where notes.CustVendCode == TableGroupAll::GroupId
+                        && notes.module == ModuleCustVend::Cust
+                        && notes.GGIOnWavePickList == NoYes::Yes
+                        && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                        && notes.ItemRelation == workLine.Itemid
+                {
+                    advNotes = advNotes + #Separator + notes.text;
+                }
+
+                select firstonly validtimestate(validFrom, validTo) logisticsAddress
+                            where logisticsAddress.RecId == SalesTable.DeliveryPostalAddress;
+
+                select firstonly LocationId
+                        from logisticsLocation
+                            where logisticsLocation.RecId == logisticsAddress.Location;
+
+                while select text
+                    from notes
+                        where notes.GGIOnWavePickList == NoYes::Yes
+                        && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                        && notes.ItemRelation == workLine.Itemid
+                        && notes.CustVendRelation == custTable.AccountNum
+                {
+                    advNotes = advNotes + #Separator + notes.text;
+                }
+
+                while select text
+                    from notes
+                        where notes.ItemCode == TableGroupAll::GroupId
+                        && notes.module == ModuleCustVend::Cust
+                        && notes.GGIOnWavePickList == NoYes::Yes
+                        && notes.ItemRelation == inventTable.FreeNotesGroup_IT
+                        && notes.CustVendRelation == custTable.AccountNum
+                        && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                {
+                    advNotes = advNotes + #Separator + notes.text;
+                }
+
+                _addingRecord.addCalculatedField('GeneralNoteLine', advNotes);
+            }
+        }
+
+        else if (tableNum(WHSWorkTable) == _qbds.table())
+        {
+            WHSWorkTable workTable = _common;
+            salesTable salesTableHeader;
+            SalesLine salesLine;
+
+            if (workTable.WorkTransType == WHSWorkTransType::Sales)
+            {
+                FreeNotesTable_IT notes;
+                SalesTable salesTable;
+                LogisticsPostalAddress  logisticsAddress;
+                LogisticsLocation       logisticsLocation;
+                utcdatetime validFrom  = DateTimeUtil::minValue();
+                utcdatetime validTo    = DateTimeUtil::maxValue();
+                CustTable custTable;
+                str advNotesHeader;
+
+                salesTable = SalesTable::find(workTable.OrderNum);
+                custTable = custTable::find(salesTable.CustAccount);
+
+                if (salesTable)
+                {
+                    while select text
+                        from notes
+                            where notes.CustVendCode == TableGroupAll::Table
+                            && notes.GGIOnWavePickList == NoYes::Yes
+                            && notes.GGILogisticsLocationId == ''
+                            && notes.CustVendRelation == custTable.AccountNum
+                            && notes.ItemRelation == ''
+                    {
+                        advNotesHeader = advNotesHeader + #Separator + notes.text;
+                    }
+
+                    while select text
+                        from notes
+                            where notes.CustVendCode == TableGroupAll::GroupId
+                            && notes.module == ModuleCustVend::Cust
+                            && notes.GGIOnWavePickList == NoYes::Yes
+                            && notes.CustVendRelation == custTable.FreeNotesGroup_IT
+                            && notes.ItemRelation == ''
+                    {
+                        advNotesHeader = advNotesHeader + #Separator + notes.text;
+                    }
+
+                    select firstonly validtimestate(validFrom, validTo) logisticsAddress
+                            where logisticsAddress.RecId == SalesTable.DeliveryPostalAddress;
+
+                    select firstonly LocationId
+                        from logisticsLocation
+                            where logisticsLocation.RecId == logisticsAddress.Location;
+
+                    while select text
+                        from notes
+                            where notes.GGIOnWavePickList == NoYes::Yes
+                            && notes.GGILogisticsLocationId == logisticsLocation.LocationId
+                            && notes.ItemRelation == ''
+                    {
+                        advNotesHeader = advNotesHeader + #Separator + notes.text;
+                    }
+
+                    _addingRecord.addCalculatedField('GeneralNoteHeader', advNotesHeader);
+                }
+
+                select firstonly salesTableHeader
+                    where salesTableHeader.SalesId == salesTable.SalesId;
+                {
+                    
+                    DocXmlRecord    salesTableHeaderInfo  = _addingRecord.addChildCalculatedRecord('SalesTable');
+                    custTable custTableInvoice = custTable::find(salesTable.InvoiceAccount);
+                    TMSSalesTable   tmsSalesTable = TMSSalesTable::find(salesTable.SalesId);
+                    WHSLoadTable    whsLoadTable = WHSLoadTable::find(workTable.LoadId);
+                    WHSLoadLine whsLoadLine;
+                    TTBPermittable  permitTable;
+
+                    
+                    permitTable = TTBPermitTable::find(salesTableHeader.ttbPermitTable);
+
+                    salesTableHeaderInfo.addCalculatedField('SalesId', salesTableHeader.SalesId);
+                    salesTableHeaderInfo.addCalculatedField('InvoiceAccount', salesTableHeader.InvoiceAccount);
+                    salesTableHeaderInfo.addCalculatedField('InvoiceAccountName', custTableInvoice.name());
+                    salesTableHeaderInfo.AddCalculatedFieldFromEdt('ShipToName', extendedTypeStr(LogisticsAddressing), salesTable.DeliveryName);
+                    salesTableHeaderInfo.AddCalculatedFieldFromEdt('ShipToAddress', extendedTypeStr(LogisticsAddressing), salesTable.deliveryAddressing());
+                    salesTableHeaderInfo.addCalculatedField('ShippingDateConfirmed', salesTableHeader.ShippingDateConfirmed);
+                    salesTableHeaderInfo.addCalculatedField('DlvMode', salesTableHeader.DlvMode);
+                    salesTableHeaderInfo.addCalculatedField('DlvTerm', salesTableHeader.DlvTerm);
+                    salesTableHeaderInfo.addCalculatedField('CarrierCode', tmsSalesTable.CarrierCode);
+                    salesTableHeaderInfo.addCalculatedField('CarrierServiceCode', tmsSalesTable.CarrierServiceCode);
+                    salesTableHeaderInfo.addCalculatedField('PurchOrderFormNum', salesTableHeader.PurchOrderFormNum);
+                    salesTableHeaderInfo.addCalculatedField('TTBPermitId', permitTable.PermitId);
+                    salesTableHeaderInfo.addCalculatedField('LoadWeight', whsLoadTable.LoadWeight);
+                   
+                    while select SalesLine
+                        where SalesLine.SalesId == salesTableHeader.SalesId
+                        && salesLine.ItemId == placeholderItemId
+                    {
+                        DocXmlRecord    salesLineInfo  = _addingRecord.addChildCalculatedRecord('SalesLine');
+                        
+                        select firstonly whsLoadLine
+                            where whsLoadLine.InventTransType == InventTransType::Sales
+                            && whsLoadLine.InventTransId == SalesLine.InventTransId;
+
+                        inventTable = InventTable::find(salesLine.ItemId);
+
+                        salesLineInfo.addCalculatedField('ItemId', salesline.ItemId);
+                        salesLineInfo.addCalculatedField('ItemGrossWeight', salesline.whsItemGrossWeight());
+                        salesLineInfo.addCalculatedField('QtyOrdered', salesline.QtyOrdered);
+                        salesLineInfo.addCalculatedField('SalesQty', salesline.SalesQty);
+                        salesLineInfo.addCalculatedField('DlvTerm', salesline.DlvTerm);
+                        salesLineInfo.addCalculatedField('LoadLineGrossWeight', WHSLoadLine.displayLoadGrossWeight());
+                        salesLineInfo.addCalculatedField('LegacyItemId', inventTable.GGINAVLegacyItemId);
+                        
+                    }
+                }
+            }
+            if (workTable.WorkTransType == WHSWorkTransType::TransferIssue || workTable.WorkTransType == WHSWorkTransType::TransferReceipt)
+            {
+                InventTransferLine  inventTransferLine;
+                InventTransferTable inventTransferTable, inventTransferTableHeader;
+                LogisticsLocation       logisticsLocation;
+                TMSInventTransferTable  tmsInvTransTable;
+                TMSCarrier          tmsCarrierTrans;
+                TMSCarrierService   tmsCarrierService;
+                VendTable           vendTable;
+                LogisticsPostalAddress  lpa;
+                TTBPermitTable      permitTable;
+
+                inventTransferTable = inventTransferTable::find(workTable.OrderNum);
+                
+                select firstonly inventTransferTableHeader
+                    where inventTransferTableHeader.TransferId == inventTransferTable.TransferId;
+                {
+                    
+                    DocXmlRecord    inventTransferHeaderInfo  = _addingRecord.addChildCalculatedRecord('InventTransferTable');
+                    WHSLoadTable    whsLoadTable = WHSLoadTable::find(workTable.LoadId);
+                    WHSLoadLine whsLoadLine;
+                    
+                    tmsInvTransTable = TMSInventTransferTable::find(inventTransferTable.transferid);
+                    tmsCarrierTrans = tmsCarrier::find(tmsInvTransTable.CarrierCode);
+
+                    tmsCarrierService = tmsCarrierService::find(tmsInvTransTable.CarrierServiceCode, tmsCarrierTrans.CarrierCode);
+
+                    select firstonly lpa
+                        where lpa.RecId == inventTransferTable.ToPostalAddress;
+
+                    select firstonly logisticsLocation
+                        where logisticsLocation.recid == lpa.Location;
+
+                    vendTable = vendTable::find(tmsCarriertrans.VendorCode);
+                    permitTable = inventTransferTable.ttbPermitTable();
+
+                    inventTransferHeaderInfo.addCalculatedFieldFromEdt('TTBPermitId', extendedTypeStr(TTBPermitId), permitTable.PermitId);
+                    inventTransferHeaderInfo.addCalculatedFieldFromEnum('TTBPermitType', enumStr(TTBPermitType), permitTable.PermitType);
+                    inventTransferHeaderInfo.addCalculatedField('TransferId', inventTransferTableHeader.TransferId);
+                    inventTransferHeaderInfo.addCalculatedField('ShipDate', inventTransferTable.ShipDate);
+                    inventTransferHeaderInfo.addCalculatedField('CarrierCode', tmsInvTransTable.CarrierCode);
+                    inventTransferHeaderInfo.addCalculatedField('CarrierServiceCode', tmsInvTransTable.CarrierServiceCode);
+                    inventTransferHeaderInfo.addCalculatedField('LoadWeight', whsLoadTable.LoadWeight);
+                    inventTransferHeaderInfo.addCalculatedField('DlvTerms', inventTransferTable.DlvTermId);
+                    inventTransferHeaderInfo.addCalculatedField('DlvName', tmsCarrierService.Name);
+                    inventTransferHeaderInfo.addCalculatedField('DlvLoadTemplateId', tmsCarrierService.LoadTemplateId);
+                    inventTransferHeaderInfo.addCalculatedField('DlvMethodCode', tmsCarrierService.MethodCode);
+                    inventTransferHeaderInfo.addCalculatedField('DlvModeId', inventTransferTable.DlvModeId);
+                    inventTransferHeaderInfo.addCalculatedField('DlvExternalCode', tmsCarrierService.ExternalCode);
+                    inventTransferHeaderInfo.addCalculatedField('DlvBillingGroupId', tmsCarrierService.BillingGroupId);
+                    inventTransferHeaderInfo.addCalculatedField('DlvVolumeFactor', tmsCarrierService.VolumeFactor);
+                    inventTransferHeaderInfo.addCalculatedField('InventLocationIdTo', inventTransferTable.InventLocationIdTo);
+                    inventTransferHeaderInfo.addCalculatedField('LocationName', inventTransferTable.locationNameTo());
+                    inventTransferHeaderInfo.addCalculatedField('TOCarrierVendorAddress', this.GetThirdPartyAddress(vendTable.AccountNum));
+                    inventTransferHeaderInfo.addCalculatedField('TOShipToAddress', inventTransferTable.toAddress());
+                    inventTransferHeaderInfo.addCalculatedField('TOShipToAddressName',logisticslocation.Description);
+                    
+
+                    while select inventTransferLine
+                        where inventTransferLine.TransferId == inventTransferTableHeader.TransferId
+                    {
+                        DocXmlRecord    transferLineInfo  = _addingRecord.addChildCalculatedRecord('InventTransferLine');
+                        
+                        select firstonly whsLoadLine
+                            where whsLoadLine.InventTransType == InventTransType::Sales
+                            && whsLoadLine.InventTransId == SalesLine.InventTransId;
+
+                        transferLineInfo.addCalculatedField('ItemId', inventTransferLine.ItemId);
+                        transferLineInfo.addCalculatedField('QtyTransfer', inventTransferLine.QtyTransfer);
+                    }
+                }
+            }
+            //else if (!this.isRuntime())
+            //{
+            //    // It's not applicable but we'll add it if this executes when DDSP is being produced
+            //    // to maintain the uniform data schema.
+            //    _addingRecord.addCalculatedField('CustomerName', '');
+            //}
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSelectedQueryRecord</Name>
+				<Source><![CDATA[
+    protected void onSelectedQueryRecord(Common _common, QueryBuildDataSource _qbds)
+    {
+        super (_common, _qbds);
+
+        // Store values for custom placeholders into global variables.
+        if (tableNum(WHSWorkLine) == _qbds.table())
+        {
+            WHSWorkLine whsWorkLine = _common;
+
+            // Check if there are more than one Shipment IDs.
+            if (placeholderShipmentId != whsWorkLine.ShipmentId)
+            {
+                isMultipleShipmentIds = placeholderShipmentId == '' ? false : true;
+                placeholderShipmentId = whsWorkLine.ShipmentId;
+            }
+           
+            // Check if there are more than one Load IDs.
+            if (placeholderLoadId != whsWorkLine.LoadId)
+            {
+                isMultipleLoadIds = placeholderLoadId == '' ? false : true;
+                placeholderLoadId = whsWorkLine.LoadId;
+            }
+
+            placeholderOrderNumber = whsWorkLine.OrderNum;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    // List of custom placeholders defined for the report:
+    #define.ShipmentId('ShipmentId')
+    #define.LoadId('LoadId')
+    #define.OrderNum('OrderNum')
+
+    [DocPlaceholderAttribute(#LoadId, 'PLS - Load ID'),
+     DocPlaceholderAttribute(#ShipmentId, 'PLS - Shipment ID'),
+     DocPlaceholderAttribute(#OrderNum, 'PLS - Order number')]
+    public DocPlaceholderManager overrideReportRunSettings(DocReportRunContext _reportRunContext, boolean _replaceStandardPlaceholders = true)
+    {
+        // Replace standard placeholders.
+        DocPlaceholderManager placeholderMng = super(_reportRunContext, _replaceStandardPlaceholders);
+
+        // Replace custom placeholders:
+        // -- Placeholder @ShipmentId@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#ShipmentId, isMultipleShipmentIds ? '*' : placeholderShipmentId);
+
+        // -- Placeholder @LoadId@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#LoadId, isMultipleLoadIds ? '*' : placeholderLoadId);
+        
+        // -- Placeholder @OrderNum@
+        placeholderMng.replacePlaceholderInCurrentPrintDest(#OrderNum, isMultipleShipmentIds || isMultipleLoadIds ? '*' : placeholderOrderNumber);
+
+        // Fill the Print archive contract.
+        if (!isMultipleShipmentIds)
+        {
+            _reportRunContext.archiveContract().setDocument(placeholderOrderNumber);
+            _reportRunContext.archiveContract().setWHSShipmentId(placeholderShipmentId);
+        }
+
+        return placeholderMng;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

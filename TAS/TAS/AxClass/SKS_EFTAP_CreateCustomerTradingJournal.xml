@@ -1,0 +1,481 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFTAP_CreateCustomerTradingJournal</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// IHB Intercompany customer journal creation .
+/// </summary>
+// SKS_FDD_9602
+class SKS_EFTAP_CreateCustomerTradingJournal
+{
+    LedgerJournalTable          ledgerJournalTable;
+    LedgerJournalTrans          ledgerJournalTrans;
+    VendTable                   vendTable;
+    InterCompanyTradingPartner  intercompanyTradingPartner, interCompanyTradingPartnerCus;
+    Voucher                     voucherLoc;
+    SKS_IHB_InterCompanySetup   sKS_IHB_InterCompanySetupLoc;
+    TransDate                   changedLastStatementdate; // SKS_Bug_10515
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createCustomerJournal</Name>
+				<Source><![CDATA[
+    public void createCustomerJournal()
+    {
+        InterCompanyTradingRelation interCompanyTradingRelation; 
+        LedgerJournalTable      ledgerJournalTableCust = null;
+
+        while select ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+        {
+            if(ledgerJournalTrans.SKS_IHB_InterComp == NoYes::Yes )
+            {
+                changecompany(ledgerJournalTrans.Company)
+                {
+                    SKS_IHB_InterCompanySetup   sks_IHB_InterCompanySetup;
+                    vendTable = VendTable::findByLedgerDimension(ledgerJournalTrans.LedgerDimension);
+                    select sks_IHB_InterCompanySetup
+                        where sks_IHB_InterCompanySetup.VendAccount == vendTable.AccountNum;
+                    sKS_IHB_InterCompanySetupLoc = sks_IHB_InterCompanySetup;
+                }
+
+                intercompanyTradingPartner = InterCompanyTradingPartner::findVendor(vendTable.Party, vendTable.DataAreaId);
+                interCompanyTradingRelation = intercompanyTradingPartner.interCompanyTradingRelation();
+                interCompanyTradingPartnerCus = InterCompanyTradingPartner::find(interCompanyTradingRelation.InterCompanyTradingCustomer);
+                    
+                if(interCompanyTradingPartnerCus.CustomerDataAreaId) // SKS_10528 additional condition has been removed
+                {
+                    changecompany(interCompanyTradingPartnerCus.CustomerDataAreaId) 
+                    {
+                        LedgerJournalTable      ledgerJournalTableCanCreateNew;
+
+                        select firstonly ledgerJournalTableCanCreateNew
+                            where ledgerJournalTableCanCreateNew.SKS_EFTAP_InterCompSourceDataAreaId == ledgerJournalTable.DataAreaId
+                                && ledgerJournalTableCanCreateNew.SKS_EFTAP_InterCompSourceJournalNum == ledgerJournalTable.JournalNum
+                                && ledgerJournalTableCanCreateNew.Posted == NoYes::No;
+
+                        ledgerJournalTableCust =  this.createJourInPaymSubCompany(ledgerJournalTableCanCreateNew, ledgerJournalTrans);
+                        ledgerJournalTableCust = null;
+                    }
+                }
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setledgerJournalTable</Name>
+				<Source><![CDATA[
+    void setledgerJournalTable(LedgerJournalTable _ledgerJournalTable)
+    {
+        ledgerJournalTable = _ledgerJournalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJourInPaymSubCompany</Name>
+				<Source><![CDATA[
+    public LedgerJournalTable createJourInPaymSubCompany(LedgerJournalTable _ledgerJournalTable, LedgerJournalTrans _ledgerJournalTrans)
+    {
+        LedgerDimensionDefaultAccount           ledgerDimension;
+        LedgerJournalNameId                     journalName;
+        LedgerJournalTable                      headerTable;
+        LedgerJournalTrans                      ledgerTrans;
+
+        journalName = SKS_EFTAP_PaymJourCreate::findInHouseBankJournal();
+        if(journalName)
+        {
+            ledgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(intercompanyTradingPartnerCus.custTable().AccountNum, LedgerJournalACType::Cust);
+            
+            if(_ledgerJournalTable == null)
+            {
+                headerTable = this.createJournalHeader(_ledgerJournalTable, journalName);
+            }
+            else
+            {
+                headerTable = _ledgerJournalTable;
+            }
+            ledgerTrans = this.createCustTrans(headerTable, LedgerJournalACType::Cust, ledgerDimension, _ledgerJournalTrans);
+            this.settleCustInvoice(ledgerTrans);
+            // SKS_Bug_10515 -->
+            if(changedLastStatementdate != dateNull() && 
+                _ledgerJournalTrans.TransDate != changedLastStatementdate)
+            {
+                info(strfmt("@SKS:SKSDateChanged",  voucherLoc,
+                                                    ledgerTrans.TransDate,
+                                                    changedLastStatementdate));
+            }
+            // SKS_Bug_10515 <--
+        }
+        else
+        {
+            checkFailed("@SKS:SKGGJNameExists", intercompanyTradingPartnerCus.CustomerDataAreaId);
+        }
+        return headerTable;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustTrans</Name>
+				<Source><![CDATA[
+    private  LedgerJournalTrans createCustTrans(
+        LedgerJournalTable _ledgerJournalTable,
+        LedgerJournalACType _accountType,
+        LedgerDimensionDefaultAccount _ledgerDimension,
+        LedgerJournalTrans  _ledgerJournalTrans)
+    {
+        LedgerJournalTrans              trans;
+        sKS_PP_Bank                     sKS_PP_Bank;
+        LedgerDimensionDefaultAccount   offsetledgerDimension;
+
+        trans.clear();
+        trans.initValue();
+        LedgerJournalEngine ledgerJournalEngine = LedgerJournalEngine::construct(_ledgerJournalTable.JournalType);
+
+        trans.JournalNum = _ledgerJournalTable.JournalNum;
+        trans.TransDate = _ledgerJournalTrans.TransDate;
+        trans.AccountType = _accountType;
+        trans.LedgerDimension = _ledgerDimension;
+        ledgerJournalEngine.accountModified(trans);
+        ledgerJournalEngine.initTaxItemGroup(trans);
+
+        if(ledgerJournalEngine.takeNewVoucher())
+        {
+            trans.Voucher = new JournalVoucherNum(JournalTableData::newTable(_ledgerJournalTable)).getNew(false);
+            voucherLoc = trans.Voucher;
+        }              
+        trans.PaymentStatus = CustVendPaymStatus::None;        
+        trans.PaymSpec = '';
+        trans.PaymReference = '';
+        trans.company = interCompanyTradingPartnerCus.CustomerDataAreaId;
+        trans.CashDiscAmount = 0;
+        //SKS_Bug_12536 -->
+        //trans.CurrencyCode = interCompanyTradingPartnerCus.custTable().Currency;
+        trans.CurrencyCode = _ledgerJournalTrans.CurrencyCode;        
+        //trans.ExchRate = _ledgerJournalTrans.ExchRate;
+        // apply the exchange rate based on current company transaction "trans"
+        trans.ExchRate = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(trans.Company).RecId), trans.CurrencyCode, trans.TransDate).getExchangeRate1();        
+        trans.ExchRateSecond = ExchangeRateHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(trans.Company).RecId), trans.CurrencyCode, trans.TransDate).getExchangeRate2();
+        trans.Triangulation = _ledgerJournalTrans.Triangulation;
+        //As part of D365 8.1 application version the new reporting currency fields(ReportingCurrencyExchRate, ReportingCurrencyExchRateSecondary) are added. The below method check will ensure those fields exist on the version before attempting to populate them
+        SysDictClass sysDictClass = new SysDictClass(className2Id(classStr(LedgerJournalEngine_Server)));
+        if (sysDictClass && sysDictClass.hasStaticMethod('reportingCurrencyModified'))
+        {
+            trans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate')) = _ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRate'));
+            trans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary')) = _ledgerJournalTrans.(fieldName2id(tableNum(LedgerJournalTrans), 'ReportingCurrencyExchRateSecondary'));
+        }
+        //SKS_Bug_12536 <--
+        trans.CashDiscCode = ''; 
+        if(abs(_ledgerJournalTrans.AmountCurCredit) > 0)
+        {
+            trans.AmountCurDebit = _ledgerJournalTrans.AmountCurCredit;
+            trans.AmountCurCredit = 0;
+        }
+        else
+        {
+            trans.AmountCurDebit = 0;
+            trans.AmountCurCredit = _ledgerJournalTrans.AmountCurDebit;
+        }
+        if(_ledgerJournalTrans.OffsetAccountType == LedgerJournalACType::Ledger)
+        {
+            trans.OffsetLedgerDimension = _ledgerJournalTrans.OffsetLedgerDimension;
+            trans.OffsetAccountType = LedgerJournalACType::Ledger;
+            ledgerJournalEngine.offsetAccountModified(trans);
+        }
+        else if(_ledgerJournalTrans.OffsetAccountType == LedgerJournalACType::Bank)
+        {
+            changecompany(sKS_IHB_InterCompanySetupLoc.PaymentCompany)
+            {
+                sKS_PP_Bank = SKS_PP_Bank::find(sKS_IHB_InterCompanySetupLoc.BankAccount);
+                changecompany(sKS_PP_Bank.SKS_IHBLinkedinhousebankcompany)
+                {
+                    offsetledgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(sKS_PP_Bank.SKS_IHBLinkedinhousebankaccount, LedgerJournalACType::Bank);
+                }
+                trans.OffsetLedgerDimension = offsetledgerDimension;
+                trans.OffsetAccountType = LedgerJournalACType::Bank;
+                ledgerJournalEngine.offsetAccountModified(trans);
+            }
+        }
+        trans.TaxGroup = _ledgerJournalTrans.TaxGroup;
+        trans.TaxItemGroup = _ledgerJournalTrans.TaxItemGroup;
+        // SKS_10528 start
+        if(this.checkCustomerInvoiceExist())
+        {
+            trans.SettleVoucher = SettlementType::SelectedTransact;
+        }
+        else
+        {
+            trans.SettleVoucher = SettlementType::None;
+        }
+        // SKS_10528 End
+        trans.PostingProfile = _ledgerJournalTrans.PostingProfile;
+        trans.BankTransType = _ledgerJournalTrans.BankTransType;
+        trans.PaymentNotes = _ledgerJournalTrans.PaymentNotes;
+        trans.TransactionType = _ledgerJournalTrans.TransactionType;
+        trans.Approved = _ledgerJournalTrans.Approved;
+        trans.Approver = _ledgerJournalTrans.Approver; //Make the currentuser? (curuserid())
+        trans.Payment = _ledgerJournalTrans.Payment;
+
+        if(this.checkInvoiceExist())        //SKS_DevOps_19372
+        {
+            trans.Txt = this.checkInvoiceExist();
+        }
+        else
+        {
+            trans.Txt  ="@SYS23013";
+        }
+
+        trans.SKS_IHB_InterOrigVoucher = _ledgerJournalTrans.Voucher; // SKS_Bug_10631
+        // SKS_Bug_10515 -->
+        changedLastStatementdate = trans.TransDate;
+        SKS_IHB_LedgerPostingPreEventHandler::IHBDateAdjust(trans, ledgerjournalTrans, true);
+        if(changedLastStatementdate != trans.TransDate)
+        {
+            changedLastStatementdate = trans.TransDate;
+        }
+        // SKS_Bug_10515 <--
+        
+        if(trans.validateWrite())
+        {
+            trans.insert();
+        }
+        return trans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalHeader</Name>
+				<Source><![CDATA[
+    public LedgerJournalTable createJournalHeader(LedgerJournalTable _ledgerJournalTable, LedgerJournalNameId _journalName)
+    {
+        LedgerJournalTable  header;
+  
+        header.clear();
+        header.JournalName = _journalName;
+        header.initFromLedgerJournalName(header.JournalName);
+        header.SKS_EFTAP_IsIHBJournal = NoYes::Yes;
+        header.SKS_EFTAP_InterCompSourceDataAreaId = ledgerJournalTable.DataAreaId;
+        header.SKS_EFTAP_InterCompSourceJournalNum = ledgerJournalTable.JournalNum;
+        header.insert();
+
+        return header;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settleCustInvoice</Name>
+				<Source><![CDATA[
+    public void settleCustInvoice(LedgerJournalTrans  _custledgerJournalTrans)
+    {
+        SpecTrans      spectrans;
+        VendTransOpen  vendTransOpenLoc;
+        boolean        isSpecTransAttachedwithCustPayment; // SKS_Bug_13812
+
+        while select crosscompany spectrans
+            where spectrans.SpecCompany == ledgerjournaltrans.DataAreaId &&
+            spectrans.SpecTableId == ledgerjournaltrans.TableId &&
+            spectrans.SpecRecId == ledgerjournaltrans.RecId
+        {
+            changecompany(spectrans.RefCompany)
+            {
+                VendTransOpen vendtransopen;
+                select vendtransopen where
+                    vendtransopen.DataAreaId == spectrans.RefCompany &&
+                    vendtransopen.TableId == spectrans.RefTableId &&
+                    vendtransopen.RecId == spectrans.RefRecId;
+                vendTransOpenLoc = vendtransopen;
+            }
+            changecompany(interCompanyTradingPartnerCus.CustomerDataAreaId)
+            {
+                CustTrans custTrans;
+                CustTransOpen custTransOpen;
+                // SKS_Bug_10555 -->
+                InvoiceId   invoiceId = vendTransOpenLoc.vendTrans().Invoice; 
+                if(invoiceId)
+                {
+                    // SKS_Bug_10555 <--
+                    select custTrans
+                        where custTrans.Invoice == invoiceId
+                            && custTrans.AccountNum == interCompanyTradingPartnerCus.custTable().AccountNum
+                    join custTransOpen
+                        where custTransOpen.AccountNum == custTrans.AccountNum
+                            && custTransOpen.RefRecId == custTrans.RecId;
+                } // SKS_Bug_10555
+                if(custTransOpen)
+                {
+                    CustVendOpenTransManager    updateSettlementManager = CustVendOpenTransManager::construct(_custledgerJournalTrans);
+                    updateSettlementManager.updateTransMarked(custTransOpen, true);
+                    // SKS_Bug_13812 -->
+                    if (!isSpecTransAttachedwithCustPayment)
+                    {
+                        isSpecTransAttachedwithCustPayment = true;
+                    }
+                    // SKS_Bug_13812 <--
+                    if(abs(spectrans.Balance01) <= abs(custTransOpen.AmountCur))
+                    {
+                        updateSettlementManager.updateSettleAmount(custTransOpen, abs(spectrans.Balance01));
+                    }
+                }
+            }
+        }
+        // SKS_Bug_13812 -->
+        if(_custledgerJournalTrans)
+        {
+            ttsbegin;
+            _custledgerJournalTrans.selectForUpdate(true);
+            // If a customer payment have marked transaction(specTrans), the LedgerJournalTrans.SettleVoucher should set as 'SelectedTransact'
+            if(isSpecTransAttachedwithCustPayment)
+            {
+                _custledgerJournalTrans.SettleVoucher = SettlementType::SelectedTransact;
+            }
+            else
+            {
+                _custledgerJournalTrans.SettleVoucher = SettlementType::None;
+            }
+            _custledgerJournalTrans.update();
+            ttscommit;
+        }
+        // SKS_Bug_13812 <--
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        this.createCustomerJournal();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkCustomerInvoiceExist</Name>
+				<Source><![CDATA[
+    public boolean checkCustomerInvoiceExist()
+    {
+        boolean         exist;
+        SpecTrans       spectrans;
+        VendTransOpen   vendtransopen;
+        CustTrans       custTrans;
+        CustTransOpen   custTransOpen;
+
+        select crosscompany spectrans
+            where spectrans.SpecCompany == ledgerjournaltrans.DataAreaId &&
+                spectrans.SpecTableId == ledgerjournaltrans.TableId &&
+                spectrans.SpecRecId == ledgerjournaltrans.RecId
+        join vendtransopen where
+                vendtransopen.DataAreaId == spectrans.RefCompany &&
+                vendtransopen.TableId == spectrans.RefTableId &&
+                vendtransopen.RecId == spectrans.RefRecId;
+        // SKS_10528 start
+        if(!vendtransopen.vendTrans().Invoice) // SKS_Bug_10555
+        {
+            exist =  false;
+            return exist;
+        }
+        // SKS_10528 end
+        select  crosscompany custTrans
+            where custTrans.Invoice == vendtransopen.vendTrans().Invoice
+                && custTrans.AccountNum == interCompanyTradingPartnerCus.custTable().AccountNum
+        join custTransOpen
+            where custTransOpen.AccountNum == custTrans.AccountNum
+                && custTransOpen.RefRecId == custTrans.RecId;
+
+        if(custTransOpen)
+        {
+            exist =  true;
+        }
+
+        return exist;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkInvoiceExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check Invoice Number
+    /// </summary>
+    /// <returns>Invoice number</returns>
+    public str checkInvoiceExist()
+    {
+        str         invoice = '';
+        SpecTrans       spectrans;
+        VendTransOpen   vendtransopen;
+
+        while select crosscompany spectrans
+            where spectrans.SpecCompany == ledgerjournaltrans.DataAreaId &&
+                spectrans.SpecTableId == ledgerjournaltrans.TableId &&
+                spectrans.SpecRecId == ledgerjournaltrans.RecId
+        join vendtransopen where
+                vendtransopen.DataAreaId == spectrans.RefCompany &&
+                vendtransopen.TableId == spectrans.RefTableId &&
+                vendtransopen.RecId == spectrans.RefRecId
+        {
+            if(vendtransopen.vendTrans().Invoice)
+            {
+                invoice += vendtransopen.vendTrans().Invoice + ',';
+            }
+        }
+
+        if(invoice)
+        {
+            invoice = subStr(invoice, 1, strLen(invoice)-1);
+        }
+
+
+        return invoice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteCustomerJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the customer record if any posting error.
+    /// </summary>
+    /// <param name = "_ledgerJourTable">_ledgerJourTable</param>
+    public static void deleteCustomerJournal(LedgerJournalTable _ledgerJourTable)
+    {
+        LedgerJournalTable  ledgerJournalTableCustomer;
+
+        while select crosscompany ledgerJournalTableCustomer
+            where ledgerJournalTableCustomer.Posted == NoYes::No &&
+                ledgerJournalTableCustomer.SKS_EFTAP_InterCompSourceJournalNum == _ledgerJourTable.JournalNum &&
+                ledgerJournalTableCustomer.SKS_EFTAP_InterCompSourceDataAreaId == _ledgerJourTable.DataAreaId
+        {
+            if(ledgerJournalTableCustomer)
+            {
+                changecompany(ledgerJournalTableCustomer.DataAreaId)
+                {
+                    LedgerJournalTable  ledgerJournalTable;
+                    ttsbegin;
+                    ledgerJournalTable = ledgerJournalTableCustomer;
+                    ledgerJournalTable.selectForUpdate(true);
+                    ledgerJournalTable.delete();
+                    ttscommit;
+                }
+            }
+        }
+                
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

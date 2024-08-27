@@ -1,0 +1,1520 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_eCommIntegrationHandler</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <b>SKS_CC_eCommIntegrationHandler</b> class contains functions for an external
+/// eCommerce site to integrate with D365 for a PayFabric Connector.
+/// </summary>
+using Retail=Microsoft.Dynamics.Retail;
+using RetailConst=Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants;
+
+class SKS_CC_eCommIntegrationHandler
+{
+    const str constAuthTxnType = 'Auth';
+    const str constSaleTxnType = 'Sale';
+    const str eCommIntPFTxnKey = 'eCommIntPFTxnKey';
+    const str PayFabricOperation = 'PayFabricOperation';
+    const str PayFabric_Operation = 'PayFabric Operation';
+    const str GetPayFabricPreAuthTrans = 'GetPayFabricPreAuthTrans';    
+    const boolean Decrypt = false;
+
+    public str PayFabricTransactionKey;
+    public str txnType;
+    SalesTable salesTableCaller;
+    CreditCardCust creditCardCustCaller;
+    RecId paymJourLineRecId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>SKS_CC_eCommInteg_CardSynch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Used to synchronize PayFabric wallets that may have been created/updated externally
+    ///    in a eCommerce site and need to be refreshed in D365 <b>CreditCardCust</b> table.
+    /// </summary>
+    /// <param name="_company">
+    ///    The DataAreaId (company/legal entity) where PayFabric payment service
+    ///    and customer record exist in D365. This value will be used to switch to
+    ///    the specific company and search for an 'active' PayFabric payment processor.
+    /// </param>
+    /// <param name="_customerNumber">
+    ///    The D365 customer number (without legal entity prefix from PayFabric) where PayFabric wallet
+    ///    should exist and needs to be synchronized. This value will be used to synchronize wallets for that customer.
+    /// </param>
+    /// <param name="_PayFabricCardToken">
+    ///    Optional. The PayFabric wallet card token (unique value) that should be read from PayFabric and synchronized with D365.
+    ///    If this parameter is not passed and the _PayFabricTransactionKey parameter is also not passed
+    ///    then all credit cards associated the customer specified will be synchronized.
+    /// </param>
+    /// <param name="_oneTimeCustRefTableId">
+    ///    Optional. The table Id of the record used to link a one-time customer.
+    /// </param>
+    /// <param name="_oneTimeCustRefRecId">
+    ///    Optional. The record Id of the record used to link a one-time customer.    
+    /// </param>
+    /// <param name="_PayFabricTransactionKey">
+    ///    Optional. The PayFabric transaction key to use to read a transaction and get the PayFabric wallet 
+    ///    card token (unique value) that should be read from PayFabric and synchronized with D365.
+    ///    If this parameter is not passed and the _PayFabricCardToken parameter is also not passed
+    ///    then all credit cards associated the customer specified will be synchronized.
+    /// </param>
+    /// <returns>
+    ///    true if the specified PayFabric card token exists in CreditCardCust for the customer specified; otherwise, false.
+    ///    If CCA module is not active an error will be thrown by this method that should be handled by calling function.
+    ///    If a PayFabric active payment connector cannot be found in company specified, an error
+    ///         will be thrown by this method that should be handled by calling function.
+    ///    If the PayFabric synchronize function returns an error the error will be rethrown to the calling function.
+    ///    If PayFabric synchronize function is successful but specified card token cannot be found in D365
+    ///         for the customer specified then this function will return false without throwing an error (if card token is passed).
+    /// </returns>
+    public static boolean SKS_CC_eCommInteg_CardSynch(
+        DataAreaId _company,
+        CustAccount _customerNumber,
+        CreditCardUniqueCardId _PayFabricCardToken = '',
+        RefTableId _oneTimeCustRefTableId = 0,
+        RefRecId _oneTimeCustRefRecId = 0,
+        str _PayFabricTransactionKey = '')
+    {
+        boolean ret = false;         
+
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        if (!_company || !_customerNumber)
+        {
+            throw error(Error::missingParameter(null));
+        }
+
+        if (!CompanyInfo::findDataArea(_company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", _company));
+        }
+
+        changecompany(_company)
+        {
+            CustTable custTable = CustTable::find(_customerNumber);
+            if (!custTable.RecId)
+            {
+                throw error(strFmt("@SKS:SKGCCCustomerSpecifiedNotValid", _customerNumber));
+            }
+
+            CreditCardProcessors activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+            CreditCardPaymentCardTokenize cardTokenize = CreditCardPaymentCardTokenize::construct();
+            cardTokenize.init(activeCreditCardProcessor.Name);
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }
+        
+            SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+            pfWalletHandler.parmCustAccount(_customerNumber);
+            if (_oneTimeCustRefTableId && _oneTimeCustRefRecId)
+            {
+                pfWalletHandler.parmOneTimeCustRefTableId(_oneTimeCustRefTableId);
+                pfWalletHandler.parmOneTimeCustRefRecId(_oneTimeCustRefRecId);
+            }
+            pfWalletHandler.setPayFabricCustomerNbr();
+
+            CreditCardCust creditCardCust;
+            if (_PayFabricCardToken || _PayFabricTransactionKey)
+            {
+                CreditCardUniqueCardId cardTokenFromPF;                
+                if (_PayFabricCardToken)
+                {
+                    cardTokenFromPF = _PayFabricCardToken;                    
+                }
+                else
+                {                    
+                    SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();
+                    CreditCardProviderAuthorizationResult authResult = eCommIntHandler.getPayFabricPreAuthTrans(_payFabricTransactionKey);
+                    if (authResult)
+                    {
+                        cardTokenFromPF = authResult.parmCreditCardUniqueCardId();
+                        if (!cardTokenFromPF)
+                        {
+                            return false;
+                        }
+                    }
+                }                
+
+                str curReadWalletResponseXmlString = pfWalletHandler.readPayFabricWallet(cardTokenFromPF, '');
+                if (!curReadWalletResponseXmlString)
+                {
+                    return false;
+                }
+
+                creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPF);
+                if (creditCardCust)
+                {
+                    creditCardCust = SKS_CC_PayFabricWalletHandler::updateCreditCardFromPayFabricResponse(curReadWalletResponseXmlString, creditCardCust.RecId, creditCardCust.CardNumber);
+                }
+                else
+                {
+                    creditCardCust = CreditCard::addCreditCard(curReadWalletResponseXmlString, _customerNumber, activeCreditCardProcessor.RecId);                    
+                }
+
+                if (!creditCardCust)
+                {
+                    return false;
+                }
+
+                if (creditCardCust.CustAccount != _customerNumber)
+                {
+                    throw error(strFmt("@SKS:SKGCCPFCardTokenSpecifiedCustNotValid", cardTokenFromPF, _customerNumber, creditCardCust.CustAccount));
+                }
+
+                if (_oneTimeCustRefTableId && _oneTimeCustRefRecId)
+                {
+
+                    creditCardCust.selectForUpdate(true);
+                    ttsbegin;
+                    creditCardCust.SKS_CC_OneTimeCustRefTableId = _oneTimeCustRefTableId;
+                    creditCardCust.SKS_CC_OneTimeCustRefRecId = _oneTimeCustRefRecId;
+                    creditCardCust.doUpdate();
+                    ttscommit;
+                }
+
+                ret = true;
+            }
+            else
+            {
+                CreditCardPaymentProperties allCreditCardPaymentProperties = pfWalletHandler.getPayFabricCreditCardsForCustomer();
+                pfWalletHandler.synchronizeCreditCardsFromPayFabric(allCreditCardPaymentProperties, activeCreditCardProcessor.RecId, '', false, true);
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_eCommInteg_OneTimeCustCardSynch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Used to synchronize PayFabric wallets that may have been created/updated externally
+    ///    in a eCommerce site and need to be refreshed in D365 <b>CreditCardCust</b> table.
+    /// </summary>
+    /// <param name="_company">
+    ///    The DataAreaId (company/legal entity) where PayFabric payment service
+    ///    and customer record exist in D365. This value will be used to switch to
+    ///    the specific company and search for an 'active' PayFabric payment processor.
+    /// </param>
+    /// <param name="_salesOrderNbr">
+    ///    The D365 sales order number (SalesId) for the sales order that was created in eCommerce site that needs to be updated.
+    /// </param>    
+    /// <param name="_PayFabricCardToken">
+    ///    Optional. The PayFabric wallet card token (unique value) that should be read from PayFabric and synchronized with D365.
+    ///    If this parameter is not passed and the _PayFabricTransactionKey parameter is also not passed
+    ///    then all credit cards associated the customer specified will be synchronized.
+    /// </param>    
+    /// <param name="_PayFabricTransactionKey">
+    ///    Optional. The PayFabric transaction key to use to read a transaction and get the PayFabric wallet
+    ///    card token (unique value) that should be read from PayFabric and synchronized with D365.
+    ///    If this parameter is not passed and the _PayFabricCardToken parameter is also not passed
+    ///    then all credit cards associated the customer specified will be synchronized.
+    /// </param>
+    /// <returns>
+    ///    true if the specified PayFabric card token exists in CreditCardCust for the customer specified; otherwise, false.
+    ///    If CCA module is not active an error will be thrown by this method that should be handled by calling function.
+    ///    If a PayFabric active payment connector cannot be found in company specified, an error
+    ///         will be thrown by this method that should be handled by calling function.
+    ///    If the PayFabric synchronize function returns an error the error will be rethrown to the calling function.
+    ///    If PayFabric synchronize function is successful but specified card token cannot be found in D365
+    ///         for the customer specified then this function will return false without throwing an error (if card token is passed).
+    /// </returns>
+    public static boolean SKS_CC_eCommInteg_OneTimeCustCardSynch(
+        DataAreaId _company, 
+        SalesId _salesOrderNbr,
+        CreditCardUniqueCardId _PayFabricCardToken = '',
+        str _PayFabricTransactionKey = '')
+    {
+        boolean ret = false;
+
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        if (!_company || !_salesOrderNbr)
+        {
+            throw error(Error::missingParameter(null));
+        }
+
+        if (!CompanyInfo::findDataArea(_company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", _company));
+        }
+
+        changecompany(_company)
+        {
+            SalesTable salesTable = SalesTable::find(_salesOrderNbr);
+            if (!salesTable.RecId)
+            {
+                throw error(strFmt("@SKS:SKGCCSalesOrderNbrSpecifiedNotValid", _salesOrderNbr));
+            }
+
+            CreditCardProcessors activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+            CreditCardPaymentCardTokenize cardTokenize = CreditCardPaymentCardTokenize::construct();
+            cardTokenize.init(activeCreditCardProcessor.Name);
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }
+        
+            SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+            pfWalletHandler.parmCustAccount(salesTable.InvoiceAccount);
+            if (salesTable.TableId && salesTable.RecId)
+            {
+                pfWalletHandler.parmOneTimeCustRefTableId(salesTable.TableId);
+                pfWalletHandler.parmOneTimeCustRefRecId(salesTable.RecId);
+            }
+            pfWalletHandler.setPayFabricCustomerNbr();
+                
+            CreditCardCust creditCardCust;
+            if (_PayFabricCardToken || _PayFabricTransactionKey)
+            {
+                CreditCardUniqueCardId cardTokenFromPF;
+                if (_PayFabricCardToken)
+                {
+                    cardTokenFromPF = _PayFabricCardToken;
+                }
+                else
+                {
+                    SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();
+                    CreditCardProviderAuthorizationResult authResult = eCommIntHandler.getPayFabricPreAuthTrans(_payFabricTransactionKey);
+                    if (authResult)
+                    {
+                        cardTokenFromPF = authResult.parmCreditCardUniqueCardId();
+                        if (!cardTokenFromPF)
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                boolean updateCustomerNumberResult = pfWalletHandler.updateCustomerNumberInPayFabricWallet(cardTokenFromPF);
+                if (!updateCustomerNumberResult)
+                {
+                    return false;
+                }
+                
+                ret = SKS_CC_eCommIntegrationHandler::SKS_CC_eCommInteg_CardSynch(
+                    _company, salesTable.InvoiceAccount, cardTokenFromPF, salesTable.TableId, salesTable.RecId);
+
+                if (ret)
+                {
+                    creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPF);
+                    if (creditCardCust)
+                    {
+                        salesTable.reread();
+                        salesTable.selectForUpdate(true);
+                        ttsbegin;
+                        salesTable.CreditCardCustRefId = creditCardCust.RecId;
+                        salesTable.doUpdate();
+                        ttscommit;
+                    }
+                }
+            }
+            else
+            {
+                throw error("@SKS:SKGCCPFTokenOrKeyMustBeSpecified");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_eCommInteg_TxnSynch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Used to synchronize PayFabric BOOK (pre-authorize) or SALE (immediate capture) transactions
+    ///    that may have been created externally in a eCommerce site and need to be updated in D365
+    ///    <b>SalesTable</b> and <b>CreditCardAuthTrans</b> tables.
+    ///    Creation of sales order is the responsibilily of the calling function and sales order number
+    ///    passed to this function must exist in D365 in the company specified and for the customer specified.
+    /// </summary>
+    /// <param name="_company">
+    ///    The DataAreaId (company/legal entity) where PayFabric payment service
+    ///    and customer record exist in D365. This value will be used to switch to
+    ///    the specific company and search for an 'active' PayFabric payment processor.
+    /// </param>
+    /// <param name="_customerNumber">
+    ///    The D365 customer number (without legal entity prefix from PayFabric) where PayFabric wallet
+    ///    should exist and needs to be synchronized. This value will be used to synchronize wallets for that customer.
+    /// </param>    
+    /// <param name="_salesOrderNbr">
+    ///    The D365 sales order number (SalesId) for the sales order that was created in eCommerce site that needs to be updated.
+    /// </param>
+    /// <param name="_PayFabricTransactionKey">
+    ///    The PayFabric unique transaction key for the  card token (unique value) that should be checked to ensure it has been synchronized with D365.
+    /// </param>
+    /// <param name="_txnType">
+    ///    The D365 transaction type to create on the sales order specified. Valid values are: Auth or Capture.
+    /// </param>
+    /// <param name="_PayFabricCardToken">
+    ///    Optional. The PayFabric wallet card token (unique value) that should be checked to ensure it has been synchronized with D365.
+    ///    If this parameter is not passed then the check would not be performed.
+    /// </param>
+    /// <returns>
+    ///    true if the specified PayFabric transaction is fetched and the D365 transaction is created; otherwise, false.
+    ///    If CCA module is not active an error will be thrown by this method that should be handled by calling function.
+    ///    If a PayFabric active payment connector cannot be found in company specified, an error
+    ///         will be thrown by this method that should be handled by calling function.
+    ///    If the PayFabric get transaction function returns an error the error will be rethrown to the calling function.    
+    /// </returns>
+    public static boolean SKS_CC_eCommInteg_TxnSynch(
+        DataAreaId _company,
+        CustAccount _customerNumber,        
+        SalesId _salesOrderNbr,
+        str _PayFabricTransactionKey,
+        str _txnType,
+        CreditCardUniqueCardId _PayFabricCardToken = '')
+    {
+        boolean ret = false;
+
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        if (!_company || !_customerNumber || !_salesOrderNbr ||
+            !_PayFabricTransactionKey || !_txnType)
+        {
+            throw error(Error::missingParameter(null));
+        }
+
+        // Only pre-authorization (BOOK) transactions will be allowed for now.
+        //if (_txnType != constAuthTxnType && _txnType != constSaleTxnType)
+        if (_txnType != constAuthTxnType)
+        {
+            throw error(strFmt("@SKS:SKGCCTxnTypeSpecifiedNotValid", _txnType));
+        }
+
+        if (!CompanyInfo::findDataArea(_company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", _company));
+        }
+
+        changecompany(_company)
+        {
+            if (!CustTable::exist(_customerNumber))
+            {
+                throw error(strFmt("@SKS:SKGCCCustomerSpecifiedNotValid", _customerNumber));
+            }
+
+            CreditCardCust creditCardCust;
+            if (_PayFabricCardToken)
+            {
+                creditCardCust = creditCardCust::findByUniqueCardId(_PayFabricCardToken);
+                if (!creditCardCust)
+                {
+                    throw error(strFmt("@SKS:SKGCCPFCardTokenSpecifiedNotValid", _PayFabricCardToken));
+                }
+
+                if (creditCardCust.CustAccount != _customerNumber)
+                {
+                    throw error(strFmt("@SKS:SKGCCPFCardTokenSpecifiedCustNotValid", _PayFabricCardToken, _customerNumber, creditCardCust.CustAccount));
+                }
+            }
+
+            SalesTable salesTable = SalesTable::find(_salesOrderNbr);
+            if (!salesTable)
+            {
+                throw error(strFmt("@SKS:SKGCCSalesOrderNbrSpecifiedNotValid", _salesOrderNbr));
+            }            
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }
+
+            CreditCardProcessors activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();            
+            SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();
+            
+            eCommIntHandler.parmPayFabricTransactionKey(_PayFabricTransactionKey);
+            eCommIntHandler.parmTxnType(_txnType);
+            eCommIntHandler.parmSalesTable(salesTable);
+
+            CreditCardUniqueCardId cardTokenFromPFTrans;
+            CreditCardPaymentProperties requestProp;
+            str requestXmlStr;
+
+            // If CreditCardCust record was fetched using the passed card token then set request properties.
+            if (creditCardCust)
+            {
+                eCommIntHandler.parmCreditCardCust(creditCardCust);
+                requestProp = eCommIntHandler.getRequestProperties();
+                requestXmlStr = requestProp.toXmlString();
+            }
+        
+            if (_txnType == constAuthTxnType)
+            {
+                // Get pre-authorization (BOOK) transaction from PayFabric and create in D365.
+                // Update sales order as needed.
+                CreditCardProviderAuthorizationResult authResult = eCommIntHandler.getPayFabricPreAuthTrans(_PayFabricTransactionKey);
+                if (authResult)
+                {
+                    // If CreditCardCust record was NOT fetched because card token was not passed
+                    // then get card token from PayFabric transaction so that request properties can be set.
+                    if (!creditCardCust)
+                    {
+                        cardTokenFromPFTrans = authResult.parmCreditCardUniqueCardId();
+                        if (cardTokenFromPFTrans)
+                        {
+                            creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPFTrans);
+                            if (creditCardCust)
+                            {
+                                eCommIntHandler.parmCreditCardCust(creditCardCust);
+                                requestProp = eCommIntHandler.getRequestProperties();
+                                requestXmlStr = requestProp.toXmlString();
+                            }
+                        }
+                    }
+
+                    CreditCard::sKS_CC_RecordAuthorization(
+                        authResult,
+                        salesTable,
+                        activeCreditCardProcessor.RecId,
+                        true,
+                        "@SKS:SKGCCECommIntGetTransDescMsg",
+                        requestXmlStr,
+                        false);
+
+                    ret = true;
+                }
+            }
+            else
+            {
+                // Get immediate capture (SALE) transaction from PayFabric and create in D365.
+                // Update sales order as needed.                
+                CreditCardProviderCaptureResult captureResult = eCommIntHandler.getPayFabricCaptureTrans(_PayFabricTransactionKey);
+                if (captureResult)
+                {
+
+                    // If CreditCardCust record was NOT fetched because card token was not passed
+                    // then get card token from PayFabric transaction so that request properties can be set.
+                    if (!creditCardCust)
+                    {
+                        cardTokenFromPFTrans = captureResult.parmCreditCardUniqueCardId();
+                        if (cardTokenFromPFTrans)
+                        {
+                            creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPFTrans);
+                            if (creditCardCust)
+                            {
+                                eCommIntHandler.parmCreditCardCust(creditCardCust);
+                                requestProp = eCommIntHandler.getRequestProperties();
+                                requestXmlStr = requestProp.toXmlString();
+                            }
+                        }
+                    }
+
+                    CreditCard::sKS_CC_recordCapture(
+                        captureResult,
+                        salesTable,
+                        '',
+                        activeCreditCardProcessor.RecId,
+                        true,
+                        true,
+                        "@SKS:SKGCCECommIntGetTransDescMsg",
+                        requestXmlStr,
+                        false);
+
+                    ret = true;
+                }                
+            }
+
+            if (ret && creditCardCust)
+            {
+                salesTable.reread();
+                salesTable.selectForUpdate(true);
+                ttsbegin;
+                salesTable.CreditCardCustRefId = creditCardCust.RecId;
+                salesTable.doUpdate();
+                ttscommit;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_PaymJourLineInteg_TxnSynch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Used to synchronize PayFabric SALE (immediate capture) transactions
+    ///    that may have been created externally in a eCommerce site and need to be updated in D365
+    ///    <b>LedgerJournalTrans</b> and <b>CreditCardAuthTrans</b> tables.
+    ///    Creation of customer payment journal line is the responsibilily of the calling function
+    ///     and Record Id passed to this function must exist in D365 in the company specified.
+    /// </summary>
+    /// <param name="_company">
+    ///    The DataAreaId (company/legal entity) where PayFabric payment service
+    ///    and customer payment journal line record exist in D365. This value will be used to switch to
+    ///    the specific company and search for an 'active' PayFabric payment processor.
+    /// </param>
+    /// <param name="_paymJourLineRecId">
+    ///    The D365 customer payment journal line Record ID that needs to be updated.
+    /// </param>
+    /// <param name="_PayFabricTransactionKey">
+    ///    The PayFabric unique transaction key for the  card token (unique value) that should be checked to ensure it has been synchronized with D365.
+    /// </param>
+    /// <returns>
+    ///    true if the specified PayFabric transaction is fetched and the D365 transaction is created; otherwise, false.
+    ///    If CCA module is not active an error will be thrown by this method that should be handled by calling function.
+    ///    If a PayFabric active payment connector cannot be found in company specified, an error
+    ///         will be thrown by this method that should be handled by calling function.
+    ///    If the PayFabric get transaction function returns an error the error will be rethrown to the calling function.
+    /// </returns>
+    public static boolean SKS_CC_PaymJourLineInteg_TxnSynch(
+        DataAreaId _company,
+        RecId _paymJourLineRecId,
+        String255 _PayFabricTransactionKey)
+    {
+        boolean ret = false;
+
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        if (!_company || !_paymJourLineRecId || !_PayFabricTransactionKey)
+        {
+            throw error(Error::missingParameter(null));
+        }        
+
+        if (!CompanyInfo::findDataArea(_company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", _company));
+        }
+
+        changecompany(_company)
+        {
+            LedgerJournalTrans ledgerJournalTrans = LedgerJournalTrans::findRecId(_paymJourLineRecId, false);
+
+            if (!ledgerJournalTrans)
+            {
+                throw error(strFmt("@SKS:SKGCCJourLineRecIdSpecifiedNotValid", _paymJourLineRecId));
+            }
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }
+
+            CreditCardProcessors activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+
+            str curPayFabricTransactionKey;
+            Counter curTransNbr;
+            container conPFTransKeys = str2con(_PayFabricTransactionKey, ',', false);
+            if (!conPFTransKeys)
+            {
+                throw error("@SKS:SKGCCPFTransKeyNotSpecified");
+            }
+
+            for (curTransNbr = 1; curTransNbr <= conLen(conPFTransKeys); curTransNbr++)
+            {
+                curPayFabricTransactionKey = strLRTrim(conPeek(conPFTransKeys, curTransNbr));
+
+                SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();            
+                eCommIntHandler.parmPayFabricTransactionKey(curPayFabricTransactionKey);
+                eCommIntHandler.parmTxnType(constSaleTxnType);
+                eCommIntHandler.parmPaymJourLineRecId(_paymJourLineRecId);
+
+                CreditCardCust creditCardCust = null;
+                CreditCardAuthTrans creditCardAuthTransApproval = null;
+                CreditCardUniqueCardId cardTokenFromPFTrans;
+                CreditCardPaymentProperties requestProp;
+                Amount transAmtFromPFTrans;
+                str requestXmlStr;
+
+                // Get immediate capture (SALE) transaction from PayFabric and create in D365.
+                // Update payment journal line as needed.
+                CreditCardProviderCaptureResult captureResult = eCommIntHandler.getPayFabricCaptureTrans(curPayFabricTransactionKey);
+                if (captureResult)
+                {
+                    cardTokenFromPFTrans = captureResult.parmCreditCardUniqueCardId();
+                    if (cardTokenFromPFTrans)
+                    {
+                        creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPFTrans);
+                        if (creditCardCust)
+                        {
+                            eCommIntHandler.parmCreditCardCust(creditCardCust);
+                            requestProp = eCommIntHandler.getRequestProperties();
+                            requestXmlStr = requestProp.toXmlString();
+                        }
+                    }
+
+                    if (!creditCardCust)
+                    {
+                        throw error(strFmt("@SKS:SKGCCUnableToFindCCRecWithPFToken", cardTokenFromPFTrans));
+                    }
+
+                    transAmtFromPFTrans = captureResult.parmTransactionAmount();
+                    if (!transAmtFromPFTrans)
+                    {
+                        throw error("@SKS:SKGCCTransAmtMayNotBeZero");
+                    }
+                
+                    SKS_CC_CustPaymTable sKS_CC_CustPaymTable;
+                    ttsbegin;
+                    sKS_CC_CustPaymTable.initValue();
+                    sKS_CC_CustPaymTable.CreditCardCustRefId = creditCardCust.RecId;
+                    sKS_CC_CustPaymTable.CreditCardTypeName = creditCardCust.CreditCardTypeName;
+                    sKS_CC_CustPaymTable.CreditCardTransAmountCur = transAmtFromPFTrans;
+
+                    if (sKS_CC_CustPaymTable.CreditCardTransAmountCur > 0)
+                    {
+                        sKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Capture;                        
+                    }
+                    else
+                    {
+                        sKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Refund;
+                    }
+
+                    sKS_CC_CustPaymTable.CreditCardTransTypeOrig = sKS_CC_CustPaymTable.CreditCardTransType;
+                    sKS_CC_CustPaymTable.CustAccount = ledgerJournalTrans.accountDisplay();
+                    sKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::JournalLine;
+                    sKS_CC_CustPaymTable.CreditCardCurrency = ledgerJournalTrans.CurrencyCode;
+                    sKS_CC_CustPaymTable.RefTableId = ledgerJournalTrans.TableId;
+                    sKS_CC_CustPaymTable.RefRecId = ledgerJournalTrans.RecId;
+                    sKS_CC_CustPaymTable.RefOriginId = ledgerJournalTrans.JournalNum;
+                    sKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::Approved;
+                    sKS_CC_CustPaymTable.insert();
+                    ttscommit;
+
+                    creditCardAuthTransApproval = CreditCard::sKS_CC_recordCapture(
+                        captureResult,
+                        null,
+                        '',
+                        activeCreditCardProcessor.RecId,
+                        true,
+                        true,
+                        "@SKS:SKGCCECommIntGetTransDescMsg",
+                        requestXmlStr,
+                        false,
+                        null,
+                        sKS_CC_CustPaymTable);
+
+                    if (creditCardAuthTransApproval)
+                    {
+                        sKS_CC_CustPaymTable.reread();
+                        ttsbegin;
+                        sKS_CC_CustPaymTable.selectForUpdate(true);
+                        sKS_CC_CustPaymTable.AuthorizationCode = creditCardAuthTransApproval.Authorization;
+                        sKS_CC_CustPaymTable.ApprovalCode = creditCardAuthTransApproval.SKS_CC_ApprovalCode;
+                        sKS_CC_CustPaymTable.ApprovedDateTime = creditCardAuthTransApproval.ApprovedDateTime;
+                        sKS_CC_CustPaymTable.update();
+                        ttscommit;
+                    }
+
+                    ret = true;
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPayFabricTrans</Name>
+				<Source><![CDATA[
+    public Retail.PaymentSDK.Portable.Response getPayFabricTrans(str _PayFabricTransactionKey)
+    {
+        CreditCardProcessors                                    activeCreditCardProcessors;
+        CreditCardAccountSetup                                  creditCardAccountSetup;
+        CreditCardProcessors                                    creditCardProcessors;
+        Retail.PaymentSDK.Portable.IPaymentProcessor            processor;
+        Retail.PaymentSDK.Portable.PaymentProperty[]            processorProperties;
+        Retail.PaymentSDK.Portable.Request                      request = new Retail.PaymentSDK.Portable.Request();
+        Retail.PaymentSDK.Portable.Response                     response;
+        CreditCardPaymentProperties                             interactionProperties = CreditCardPaymentProperties::construct();
+        CreditCardPaymentProperties                             requestProperties;        
+        
+        activeCreditCardProcessors = CreditCardProcessors::findActiveProcessor();
+
+        select firstonly1 creditCardAccountSetup
+        exists join creditCardProcessors
+            where creditCardProcessors.Name == activeCreditCardProcessors.Name &&
+                  creditCardProcessors.RecId == creditCardAccountSetup.CreditCardProcessors;
+
+        if (!creditCardAccountSetup)
+        {
+            throw error(strFmt("@SYS4040016", activeCreditCardProcessors.Name));
+        }
+
+        var merchant = creditCardAccountSetup.manageEncryptionForSecureMerchantProperties(Decrypt, '');
+        processorProperties = Retail.PaymentSDK.Portable.PaymentProperty::ConvertXMLToPropertyArray(merchant);
+        requestProperties = CreditCardPaymentProperties::fromProperties(processorProperties);
+
+        processor = this.getProcessor(creditCardAccountSetup.ConnectorName);
+
+        requestProperties.add(CreditCardPaymentProperty::newDisplay(
+            RetailConst.GenericNamespace::get_PaymentCard(),
+            PayFabricOperation,
+            CreditCardPropertySecurityLevel::None,
+            PayFabric_Operation,
+            PayFabric_Operation,
+            GetPayFabricPreAuthTrans));
+
+        requestProperties.add(CreditCardPaymentProperty::newDisplay(
+            RetailConst.GenericNamespace::get_PaymentCard(),
+            eCommIntPFTxnKey,
+            CreditCardPropertySecurityLevel::None,
+            eCommIntPFTxnKey,
+            eCommIntPFTxnKey,
+            _PayFabricTransactionKey));
+
+        const str constAuthCodeParm = 'AuthCodeParm';
+        str authCodeParmValue;
+
+        SKS_PP_Setup sKS_PP_SetupLocal = SKS_PP_Setup::find();
+        authCodeParmValue = 'PFTransId';
+        if (sKS_PP_SetupLocal.CCAuthCodeValue == SKS_CC_AuthCodeValue::OriginationId)
+        {
+            authCodeParmValue = 'OriginationId';
+        }
+
+        requestProperties.add(CreditCardPaymentProperty::newDisplay(
+            RetailConst.GenericNamespace::get_TransactionData(),
+            constAuthCodeParm,
+            CreditCardPropertySecurityLevel::None,
+            constAuthCodeParm,
+            constAuthCodeParm,
+            authCodeParmValue));
+
+        request.set_Locale(currentUserLanguage());
+        request.set_Properties(requestProperties.toArray());
+
+        response = processor.GenerateCardToken(request, interactionProperties.toArray());
+        
+        return response;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPayFabricPreAuthTrans</Name>
+				<Source><![CDATA[
+    public CreditCardProviderAuthorizationResult getPayFabricPreAuthTrans(str _PayFabricTransactionKey,
+        Retail.PaymentSDK.Portable.Response _response = null)
+    {
+        Retail.PaymentSDK.Portable.Response     response;
+        CreditCardPaymentErrors                 errors;
+        CreditCardProviderAuthorizationResult   authResult;
+
+        if (_response)
+        {
+            response = _response;
+        }
+        else
+        {
+            response = this.getPayFabricTrans(_PayFabricTransactionKey);
+        }
+
+        errors = CreditCardPaymentErrors::fromPaymentErrors(response.get_Errors());
+
+        if (errors.count() == 0)
+        {
+            authResult = CreditCardProviderAuthorizationResult::constructFromResponse(response);
+        }
+        else
+        {
+            throw error(strFmt("@SKS:SKGCCGetPFPreAuthTxnErrMsg", _PayFabricTransactionKey, '\n', strReplace(errors.toString(), '\n', '; ')));
+        }
+
+        if (authResult == null)
+        {
+            throw error(strFmt("@SKS:SKGCCFindPFTxnErrMsg", _PayFabricTransactionKey));
+        }
+
+        return authResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPayFabricCaptureTrans</Name>
+				<Source><![CDATA[
+    public CreditCardProviderCaptureResult getPayFabricCaptureTrans(str _PayFabricTransactionKey,
+        Retail.PaymentSDK.Portable.Response _response = null)
+    {
+        Retail.PaymentSDK.Portable.Response     response;
+        CreditCardPaymentErrors                 errors;
+        CreditCardProviderCaptureResult         captureResult;
+
+        if (_response)
+        {
+            response = _response;
+        }
+        else
+        {
+            response = this.getPayFabricTrans(_PayFabricTransactionKey);
+        }
+
+        errors = CreditCardPaymentErrors::fromPaymentErrors(response.get_Errors());
+
+        if (errors.count() == 0)
+        {
+            Retail.PaymentSDK.Portable.PaymentProperty[] responseProperties = response.get_Properties();
+            AmountCur salesAmount;
+            CreditCardAuthorization approvalCode;
+            if (responseProperties != null)
+            {
+                Retail.PaymentSDK.Portable.PaymentProperty captureResponseProperty;
+
+                captureResponseProperty = CreditCardConnectorSetup::findPropertyByName(
+                    responseProperties,
+                    Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_CaptureResponse(),
+                    Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_Properties());
+
+                if (captureResponseProperty)
+                {
+                    Retail.PaymentSDK.Portable.PaymentProperty[] authRespProperties;
+                    authRespProperties = captureResponseProperty.get_PropertyList();
+
+                    Retail.PaymentSDK.Portable.PaymentProperty property;
+                    property = CreditCardConnectorSetup::findPropertyByName(
+                        authRespProperties,
+                        Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_AuthorizationResponse(),
+                        Retail.PaymentSDK.Portable.Constants.AuthorizationResponseProperties::get_ApprovedAmount());
+
+                    if (property)
+                    {
+                        salesAmount = property.get_DecimalValue();
+                    }
+
+                    property = CreditCardConnectorSetup::findPropertyByName(
+                        authRespProperties,
+                        Retail.PaymentSDK.Portable.Constants.GenericNamespace::get_CaptureResponse(),
+                        Retail.PaymentSDK.Portable.Constants.CaptureResponseProperties::get_ProviderTransactionId());
+
+                    if (property)
+                    {
+                        approvalCode = property.get_StringValue();
+                    }                    
+                }                
+            }
+
+            captureResult = CreditCardProviderCaptureResult::constructFromResponse(response, salesAmount, approvalCode);
+        }
+        else
+        {
+            throw error(strFmt("@SKS:SKGCCGetPFSaleTxnErrMsg", _PayFabricTransactionKey, '\n', strReplace(errors.toString(), '\n', '; ')));
+        }
+
+        if (captureResult == null)
+        {
+            throw error(strFmt("@SKS:SKGCCFindPFTxnErrMsg", _PayFabricTransactionKey));
+        }
+
+        return captureResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRequestProperties</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the properties needed for an authorization or immediate capture request.
+    /// </summary>
+    /// <returns>
+    /// The properties needed.
+    /// </returns>
+    public CreditCardPaymentProperties getRequestProperties()
+    {
+        var properties = this.getCardToken();
+        var transNamespace = RetailConst.GenericNamespace::get_TransactionData();
+
+        properties.add(CreditCardPaymentProperty::newValue(transNamespace, eCommIntPFTxnKey, this.parmPayFabricTransactionKey()));
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCardToken</Name>
+				<Source><![CDATA[
+    public CreditCardPaymentProperties getCardToken()
+    {
+        str cardToken = creditCardCustCaller.CardToken;
+
+        var properties = CreditCardPaymentProperties::fromXmlString(cardToken);
+
+        return properties;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        try
+        {
+            Retail.SDKManager.Portable.PaymentProcessorManager::LoadAllAssemblies(CreditCardConnectorSetup::getConnectorsDirectories());
+        }
+        catch (Exception::CLRError)
+        {
+            throw error("@SYP4910242" + ' ' + this.getClrExceptionMessage());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_eCommIntegrationHandler construct()
+    {
+        return new SKS_CC_eCommIntegrationHandler();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPayFabricTransactionKey</Name>
+				<Source><![CDATA[
+    public str parmPayFabricTransactionKey(str _PayFabricTransactionKey = PayFabricTransactionKey)
+    {
+        PayFabricTransactionKey = _PayFabricTransactionKey;
+        return PayFabricTransactionKey;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTxnType</Name>
+				<Source><![CDATA[
+    public str parmTxnType(str _txnType = txnType)
+    {
+        txnType = _txnType;
+        return txnType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSalesTable</Name>
+				<Source><![CDATA[
+    public SalesTable parmSalesTable(SalesTable _salesTableCaller = salesTableCaller)
+    {
+        salesTableCaller = _salesTableCaller;
+        return salesTableCaller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCreditCardCust</Name>
+				<Source><![CDATA[
+    public CreditCardCust parmCreditCardCust(CreditCardCust _creditCardCustCaller = creditCardCustCaller)
+    {
+        creditCardCustCaller = _creditCardCustCaller;
+        return creditCardCustCaller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPaymJourLineRecId</Name>
+				<Source><![CDATA[
+    public RecId parmPaymJourLineRecId(RecId _paymJourLineRecId = paymJourLineRecId)
+    {
+        paymJourLineRecId = _paymJourLineRecId;
+        return paymJourLineRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getClrExceptionMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the exception message of the last exception thrown.
+    /// </summary>
+    /// <returns>
+    /// The text of the last thrown exception.
+    /// </returns>
+    public str getClrExceptionMessage()
+    {
+        str                 exceptionMessage;
+        System.Exception    exception;
+        System.Exception    innerException;
+        InteropPermission   perm = new InteropPermission(InteropKind::ClrInterop);
+
+        perm.assert();
+
+        //BP Deviation Documented
+        exception = CLRInterop::getLastException();
+        if (exception)
+        {
+            exceptionMessage = exception.get_Message();
+
+            innerException = exception.get_InnerException();
+            if (innerException)
+            {
+                exceptionMessage = innerException.get_Message();
+            }
+        }
+
+        CodeAccessPermission::revertAssert();
+
+        return exceptionMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_PayLink_SalesOrderTxnSynch</Name>
+				<Source><![CDATA[
+    public static boolean SKS_CC_PayLink_SalesOrderTxnSynch(
+        DataAreaId _company,
+        CustAccount _customerNumber,
+        SalesId _salesOrderNbr,
+        str _payFabricTransactionKey,
+        str _txnType)
+    {
+        boolean ret = false;
+
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        if (!_company || !_customerNumber || !_salesOrderNbr ||
+            !_payFabricTransactionKey || !_txnType)
+        {
+            throw error(Error::missingParameter(null));
+        }
+
+
+        if (_txnType != constAuthTxnType && _txnType != constSaleTxnType)
+        {
+            throw error(strFmt("@SKS:SKGCCTransTypeNotValidForPFTxnSynch", _txnType));
+        }
+
+        if (!CompanyInfo::findDataArea(_company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", _company));
+        }
+
+        changecompany(_company)
+        {
+            CustTable custTable = CustTable::find(_customerNumber);
+            if (!custTable)
+            {
+                throw error(strFmt("@SKS:SKGCCCustomerSpecifiedNotValid", _customerNumber));
+            }
+
+            SalesTable salesTable = SalesTable::find(_salesOrderNbr);
+            if (!salesTable)
+            {
+                throw error(strFmt("@SKS:SKGCCSalesOrderNbrSpecifiedNotValid", _salesOrderNbr));
+            }
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }
+        
+            if (_txnType == constAuthTxnType)
+            {
+                // Get pre-authorization (BOOK) transaction from PayFabric and create in D365.
+                // Update sales order as needed.
+
+                CreditCardProcessors activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+                SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();
+            
+                eCommIntHandler.parmPayFabricTransactionKey(_payFabricTransactionKey);
+                eCommIntHandler.parmTxnType(_txnType);
+                eCommIntHandler.parmSalesTable(salesTable);
+
+                CreditCardUniqueCardId cardTokenFromPFTrans;
+                CreditCardPaymentProperties requestProp;
+                str requestXmlStr;
+                RefTableId oneTimeCustRefTableId;
+                RefRecId oneTimeCustRefRecId;
+                CreditCardCust creditCardCust;
+
+                CreditCardProviderAuthorizationResult authResult = eCommIntHandler.getPayFabricPreAuthTrans(_payFabricTransactionKey);
+                if (authResult)
+                {
+                    cardTokenFromPFTrans = authResult.parmCreditCardUniqueCardId();
+                    if (cardTokenFromPFTrans)
+                    {
+                        creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPFTrans);
+                        if (!creditCardCust)
+                        {
+                            if (custTable.OneTimeCustomer)
+                            {
+                                oneTimeCustRefTableId = salesTable.TableId;
+                                oneTimeCustRefRecId = SalesTable.RecId;
+                            }
+
+                            SKS_CC_eCommIntegrationHandler::SKS_CC_eCommInteg_CardSynch(
+                                _company,
+                                custTable.AccountNum,
+                                cardTokenFromPFTrans,
+                                oneTimeCustRefTableId,
+                                oneTimeCustRefRecId);
+
+                            creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPFTrans);                            
+                        }
+
+                        // If CreditCardCust record was fetched using the retrieved card token
+                        // from the PayFabric transaction then set request properties.
+                        if (creditCardCust)
+                        {
+                            if (creditCardCust.CustAccount != _customerNumber)
+                            {
+                                throw error(strFmt("@SKS:SKGCCPFCardTokenSpecifiedCustNotValid", cardTokenFromPFTrans, _customerNumber, creditCardCust.CustAccount));
+                            }
+
+                            // Set properties for transaction creation below.
+                            eCommIntHandler.parmCreditCardCust(creditCardCust);
+                            requestProp = eCommIntHandler.getRequestProperties();
+                            requestXmlStr = requestProp.toXmlString();
+                        }                        
+                    }
+
+                    CreditCardAuthTrans creditCardAuthTransLoc = CreditCardAuthTrans::sKS_CC_FindAuthTransWithPFTransKey(
+                        _payFabricTransactionKey, CreditCardOperation::Authorize);
+
+                    if (!creditCardAuthTransLoc)
+                    {
+                        CreditCard::sKS_CC_RecordAuthorization(
+                            authResult,
+                            salesTable,
+                            activeCreditCardProcessor.RecId,
+                            true,
+                            "@SKS:SKGCCPayLinkTransImportedFromPayFabric",
+                            requestXmlStr,
+                            false);
+                    }
+
+                    ret = true;
+                }
+
+                if (ret && creditCardCust)
+                {
+                    salesTable.reread();                    
+                    salesTable.selectForUpdate(true);
+                    ttsbegin;
+                    salesTable.CreditCardCustRefId = creditCardCust.RecId;
+                    salesTable.doUpdate();
+                    ttscommit;
+                }
+            }
+            else
+            {
+                // Get pre-payment capture (SALE) transaction from PayFabric and create in D365.
+                // Update sales order as needed.
+                SKS_CC_PayLinkPrePayPaymentJournal payLinkPrePayPaymentJournal = SKS_CC_PayLinkPrePayPaymentJournal::construct(salesTable);
+                if (payLinkPrePayPaymentJournal)
+                {
+                    payLinkPrePayPaymentJournal.parmPayFabricTransactionKey(_payFabricTransactionKey);
+                }
+                payLinkPrePayPaymentJournal.run();
+
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_PayLink_JournalLineTxnSynch</Name>
+				<Source><![CDATA[
+    public static boolean SKS_CC_PayLink_JournalLineTxnSynch(
+        DataAreaId _company,
+        CustAccount _customerNumber,
+        RecId _paymJourLineRecId,
+        str _payFabricTransactionKey,
+        boolean _isSingleRecordRefresh = false)
+    {
+        boolean ret = false;
+
+        // Confirm that CCA is active
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS:SKGCCModuleNotActiveErrMsg");
+        }
+
+        if (!_company || !_customerNumber || !_paymJourLineRecId ||
+            !_payFabricTransactionKey)
+        {
+            throw error(Error::missingParameter(null));
+        }
+
+        if (!CompanyInfo::findDataArea(_company).RecId)
+        {
+            throw error(strFmt("@SKS:SKGCCCompanySpecifiedNotValid", _company));
+        }
+
+        changecompany(_company)
+        {
+            CustTable custTable = CustTable::find(_customerNumber);
+            if (!custTable)
+            {
+                throw error(strFmt("@SKS:SKGCCCustomerSpecifiedNotValid", _customerNumber));
+            }
+
+            LedgerJournalTrans ledgerJournalTrans = LedgerJournalTrans::findRecId(_paymJourLineRecId, false);
+            if (!ledgerJournalTrans)
+            {
+                throw error(strFmt("@SKS:SKGCCJourLineRecIdSpecifiedNotValid", _paymJourLineRecId));
+            }
+
+            LedgerJournalTable ledgerJournalTable = ledgerJournalTrans.ledgerJournalTable();
+            if (ledgerJournalTable.Posted == NoYes::Yes)
+            {
+                throw error(strFmt("@SKS:SKGCCPaymentJournalIsPosted", ledgerJournalTrans.JournalNum));
+            }
+        
+            boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (!isPayFabricActiveProcessor)
+            {
+                throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+            }        
+
+            // Get pre-authorization (BOOK) transaction from PayFabric and create in D365.
+            // Update sales order as needed.
+            CreditCardProcessors activeCreditCardProcessor = CreditCardProcessors::findActiveProcessor();
+            SKS_CC_eCommIntegrationHandler eCommIntHandler = SKS_CC_eCommIntegrationHandler::construct();
+            
+            eCommIntHandler.parmPayFabricTransactionKey(_payFabricTransactionKey);
+            eCommIntHandler.parmTxnType(constSaleTxnType);
+            eCommIntHandler.parmPaymJourLineRecId(_paymJourLineRecId);            
+
+            CreditCardUniqueCardId cardTokenFromPFTrans;
+            CreditCardPaymentProperties requestProp;
+            str requestXmlStr;
+            RefTableId oneTimeCustRefTableId;
+            RefRecId oneTimeCustRefRecId;
+            CreditCardCust creditCardCust;
+            CreditCardTypeName creditCardTypeName;
+            AmountCur transAmtFromPFTrans;
+
+            // Get immediate capture (SALE) transaction from PayFabric and create in D365.
+            // Update payment journal line as needed.
+            CreditCardProviderCaptureResult captureResult = eCommIntHandler.getPayFabricCaptureTrans(_payFabricTransactionKey);
+            if (captureResult)
+            {
+                transAmtFromPFTrans = captureResult.parmTransactionAmount();
+                if (transAmtFromPFTrans <= 0)
+                {
+                    throw error("@SKS:SKGCCTransAmtMayNotBeZero");
+                }
+
+                cardTokenFromPFTrans = captureResult.parmCreditCardUniqueCardId();
+                if (cardTokenFromPFTrans)
+                {
+                    if (custTable.OneTimeCustomer)
+                    {
+                        oneTimeCustRefTableId = ledgerJournalTable.TableId;
+                        oneTimeCustRefRecId = ledgerJournalTable.RecId;
+                    }
+
+                    SKS_CC_eCommIntegrationHandler::SKS_CC_eCommInteg_CardSynch(
+                        _company,
+                        custTable.AccountNum,
+                        cardTokenFromPFTrans,
+                        oneTimeCustRefTableId,
+                        oneTimeCustRefRecId);
+
+                    creditCardCust = CreditCardCust::findByUniqueCardId(cardTokenFromPFTrans);
+                }
+
+                // If CreditCardCust record was fetched using the retrieved card token
+                // from the PayFabric transaction then set request properties.
+                if (creditCardCust)
+                {
+                    if (creditCardCust.CustAccount != _customerNumber)
+                    {
+                        throw error(strFmt("@SKS:SKGCCPFCardTokenSpecifiedCustNotValid", cardTokenFromPFTrans, _customerNumber, creditCardCust.CustAccount));
+                    }
+
+                    // Set properties for transaction creation below.
+                    creditCardTypeName = creditCardCust.CreditCardTypeName;
+                    eCommIntHandler.parmCreditCardCust(creditCardCust);
+                    requestProp = eCommIntHandler.getRequestProperties();
+                    requestXmlStr = requestProp.toXmlString();
+                }
+
+                if (!creditCardTypeName)
+                {
+                    creditCardTypeName = captureResult.parmCreditCardTypeName();
+                }
+
+                SKS_CC_CustPaymTable sKS_CC_CustPaymTable;
+                ttsbegin;
+                sKS_CC_CustPaymTable.initValue();
+                sKS_CC_CustPaymTable.CreditCardCustRefId = creditCardCust.RecId;
+                sKS_CC_CustPaymTable.CreditCardTypeName = creditCardTypeName;
+                sKS_CC_CustPaymTable.CreditCardTransAmountCur = transAmtFromPFTrans;
+                sKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Capture;
+                sKS_CC_CustPaymTable.CreditCardTransTypeOrig = sKS_CC_CustPaymTable.CreditCardTransType;
+                sKS_CC_CustPaymTable.CustAccount = ledgerJournalTrans.accountDisplay();
+                sKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::JournalLine;
+                sKS_CC_CustPaymTable.CreditCardCurrency = ledgerJournalTrans.CurrencyCode;
+                sKS_CC_CustPaymTable.RefTableId = ledgerJournalTrans.TableId;
+                sKS_CC_CustPaymTable.RefRecId = ledgerJournalTrans.RecId;
+                sKS_CC_CustPaymTable.RefOriginId = ledgerJournalTrans.JournalNum;
+                sKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::Approved;
+                sKS_CC_CustPaymTable.insert();
+                ttscommit;
+
+                CreditCardAuthTrans creditCardAuthTransApproval = CreditCardAuthTrans::sKS_CC_FindAuthTransWithPFTransKey(
+                    _payFabricTransactionKey, CreditCardOperation::AuthorizeAndCapture);
+
+                if (!creditCardAuthTransApproval)
+                {                
+                    creditCardAuthTransApproval = CreditCard::sKS_CC_recordCapture(
+                        captureResult,
+                        null,
+                        '',
+                        activeCreditCardProcessor.RecId,
+                        true,
+                        true,
+                        "@SKS:SKGCCPayLinkTransImportedFromPayFabric",
+                        requestXmlStr,
+                        false,
+                        null,
+                        sKS_CC_CustPaymTable);
+                }
+
+                if (creditCardAuthTransApproval)
+                {
+                    sKS_CC_CustPaymTable.reread();
+                    ttsbegin;
+                    sKS_CC_CustPaymTable.selectForUpdate(true);
+                    sKS_CC_CustPaymTable.AuthorizationCode = creditCardAuthTransApproval.Authorization;
+                    sKS_CC_CustPaymTable.ApprovalCode = creditCardAuthTransApproval.SKS_CC_ApprovalCode;
+                    sKS_CC_CustPaymTable.ApprovedDateTime = creditCardAuthTransApproval.ApprovedDateTime;
+                    sKS_CC_CustPaymTable.update();
+                    ttscommit;
+                }
+
+                ret = true;
+            }
+
+            ledgerJournalTrans.reread();            
+            if (ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::Confirmed)
+            {
+                SKS_PP_Setup sks_PP_Setup = SKS_PP_Setup::find();
+                if (sks_PP_Setup.CCPLAutoPostJournal == NoYes::Yes)
+                {
+                    LedgerJournalTrans ledgerJournalTransCheck;
+                    SKS_CC_CustPaymTable sKS_CC_CustPaymTableCheck;
+
+                    select firstonly RecId from ledgerJournalTransCheck
+                        where ledgerJournalTransCheck.JournalNum == ledgerJournalTrans.JournalNum
+                        && ledgerJournalTransCheck.PaymentStatus != CustVendPaymStatus::Confirmed
+                        && ledgerJournalTransCheck.RecId != ledgerJournalTrans.RecId
+                    exists join sKS_CC_CustPaymTableCheck
+                        where sKS_CC_CustPaymTableCheck.RefTableId == ledgerJournalTransCheck.TableId
+                        && sKS_CC_CustPaymTableCheck.RefRecId == ledgerJournalTransCheck.RecId;
+                    
+                    if (!ledgerJournalTransCheck.RecId)
+                    {
+                        select firstonly RecId from ledgerJournalTransCheck
+                            where ledgerJournalTransCheck.JournalNum == ledgerJournalTrans.JournalNum                            
+                            && ledgerJournalTransCheck.RecId != ledgerJournalTrans.RecId
+                        notexists join sKS_CC_CustPaymTableCheck
+                            where sKS_CC_CustPaymTableCheck.RefTableId == ledgerJournalTransCheck.TableId
+                            && sKS_CC_CustPaymTableCheck.RefRecId == ledgerJournalTransCheck.RecId;
+
+                        if (!ledgerJournalTransCheck.RecId)
+                        {
+                            Args args = new Args();
+                            args.record(ledgerJournalTable);
+
+                            int line;
+                            if (!_isSingleRecordRefresh)
+                            {
+                                line = Global::infologLine();
+                            }
+                            LedgerJournalPost::main(args);
+
+                            if (!_isSingleRecordRefresh)
+                            {
+                                infolog.clear(Line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProcessor</Name>
+				<Source><![CDATA[
+    protected Retail.PaymentSDK.Portable.IPaymentProcessor getProcessor(CreditCardConnectorName _connectorName)
+    {
+        InteropPermission perm = new InteropPermission(InteropKind::ClrInterop);
+
+        perm.assert();
+
+        Retail.PaymentSDK.Portable.IPaymentProcessor processor;
+
+        try
+        {
+            processor = new CreditCardPaymentProcessorFactory().getProcessor(_connectorName);
+        }
+        catch (Exception::CLRError)
+        {
+            throw error("@SYS4040006" + ' ' + this.getClrExceptionMessage());
+        }
+        catch
+        {
+            throw error("@SYS4040006");
+        }
+
+        CodeAccessPermission::revertAssert();
+
+        return processor;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

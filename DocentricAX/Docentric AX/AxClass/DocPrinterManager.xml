@@ -1,0 +1,915 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocPrinterManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.IO;
+using Microsoft.Dynamics.AX.Framework.DocumentContract;
+using Microsoft.Dynamics.AX.Framework.Reports.CloudStorage;
+using Microsoft.Dynamics.AX.Framework.Reporting.Shared;
+
+class DocPrinterManager
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getDefaultPrinterPath</Name>
+				<Source><![CDATA[
+    public static str getDefaultPrinterPath(UserId _userId = curUserId())
+    {
+        return DocDefaultPrintersView::getEffectivePrinterPath(_userId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDefaultPrintersViewRecord</Name>
+				<Source><![CDATA[
+    public static DocDefaultPrintersView getDefaultPrintersViewRecord(UserId _userId = curUserId())
+    {
+        DocDefaultPrintersView view = DocDefaultPrintersView::findByUserId(_userId);
+        return view;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDefaultPrinterName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the default printer's name no matter if the printer is active or not.
+    /// </summary>
+    /// <param name = "_userId">User ID</param>
+    /// <returns>Default printer name set for the provided user</returns>
+    public static str getDefaultPrinterName(UserId _userId = curUserId())
+    {
+        DocDefaultPrintersView view = DocPrinterManager::getDefaultPrintersViewRecord(_userId);
+        return view.DefaultPrinterEffective;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendPdfDocumentToDocumentRouter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Send any PDF document to DRA. If DRA is running as a service, document of any type can be sent to DRA
+    /// and not only PDF; such files will be saved to the preconfigured shared folder on the local file system.
+    /// If DRA is running a desktop app, sending document must be a PDF documenent since Adobe Reader will be
+    /// used to print it.
+    /// </summary>
+    /// <param name = "_printerName">Name of a printer registered in Network printers (and active) for the current company</param>
+    /// <param name = "_pdfFileName">Filename of the sending document</param>
+    /// <param name = "_pdfFileContent">File content of the sending document</param>
+    /// <returns>The corresponding logged document routing job</returns>
+    public static DocumentRoutingJob sendPdfDocumentToDocumentRouter(str _printerName, str _pdfFileName, System.Byte[] _pdfFileContent)
+    {
+        if (!_printerName)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _printerName is not set');
+        }
+
+        if (!_pdfFileName)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _pdfFileName is not set');
+        }
+
+        if (_pdfFileContent == null || _pdfFileContent.Length == 0)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _pdfFileContent is not set or it is empty');
+        }
+
+        // We need to create print job settings to fill the document contract.
+        DocPrintDestSettingsPrinter printerPrintDestSettings = DocPrintDestSettingsPrinter::construct(_printerName);
+        printerPrintDestSettings.createPrintJobSettingsXml();
+
+        // Create document contract.
+        PdfDocumentContract pdfDocumentContract = DocumentContractFactory::Instance.Create(DocumentContractType::Pdf);
+        pdfDocumentContract.Name = _pdfFileName;
+        pdfDocumentContract.Contents = _pdfFileContent;
+        pdfDocumentContract.Settings = printerPrintDestSettings.getPrintJobSettingsXmlStr();
+        pdfDocumentContract.TargetType = TargetType::Printer;
+        pdfDocumentContract.ActivityID = InstrumentationHelper::EnsureActivityIdIsSet();
+
+        // Send the document contract to DRA (Document Routing Agent) and log the created document routing job.
+        DocumentRoutingJob docRoutingJob = DocPrinterManager::sendDocumentContractToDocumentRouter(pdfDocumentContract);
+
+        return docRoutingJob;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendDocumentContractToDocumentRouter</Name>
+				<Source><![CDATA[
+    /*  Copied from SrsReportRunPrinter::sendDocumentContractToDocumentRouter()  */
+    public static DocumentRoutingJob sendDocumentContractToDocumentRouter(DocumentContract _documentContract)
+    {
+        str printerPath, blobItemName, blobContainerName_or_queueName;
+        guid printerId;
+        DocumentRoutingJob docRoutingJob;
+
+
+        // Ensure that document routing history cleanup batch job is up and running.
+        DocPrinterManager::ensureDocumentRoutingHistoryCleanupBatchJob();
+
+        try
+        {
+            if (!_documentContract)
+            {
+                throw error(strFmt("@SYS318601", '_documentContract'));
+            }
+
+            if (!_documentContract.Settings)
+            {
+                throw error(strFmt("@SYS318601", 'Settings'));
+            }
+
+            if (!_documentContract.Contents)
+            {
+                throw error(strFmt("@SYS318601", 'Contents'));
+            }
+
+            // Activity Id is the unique identifier for each print job initiated.
+            if (_documentContract.ActivityID == emptyGuid())
+            {
+                _documentContract.ActivityID = InstrumentationHelper::EnsureActivityIdIsSet();
+            }
+
+            IDocumentUploader uploader = DocumentUploaderFactory::Create();
+
+            // Retrieve the printer path and ID.
+            printerPath = uploader.ValidateDocumentContractAndGetPrinterPath(_documentContract);
+            printerId = DocPrinterManager::getPrinterIdbyPrinterPath(printerPath);
+
+            /***  Use this code for up to July 2017 Update app version  ***/
+            //blobContainerName_or_queueName = CommonUtilities::GenerateQueueName(printerPath, curExt(), printerId);
+
+            /***  Use this code for 7.3 app version and up  ***/
+            blobContainerName_or_queueName = CommonUtilities::GenerateBlobContainerName(printerPath, curExt(), printerId);
+
+            // Upload the blob containing the printing document.
+            blobItemName = uploader.UploadDocumentContract(_documentContract, blobContainerName_or_queueName);
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), strFmt("@DocentricAX:UploadingReportToAzureQueueFailedPrintAsPdf", _documentContract.Name));
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:UploadingReportToAzureQueueFailedPrintAsPdf", _documentContract.Name));
+        }
+
+        // Log the printing.
+        try
+        {
+            // Create a new document routing job.
+            docRoutingJob = DocPrinterManager::createNewDocumentRoutingJobWithConnection(blobItemName, printerPath, printerPath, _documentContract.Name, _documentContract.ActivityID, 0, printerId);
+        }
+        catch
+        {
+            DocGlobalHelper::handleWarning(
+                strFmt("@DocentricAX:CreationDocumentRoutingJobFailed", _documentContract.Name, printerPath), true, funcName());
+        }
+
+        return docRoutingJob;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewDocumentRoutingJobWithConnection</Name>
+				<Source><![CDATA[
+    /*  Copied from SrsReportRunPrinter::createNewDocumentRoutingJobWithConnection()  */
+    public static DocumentRoutingJob createNewDocumentRoutingJobWithConnection(str _blobItemName, str _printerName, str _printerPath, str _documentName, guid _activityId, int _totalPages, guid _printerId)
+    {
+        DocumentRoutingJob documentRoutingJob;
+
+        UserConnection newConnection = new UserConnection();
+        try
+        {
+            newConnection.ttsbegin();
+            documentRoutingJob = DocPrinterManager::createNewDocumentRoutingJob(
+                _blobItemName, _printerName, _printerPath, _documentName, _activityId, _totalPages, _printerId, curExt(), newConnection);
+            newConnection.ttscommit();
+        }
+        finally
+        {
+            newConnection.finalize();
+        }
+
+        return documentRoutingJob;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewDocumentRoutingJob</Name>
+				<Source><![CDATA[
+    /*  Copied from DocumentRoutingJob::createNewDocumentRoutingJob()  */
+    public static DocumentRoutingJob createNewDocumentRoutingJob(str _blobItemName, str _printerName, str _printerPath,
+        str _documentName, guid _activityId, int _totalPages, Guid _printerId, CompanyId _companyId = curExt(), UserConnection _uc = null)
+    {
+        DocumentRoutingJob newJob;
+
+        if (!_blobItemName)
+        {
+            throw error(strfmt("@SYS318601", '_blobItemName'));
+        }
+
+        if (!_printerName)
+        {
+            throw error(strfmt("@SYS318601", '_printerName'));
+        }
+
+        if (!_printerPath)
+        {
+            throw error(strfmt("@SYS318601", '_printerPath'));
+        }
+
+        if (_activityId == emptyGuid())
+        {
+            _activityId = InstrumentationHelper::EnsureActivityIdIsSet();
+        }
+
+        if (_printerId == emptyGuid())
+        {
+            throw error(strfmt("@SYS318601", '_printerId'));
+        }
+
+        if (_totalPages < 0)
+        {
+            throw error("@BI:ReportInvalidTotalPages");
+        }
+
+        if (_uc)
+        {
+            newJob.setConnection(_uc);
+        }
+
+        newJob.clear();
+        newJob.JobId = _blobItemName;
+        newJob.ActivityId = _activityId;
+        newJob.JobStatus = DocumentRoutingJobStatus::Pending;
+        newJob.PrinterName = _printerName;
+        newJob.PrinterPath = _printerPath;
+        newJob.ReportName = _documentName;
+        newJob.TotalNumberOfPages = _totalPages;
+        newJob.CompanyId = _companyId;
+        newJob.PrinterId = _printerId;
+        newJob.insert();
+
+        return newJob;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ensureDocumentRoutingHistoryCleanupBatchJob</Name>
+				<Source><![CDATA[
+    public static void ensureDocumentRoutingHistoryCleanupBatchJob()
+    {
+        // If not configure, don't start the clean-up batch job of Document routing history.
+        if (!DocDocumentRoutingParameters::find().ActivateDocRoutingHistoryCleanUpJob)
+        {
+            return;
+        }
+
+        try
+        {
+            // Make sure that the document routing history clean up job is up and running.
+            DocumentRoutingHistoryCleanupBatchJob::create();
+        }
+        catch
+        {
+            DocGlobalHelper::handleWarning("@DocentricAX2:FailedToStartCleanUpJobDocRoutingHistory");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrinterIdbyPrinterPath</Name>
+				<Source><![CDATA[
+    public static guid getPrinterIdbyPrinterPath(str printerPath)
+    {
+        System.Exception ex;
+        try
+        {
+            ttsbegin;
+            SysCorpNetPrinters xPrinter;
+            select firstonly xPrinter where xPrinter.PrinterPath == printerPath;
+
+            if (xPrinter.RecId == 0)
+            {
+                throw error(strfmt("@DocentricAX2:UnableToFindPrinterError", printerPath));
+            }
+
+            // Since the PrinterId is a new added column in SysCorpnetPrinters table. The value could be empty guid for upgraded existing value.
+            if (xPrinter.PrinterId == emptyGuid())
+            {
+                xPrinter.selectForUpdate(true);
+                xPrinter.PrinterId = System.Guid::NewGuid();
+                xPrinter.update();
+            }
+
+            ttscommit;
+
+            return xPrinter.PrinterId;
+        }
+        catch (ex)
+        {
+            throw error(ex.Message);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isPrinterActiveAndAllowed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given printer is active and allowed (i.e. not restricted) for the given report and current user.
+    /// </summary>
+    /// <param name = "_selectedPrinterName">Selected printer name; it can contain a printer token, e.g. @DEFAULT_PRINTER@</param>
+    /// <param name = "_resolvedPrinterName">Resolved selected printer name - without any tokens; if the selected printer name doesn't contain any token, then the selected and resolved printer names are equal.</param>
+    /// <param name = "_printValidationErrors">Should warning messages be printed to the infolog</param>
+    /// <param name = "_reportId">If empty, the method will not check if the printer is restricted</param>
+    /// <param name = "_reportContextInfo">
+    /// Contains the report context information - DocPrintReportSettings or SrsReportDataContract object.
+    /// Used in the DocReportRunDelegates.onValidatingRestrictedPrinter() delegate that enables applying custom printer restriction rules.
+    /// </param>
+    /// <param name = "_userId">
+    /// If the user is provided and we are in the 'Allowed printers' mode, method checks if the printer is allowed for this user.
+    /// If _userId is empty, restriction per user isn't checked but we only check if the printer is active, no matter if we are in the 'Allowed printers' mode or not.
+    /// </param>
+    /// <returns>True, if the given printer is active and allowed for the given report and the given user</returns>
+    public static boolean isPrinterActiveAndAllowed(str _selectedPrinterName, str _resolvedPrinterName = _selectedPrinterName, boolean _printValidationErrors = true,
+                                                    str _reportId = '', Object _reportContextInfo = null, str _userId = curUserId())
+    {
+        // Check if the given printer active and allowed for the given user.
+        boolean isValid = DocPrinterManager::isPrinterActiveAndAllowedForUser(_userId, _selectedPrinterName, _resolvedPrinterName, _printValidationErrors);
+
+        // Check if the given printer is allowed for the given report.
+        isValid = DocPrinterManager::isPrinterAllowedForReport(_selectedPrinterName, _resolvedPrinterName, _printValidationErrors, _reportId, _reportContextInfo) && isValid;
+        
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isPrinterActiveAndAllowedForUser</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given printer is active and allowed for the given user.
+    /// </summary>
+    /// <param name = "_userId">
+    /// If the user is provided and we are in the 'Allowed printers' mode, the method checks if the printer is allowed for this user.
+    /// If _userId is empty, the User-allowed printers setup is ignored and we only check if the printer exists and it is active.
+    /// </param>
+    /// <param name = "_selectedPrinterName">Selected printer name; it can contain a printer token, e.g. @DEFAULT_PRINTER@</param>
+    /// <param name = "_resolvedPrinterName">
+    /// Resolved selected printer name - without any tokens; if the selected printer name doesn't contain any token,
+    /// then the selected and resolved printer names are equal.
+    /// </param>
+    /// <param name = "_printValidationErrors">Should validation messages be printed to the infolog</param>
+    /// <returns>
+    /// If the user is provided, returns True, if the printer is active and allowed for the given user.
+    /// If the user is not provided, returns True, if the printer is registered and active.
+    /// </returns>
+    public static boolean isPrinterActiveAndAllowedForUser(str _userId, str _selectedPrinterName, str _resolvedPrinterName = _selectedPrinterName, boolean _printValidationErrors = true)
+    {
+        boolean isValid = true;
+
+        DocActivePrintersView activePrinter;
+        DocUserPrinter userPrinter;
+
+        str formattedPrinterName = DocPrintDestSettingsPrinter::formatPrinterName(_selectedPrinterName, _resolvedPrinterName);
+        
+        // Check through single query 2 things: if the selected printer is active,
+        // and if it is assigned to the given user.
+        select firstonly RecId from activePrinter
+            where activePrinter.PrinterName == _resolvedPrinterName
+        outer join RecId from userPrinter
+            where userPrinter.PrinterName == activePrinter.PrinterName
+                && userPrinter.UserId == _userId;
+        
+        if (activePrinter.RecId == 0)
+        {
+            // Printer not found among the active printers
+            isValid = false;
+            if (_printValidationErrors)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX:SelectedPrinterNotRegistered", formattedPrinterName));
+            }
+        }
+
+        // If we are in the 'Allowed printers' mode and the user is provided, check if the printer is allowed for this user.
+        if (_userId != '' && DocPrinterManager::getUserPrintersMode() != DocUserPrinterMode::UserFavoritePrinters && userPrinter.RecId == 0)
+        {
+            // Printer is not allowed for the given user
+            isValid = false;
+            if (_printValidationErrors)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:SelectedPrinterNotAssignedToUser", formattedPrinterName, _userId));
+            }
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrinterValidationErrorForUser</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a validation error message for the provided printer. If the printer is valid, returns an empty string.
+    /// </summary>
+    /// <param name = "_userId">User ID. If empty, User-allowed printers will be ignored.</param>
+    /// <param name = "_printerName">Printer name</param>
+    /// <returns>Validation error, if the given printer is invalid. Returns an empty string, if the provided printer is valid for the given user.</returns>
+    public static str getPrinterValidationErrorForUser(str _userId, str _printerName)
+    {
+        str errorMessage = '';
+
+        DocActivePrintersView activePrinter;
+        DocUserPrinter userPrinter;
+        
+        // Check through single query 2 things: if the selected printer is active,
+        // and if it is assigned to the given user.
+        select firstonly RecId from activePrinter
+            where activePrinter.PrinterName == _printerName
+        outer join RecId from userPrinter
+            where userPrinter.PrinterName == activePrinter.PrinterName
+                && userPrinter.UserId == _userId;
+        
+        if (activePrinter.RecId == 0)
+        {
+            // Printer not found among the active printers
+            errorMessage = "@DocentricAX4:SelectedPrinterNotRegisteredLessChatty";
+        }
+
+        // If we are in the 'Allowed printers' mode and the user is provided, check if the printer is allowed for this user.
+        if (_userId != '' && DocPrinterManager::getUserPrintersMode() != DocUserPrinterMode::UserFavoritePrinters && userPrinter.RecId == 0)
+        {
+            // Printer is not allowed for the given user
+            errorMessage += (errorMessage == '' ? '' : '\n') + "@DocentricAX4:SelectedPrinterNotAssignedToUserLessChatty";
+        }
+
+        return errorMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isPrinterAllowedForReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given printer is allowed (i.e. not restricted) for the given report.
+    /// </summary>
+    /// <param name = "_selectedPrinterName">Selected printer name; it can contain a printer token, e.g. @DEFAULT_PRINTER@</param>
+    /// <param name = "_resolvedPrinterName">Resolved selected printer name - without any tokens; if the selected printer name doesn't contain any token, then the selected and resolved printer names are equal.</param>
+    /// <param name = "_printValidationErrors">Should warning messages be printed to the infolog</param>
+    /// <param name = "_reportId">If empty, the method will not check if the printer is restricted</param>
+    /// <param name = "_reportContextInfo">
+    /// Contains the report context information - DocPrintReportSettings or SrsReportDataContract object.
+    /// Used in the DocReportRunDelegates.onValidatingRestrictedPrinter() delegate that enables applying custom printer restriction rules.
+    /// </param>
+    /// <returns>True, if the given printer is allowed for the given report</returns>
+    public static boolean isPrinterAllowedForReport(str _selectedPrinterName, str _resolvedPrinterName = _selectedPrinterName, boolean _printValidationErrors = true,
+                                                    str _reportId = '', Object _reportContextInfo = null)
+    {
+        boolean isValid = true;
+
+        DocActivePrintersView activePrinter;
+        DocRestrictedPrinter restrictedPrinter;
+        DocRestrictedPrinterInfo restrictedPrinterInfo;
+        DocReportTable reportTable;
+
+        // If Report-restricted printers option is turned on, continue checking.
+        if (_reportId && DocPrinterManager::getRestrictPrintersMode() != DocRestrictPrinters::None)
+        {
+            // Check if this report-printer combination is restricted (which means: does it exist
+            // in the DocRestrictedPrinter table.
+            select firstonly RecId from activePrinter
+                where activePrinter.PrinterName == _resolvedPrinterName
+                    outer join RecId, RestrictForUnregisteredReports from restrictedPrinterInfo
+                        where restrictedPrinterInfo.PrinterName == activePrinter.PrinterName
+                    outer join RecId from restrictedPrinter
+                        where restrictedPrinter.PrinterName == activePrinter.PrinterName
+                            && restrictedPrinter.ReportId == _reportId
+                    outer join RecId from reportTable
+                        where reportTable.ReportId == _reportId;
+            
+            // If report isn't registered for Docentric and printer has flag to be restricted
+            // for unregistered reports, then prepare the  information for the delegate below
+            // that the printer should be restricted.
+            if (reportTable.RecId == 0
+                && restrictedPrinterInfo.RecId != 0     // If nobody ever entered any restriction-related setup, this table might have no records
+                && restrictedPrinterInfo.RestrictForUnregisteredReports == NoYes::Yes)
+            {
+                restrictedPrinter.RecId = 1;
+            }
+
+            // Give a chance to custom code to apply additional restriction conditions for the selected printer and given report (e.g. per user and location).
+            DocReportRunDelegates::instance().onValidatingRestrictedPrinter(_selectedPrinterName, _resolvedPrinterName,
+                _printValidationErrors, _reportId, _reportContextInfo, restrictedPrinter);
+
+            if (restrictedPrinter.RecId != 0)
+            {
+                // Printer is restricted for this report.
+                isValid = false;
+                if (_printValidationErrors)
+                {
+                    DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:SelectedPrinterIsRestrictedForReport", 
+                                                    DocPrintDestSettingsPrinter::formatPrinterName(_selectedPrinterName, _resolvedPrinterName), _reportId));
+                }
+            }
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getActiveAndAllowedPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the set with active and allowed printers for the given report or report type and specified user.
+    /// </summary>
+    /// <param name = "_reportId">Report ID. Consider this parameter if you need to apply restriction only for particular reports.</param>
+    /// <param name = "_reportType">Print management document type. Important when posting a Print management report, because then Report ID is not known.</param>
+    /// <param name = "_reportTypeProvided">Is Print management document type provided.</param>
+    /// <param name = "_userId">User Id for which the allowed printers are checked.</param>
+    /// <returns>Set with the active printers which are allowed for the given report or report type. Set(Types::String) contains printer names.</returns>
+    /// <remarks>If neither of _reportId and _reportType is provided, the set will contain all active printers for the current company.</remarks>
+    public static Set getActiveAndAllowedPrinters(DocReportId _reportId, PrintMgmtDocumentType _reportType, boolean _reportTypeProvided, UserId _userId = curUserId())
+    { 
+        Set validPrinters = new Set(Types::String);   // Set with the names of active and allowed printers for the current company.
+        
+        if (DocPrinterManager::getRestrictPrintersMode() != DocRestrictPrinters::None)
+        {
+            // "Restrict printers" option is turned on.
+            if (_reportId)
+            {
+                // Report ID is known, collect all active printers not restricted for this report
+                // and allowed for this user.
+                DocPrinterManager::addActiveAndAllowedPrintersForReportAndUser(validPrinters, _reportId, _userId);
+            }
+            else if (_reportTypeProvided)
+            {
+                // Report type is known, collect all report IDs for this report type, then for each report ID 
+                // collect all allowed active printers. Result is a union of all allowed printers for all related
+                // report IDs, sorted alphabetically. Make sure that if a printer is allowed for different report IDs,
+                // it appears only once in the resulting set. 
+                
+                container reportDesignNames = DocReportTypeHelper::getSRSReportDesignNamesForType(_reportType);
+
+                for (int i = 1; i <= conLen(reportDesignNames); i++)
+                {
+                    str reportDesignName = conPeek(reportDesignNames, i);
+                    
+                    // Add all printers allowed for this report and user to the Set. This guarantees that each printer 
+                    // appears only once, and also Set automatically orders its elements.
+                    DocPrinterManager::addActiveAndAllowedPrintersForReportAndUser(validPrinters, reportDesignName, _userId);
+                }
+            }
+            else
+            {
+                // We can't retrieve the information about the report Id, so we can't apply 
+                // the information about the restricted printer per report.
+                // Simply collect all active printers allowed for the current user.
+                validPrinters = DocPrinterManager::getActiveAndAllowedPrintersForUser(_userId);
+            }
+        }
+        else
+        {
+            // Ignore the information about the restricted printers, 
+            // just collect the active printers allowed for the current user.
+            validPrinters = DocPrinterManager::getActiveAndAllowedPrintersForUser(_userId);
+        }
+
+        return validPrinters;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getActiveAndAllowedPrintersForUser</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the set with all active network printers in the current company, which are allowed for the specified user.
+    /// </summary>
+    /// <param name = "_userId">User Id of the user for which the allowed printers should be checked.</param>
+    /// <returns>Set with the active printers in the current company allowed for the specified user. Set(Types::String) contains printer names.</returns>
+    public static Set getActiveAndAllowedPrintersForUser(UserId _userId)
+    {
+        DocActivePrintersView activePrinter;
+        Set activePrinters = new Set(Types::String);
+        DocUserPrinterMode printerMode = DocPrinterManager::getUserPrintersMode();
+
+        if (printerMode == DocUserPrinterMode::UserFavoritePrinters || _userId == '')
+        {
+            // All printers are allowed for the specified user, or no user specified --> add all active printers.
+            while select activePrinter order by PrinterName
+            {
+                activePrinters.add(activePrinter.PrinterName);
+            }           
+        }
+        else
+        {
+            // Take only the active printers which are assigned to the specified user.
+            DocUserPrinter userPrinter;
+            while select activePrinter order by PrinterName
+                exists join userPrinter 
+                    where userPrinter.PrinterName == activePrinter.PrinterName
+                        && userPrinter.UserId == _userId
+            {
+                activePrinters.add(activePrinter.PrinterName);
+            }
+        }
+
+        return activePrinters;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addActiveAndAllowedPrintersForReportAndUser</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add active and allowed printers for the given report and user to the given printer set.
+    /// </summary>
+    /// <param name = "_validPrinters">Set(Types::String) to which the names of the active and allowed printers are added.</param>
+    /// <param name = "_reportId">Report ID, the same as SSRS report design name.</param>
+    /// <param name = "_userId">User ID</param>
+    private static void addActiveAndAllowedPrintersForReportAndUser(Set _validPrinters, DocReportId _reportId, UserId _userId)
+    {
+        DocActivePrintersView activePrinter;
+        DocRestrictedPrinter restrictedPrinter;
+        DocRestrictedPrinterInfo restrictedPrinterInfo;
+        boolean isReportRegistered = DocReportTable::existsReportId(_reportId);
+        
+        if (DocPrinterManager::getUserPrintersMode() == DocUserPrinterMode::UserFavoritePrinters || _userId == '')
+        {
+            // No restriction per user, or user not provided --> apply only the restriction per report.
+            // Collect all active printers not restricted for this report.
+            // If report isn't registered for Docentric, then check the RestrictForUnregisteredReports flag.
+            while select activePrinter order by PrinterName
+            join RecId, RestrictForUnregisteredReports from restrictedPrinterInfo
+                where restrictedPrinterInfo.PrinterName == activePrinter.PrinterName
+                    && (isReportRegistered || restrictedPrinterInfo.RestrictForUnregisteredReports == NoYes::No)
+            notexists join restrictedPrinter
+                where restrictedPrinter.PrinterName == activePrinter.PrinterName
+                    && restrictedPrinter.ReportId == _reportId
+            {
+                _validPrinters.add(activePrinter.PrinterName);
+            }
+        }
+        else
+        {
+            // In addition to the above query, also take the User allowed printers into account.
+            DocUserPrinter userPrinter;
+
+            while select activePrinter order by PrinterName
+            join RecId, RestrictForUnregisteredReports from restrictedPrinterInfo
+                where restrictedPrinterInfo.PrinterName == activePrinter.PrinterName
+                    && (isReportRegistered || restrictedPrinterInfo.RestrictForUnregisteredReports == NoYes::No)
+            exists join userPrinter
+                where userPrinter.PrinterName == activePrinter.PrinterName
+                    && userPrinter.UserId == _userId
+            notexists join restrictedPrinter
+                where restrictedPrinter.PrinterName == activePrinter.PrinterName
+                    && restrictedPrinter.ReportId == _reportId
+            {
+                _validPrinters.add(activePrinter.PrinterName);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyOrderFromUserPrinterSetup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Transform the set of active and allowed printers from Set into List.
+    /// The main reason for this is to match the order of printers configured
+    /// by users (if printer mode is User favorite printers), because Set
+    /// is automatically ordered alphabetically. 
+    /// </summary>
+    /// <param name = "_printerSet">Set(Types::String) with printer names</param>
+    /// <param name = "_userId">User Id of the user for which the favorite printers are collected/</param>
+    /// <returns>List(Types::String) with printer names</returns>
+    public static List applyOrderFromUserPrinterSetup(Set _printerSet, UserId _userId)
+    {
+        List printerList = new List(Types::String);
+        DocUserPrinterMode userPrinterMode = DocPrinterManager::getUserPrintersMode();
+        DocFavoritePrinterSelection favoritePrinterSelection = DocFavoritePrinterSelection::All;
+
+        if (!_printerSet.empty())
+        {
+            // We can re-arrange the provided list only if user is known
+            if (_userId != '')
+            {
+                favoritePrinterSelection = SysUserInfo::find(_userId).FavoritePrinterSelection_DC;
+
+                if (favoritePrinterSelection != DocFavoritePrinterSelection::All || 
+                    userPrinterMode != DocUserPrinterMode::UserFavoritePrinters)
+                {
+                    // Re-arrange the printers according to the User printer setting.
+                    DocUserPrinter userPrinter;
+
+                    // Take the printers from the User printers, in the same order as set there.
+                    // Remove the used printers from the input Set.
+                    while select PrinterName from userPrinter
+                        order by userPrinter.LineNum
+                        where userPrinter.UserId == _userId
+                    {
+                        if (_printerSet.in(userPrinter.PrinterName))
+                        {
+                            printerList.addEnd(userPrinter.PrinterName);
+                            _printerSet.remove(userPrinter.PrinterName);
+                        }
+                    }
+                }
+            }
+
+            // In any other mode than User favorite printers with FavoriteOnly selection,
+            // add the remaining printers from the Set into the List
+            if (favoritePrinterSelection != DocFavoritePrinterSelection::FavoriteOnly)
+            {
+                SetEnumerator se = _printerSet.getEnumerator();
+                se.reset();
+
+                while (se.moveNext())
+                {
+                    printerList.addEnd(se.current());
+                }
+            }            
+        }
+
+        return printerList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populatePrinterCombo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates the provided printer combobox with the active and allowed printers for the current company and the given report or report type.
+    /// </summary>
+    /// <param name = "_printerCombo">Printer combo to populate with the names of active and allowed printers.</param>
+    /// <param name = "_reportId">Report ID. Consider this parameter if you need to apply restriction only for particular reports.</param>
+    /// <param name = "_reportType">Print management document type. Important when posting a Print management report, because then Report ID is not known.</param>
+    /// <param name = "_reportTypeProvided">Is Print management document type provided.</param>
+    /// <param name = "_addUserDefaultPrinter">Is the @DEFAULT_PRINTER@ token already added in the printer combo</param>
+    [SysObsoleteAttribute('Use the DocPrinterSelectorTmp::fillTableWithPrintersActiveAndAllowedForReportAndUser() method instead.', false, 19\08\2021)]
+    public static void populatePrinterCombo(FormComboBoxControl _printerCombo, 
+        DocReportId _reportId, PrintMgmtDocumentType _reportType, boolean _reportTypeProvided, boolean _addUserDefaultPrinter = true)
+    {
+        // First add the @DEFAULT_PRINTER@ token.
+        if (_addUserDefaultPrinter)
+        {
+            _printerCombo.add(DocConstant::DefaultPrinterPlaceholder);
+        }
+
+        // Get all active and allowed printers for the current company, report and user.
+        Set validPrinters = DocPrinterManager::getActiveAndAllowedPrinters(_reportId, _reportType, _reportTypeProvided, curUserId());
+
+        // Give a chance to custom code to apply additional restriction to the retrieved printer set.
+        DocReportRunDelegates::instance().onPopulatePrinterCombo(_printerCombo, _reportId, _reportType, _reportTypeProvided, _addUserDefaultPrinter, validPrinters);
+        
+        // Apply the logic for user-favorite printers and convert the set of the active and allowed printers 
+        // to a list that reflects user-favorite setup.
+        // Note that after returning from this method, input set (validPrinters) will be empty.
+        List validPrintersList = DocPrinterManager::applyOrderFromUserPrinterSetup(validPrinters, curUserId());
+
+        // Populate the printer combo from the List values
+        if (validPrintersList.elements() > 0)
+        {
+            ListEnumerator le = validPrintersList.getEnumerator();
+            le.reset();
+
+            while (le.moveNext())
+            {
+                _printerCombo.add(le.current());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRestrictPrintersMode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the RestrictPrinters setting applicable to current company.
+    /// If the company-specific setting exists, return it. 
+    /// Otherwise, return the global setting from the DocParameters table.
+    /// </summary>
+    /// <returns>DocRestrictPrinters enum value corresponding to the RestrictPrinters setting</returns>
+    public static DocRestrictPrinters getRestrictPrintersMode()
+    {
+        DocRestrictPrinters retval;
+
+        DocParametersCompanySetting compSetting = DocParametersCompanySetting::findSettingName(curExt(), DocConstant::ParameterRestrictPrintersSettingName);
+        if (compSetting)
+        {
+            // Company-specific setting found, use it.
+            retval = symbol2Enum(enumNum(DocRestrictPrinters), compSetting.SettingValue);
+        }
+        else
+        {
+            // Use the global setting found in DocParameters table.
+            retval = DocParameters::find().RestrictPrinters;
+        }
+
+        return retval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeRestrictedPrintersTables</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize the helper tables needed for Restricted printers.
+    /// </summary>
+    public static void initializeRestrictedPrintersTables()
+    {
+        DocRestrictedPrinterInfo::addMissingInfoRecords();
+
+        DocRestrictedPrinterTokens::initialize();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>filterPrintersWithApp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// In case of a cloud environment, filter only the printers that are linked to D365FO application.
+    /// For example, if printer is first enabled in DRA and later disabled, it still exists in the
+    /// SyscorpnetPrinters table, but doesn't appear in the Network printers form, because of this filter.
+    /// We want to achieve the same behaviour whenever the SysCorpNetPrinters is a main form datasource, 
+    /// or inner-joined to a main form datasource (for example, some of our forms for printer-related
+    /// functionalities, such as Restricted report by printer).
+    /// This method does the same thing as the method with same name in SysCorpNetPrinterList form.
+    /// </summary>
+    /// <param name = "_qbds">QueryBuildDataSource that must be for the SysCropNetPrinters table</param>
+    public static void filterPrintersWithApp(QueryBuildDataSource _qbds)
+    {
+        if (_qbds.table() != tableNum(SysCorpNetPrinters))
+        {
+            return;
+        }
+
+        if (!DocConstantGlobal::isOnPremEnvironment())
+        {
+            QueryBuildDataSource printerApp = _qbds.addDataSource(tableNum(DocumentRoutingPrinterAppAssociation));
+            printerApp.joinMode(JoinMode::ExistsJoin);
+            printerApp.relations(true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUserPrintersMode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the UserPrintersMode setting applicable to current company.
+    /// If the company-specific setting exists, return it.
+    /// Otherwise, return the global setting from the DocParameters table.
+    /// </summary>
+    /// <returns>DocUserPrinterMode enum value corresponding to the UserPrintersMode setting</returns>
+    public static DocUserPrinterMode getUserPrintersMode()
+    {
+        DocUserPrinterMode retval;
+
+        DocParametersCompanySetting compSetting = DocParametersCompanySetting::findSettingName(curExt(), DocConstant::ParameterUserPrintersModeSettingName);
+        if (compSetting)
+        {
+            // Company-specific setting found, use it.
+            retval = symbol2Enum(enumNum(DocUserPrinterMode), compSetting.SettingValue);
+        }
+        else
+        {
+            // Use the global setting found in DocParameters table.
+            retval = DocParameters::find().UserPrinterMode;
+        }
+
+        return retval;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

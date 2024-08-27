@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PCard_ProcessBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_PCard_ProcessBatch extends SKS_EB_Batch
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Three loops are needed, two of these are nested. For each Company(looped through in the outer) we process each Bank Account(in the second loop) and in the innermost loop, we process each file for that bank account. There is no way to refactor this without serious loss of code readablity")]
+    public void run()
+    {
+        SKS_EB_FileHub locSKS_EB_FileHub;
+        SKS_EB_Send locSKS_EB_Send;
+        Batch bat;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+        SKS_PP_Bank locSKS_PP_Bank;
+        SKS_EB_FileStorage locSKS_EB_FileStorage;
+        SKS_CCR_Sys  locSKS_CCR_Sys;
+        RefRecId locRefRecID;
+        str locPrevCCRPath;
+        SelectableDataArea locPrevCompany;
+        str loclabelOutputForBatchLog; //Batch log will show the literal label, if you don't put it to str frist.
+        list ListOfFilesToProcess;
+        ListEnumerator locFilesToProcessEnum;
+        SKS_PP_500PPBas locSKS_PP_500PPBas;
+        str locSKS_EB_Send_getParams;
+        boolean locSKS_EB_Send_Send;
+        SKS_BF_BankIntType locSKS_BF_BankIntType;
+        SKS_EB_FilePath locFilePath;
+
+        void processBankAccount()
+        {
+            locFilePath = locSKS_EB_FileStorage.StorageOption_CCR == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue ? locSKS_PP_Bank.CCR_BankFabricLocation :  locSKS_PP_Bank.CCR_Path;
+            if(locPrevCCRPath != locFilePath)
+            {
+                if(!locSKS_EB_FileHub.runDirectoryExists(locFilePath))
+                {
+                    warning(strFmt("@SKS3215",
+                            locFilePath, locSKS_PP_Bank.company(), locSKS_PP_Bank.BankAccountId));
+                    return;
+                }
+                    
+                ListOfFilesToProcess = locSKS_EB_FileHub.runDirectoryGetFiles(locFilePath);
+                changeCompany(locSKS_PP_Bank.company())
+                {
+                    if(locPrevCompany != locSKS_PP_Bank.company())
+                    {
+                        if(!locSKS_PP_500PPBas)
+                                locSKS_PP_500PPBas = new SKS_PP_500PPBas();
+                        locPrevCompany = locSKS_PP_Bank.company();
+                    }
+                    if(ListOfFilesToProcess)
+                    {
+    
+                        if(!locFilesToProcessEnum && ListOfFilesToProcess.elements() > 0)
+                        {
+                            locFilesToProcessEnum = ListOfFilesToProcess.getEnumerator();
+                            while(locFilesToProcessEnum.moveNext())
+                            {
+                                if(!locSKS_CCR_Sys)
+                                {
+                                    locSKS_CCR_Sys = new SKS_CCR_Sys();
+                                    locSKS_CCR_Sys.setSKS_EB_CommProcess(locSKS_EB_CommProcess);
+                                }
+                                loclabelOutputForBatchLog = strfmt("@SKS3211", locFilesToProcessEnum.current());
+                                info(loclabelOutputForBatchLog);
+                                locSKS_CCR_Sys.CCR_ProcessFolder(locFilePath, locFilesToProcessEnum.current(), locSKS_BF_BankIntType);
+                            }
+                            locFilesToProcessEnum = null;
+                            ListOfFilesToProcess = null;
+                        }
+                    }
+                }
+                locPrevCCRPath = locFilePath;
+            }
+        }
+            
+        bat = this.parmCurrentBatch();
+        locRefRecID = bat.RecId;
+        
+        select firstonly StorageOption_CCR from locSKS_EB_FileStorage;
+        locSKS_BF_BankIntType = locSKS_EB_FileStorage.StorageOption_CCR == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue ? SKS_BF_BankIntType::BankFabric : SKS_BF_BankIntType::FileHubLocal;
+        locSKS_EB_FileHub = SKS_EB_FileHub::construct(locSKS_BF_BankIntType);
+        while select crossCompany locSKS_EB_CommProcess where locSKS_EB_CommProcess.BatchJobId == locRefRecID
+        {
+            locSKS_PP_Bank = null;
+            locPrevCompany = '';
+
+            //BankFabric processing
+            while Select crossCompany CCR_BankFabricLocation, CCR_FormatID, CCR_Path, dataAreaId from locSKS_PP_Bank
+                order by locSKS_PP_Bank.dataAreaId, locSKS_PP_Bank.CCR_BankFabricLocation
+                where  locSKS_EB_FileStorage.StorageOption_CCR == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue && locSKS_PP_Bank.CCR_BankFabricLocation != ''
+                    && locSKS_PP_Bank.CCR_FormatID != ''
+                    && locSKS_PP_Bank.CCR_InCommID == locSKS_EB_CommProcess.CommID
+            {
+                if(strLRTrim(locSKS_PP_Bank.CCR_BankFabricLocation) == '')
+                {
+                    Info("@SKS:SKGBRBFLocatoinNotSet",locSKS_PP_Bank.BankAccountId);
+                    continue;
+                }
+                processBankAccount();
+            }
+            //FileHub/local processnig
+            while Select crossCompany CCR_BankFabricLocation, CCR_FormatID, CCR_Path, dataAreaId from locSKS_PP_Bank
+                order by locSKS_PP_Bank.dataAreaId, locSKS_PP_Bank.CCR_Path
+                where  locSKS_EB_FileStorage.StorageOption_CCR == SKS_EB_BankIntegOptWithNoLicense::FileHubLocalEnumValue
+                    && locSKS_PP_Bank.CCR_FormatID != ''
+                    && locSKS_PP_Bank.CCR_InCommID == locSKS_EB_CommProcess.CommID
+            {
+                if(strLRTrim(locSKS_PP_Bank.CCR_Path) == '')
+                {
+                    Info("@SKS:SKGBRPathNotSet",locSKS_PP_Bank.BankAccountId);
+                    continue;
+                }
+                processBankAccount();
+            }
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static client server ClassDescription description()
+    {
+        return "@SKS:EnrichInProcess";
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        boolean ret;
+    
+        ret = super();
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,487 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIIntegrationsConcurImportService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class GGIIntegrationsConcurImportService extends SysOperationServiceBase
+{  
+    GGIIntegrationsConcurConfiguration parameters;
+    Map invoiceVendorMap;
+    
+    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    public void processOperation()
+    {
+        parameters = GGIIntegrationsConcurConfiguration::find();
+        invoiceVendorMap = new Map(Types::String, Types::String);
+        info ("Running Concur vendor journal import");
+        
+        this.importSFTPDirFiles();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importSFTPDirFiles</Name>
+				<Source><![CDATA[
+    private void importSFTPDirFiles()
+    {
+        System.IO.Stream                    ioStream;
+        System.IO.StreamReader              ioStreamReader;
+        System.String                       strReadLine;
+        container                           conFTPFilesDownload;
+        ListIterator                        ftpFilesListIterator;
+        Renci.SshNet.Sftp.SftpFile          sftpFile;
+        System.IO.StreamReader              reader;
+        System.String                       line;
+
+        System.ObjectDisposedException                  error_ObjectDisposedException;
+        System.InvalidOperationException                error_InvalidOperationException;
+        System.Net.Sockets.SocketException              error_SocketException;
+        Renci.SshNet.Common.SshConnectionException      error_SshConnectionException;
+        Renci.SshNet.Common.SshAuthenticationException  error_SshAuthenticationException;
+        Renci.SshNet.Common.ProxyException              error_ProxyException;
+        System.ArgumentNullException                    error_ArgumentNullException;
+        Renci.SshNet.Common.SftpPathNotFoundException   error_SftpPathNotFoundException;
+        str fileName;
+ 
+        //BUG 8902 - Remove casting to CLrObject
+        //ClrObject list = new ClrObject("System.Collections.Generic.List`1[Renci.SshNet.Sftp.SftpFile]"); 
+ 
+        GGI.Integrations.FileHandling.SFTPConnection sftp = new GGI.Integrations.FileHandling.SFTPConnection();
+        
+        using (Renci.SshNet.SftpClient sftpConnection = sftp.OpenSFTPConnection(parameters.SFTPHost, parameters.SFTPPort, parameters.User, parameters.passwordEdit(false,'')))
+        {
+            try
+            {
+                int totalFiles = 0;
+                sftpConnection.ChangeDirectory(parameters.SFTPFileImportPath);
+
+                //BUG 8902 - Remove casting to CLrObject
+                //list = sftp.GetFiles(sftpConnection, parameters.SFTPFileImportPath);
+                //ClrObject enumerator = list.getEnumerator();
+
+                //BUG 8902 - Using generic types
+                var files = sftp.GetFiles(sftpConnection, parameters.SFTPFileImportPath);
+                var enumerator = files.GetEnumerator();     
+                 
+                while (enumerator.movenext())
+                {
+                    sftpFile = enumerator.get_Current();
+ 
+                    if(sftpFile.Name != ".." && sftpFile !=null && sftpFile.Name != "." && sftpFile.Length > 0)
+                    {
+                        totalFiles ++;
+                        try
+                        {
+                            fileName = sftpFile.Name;
+                            sftp.MoveFile(sftpConnection, parameters.SFTPFileImportPath + '/'+sftpFile.Name,   parameters.SFTPFileErrorPath + '/' + fileName,false);
+                            ioStream = sftp.DownloadFile(sftpConnection, parameters.SFTPFileErrorPath + '/' + fileName);
+                            //ioStream = sftp.DownloadFile(sftpConnection, parameters.SFTPFileImportPath + '/'+sftpFile.Name);
+                            
+                            if(parameters.UseEncryption)
+                            {                                
+                                //str encryptedString = GGI.Integrations.Cryptography.IoHelper::GetString(ioStream);
+                                str decryptedString = GGI.Integrations.Cryptography.Encryption::DecryptPgpIoStream(ioStream);
+                                ioStream = GGI.Integrations.Cryptography.IoHelper::GetStream(decryptedString);
+                            }
+                            if(this.readConcurCSVFileAndCreateJournal(ioStream,fileName))//sftpFile.Name))
+                            {
+                                //sftp.MoveFile(sftpConnection, parameters.SFTPFileImportPath  + '/'+sftpFile.Name,   parameters.SFTPFileArchivePath  + '/'+ this.getReturnFileName(sftpFile.Name),false);
+                                //nfo(strFmt("File moved to archive folder: %1", sftpFile.Name));
+
+                                //sftp.DeleteFile(sftpConnection, parameters.SFTPFileImportPath  + '/'+sftpFile.Name);
+
+                                sftp.DeleteFile(sftpConnection, parameters.SFTPFileErrorPath + '/' + fileName);
+                                info(strFmt("File %1 has been successfully imported", fileName));//sftpFile.Name));
+                            }
+                            else
+                            {
+                                //sftp.MoveFile(sftpConnection, parameters.SFTPFileImportPath + '/'+sftpFile.Name,   parameters.SFTPFileErrorPath + '/' + this.getReturnFileName(sftpFile.Name),false);
+                                //sftp.MoveFile(sftpConnection, parameters.SFTPFileErrorPath + '/'+sftpFile.Name,   parameters.SFTPFileErrorPath + '/' + this.getReturnFileName(fileName),false);
+                                info(strFmt("File moved to error folder: %1", fileName));//sftpFile.Name));
+                            }
+                        }
+                        catch (error_ArgumentNullException)
+                        {
+                            throw error("Path is null.");
+                        }
+                        catch (error_SshConnectionException)
+                        {
+                            throw error("Client is not connected.");
+                        }
+                        catch (error_SftpPathNotFoundException)
+                        {
+                            throw error("The specified path is invalid, or its directory was not found on the remote host.");
+                        }
+                        catch (error_ObjectDisposedException)
+                        {
+                            throw error("The method was called after the client was disposed.");
+                        }
+                    }
+                }
+                if (totalFiles == 0)
+                {
+                    info("No file found to process");
+                }
+            }             
+            catch (error_ObjectDisposedException)
+            {
+                throw error("The method was called after the client was disposed.. ");
+            }
+            catch (error_InvalidOperationException)
+            {
+                throw error("The client is already connected.");
+            }
+            catch (error_SocketException)
+            {
+                throw error("Socket connection to the SSH server or proxy server could not be established or an error occurred while resolving the hostname.");
+            }
+            catch (error_SshConnectionException)
+            {
+                throw error("SSH session could not be established.");
+            }
+            catch (error_SshAuthenticationException)
+            {
+                throw error("Authentication of SSH session failed.");
+            }
+            catch (error_ProxyException)
+            {
+                throw error("Failed to establish proxy connection.");
+            }
+            finally
+            {
+                if(sftpConnection.IsConnected)
+                    sftpConnection.Disconnect();
+            }
+        }
+        
+              
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readConcurCSVFileAndCreateJournal</Name>
+				<Source><![CDATA[
+    private boolean readConcurCSVFileAndCreateJournal(System.IO.Stream _fileStream, str _fileName = "") 
+    { 
+             
+        
+        System.Exception       ex;
+        AsciiStreamIo          file;
+        Array                  fileLines;        
+
+        Counter                 fileCounter = 0;  
+        Counter                 counter;
+        int                     numLines;
+        str                     tempHolding;
+
+        container               dimAttribute, dimValue, emptyContainer;        
+        LedgerJournalTable      ledgerJournalTable;
+        LedgerJournalTrans      ledgerJournalTrans,ledgerJournalTransIterator;;
+        LedgerJournalId         journalId;        
+        Amount                  totalDebit; 
+        boolean                 newVoucher;
+        str                     vendorAcc;
+         
+        
+        #OCCRetryCount
+
+        try
+        {   
+            //str decrypted = GGI.Integrations.Cryptography.Encryption::
+           
+            file = AsciiStreamIo::constructForRead(_fileStream);
+
+            if (file)
+            {
+                if (file.status())
+                {
+                    throw error("@SYS52680");
+                }
+
+                file.inFieldDelimiter(','); 
+                file.inRecordDelimiter("\r\n");
+            }
+            
+            container rec;
+            counter = 0;
+
+            rec = file.read();
+           
+            if (conLen(rec) && counter == 0 && conPeek(rec, 2) == "Employee ID")
+            {  
+                //ttsbegin;               
+                
+                while (file.status() == IO_Status::Ok)
+                {
+                    rec = file.read();
+                    if (conLen(rec) )
+                    {
+                        counter++;                        
+            
+                        if (!ledgerJournalTable.RecId)
+                        {
+                            ledgerJournalTable.clear();
+                            ledgerJournalTable.initValue();
+                            ledgerJournalTable.JournalName = parameters.LedgerJournalNameId;//"APInvoice";
+                            if(parameters.AddFileNameToDescription)
+                            {
+                                ledgerJournalTable.Name = ledgerJournalTable.Name + _fileName;
+                            }
+                            ledgerJournalTable.initFromLedgerJournalName();
+                            ledgerJournalTable.JournalNum = JournalTableData::newTable(ledgerJournalTable).nextJournalId();
+                            //ledgerJournalTable.Name = "Concur expense: " + conPeek(rec, 1);
+                            ledgerJournalTable.Name = _fileName;//the journal name includes the file name
+                            ledgerJournalTable.insert();
+                            info(strFmt("Journal %1 created", ledgerJournalTable.JournalNum));
+                            journalId = ledgerJournalTable.JournalNum;
+                        }
+
+                        if (ledgerJournalTrans.RecId !=0 && ledgerJournalTrans.Invoice != conPeek(rec, 5) && ledgerJournalTrans.Invoice != "")
+                        {
+                            select sum(AmountCurDebit)
+                                                from ledgerJournalTransIterator where ledgerJournalTransIterator.JournalNum == ledgerJournalTable.JournalNum && ledgerJournalTransIterator.Invoice == ledgerJournalTrans.Invoice;
+                            totalDebit = ledgerJournalTransIterator.AmountCurDebit;
+                             if(totalDebit != 0)
+                            {
+                                this.insertVendorDebit(ledgerJournalTable.JournalNum, ledgerJournalTrans.Voucher, VendorAcc, ledgerJournalTrans.invoice, ledgerJournalTrans.currencyCode, ledgerJournalTrans.transDate, ledgerJournalTrans.documentDate, totalDebit);
+                                
+                            }
+                            newVoucher = true;
+                        }
+                        else
+                        {
+                            newVoucher = false;
+                        }
+                    
+                        ledgerJournalTrans.clear();
+                        ledgerJournalTrans.initValue();
+                        ledgerJournalTrans.JournalNum             = ledgerJournalTable.JournalNum;
+                        ledgerJournalTrans.TransDate              = str2Date(conPeek(rec, 1),321);//?
+                        //Build out financial dimensions
+                        dimAttribute = emptyContainer;
+                        dimValue = emptyContainer;
+                        if(parameters.UseLegacyAccountCodes)
+                        {
+                            dimAttribute += ("MAINACCOUNT");
+                            dimValue += (GGIIntegrationsConcurUtility::mapGLAccountCode(conPeek(rec, 10)));                            
+                            dimAttribute += ("SITES");
+                            dimValue += "U001";
+                            dimAttribute += ("DEPARTMENT");
+                            dimValue += (GGIIntegrationsConcurUtility::mapDepartmentCode(conPeek(rec, 31)));   //Department               
+                            
+                        }
+                        else
+                        {
+                            dimAttribute += ("MAINACCOUNT");
+                            dimValue += (conPeek(rec, 24));//Journal Account Code
+                            dimAttribute += ("SITES");
+                            dimValue += (conPeek(rec, 30));//Location
+                            dimAttribute += ("DEPARTMENT");
+                            dimValue += (conPeek(rec, 31));//Department
+                                                    
+                        }
+                        ledgerJournalTrans.LedgerDimension = GGIIntegrationsConcurUtility::getLedgerDimension(dimValue);
+                        ledgerJournalTrans.AccountType = LedgerJournalACType::Ledger;
+                        ledgerJournalTrans.Txt = conPeek(rec, 9);
+                        if (ledgerJournalTrans.LedgerDimension == 0)
+                        {
+                            ledgerJournalTrans.Txt = strFmt("Invalid Account values: ‘%1 – %2 – %3’ - ",conPeek(dimValue,1),conPeek(dimValue,2),conPeek(dimValue,3)) + ledgerJournalTrans.Txt;
+                        }
+                        if(conPeek(rec, 13) != "")
+                        {
+                            ledgerJournalTrans.Txt = ledgerJournalTrans.Txt + '-' + conPeek(rec, 13);//checked
+                        }
+                        ledgerJournalTrans.TransactionType = LedgerTransType::Vend;
+                        ledgerJournalTrans.TaxGroup = parameters.TaxGroup;
+                        ledgerJournalTrans.TaxItemGroup = parameters.TaxItemGroup;
+                        ledgerJournalTrans.Invoice = conPeek(rec, 5);                   //ReportId
+                        ledgerJournalTrans.CurrencyCode = conPeek(rec, 6);              //Currency
+                        ledgerJournalTrans.DocumentDate = str2Date(conPeek(rec, 7),321);//checked
+                        ledgerJournalTrans.AmountCurDebit = str2Num(conPeek(rec, 23));//checked
+                    
+                        ledgerJournalTrans.defaultRow();
+                        if (newVoucher)
+                        {
+                            JournalVoucherNum journalVoucherNum = new JournalVoucherNum(JournalTableData::newTable(LedgerJournalTable::find(ledgerJournalTable.JournalNum)));
+                            ledgerJournalTrans.Voucher = journalVoucherNum.getNew(true);
+                            journalVoucherNum.used(ledgerJournalTrans.Voucher);
+                        }
+                        
+                        ledgerJournalTrans.Approver = parameters.Approver;
+                        ledgerJournalTrans.Approved = parameters.Approved;
+                        ledgerJournalTrans.insert();
+                        VendorAcc = conPeek(rec, 2);//EmployeeId
+                    }
+                    
+                }
+                
+                ledgerJournalTransIterator.clear();
+                totalDebit = 0;
+                
+                if (ledgerJournalTrans.RecId !=0)
+                {
+                    select sum(AmountCurDebit)
+                           from ledgerJournalTransIterator order by Invoice where ledgerJournalTransIterator.JournalNum == ledgerJournalTable.JournalNum && ledgerJournalTransIterator.Invoice == ledgerJournalTrans.Invoice;
+                           
+                    totalDebit = ledgerJournalTransIterator.AmountCurDebit;
+                    if(totalDebit != 0)
+                    {
+                        this.insertVendorDebit(ledgerJournalTable.JournalNum, ledgerJournalTrans.Voucher, vendorAcc, ledgerJournalTrans.invoice, ledgerJournalTrans.currencyCode, ledgerJournalTrans.transDate, ledgerJournalTrans.documentDate, totalDebit);
+                                
+                    }
+                    
+                }
+                
+                //ttscommit;     
+                fileCounter++;
+            } 
+            if(fileCounter == 0)
+            {
+                info("No files processed.");
+            }
+            info("Operation complete.");
+            return true;
+
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch(Exception::Error)
+        {
+            info("Error processing file");
+            return false;
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertVendorDebit</Name>
+				<Source><![CDATA[
+    private void insertVendorDebit(LedgerJournalId _journalNum,Voucher _voucher, str _vendorAcc, InvoiceId _invoiceId, CurrencyCode _currencyCode, date _transDate, date _documentDate, Amount _totalDebit)
+    {
+        LedgerJournalTrans      ledgerJournalTrans;
+        VendAccount             vendAccount;
+        
+
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+        ledgerJournalTrans.JournalNum             = _journalNum;
+        ledgerJournalTrans.Voucher                = _voucher;
+        ledgerJournalTrans.TransDate              = _transDate;
+        //Build out financial dimensions
+        if(parameters.UseLegacyAccountCodes)
+        {
+            vendAccount = GGIIntegrationsConcurUtility::mapLegacyVendor(invoiceVendorMap.lookup(_invoiceId));
+        }
+        else
+        {
+            vendAccount = _vendorAcc;
+        }
+             
+        if(parameters.UseFakeVendorId)
+        {
+            vendAccount = parameters.VendAccount;
+        }
+        
+        try
+        {
+            ledgerJournalTrans.LedgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(vendAccount,LedgerJournalACType::Vend);
+        }
+        catch (Exception::Error)
+        {
+            ledgerJournalTrans.LedgerDimension = 0;
+        }
+        ledgerJournalTrans.AccountType = LedgerJournalACType::Vend;
+        ledgerJournalTrans.TransactionType = LedgerTransType::Vend;
+        ledgerJournalTrans.Invoice = _invoiceId;
+        ledgerJournalTrans.Txt = _invoiceId;
+        if (ledgerJournalTrans.LedgerDimension == 0)
+        {
+            ledgerJournalTrans.Txt = strFmt("Invalid Account value: ‘%1’ - ",vendAccount) + ledgerJournalTrans.Txt;
+        }
+        ledgerJournalTrans.CurrencyCode = _currencyCode;
+        ledgerJournalTrans.DocumentDate = _documentDate;
+                    
+        ledgerJournalTrans.AmountCurCredit = _totalDebit;
+                    
+        ledgerJournalTrans.defaultRow();
+        ledgerJournalTrans.Approver = parameters.Approver;
+        ledgerJournalTrans.Approved = parameters.Approved;
+        ledgerJournalTrans.insert();        
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReturnFileName</Name>
+				<Source><![CDATA[
+    public str getReturnFileName(str filePath)
+    {
+        str         actualFileName, fileExtension, actualFilePath;
+ 
+        [actualFilePath,actualFileName, fileExtension] = fileNameSplit(filePath);
+ 
+        return strfmt('%1_%2%3',actualFileName,this.TimestampString(),fileExtension);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>TimestampString</Name>
+				<Source><![CDATA[
+    public str TimestampString()
+    {
+        int time;
+        str s;
+ 
+        time    = timenow();
+        s       = date2Str(today(),
+                            321,
+                            DateDay::Digits2,
+                            DateSeparator::None, // no separator
+                            DateMonth::Digits2,
+                            DateSeparator::None, // no separator
+                            DateYear::Digits4);
+ 
+        return  s + "_" +
+                num2str0(time div 3600       ,2,0,0,0) + "_" +
+                num2Str0(time mod 3600 div 60,2,0,0,0) + "_" +
+                num2Str0(time mod 3600 mod 60,2,0,0,0);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

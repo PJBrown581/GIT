@@ -1,0 +1,450 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>DocCustomBlobStorageFontsUploadDialog</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+using DocFS = Docentric.AX.Storage.File;
+using Docentric.AX.Storage.Azure.BlobStorage;
+
+/// <summary>
+/// Dialog form for uploading ZIP package of font files to Azure Blob storage.
+/// </summary>
+[Form]
+public class DocCustomBlobStorageFontsUploadDialog extends FormRun
+{
+    FormDataSource          callerReportFormDataSource;
+    System.IO.Stream        templateZipPackageContent;
+    DocParameters           docParameters;
+
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize the form.
+    /// </summary>
+    public void init()
+    {
+        super();
+    
+        if (this.args() != null)
+        {
+            // Initialize form values
+            docParameters = this.args().record();
+            ContainerName.text(docParameters.CustomFontsBlobStorageContainer);
+        }
+
+        // Update the instruction text
+        str maximumAllowedPackageFile = strFmt('%1MB', num2Str(DocConstant::CustomBlobStorageFontsMaximumZipFileSize / 1024 / 1024, 0, 0, -1, -1));
+        Instructions.text(strFmt("@DocentricAX3:DocCustomBlobStorageFontsUploadDialogInstructionText", maximumAllowedPackageFile));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfCustomFontsZipPackageExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method for checking if the blob ZIP package container exists in current Azure Storage container
+    /// </summary>
+    /// <returns>True if blob ZIP package exists, otherwise False</returns>
+    private boolean checkIfCustomFontsZipPackageExists()
+    {
+        str blobName = DocConstant::CustomBlobStorageFontsZipFilename;
+        str azureContainer = ContainerName.text();
+        boolean blobExists = false;
+
+        try
+        {
+            // Check if the blob already exists.
+            blobExists = BlobStorageHelper::BlobExists(azureContainer, blobName);
+        }
+        catch
+        {
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:ErrorRetrievingBlobStorageExists", blobName, azureContainer));
+        }
+
+        return blobExists;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeOk</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// User clicks OK.
+    /// </summary>
+    public void closeOk()
+    {
+        // Check if form is valid
+        if (!this.validate())
+        {
+            return;
+        }
+
+        // If custom fonts exist on server ask the user to confirm replacement of custom fonts
+        if (this.checkIfCustomFontsZipPackageExists())
+        {
+            // Ask user to confirm replace of existing fonts
+            DialogButton dlgResult = Box::yesNo("@DocentricAX3:ReplaceTemplateFontsConfirmDialogText",
+            DialogButton::No,
+                "@DocentricAX3:ReplaceTemplateFontsConfirmDialogTitle");
+
+            // If the user selected No then cancel replace of existing custom fonts.
+            if (dlgResult == DialogButton::No)
+            {
+                return;
+            }
+        }
+
+        // Do actual reading of source font ZIP package, check all included fonts, 
+        // repack and flatten all files to new ZIP package and upload it to Azure Blob storage
+        boolean shouldClose = false;
+        int uploadedTemplateFontCount, fileInArchiveListCount, invalidFilesInArchiveListCount;
+
+        str azureContainer = ContainerName.text();
+        [uploadedTemplateFontCount, fileInArchiveListCount, invalidFilesInArchiveListCount] =
+               DocReportingSetupHelper::uploadTemplateFontsToAzureContainer(templateZipPackageContent, azureContainer, true, true);
+
+        // Display the result to UI
+        if (fileInArchiveListCount == 0)
+        {
+            DocGlobalHelper::handleWarning("@DocentricAX3:NoTemplateFontsInZipArchive");
+        }
+        else // if (fileInArchiveListCount > 0)
+        {
+            if (uploadedTemplateFontCount == 0)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:UploadedTemplateFontCountZeroAzure", fileInArchiveListCount, azureContainer));
+            }
+            else // if (uploadedTemplateCount > 0)
+            {
+                super();
+                DocGlobalHelper::handleInfo(strFmt("@DocentricAX3:UploadedTemplateFontCountAzure", uploadedTemplateFontCount, fileInArchiveListCount, azureContainer));
+                shouldClose = true;
+            }
+            int failedToUpload = fileInArchiveListCount - uploadedTemplateFontCount;
+            if (failedToUpload > 0 && uploadedTemplateFontCount > 0)
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:TemplateFontFilesCountFailedUpload", failedToUpload, fileInArchiveListCount));
+            }
+        }
+
+        if (shouldClose)
+        {
+            // We need to do cleanup
+            if (templateZipPackageContent != null)
+            {
+                templateZipPackageContent.Dispose();
+                templateZipPackageContent = null;
+            }
+
+            if (docParameters != null)
+            {
+                // we only refresh if there were any changes on the form
+                if (docParameters.CustomFontsBlobStorageContainer != azureContainer)
+                {
+                    docParameters.CustomFontsBlobStorageContainer = azureContainer;
+                    FormDataUtil::getFormDataSource(docParameters).refresh();
+                    //docParameters.dataSource().refresh();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate input values before we can click OK.
+    /// </summary>
+    /// <returns></returns>
+    public boolean validate()
+    {
+        // Check, if ZIP package is present
+        if (templateZipPackageContent == null)
+        {
+            DocGlobalHelper::handleWarning("@DocentricAX:SelecteAndUploadZipPackageWarning");
+            return false;
+        }
+
+        if (templateZipPackageContent.Length > DocConstant::CustomBlobStorageFontsMaximumZipFileSize)
+        {
+            str maximumAllowedPackageFile = strFmt('%1MB', num2Str(DocConstant::CustomBlobStorageFontsMaximumZipFileSize / 1024 / 1024, 0, 0, -1, -1));
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX3:MaximumTemplateFontZipFileExceeded", maximumAllowedPackageFile));
+            return false;
+        }
+
+        // Check the container name
+        str blobContainerName = ContainerName.text();
+
+        if (blobContainerName == '')
+        {
+            return false;
+        }
+
+        if (!DocAzureBlobHelper::isContainerNameValid(blobContainerName))
+        {
+            DocGlobalHelper::handleWarning(strFmt("@DocentricAX:InvalidContainerName", blobContainerName));
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="" />
+		<DataControls xmlns="">
+			<Control>
+				<Name>GetZipPackage</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Upload source font ZIP package to temporary Azure Blob storage
+        /// </summary>
+        public void clicked()
+        {
+            str errMsg = "@DocentricAX3:TemplateFontsUploadFailed";
+            str templateZipPackageFilename;
+
+            super();
+
+            ZipPackageName.text('');
+            // Dispose existing package, if it was uploaded before
+            if (templateZipPackageContent != null)
+            {
+                templateZipPackageContent.Dispose();
+                templateZipPackageContent = null;
+            }
+
+            if (DocConstantGlobal::isOnPremEnvironment()) // on-premise upload scenario
+            {
+                DocFS.File templateZipPackage = DocFileUploadOnPremHelper::GetFileFromUser(DocConstantFile::FileExtensionDelimiter + DocConstantFile::FileExtZip);
+                if (templateZipPackage != null)
+                {
+                    try
+                    {
+                        templateZipPackageFilename = templateZipPackage.Name;
+                        templateZipPackageContent = DocGlobalHelper::convertBytesToMemoryStream(templateZipPackage.Bytes);
+                        if (templateZipPackageContent == null || templateZipPackageFilename == '')
+                        {
+                            throw Exception::Error;
+                        }
+                        ZipPackageName.text(templateZipPackageFilename);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleError(errMsg);
+                    }
+                }
+            }
+            else // cloud upload scenario
+            {
+                FileUploadResultBase result = File::GetFileFromUser(classStr(DocFileUploadTemporaryFontsZipFileStorageStrategy));
+                if (result && result.getUploadStatus())
+                {
+                    try
+                    {
+                        templateZipPackageContent = result.openResult();
+                        templateZipPackageFilename = result.getFileName();
+                    }
+                    catch (Exception::CLRError)
+                    {
+                        DocGlobalHelper::handleClrError('', errMsg, true);
+                    }
+                    catch (Exception::Internal)
+                    {
+                        DocGlobalHelper::handleClrError('', errMsg, true);
+                    }
+                    catch
+                    {
+                        DocGlobalHelper::handleError(errMsg, true, '', true);
+                    }
+
+                    if (templateZipPackageContent == null || templateZipPackageFilename == '')
+                    {
+                        DocGlobalHelper::handleError(errMsg, true, '', true);
+                    }
+
+                    ZipPackageName.text(templateZipPackageFilename);
+                }
+            }
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources />
+	<Design>
+		<Caption xmlns="">@DocentricAX3:DocCustomBlobStorageFontsUploadDialog</Caption>
+		<DefaultAction xmlns="">OKButton</DefaultAction>
+		<DialogSize xmlns="">Medium</DialogSize>
+		<Pattern xmlns="">Dialog</Pattern>
+		<PatternVersion xmlns="">1.2</PatternVersion>
+		<Style xmlns="">Dialog</Style>
+		<ViewEditMode xmlns="">Edit</ViewEditMode>
+		<WindowType xmlns="">Popup</WindowType>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormStaticTextControl">
+				<Name>Instructions</Name>
+				<AutoDeclaration>Yes</AutoDeclaration>
+				<ExtendedStyle>dialog_secondaryInstruction</ExtendedStyle>
+				<Type>StaticText</Type>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Text>@DocentricAX3:DocCustomBlobStorageFontsUploadDialogInstructionText</Text>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>DialogHeader</Name>
+				<Pattern>FieldsFieldGroups</Pattern>
+				<PatternVersion>1.1</PatternVersion>
+				<Type>Group</Type>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormGroupControl">
+						<Name>AzureContainerTarget</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Type>Group</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>ContainerName</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<Type>String</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>DocCustomFontsBlobStorageContainer</ExtendedDataType>
+								<Mandatory>Yes</Mandatory>
+							</AxFormControl>
+						</Controls>
+					</AxFormControl>
+				</Controls>
+				<ColumnsMode>Fill</ColumnsMode>
+				<Style>DialogContent</Style>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>DialogContent</Name>
+				<ElementPosition>715827882</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<HeightMode>SizeToAvailable</HeightMode>
+				<Pattern>FieldsFieldGroups</Pattern>
+				<PatternVersion>1.1</PatternVersion>
+				<Type>Group</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormGroupControl">
+						<Name>ZipPackageNameGroup</Name>
+						<Type>Group</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>ZipPackageName</Name>
+								<AllowEdit>No</AllowEdit>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HelpText>@DocentricAX3:UploadZipWithCustomFontsHelp</HelpText>
+								<Skip>Yes</Skip>
+								<Type>String</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>DocReportTemplateZipFilename</ExtendedDataType>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonControl">
+								<Name>GetZipPackage</Name>
+								<ExtendedStyle>button_inlineImageOnly</ExtendedStyle>
+								<Type>Button</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<ButtonDisplay>ImageOnly</ButtonDisplay>
+								<NormalImage>Upload</NormalImage>
+								<Text>@DocentricAX2:UploadFile</Text>
+							</AxFormControl>
+						</Controls>
+						<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+						<FrameType>None</FrameType>
+					</AxFormControl>
+				</Controls>
+				<ColumnsMode>Fill</ColumnsMode>
+				<Style>DialogContent</Style>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormButtonGroupControl">
+				<Name>ButtonGroup</Name>
+				<ElementPosition>1073741822</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<LeftMode>AutoRight</LeftMode>
+				<Type>ButtonGroup</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>OKButton</Name>
+						<ElementPosition>1073741822</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Skip>Yes</Skip>
+						<Type>CommandButton</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Command>OK</Command>
+						<DefaultButton>Yes</DefaultButton>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>CancelButton</Name>
+						<ElementPosition>1610612733</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Skip>Yes</Skip>
+						<Type>CommandButton</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Command>Cancel</Command>
+					</AxFormControl>
+				</Controls>
+				<ArrangeMethod>HorizontalRight</ArrangeMethod>
+				<Style>DialogCommitContainer</Style>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

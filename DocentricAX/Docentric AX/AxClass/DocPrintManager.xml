@@ -1,0 +1,1109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocPrintManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Diagnostics;
+
+public class DocPrintManager
+{
+    DocPrintReportSettings            printReportSettings;
+    DocPrintDestSettingsGenerateDS    generateDSPrintDestSettings;
+    DocPrintDestSettingsPrinter       printerPrintDestSettings;
+    DocPrintDestSettingsEmail         emailPrintDestSettings;
+    DocPrintDestSettingsFile          filePrintDestSettings;
+    DocPrintDestSettingsMemory        memoryPrintDestSettings;
+    RecId                             batchId, batchJobId;
+    DocReportType                     reportType;
+    DocReportTable                    reportTableActiveReport;
+    DocReportExecutionInfo            docReportExecutionInfo;
+    DocReportRunDelegates             delegatesHelper;
+    boolean                           isTargetTemplateErBased = false;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>cleanPrintDestinationSettings</Name>
+				<Source><![CDATA[
+    private void cleanPrintDestinationSettings()
+    {
+        switch (printReportSettings.parmPrintDestination())
+        {
+            case DocPrintDestination::File:
+                // Replace invalid characters in output filename
+                filePrintDestSettings.escapeOutputFilename();
+                break;
+
+            case DocPrintDestination::Email:
+                // Replace invalid characters in the attachment filename.
+                emailPrintDestSettings.escapeAttachmentFilename();
+
+                // Remove all empty and duplicated email addresses from To, Cc and Bcc email lists, if any.
+                emailPrintDestSettings.deleteEmptyAndDuplicatedEmailAddresses();
+
+                // Fix bare line feeds.
+                // Bare line feeds (LF) without the carriage return character (CR) are found in the email message body when print settings are loaded from SysLastValue.
+                // This is a MS bug but we created here a workaround that replaces each occurrence of LF with CRLF field in the email message body.
+                emailPrintDestSettings.fixBareLinefeeds();
+
+                // Call delegate publisher for removing invalid email addresses.
+                emailPrintDestSettings.removeInvalidEmailAddresses(printReportSettings);
+                break;
+
+            case DocPrintDestination::Printer:
+                // Replace invalid characters in the PDF filename.
+                printerPrintDestSettings.escapePdfFilename();
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDocReportExecutionInfo</Name>
+				<Source><![CDATA[
+    public DocReportExecutionInfo getDocReportExecutionInfo()
+    {
+        return docReportExecutionInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRuntimeReportDataSourceProvider</Name>
+				<Source><![CDATA[
+    private DocDataSourceProviderBase getRuntimeReportDataSourceProvider(DocReportRunContext _reportRunContext)
+    {
+        // Set default values and init DS provider params from Report params.
+        DocDataSourceProviderParams dsParams = new DocDataSourceProviderParams();
+        this.initDsParamsForReportRunTime(dsParams);
+        dsParams.setDefaultParmValues();
+    
+        DocDataSourceProviderParamsReporting dsParamsReporting = new DocDataSourceProviderParamsReporting();
+        this.initDsReportParamsForDesignAndRunTime(dsParamsReporting, _reportRunContext);
+    
+        DocDataSourceProviderBase dsProvider = DocDataSourceProviderBase::constructOnServer(dsParams.parmDsProviderDerivedClassName());
+
+        // Set params.
+        dsProvider.parmParams(dsParams);
+        dsProvider.parmParamsReporting(dsParamsReporting);
+    
+        // Return.
+        return dsProvider;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDsParamsForReportDesignTime</Name>
+				<Source><![CDATA[
+    private void initDsParamsForReportDesignTime(DocDataSourceProviderParams dsParams, DocDataSourceGenerationMode _dataSourceGenerationMode)
+    {
+        dsParams.parmIsRuntime(false);
+        dsParams.parmDocentricScriptEngine(generateDSPrintDestSettings.getDocentricEngine());
+    
+        dsParams.parmCompanyId(printReportSettings.parmCompanyId());
+        dsParams.parmHcmWorkerRecId(printReportSettings.parmHcmWorkerRecId());
+        dsParams.parmUserId(printReportSettings.parmUserId());
+    
+        dsParams.parmDsLanguageId(generateDSPrintDestSettings.parmLanguageId());
+        dsParams.parmPreviewLanguages(generateDSPrintDestSettings.parmPreviewLanguages());
+        dsParams.parmSaveXmlDataSourceToFile(true);
+    
+        // Set SSRS Data source generation mode that is applicable only for SSRS reports.
+        dsParams.parmDataSourceGenerationMode(_dataSourceGenerationMode);
+
+        // Set DDSP filename.
+        if (_dataSourceGenerationMode == DocDataSourceGenerationMode::ConfigurableBusinessDocuments)
+        {
+            str ddspCbdFilename = DocFileMngHelper::getFileNameWithoutExtension(generateDSPrintDestSettings.parmXmlDataSourceFilename()) +
+                                  DocConstantFile::CBDFilenameSuffix +
+                                  DocFileMngHelper::getFileExtensionWithDot(generateDSPrintDestSettings.parmXmlDataSourceFilename());
+            dsParams.parmXmlDataSourceFilename(ddspCbdFilename);
+        }
+        else
+        {
+            dsParams.parmXmlDataSourceFilename(generateDSPrintDestSettings.parmXmlDataSourceFilename());
+        }
+
+        if (reportTableActiveReport.RecId != 0)
+        {
+            dsParams.parmIncludeCompanyLogoInDs(reportTableActiveReport.IncludeCompanyLogoInDS);
+            dsParams.parmDsProviderDerivedClassName(reportTableActiveReport.DataSourceProviderClassName);
+            dsParams.parmIncludeDisplayMethodsInDs(reportTableActiveReport.IncludeAllDisplayMethodsInDS);
+            
+            // Set ER Model Mapping and Data Model.
+            dsParams.parmERModelMappingTable(reportTableActiveReport.ERModelMappingTable());
+            dsParams.parmERDataModelTable(reportTableActiveReport.ERDataModelTable());
+            dsParams.parmERSolutionTable(reportTableActiveReport.ERSolutionTable());
+            dsParams.parmERModelDataToIncludeInDS(reportTableActiveReport.ERModelDataToIncludeInDS);
+        }
+        else
+        {
+            dsParams.parmIncludeCompanyLogoInDs(false);
+            dsParams.parmDsProviderDerivedClassName(classStr(DocDataSourceProviderSrsReporting));
+            dsParams.parmIncludeDisplayMethodsInDs(false);
+            dsParams.parmERModelMappingTable(null);
+            dsParams.parmERDataModelTable(null);
+            dsParams.parmERSolutionTable(null);
+            dsParams.parmERModelDataToIncludeInDS(DocERModelDataToIncludeInDS::IncludeMappedDataOnly);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDsParamsForReportRunTime</Name>
+				<Source><![CDATA[
+    private void initDsParamsForReportRunTime(DocDataSourceProviderParams dsParams)
+    {
+        dsParams.parmIsRuntime(true);
+        dsParams.parmDocentricScriptEngine(DocConstantDSP::ScriptEngineTemplateDefined);
+    
+        dsParams.parmCompanyId(printReportSettings.parmCompanyId());
+        dsParams.parmHcmWorkerRecId(printReportSettings.parmHcmWorkerRecId());
+        dsParams.parmDsLanguageId(printReportSettings.parmLanguageId());
+        dsParams.parmUserId(printReportSettings.parmUserId());
+    
+        dsParams.parmXmlDataSourceFilename('');
+        dsParams.parmSaveXmlDataSourceToFile(false);
+    
+        if (reportTableActiveReport.RecId != 0)
+        {
+            dsParams.parmIncludeCompanyLogoInDs(reportTableActiveReport.IncludeCompanyLogoInDS);
+            dsParams.parmDsProviderDerivedClassName(reportTableActiveReport.DataSourceProviderClassName);
+            dsParams.parmIncludeDisplayMethodsInDs(reportTableActiveReport.IncludeAllDisplayMethodsInDS);
+            
+            // Set ER Model Mapping and Data Model.
+            ERModelMappingTable erModelMapping = reportTableActiveReport.ERModelMappingTable();
+            if (erModelMapping)
+            {
+                dsParams.parmERModelMappingTable(erModelMapping);
+                dsParams.parmERDataModelTable(reportTableActiveReport.ERDataModelTable());
+                dsParams.parmERSolutionTable(reportTableActiveReport.ERSolutionTable());
+                // In the runtime, we always include Mapped Data only.
+                dsParams.parmERModelDataToIncludeInDS(DocERModelDataToIncludeInDS::IncludeMappedDataOnly);
+            }
+            else
+            {
+                dsParams.parmERModelMappingTable(null);
+                dsParams.parmERDataModelTable(null);
+                dsParams.parmERSolutionTable(null);
+                dsParams.parmERModelDataToIncludeInDS(DocERModelDataToIncludeInDS::IncludeMappedDataOnly);
+            }
+            
+            // Set SSRS Data source generation mode that is applicable only for SSRS reports.
+            dsParams.parmDataSourceGenerationMode(DocDataSourceGenerationMode::NotSet);
+            if (reportTableActiveReport.ReportUsageType == DocReportUsageType::ClassicSSRS)
+            {
+                dsParams.parmDataSourceGenerationMode(isTargetTemplateErBased ? DocDataSourceGenerationMode::ConfigurableBusinessDocuments : DocDataSourceGenerationMode::SSRS);
+            }
+        }
+        else
+        {
+            dsParams.parmIncludeCompanyLogoInDs(false);
+            dsParams.parmDsProviderDerivedClassName(classStr(DocDataSourceProviderSrsReporting));
+            dsParams.parmIncludeDisplayMethodsInDs(false);
+            dsParams.parmERModelMappingTable(null);
+            dsParams.parmERDataModelTable(null);
+            dsParams.parmERSolutionTable(null);
+            dsParams.parmERModelDataToIncludeInDS(DocERModelDataToIncludeInDS::IncludeMappedDataOnly);
+            // If we are running a report without any entry in Docentric report setup, we can safely assumed that this is a classic SSRS.
+            dsParams.parmDataSourceGenerationMode(DocDataSourceGenerationMode::SSRS);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDsReportParamsForDesignAndRunTime</Name>
+				<Source><![CDATA[
+    private void initDsReportParamsForDesignAndRunTime(DocDataSourceProviderParamsReporting _dsParamsReporting,
+                                                       DocReportRunContext _reportRunContext)
+    {
+        _dsParamsReporting.parmReportExecutionContextDataAreaId(printReportSettings.parmReportExecutionContextDataAreaId());
+        _dsParamsReporting.parmReportExecutionContextTableId(printReportSettings.parmReportExecutionContextTableId());
+        _dsParamsReporting.parmReportExecutionContextTableRecId(printReportSettings.parmReportExecutionContextTableRecId());
+        _dsParamsReporting.parmReportId(printReportSettings.parmReportId());
+        _dsParamsReporting.parmReportCaption(printReportSettings.parmReportCaption());
+        _dsParamsReporting.parmReportMenuItemName(printReportSettings.parmReportMenuItemName());
+        _dsParamsReporting.parmReportMenuItemType(printReportSettings.parmReportMenuItemType());
+        _dsParamsReporting.parmSrsReportContract(printReportSettings.parmSrsReportContract());
+        _dsParamsReporting.parmReportRunContext(_reportRunContext);
+        _dsParamsReporting.parmOriginalCopyType(printReportSettings.parmOriginalCopyType());
+        _dsParamsReporting.parmDocumentTitleOriginal(printReportSettings.parmDocumentTitleOriginal());
+        _dsParamsReporting.isPrintingSsrsBuiltInDesign(printReportSettings.printSrsOriginalDesign());
+        _dsParamsReporting.parmTargetPrintDestination(printReportSettings.parmPrintDestination());
+        _dsParamsReporting.parmIsTargetTemplateERBased(isTargetTemplateErBased);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(DocPrintReportSettings         _printReportSettings,
+                       DocPrintDestSettingsGenerateDS _generateDSPrintDestSettings,
+                       DocPrintDestSettingsPrinter    _printerPrintDestSettings,
+                       DocPrintDestSettingsEmail      _emailPrintDestSettings,
+                       DocPrintDestSettingsFile       _filePrintDestSettings,
+                       DocPrintDestSettingsMemory     _memoryPrintDestSettings,
+                       DocReportType                  _reportType,
+                       RecId                          _batchId,
+                       RecId                          _batchJobId)
+    {
+        // Validate parameters.
+        if (_printReportSettings == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _printReportSettings is null');
+        }
+        
+        if (!_printReportSettings.parmReportId())
+        {
+            DocGlobalHelper::handleException(funcName(), "@DocentricAX:ReportIdIsNotSet");
+        }
+
+        // Find the executing report in Docentric report setup, if it is Active.
+        // Note that the report can exists in Docentric report setup but will not be found if the IsActiveSRS field is set to false.
+        reportTableActiveReport = DocReportTable::findActiveReport(_printReportSettings.parmReportId());
+        
+        // If the executing report is registered in Docentric report setup and it is active, validate the DSP class.
+        if (reportTableActiveReport.RecId != 0 && !reportTableActiveReport.validateDsProviderClass())
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:ReportDspClassInvalid", _printReportSettings.parmReportId()));
+        }
+        
+        // Instance new DocPrintManager object
+        this.instance(_printReportSettings, _generateDSPrintDestSettings, _printerPrintDestSettings, _emailPrintDestSettings,
+                      _filePrintDestSettings, _memoryPrintDestSettings, _reportType, _batchId, _batchJobId);
+       
+        // Instance a DocReportExecutionInfo object.
+        docReportExecutionInfo = DocReportExecutionInfo::constructOnReportExecutionBegin(
+            printReportSettings, filePrintDestSettings, emailPrintDestSettings, printerPrintDestSettings,
+            memoryPrintDestSettings, batchId, batchJobId);
+
+        // Remove all empty and duplicated email addresses from To, Cc, Bcc, Reply-to, Bounce-to and From email address(es), if any.
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::Email)
+        {
+            emailPrintDestSettings.deleteEmptyAndDuplicatedEmailAddresses();
+        }
+
+        // Set default values if not set.
+        this.setDefaultParmValuesInSettings();
+
+        if (printReportSettings.parmPrintDestination() != DocPrintDestination::GenerateDataSource)
+        {
+            // If the report is printed using a Docentric template, it has to be registered in Docentric report setup (and active).
+            // NOTE: We already did kind of the same check in the DocSrsReportRunUtil::validateReportAndSelectedDocentricTemplate() method
+            // invoked from the DocSrsReportRunUtil::constructPrintManagerFromSrsReportDataContract() -> DocPrintManager::construct() method.
+            if (!_printReportSettings.printSrsOriginalDesign() && reportTableActiveReport.RecId == 0)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX:ReportWithIdNotExist", _printReportSettings.parmReportId()));
+            }
+
+            // Determine if the selected template is an ER based template.
+            isTargetTemplateErBased = reportTableActiveReport.isTemplateERBased(printReportSettings.parmTemplateId(), printReportSettings.parmCompanyId(), printReportSettings.parmLanguageId());
+
+            // If the selected template is ER-based, check if the CBD feature is enabled.
+            if (isTargetTemplateErBased && !DocParameters::find().EnableCbdDs)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:CannotUserERBasedTemplateWithCbdFeatureTurnedOff", printReportSettings.parmTemplateId()));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instance</Name>
+				<Source><![CDATA[
+    private void instance(DocPrintReportSettings         _printReportSettings,
+                          DocPrintDestSettingsGenerateDS _generateDSPrintDestSettings,
+                          DocPrintDestSettingsPrinter    _printerPrintDestSettings,
+                          DocPrintDestSettingsEmail      _emailPrintDestSettings,
+                          DocPrintDestSettingsFile       _filePrintDestSettings,
+                          DocPrintDestSettingsMemory     _memoryPrintDestSettings,
+                          DocReportType                  _reportType,
+                          RecId                          _batchId,
+                          RecId                          _batchJobId)
+    {
+        reportType = _reportType;
+        batchId = _batchId;
+        batchJobId = _batchJobId;
+    
+        boolean isExecutingInBatch = batchId != 0 || batchJobId != 0;
+    
+        printReportSettings = _printReportSettings;
+    
+        if (!printReportSettings.parmExecuteOnlyData())
+        {
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::GenerateDataSource &&
+                _generateDSPrintDestSettings == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _generateDSPrintDestSettings is null');
+            }
+    
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::Printer &&
+                _printerPrintDestSettings == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _printerPrintDestSettings is null');
+            }
+    
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::Email &&
+                _emailPrintDestSettings == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _emailPrintDestSettings is null');
+            }
+    
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::File &&
+                _filePrintDestSettings == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _filePrintDestSettings is null');
+            }
+
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::Memory &&
+                _memoryPrintDestSettings == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'Parameter _memoryPrintDestSettings is null');
+            }
+        }
+    
+        // Initialize.
+        generateDSPrintDestSettings = _generateDSPrintDestSettings;
+        if (generateDSPrintDestSettings == null)
+        {
+            generateDSPrintDestSettings = new DocPrintDestSettingsGenerateDS();
+        }
+    
+        printerPrintDestSettings = _printerPrintDestSettings;
+        if (printerPrintDestSettings == null)
+        {
+            printerPrintDestSettings = new DocPrintDestSettingsPrinter();
+        }
+    
+        emailPrintDestSettings = _emailPrintDestSettings;
+        if (emailPrintDestSettings == null)
+        {
+            emailPrintDestSettings = new DocPrintDestSettingsEmail();
+        }
+    
+        filePrintDestSettings = _filePrintDestSettings;
+        if (filePrintDestSettings == null)
+        {
+            filePrintDestSettings = new DocPrintDestSettingsFile();
+        }
+
+        memoryPrintDestSettings = _memoryPrintDestSettings;
+        if (memoryPrintDestSettings == null)
+        {
+            memoryPrintDestSettings = new DocPrintDestSettingsMemory();
+        }
+        
+        // Check if the selected print destination can be executed in batch.
+        if (isExecutingInBatch)
+        {
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::Screen)
+            {
+                DocGlobalHelper::handleException(funcName(), "@DocentricAX:PrintToScreenNotAllowedInBatch");
+            }
+    
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::GenerateDataSource)
+            {
+                DocGlobalHelper::handleException(funcName(), "@DocentricAX:PrintToGenerateDsNotAllowedInBatch");
+            }
+
+            if (printReportSettings.parmPrintDestination() == DocPrintDestination::File &&
+                filePrintDestSettings.parmSaveToAttachments() == false &&
+                filePrintDestSettings.parmSaveToSharePoint() == false &&
+                filePrintDestSettings.parmSaveToAzureBlobStorage() == false &&
+                filePrintDestSettings.parmSaveToAzureFiles() == false &&
+                filePrintDestSettings.parmSaveToFileSystem() == false)
+            {
+                DocGlobalHelper::handleException(funcName(), "@DocentricAX:PrintToFileNotAllowedInBatch");
+            }
+        }
+
+        delegatesHelper = DocReportRunDelegates::instance();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>overrideReportRunSettings</Name>
+				<Source><![CDATA[
+    private boolean overrideReportRunSettings(DocDataSourceProviderBase _dsProvider, DocReportRunContext _reportRunContext)
+    {
+        boolean reportCaptionOverriden = false;
+        
+        // Override TemplateId.
+        if (printReportSettings.parmTemplateId() != _reportRunContext.parmTemplateId())
+        {
+            // Check if the changed template ID belogns to the same report as the original one
+            DocReportId reportId = DocReportTable::findReportTemplateId(_reportRunContext.parmTemplateId()).ReportId;
+            if (reportTableActiveReport.ReportId != reportId)
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:ChangeTemplateIdError",
+                    printReportSettings.parmTemplateId(), printReportSettings.parmCompanyId(), printReportSettings.parmLanguageId(), reportTableActiveReport.ReportId,
+                    _reportRunContext.parmTemplateId(), _reportRunContext.parmTemplateCompanyId(), _reportRunContext.parmTemplateLanguageId(), reportId,
+                    classId2Name(classIdGet(_dsProvider))));
+            }
+
+            // Before overridding the template ID, check if the new template differs regarding its DataSourceType (i.e. ER based vs. SSRS based).
+            if (isTargetTemplateErBased != reportTableActiveReport.isTemplateERBased(_reportRunContext.parmTemplateId(), _reportRunContext.parmTemplateCompanyId(), _reportRunContext.parmTemplateLanguageId()))
+            {
+                DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX3:ChangeTemplateIdError", 
+                    printReportSettings.parmTemplateId(), printReportSettings.parmCompanyId(), printReportSettings.parmLanguageId(),
+                    isTargetTemplateErBased ? DocTemplateDataSourceType::ERDataModel : DocTemplateDataSourceType::SSRS,
+                    _reportRunContext.parmTemplateId(), _reportRunContext.parmTemplateCompanyId(), _reportRunContext.parmTemplateLanguageId(),
+                    isTargetTemplateErBased ? DocTemplateDataSourceType::SSRS : DocTemplateDataSourceType::ERDataModel,
+                    classId2Name(classIdGet(_dsProvider))));
+            }
+
+            // Override the template.
+            printReportSettings.parmTemplateId(_reportRunContext.parmTemplateId());
+        }
+    
+        // Override LanguageId which will be used only for retrieving the template and for resoving dynamic labels used in the template.
+        // All other labels has been already resolved, and placeholders has been formatted using the run-time language.
+        // To change the runtime language which affects all the aspects, use dspClass.parmParams().parmDsLanguageId() in the dspClass.preRunGenerateDS() method;
+        // afterwards _reportRunContext.parmTemplateLanguageId() gets updated in DocDataSourceProviderBase.updateReportRunContext().
+        printReportSettings.parmLanguageId(_reportRunContext.parmTemplateLanguageId());
+    
+        // From 3.3.9: Skip overriding CompanyId.
+        //printReportSettings.parmCompanyId(_reportRunContext.parmTemplateCompanyId());
+    
+        // Override Report Execution Context.
+        printReportSettings.parmReportExecutionContextTableId(_reportRunContext.parmReportExecutionContextTableId());
+        printReportSettings.parmReportExecutionContextDataAreaId(_reportRunContext.parmReportExecutionContextDataAreaId());
+        printReportSettings.parmReportExecutionContextTableRecId(_reportRunContext.parmReportExecutionContextTableRecId());
+
+        // Override the SaveToArchive flag and the Print archive's document type.
+        printReportSettings.parmSaveToArchive(_reportRunContext.parmSaveToArchive());
+        printReportSettings.parmSaveToArchiveDocuTypeId(_reportRunContext.parmSaveToArchiveDocuTypeId());
+        printReportSettings.parmSaveToArchiveNote(_reportRunContext.parmSaveToArchiveNote());
+        printReportSettings.parmSaveToArchiveSharePointMetadata(_reportRunContext.parmSaveToArchiveSharePointMetadata());
+    
+        // Override the SuppressSuccessMsg flag.
+        printReportSettings.parmSuppressSuccessMsg(_reportRunContext.parmSuppressSuccessMsg());
+    
+        // Override the ExecuteOnlyData flag.
+        printReportSettings.parmExecuteOnlyData(_reportRunContext.parmExecuteOnlyData());
+    
+        // Override PrintDestination.
+        printReportSettings.parmPrintDestination(_reportRunContext.parmPrintDestination());
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::GenerateDataSource)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Print destination cannot be overriden to "Generate data source" in the runtime');
+        }
+    
+        // Override ReportCaption.
+        if (printReportSettings.parmReportCaption() != _reportRunContext.parmReportCaption())
+        {
+            printReportSettings.parmReportCaption(_reportRunContext.parmReportCaption());
+            reportCaptionOverriden = true;
+        }
+
+        // Override ArchiveContract.
+        printReportSettings.parmArchiveContract(_reportRunContext.archiveContract());
+    
+        // Override CustomSettings.
+        printReportSettings.parmCustomSettings(_reportRunContext.parmCustomSettings());
+
+        // Override Preview before print.
+        printReportSettings.parmPreviewBeforePrint(_reportRunContext.parmPreviewBeforePrint());
+
+        // Override AttachmentRuleList.
+        printReportSettings.parmAttachmentRuleList(_reportRunContext.attachmentRuleList());
+
+        // Override PDF encryption settings PdfPassword, PdfEncryptionCondition and PDFEncryptionAlgorithm.
+        printReportSettings.parmPdfPassword(_reportRunContext.parmPdfPassword());
+        printReportSettings.parmPdfEncryptionConditionSet(_reportRunContext.parmPdfEncryptionConditionSet());
+        printReportSettings.parmPdfEncryptionAlgorithm(_reportRunContext.parmPdfEncryptionAlgorithm());
+
+        // Override PDF signature settings.
+        printReportSettings.parmPdfSignatureSettings(_reportRunContext.parmPdfSignatureSettings());
+
+        // Override PDF/A conformance level.
+        printReportSettings.parmPdfAConformanceLevel(_reportRunContext.parmPdfAConformanceLevel());
+
+        // Override document properties Title, Author, Subject and Keywords.
+        printReportSettings.parmDocumentTitle(_reportRunContext.parmDocumentTitle());
+        printReportSettings.parmDocumentAuthor(_reportRunContext.parmDocumentAuthor());
+        printReportSettings.parmDocumentSubject(_reportRunContext.parmDocumentSubject());
+        printReportSettings.parmDocumentKeywords(_reportRunContext.parmDocumentKeywords());
+
+        // Set the report placeholder map, which contains all Custom placeholders for the report
+        // and those Standard placeholders which are used in the target print destination settings.
+        // This map doesn't contain any User-defined placeholders.
+        // This map was built during processing Custom placeholders in the DocPlaceholderManager class.
+        printReportSettings.parmPlaceholderMap(_reportRunContext.placeholderMap());
+
+        // Override print destination settings.
+        switch (printReportSettings.parmPrintDestination())
+        {
+            case DocPrintDestination::Email:
+                emailPrintDestSettings = _reportRunContext.emailPrintDestSettings();
+                if (emailPrintDestSettings == null)
+                {
+                    emailPrintDestSettings = new DocPrintDestSettingsEmail();
+                }
+                docReportExecutionInfo.parmEmailPrintDestSettings(emailPrintDestSettings);
+                break;
+    
+            case DocPrintDestination::File:
+                filePrintDestSettings = _reportRunContext.filePrintDestSettings();
+                if (_reportRunContext.filePrintDestSettings() == null)
+                {
+                    filePrintDestSettings = new DocPrintDestSettingsFile();
+                }
+                docReportExecutionInfo.parmFilePrintDestSettings(filePrintDestSettings);
+                break;
+    
+            case DocPrintDestination::Printer:
+                printerPrintDestSettings = _reportRunContext.printerPrintDestSettings();
+                if (_reportRunContext.printerPrintDestSettings() == null)
+                {
+                    printerPrintDestSettings = new DocPrintDestSettingsPrinter();
+                }
+                docReportExecutionInfo.parmPrinterPrintDestSettings(printerPrintDestSettings);
+                break;
+    
+            default:
+                break;
+        }
+    
+        if (reportCaptionOverriden)
+        {
+            _dsProvider.updateDsPackageXmlAttribute(DocConstantDSP::UpdateDsActionTokenReportCaption, printReportSettings.parmReportCaption());
+        }
+
+        boolean ddspXmlChanged = reportCaptionOverriden == true;
+        return ddspXmlChanged;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printReportDataSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the DDSP file.
+    /// </summary>
+    /// <param name = "_reportRunContext">An instance of DocReportRunContext</param>
+    /// <param name = "_dataSourceGenerationMode">Docentric data source generation mode</param>
+    private void printReportDataSource(DocReportRunContext _reportRunContext, DocDataSourceGenerationMode _dataSourceGenerationMode)
+    {
+        // DDSP file cannot be downloaded if executing in batch.
+        if (DocGlobalHelper::isNonInteractiveSession())
+        {
+            DocGlobalHelper::handleWarning("@DocentricAX3:CannotDownloadDdspInBatchErrorMsg");
+            return;
+        }
+
+        try
+        {
+            // Validate print destination settings.
+            if (!generateDSPrintDestSettings.validate(true))
+            {
+                DocGlobalHelper::handleError(strFmt("@DocentricAX:SelectedPrintDestSettingsNotValid", DocPrintDestination::GenerateDataSource), true, '', true);
+            }
+    
+            // Set default values and init DS provider params from Report params.
+            DocDataSourceProviderParams dsParams = new DocDataSourceProviderParams();
+            this.initDsParamsForReportDesignTime(dsParams, _dataSourceGenerationMode);
+            dsParams.setDefaultParmValues();
+    
+            DocDataSourceProviderParamsReporting dsParamsReporting = new DocDataSourceProviderParamsReporting();
+            this.initDsReportParamsForDesignAndRunTime(dsParamsReporting, _reportRunContext);
+    
+            DocDataSourceProviderBase dsProvider = DocDataSourceProviderBase::constructOnServer(dsParams.parmDsProviderDerivedClassName());
+    
+            // Set params.
+            dsProvider.parmParams(dsParams);
+            dsProvider.parmParamsReporting(dsParamsReporting);
+    
+            Stopwatch sw = DocDiagnosticsManager::startMeasurement();
+
+            // Generate and save report data source.
+            dsProvider.run();
+    
+            // Set the DSP execution time.
+            DocDiagnosticsManager::stopMeasurement_DspExecTime(sw, docReportExecutionInfo);
+
+            // Inform about success.
+            if (!printReportSettings.parmSuppressSuccessMsg())
+            {
+                Filename dsOutputFilename = dsParams.parmXmlDataSourceFilename();
+                DocGlobalHelper::handleInfo(strFmt("@DocentricAX:DdspGeneratedSuccessMsg", dsOutputFilename, dsParamsReporting.parmReportId()));
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), "@DocentricAX3:ErrorWhileGeneratingDDSPMsg");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printReportDSWithGenerateDSPrintDestination</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the DDSP file via Generate DS print destination.
+    /// </summary>
+    /// <param name = "_reportRunContext">An instance of DocReportRunContext</param>
+    private void printReportDSWithGenerateDSPrintDestination(DocReportRunContext _reportRunContext)
+    {
+        if (!reportTableActiveReport)
+        {
+            // If we are running a report without any entry in Docentric report setup, we can safely assumed that this is a SSRS report being printed using Docentric.
+            this.printReportDataSource(_reportRunContext, DocDataSourceGenerationMode::SSRS);
+        }
+        else if (reportTableActiveReport.ReportUsageType == DocReportUsageType::ClassicSSRS)
+        {
+            this.printReportDataSource(_reportRunContext, DocDataSourceGenerationMode::SSRS);
+
+            // If the CBD feature is enabled and ER Model Mapping is set, generate additional DDSP package that is CBD based,
+            // since report can have multiple templates of mixed data source types.
+            if (DocParameters::find().EnableCbdDs && reportTableActiveReport.ERModelMappingTable())
+            {
+                this.printReportDataSource(_reportRunContext, DocDataSourceGenerationMode::ConfigurableBusinessDocuments);
+            }
+        }
+        else // Other usage types, to be implemented later...
+        {
+            this.printReportDataSource(_reportRunContext, DocDataSourceGenerationMode::NotSet);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printReportDSAlongsideReportExecution</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the DDSP file alongside report execution.
+    /// </summary>
+    /// <param name = "_reportRunContext">An instance of DocReportRunContext</param>
+    private void printReportDSAlongsideReportExecution(DocReportRunContext _reportRunContext)
+    {
+        DocPrintDestSettingsGenerateDS   generateDSPrintDestSettingsBkp;
+        boolean                          suppressSuccessMsgBkp;
+    
+    
+        // Save generateDSPrintDestSettings and suppressSuccessMsg in order
+        // to be able to restore it after generating design-time DS is done.
+        generateDSPrintDestSettingsBkp = new DocPrintDestSettingsGenerateDS();
+        generateDSPrintDestSettingsBkp.unpack(generateDSPrintDestSettings.pack());
+        suppressSuccessMsgBkp = printReportSettings.parmSuppressSuccessMsg();
+    
+        // Load generateDSPrintDestSettings from the report setup.
+        if (reportTableActiveReport.GenerateXmlDsWithReportRunSettings != conNull())
+        {
+            generateDSPrintDestSettings.unpack(reportTableActiveReport.GenerateXmlDsWithReportRunSettings);
+        }
+        else
+        {
+            generateDSPrintDestSettings = new DocPrintDestSettingsGenerateDS();
+        }
+    
+        // Set default values.
+        generateDSPrintDestSettings.setDefaultParmValues(printReportSettings.parmReportId());
+        generateDSPrintDestSettings.parmIsGeneratedAlongsideReport(true);
+
+        // Always show success message.
+        printReportSettings.parmSuppressSuccessMsg(false);
+    
+        // Generate exactly one DDSP package: CBD or SSRS based and inform about success.
+        if (reportTableActiveReport.ReportUsageType == DocReportUsageType::ClassicSSRS)
+        {
+            this.printReportDataSource(_reportRunContext, isTargetTemplateErBased ? DocDataSourceGenerationMode::ConfigurableBusinessDocuments : DocDataSourceGenerationMode::SSRS);
+
+            // Generate also the other DDSP type that wasn't generated with the previously line, if it is configured so.
+            if (DocParameters::find().EnableCbdDs && reportTableActiveReport.GenerateXmlDsWithReportRunMode == DocReportGenerateDdspMode::BothSsrsAndCbdDdsp)
+            {
+                // If we are going to generate CBD DDSP in the next step, check if the ER Model mapping is set.
+                if (!isTargetTemplateErBased && !reportTableActiveReport.ERModelMapping)
+                {
+                    DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX3:ERModelMappingIsNotSetPreError", "@DocentricAX3:WhichDDSPToGenerate", "@DocentricAX3:BothSsrsAndCbdDDSP", "@DocentricAX3:ERModelMappingNotSetForReport"));
+                }
+
+                this.printReportDataSource(_reportRunContext, !isTargetTemplateErBased ? DocDataSourceGenerationMode::ConfigurableBusinessDocuments : DocDataSourceGenerationMode::SSRS);
+            }
+        }
+        else // Other usage types, to be implemented later...
+        {
+            this.printReportDataSource(_reportRunContext, DocDataSourceGenerationMode::NotSet);
+        }
+    
+        // Restore generateDSPrintDestSettings and suppressSuccessMsg.
+        generateDSPrintDestSettings.unpack(generateDSPrintDestSettingsBkp.pack());
+        generateDSPrintDestSettingsBkp = null;
+    
+        printReportSettings.parmSuppressSuccessMsg(suppressSuccessMsgBkp);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>skipDspExecutionForReportUsingSsrsDesign</Name>
+				<Source><![CDATA[
+    private boolean skipDspExecutionForReportUsingSsrsDesign()
+    {
+        // Don't skip DSP execution if the report is using Docentric template
+        if (!printReportSettings.printSrsOriginalDesign())
+        {
+            return false;
+        }
+
+        // Report is using SSRS design, but print destination might contain placeholders,
+        // have SharePoint metadata, ER Model Mapping, Email templates, etc.
+        // First check if the report is registered within Docentric setup and if it is active.
+        // If so, don't skip DSP execution.
+        if (reportTableActiveReport.RecId != 0)
+        {
+            return false;
+        }
+
+        // Next, check if the target print destination (Email, File or Printer) contains any placeholder.
+        // If so, don't skip DSP execution.
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::Printer &&
+            DocPlaceholderManager::containPlaceholders_printerPrintDestSettings(printerPrintDestSettings))
+        {
+            return false;
+        }
+        
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::File &&
+            DocPlaceholderManager::containPlaceholders_filePrintDestSettings(filePrintDestSettings))
+        {
+            return false;
+        }
+            
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::Email &&
+            DocPlaceholderManager::containPlaceholders_emailPrintDestSettings(emailPrintDestSettings))
+        {
+            return false;
+
+            // NOTE: if an Email template is used for the email body, it will be loaded into the email body later, during DSP execution,
+            // and this loaded template into the body might contain placeholders. In this case however, the report has to be registered in
+            // Docentric report setup, which we already checked at the beginning of the method. So no special checks on Email templates are needed.
+        }
+
+        // Don't skip DSP execution if print settings contain Additional attachment rules.
+        if (printReportSettings.parmAttachmentRuleList() != null && !printReportSettings.parmAttachmentRuleList().empty())
+        {
+            return false;
+        }
+
+        // Don't skip DSP execution also if Report caption, any of Additional attachment rules,
+        // Print archive note, PDF encryption password or document properties contain placeholders.
+        if (DocPlaceholderManager::containPlaceholders_printReportSettings(printReportSettings))
+        {
+            return false;
+        }
+
+        // In all other cases we can skip DSP execution.
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpTemporaryDocentricReportStorage</Name>
+				<Source><![CDATA[
+    private void cleanUpTemporaryDocentricReportStorage()
+    {
+        try
+        {
+            // Clean up Docentric temporary report storage for proforma data objects.
+            Docentric.AX.Reporting.TemporaryReportDataStorage::Cleanup();
+        }
+
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), 'Failed to clean up Docentric temporary report storage for proforma data objects',
+                Exception::Error, DocConstantDiagnostics::ErrProformaReportTempStorage);
+        }
+    
+        catch (Exception::Internal)
+        {
+            DocGlobalHelper::handleClrException(funcName(), 'Failed to clean up Docentric temporary report storage for proforma data objects',
+                Exception::Error, DocConstantDiagnostics::ErrProformaReportTempStorage);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        str                                      xmlReportDataSourceStr;
+        DocReportRunContext                      reportRunContext;
+        DocDataSourceProviderBase                dsProvider;
+        DocPrintReportToFileExecutionInfo        printToFileExecutionInfo;
+        DocPrintReportToEmailExecutionInfo       printToEmailExecutionInfo;
+        DocPrintReportToPrinterExecutionInfo     printToPrinterExecutionInfo;
+        DocPrintReportToScreenExecutionInfo      printToScreenExecutionInfo;
+        DocPrintReportToMemoryExecutionInfo      printToMemoryExecutionInfo;
+        DocPrintReportToArchiveExecutionInfo     printToArchiveExecutionInfo;
+        DocEventHandlerResult                    eventHandlerResult;
+        Stopwatch                                swDspExec, swTotalExec;
+
+
+        // Clean up Docentric temporary report storage for proforma data objects.
+        this.cleanUpTemporaryDocentricReportStorage();
+
+
+        //*** Publish event that report execution begins.
+        eventHandlerResult = delegatesHelper.onReportExecutionBegin(docReportExecutionInfo);
+        if (eventHandlerResult.cancelExecution())
+        {
+            return;
+        }
+    
+        // Prepare reportRunContext in order to allow override of certain properties.
+        reportRunContext = DocReportRunContext::construct(printReportSettings, printerPrintDestSettings,
+                emailPrintDestSettings, filePrintDestSettings, batchId, batchJobId, isTargetTemplateErBased, reportTableActiveReport, generateDSPrintDestSettings);
+
+        /* Handle print destination Generate Data Source. */
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::GenerateDataSource)
+        {
+            // Generate and save report data source to the file location and inform about success.
+            this.printReportDSWithGenerateDSPrintDestination(reportRunContext);
+            return;
+        }
+    
+        /* Handle other print destinations. */
+    
+        // If the report design-time DS should be generated alongside report execution, generate it
+        // using reportTableActiveReport.GenerateXmlDsWithReportRunSettings and inform about success.
+        if (reportTableActiveReport.GenerateXmlDsWithReportRun)
+        {
+            this.printReportDSAlongsideReportExecution(reportRunContext);
+        }
+    
+        // Proceed to the selected print destination:
+        // Start the measurement for the total report execution time.
+        swTotalExec = DocDiagnosticsManager::startMeasurement();
+
+
+        /*----- Generate report data source and override report run settings -----*/
+
+        if (!this.skipDspExecutionForReportUsingSsrsDesign())
+        {
+            // Get report XML data source provider.
+            dsProvider = this.getRuntimeReportDataSourceProvider(reportRunContext);
+    
+            // Generate runtime report XML data source.
+            swDspExec = DocDiagnosticsManager::startMeasurement();
+            dsProvider.run();
+            DocDiagnosticsManager::stopMeasurement_DspExecTime(swDspExec, docReportExecutionInfo);
+            
+            // Override report run settings: reportRunContext -> printReportSettings.
+            boolean ddspXmlChanged = this.overrideReportRunSettings(dsProvider, reportRunContext);
+    
+            // Set the report DDSP serialized to XML and as an object to printReportSettings.
+            xmlReportDataSourceStr = dsProvider.getXmlDataSourceStr(ddspXmlChanged);
+            printReportSettings.parmXmlDataSourceStr(xmlReportDataSourceStr);
+            printReportSettings.parmDataSourceObject(dsProvider.getDataSourceObject());
+
+            // Dispose DSP class.
+            dsProvider = null;
+
+            //*** Publish event that report data generation completed.
+            eventHandlerResult = delegatesHelper.onReportDataSourceGenerated(docReportExecutionInfo);
+            if (eventHandlerResult.cancelExecution())
+            {
+                return;
+            }
+
+            // If the ExecuteOnlyData flag is set, don't print the report.
+            if (printReportSettings.parmExecuteOnlyData())
+            {
+                return;
+            }
+        }
+
+        
+        /*----- Generate the report using Docentric template or SSRS original design and distribute report -----*/
+
+        //*** Publish event that report generation and distribution begin.
+        eventHandlerResult = delegatesHelper.onReportPrintBegin(docReportExecutionInfo);
+        if (eventHandlerResult.cancelExecution())
+        {
+            return;
+        }
+
+        // Clean print destination settings: remove empty/duplicated email addresses, escape output filename, fix bare line feeds, etc.
+        this.cleanPrintDestinationSettings();
+    
+        // Set default values again in case they were reset.
+        this.setDefaultParmValuesInSettings();
+
+        // Validate report settings.
+        if (!printReportSettings.validate())
+        {
+            DocGlobalHelper::handleError("@DocentricAX:PrintReportSettingsInvalid", true, '', true, DocConstantDiagnostics::ErrParametersValidation);
+        }
+    
+        // Validate print destination settings.
+        if (!this.validatePrintDestinationSettings())
+        {
+            DocGlobalHelper::handleError(strFmt("@DocentricAX:SelectedPrintDestSettingsNotValid", printReportSettings.parmPrintDestination()), 
+                                         true, '', true, DocConstantDiagnostics::ErrParametersValidation);
+        }
+    
+        // Print report to the target print destination.
+        switch (printReportSettings.parmPrintDestination())
+        {
+            case DocPrintDestination::Archive:
+                printToArchiveExecutionInfo = DocOutputManager::printReportToArchive(printReportSettings);
+                docReportExecutionInfo.parmPrintToArchiveExecutionInfo(printToArchiveExecutionInfo);
+                break;
+    
+            case DocPrintDestination::Email:
+                printToEmailExecutionInfo = DocOutputManager::printReportToEmail(printReportSettings, emailPrintDestSettings);
+                docReportExecutionInfo.parmPrintToEmailExecutionInfo(printToEmailExecutionInfo);
+                break;
+    
+            case DocPrintDestination::File:
+                printToFileExecutionInfo = DocOutputManager::printReportToFile(printReportSettings, filePrintDestSettings);
+                docReportExecutionInfo.parmPrintToFileExecutionInfo(printToFileExecutionInfo);
+                break;
+    
+            case DocPrintDestination::Printer:
+                if (DocConstantGlobal::isOnPremEnvironment())
+                {
+                    printToPrinterExecutionInfo = DocOutputManager::printReportToPrinterOnPremise(printReportSettings, printerPrintDestSettings);
+                }
+                else
+                {
+                    // For cloud environments check if the "Print as PDF" mode is on.
+                    if (!printerPrintDestSettings.parmPrintAsPdf())
+                    {
+                        printToPrinterExecutionInfo = DocOutputManager::printReportToPrinter(printReportSettings, printerPrintDestSettings);
+                    }
+                    else
+                    {
+                        printToPrinterExecutionInfo = DocOutputManager::printReportToPrinterAsPdf(printReportSettings, printerPrintDestSettings);
+                    }
+                }
+
+                docReportExecutionInfo.parmPrintToPrinterExecutionInfo(printToPrinterExecutionInfo);
+                break;
+    
+            case DocPrintDestination::Screen:
+                printToScreenExecutionInfo = DocOutputManager::printReportToScreen(printReportSettings);
+                docReportExecutionInfo.parmPrintToScreenExecutionInfo(printToScreenExecutionInfo);
+                break;
+
+            case DocPrintDestination::Memory:
+                printToMemoryExecutionInfo = DocOutputManager::printReportToMemory(printReportSettings, memoryPrintDestSettings);
+                docReportExecutionInfo.parmPrintToMemoryExecutionInfo(printToMemoryExecutionInfo);
+                break;
+                
+            default:
+                DocGlobalHelper::handleException(funcName(),
+                        strFmt('Unsupported DocPrintDestination %1', printReportSettings.parmPrintDestination()));
+        }
+
+
+        //*** Publish event that report execution completed.
+        eventHandlerResult = delegatesHelper.onReportExecutionEnd(docReportExecutionInfo);
+
+        // Stop the measurement for the total report execution time.
+        DocDiagnosticsManager::stopMeasurement_TotalExecTime(swTotalExec, docReportExecutionInfo);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDefaultParmValuesInSettings</Name>
+				<Source><![CDATA[
+    private void setDefaultParmValuesInSettings()
+    {
+        printReportSettings.setDefaultParmValues();
+        switch (printReportSettings.parmPrintDestination())
+        {
+            case DocPrintDestination::File:
+                filePrintDestSettings.setDefaultParmValues(printReportSettings.parmReportId(), printReportSettings.parmReportCaption());
+                break;
+
+            case DocPrintDestination::Email:
+                emailPrintDestSettings.setDefaultParmValues(printReportSettings.parmReportId(), printReportSettings.parmReportCaption(), true);
+                break;
+    
+            case DocPrintDestination::GenerateDataSource:
+                generateDSPrintDestSettings.setDefaultParmValues(printReportSettings.parmReportId());
+                break;
+    
+            case DocPrintDestination::Printer:
+                printerPrintDestSettings.setDefaultParmValues(printReportSettings.parmReportId(), printReportSettings.parmReportCaption());
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validatePrintDestinationSettings</Name>
+				<Source><![CDATA[
+    private boolean validatePrintDestinationSettings()
+    {
+        boolean isValid;
+    
+        isValid = true;
+    
+        // Validate selected print destionation settings.
+        switch (printReportSettings.parmPrintDestination())
+        {
+            case DocPrintDestination::Email:
+                isValid = emailPrintDestSettings.validate(printReportSettings.parmReportId(), true, true, true) &&
+                          emailPrintDestSettings.validateEmailTemplate(printReportSettings.parmReportId(), printReportSettings.parmCompanyId(), printReportSettings.parmLanguageId(), true);
+                break;
+    
+            case DocPrintDestination::File:
+                isValid = filePrintDestSettings.validate(true, true);
+                break;
+    
+            case DocPrintDestination::GenerateDataSource:
+                isValid = generateDSPrintDestSettings.validate(true);
+                break;
+    
+            case DocPrintDestination::Printer:
+                isValid = printerPrintDestSettings.validate(true, false, true, printReportSettings.parmReportId(), printReportSettings);
+                break;
+        }
+    
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static DocPrintManager construct(DocPrintReportSettings         _printReportSettings,
+                                            DocPrintDestSettingsGenerateDS _generateDSPrintDestSettings,
+                                            DocPrintDestSettingsPrinter    _printerPrintDestSettings,
+                                            DocPrintDestSettingsEmail      _emailPrintDestSettings,
+                                            DocPrintDestSettingsFile       _filePrintDestSettings,
+                                            DocPrintDestSettingsMemory     _memoryPrintDestSettings,
+                                            DocReportType                  _reportType,
+                                            RecId                          _batchId,
+                                            RecId                          _batchJobId)
+    {
+        return new DocPrintManager(_printReportSettings, _generateDSPrintDestSettings,
+                                   _printerPrintDestSettings, _emailPrintDestSettings,
+                                   _filePrintDestSettings, _memoryPrintDestSettings,
+                                   _reportType, _batchId, _batchJobId);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

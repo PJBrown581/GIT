@@ -1,0 +1,529 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_MissingBankStmts</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Missing statements logic
+/// </summary>
+class SKS_BR_MissingBankStmts extends SKS_BR_Batch
+{
+    SKS_BR_BankStatementMonitor         sKS_BR_BankStatementMonitor;
+    SKS_BR_MissingBankTransEmailDataTmp sKS_BR_MissingBankTransEmailData;
+    SKS_BR_MissingBankStatements        sKS_BR_MissingBankStatements;
+    SKS_PP_Bank                         sKS_PP_BankScr;
+    BankAccountTable                    bankAccountTable;
+    Counter                             skippedPerBank;
+    Counter                             missingCountPerBank;
+    Counter                             totalMissing;
+    Counter                             totalSkipped;
+    Counter                             totalFound;
+    Counter                             totalCount;
+    Counter                             totalBanks;
+    Email                               toEmail;
+    RefRecId                            locRefRecID;
+    TransDate                           jobDate;
+    TransDate                           stmtDate;
+    DataAreaId                          oldCompany;
+    SysEmailTable                       emailTable;
+    Email                               notifiedEmail; //SKS_20603
+    UserId                              oldNotifiedEmail; //SKS_20603
+    container                           tASCompanies;
+    container                           remainingCompanies;
+    
+    Email                               oldEmail;
+    Counter                             missingStatements;
+    guid                                newGuid;
+    boolean                             firstRecord = true;
+    boolean                             hierarchyCompanies = false;
+    boolean                             exceptionFound = false;
+    str                                 buildRow = '';
+
+   
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Missing statements logic
+    /// </summary>
+    public void run(TransDate _stmtDate = dateNull(), RefRecId    _recId = 0)
+    {
+        Batch                           bat;
+        
+        bat = this.parmCurrentBatch();
+        if(!_recId)
+        {
+            locRefRecID = bat.RecId;
+        }
+        else
+        {
+            locRefRecID = _recId;
+        }
+
+        if(!_stmtDate)
+        {
+            jobDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+        }
+        else
+        {
+            jobDate = _stmtDate;
+        }
+
+        if(dayOfWk(jobDate) == WeekDays::Saturday || dayOfWk(jobDate) == WeekDays::Sunday)
+        {
+            this.insertIntoSKS_BR_BankStatementsMonitor(curExt());
+        }
+        else
+        {
+            //Companies using the companies defined in the organization hierarchy associated with the Treasury Automation Bank Reconciliation organization hierarchy purpose
+            // if no companies defined it considers only the current company
+            remainingCompanies = this.getCompanies();
+            tASCompanies = SKS_EB_VirtualCompany::getBankRecCompanies();
+            
+            newGuid = newGuid();
+            for (int i = 1 ; i <= conLen(tASCompanies); i++)
+            {
+                // delete the processed companies from rest of the companies
+                remainingCompanies = conDel(remainingCompanies,conFind(remainingCompanies,conPeek(tASCompanies, i)),1);
+            }
+            this.processData(_stmtDate, tASCompanies,true);
+            if(totalMissing)
+            {
+                notifiedEmail = oldNotifiedEmail; //SKS_20603
+                this.insertIntoSKS_BR_BankStatementsMonitor(curExt());
+                this.processEmails();
+                delete_from sKS_BR_MissingBankTransEmailData;
+            }
+            // Processing statements for remaining companies
+            newGuid = newGuid();
+            oldCompany      = '';
+            oldNotifiedEmail = ''; //SKS_20603
+            this.processData(_stmtDate,remainingCompanies,false);
+            if(totalMissing)
+            {
+                notifiedEmail= oldNotifiedEmail; //SKS_20603
+                this.insertIntoSKS_BR_BankStatementsMonitor(oldCompany);
+                this.processEmails();
+                delete_from sKS_BR_MissingBankTransEmailData;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertIntoSKS_BR_BankStatementsMonitor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts record in missing bank statements table SelectableDataArea _company.
+    /// </summary>
+    /// <param name="_company">
+    /// It contains the bank statements company information.
+    /// </param>
+    public void insertIntoSKS_BR_BankStatementsMonitor(SelectableDataArea _company)
+    {
+        changecompany(_company)
+        {
+            SKS_BR_BankStatementMonitor.clear();
+            SKS_BR_BankStatementMonitor.BatchJobId             = locRefRecID;
+            //SKS_BR_BankStatementMonitor.NotifyUserId           = notifiedUser;
+            SKS_BR_BankStatementMonitor.Email                  = notifiedEmail; // SKS_20603
+            SKS_BR_BankStatementMonitor.MissingCount           = totalMissing;
+            SKS_BR_BankStatementMonitor.FoundCount             = totalFound;
+            SKS_BR_BankStatementMonitor.SkippedCount           = totalSkipped;
+            SKS_BR_BankStatementMonitor.BankCount              = totalBanks;
+            SKS_BR_BankStatementMonitor.SnapshotDateTime       = DateTimeUtil::utcNow();
+            SKS_BR_BankStatementMonitor.StatementGuid          = newGuid;
+            SKS_BR_BankStatementMonitor.insert();
+            totalBanks   = 0;
+            totalFound   = 0;
+            totalMissing = 0;
+            totalSkipped = 0;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertIntoSKS_BR_sKS_BR_MissingBankStatements</Name>
+				<Source><![CDATA[
+    public void insertIntoSKS_BR_sKS_BR_MissingBankStatements()
+    {
+        sKS_BR_MissingBankStatements.clear();
+        sKS_BR_MissingBankStatements.Company                 = sKS_PP_BankScr.company();
+        sKS_BR_MissingBankStatements.AccountID               = sKS_PP_BankScr.BankAccountId;
+        sKS_BR_MissingBankStatements.StatementGuid           = newGuid;
+        sKS_BR_MissingBankStatements.AccountStatementDate    = stmtDate;
+        sKS_BR_MissingBankStatements.AccountNum              = bankAccountTable.AccountNum;
+        sKS_BR_MissingBankStatements.Name                    = bankAccountTable.Name;
+        sKS_BR_MissingBankStatements.IBAN                    = bankAccountTable.IBAN;
+        sKS_BR_MissingBankStatements.RegistrationNum         = bankAccountTable.RegistrationNum;
+        sKS_BR_MissingBankStatements.SWIFTNo                 = bankAccountTable.SWIFTNo;
+        sKS_BR_MissingBankStatements.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processEmails</Name>
+				<Source><![CDATA[
+    // Method to process email data and send emails
+    public void processEmails()
+    {
+        while select * from sKS_BR_MissingBankTransEmailData
+            order by ReceipentEmailId,Company
+        {
+            if(oldEmail != sKS_BR_MissingBankTransEmailData.ReceipentEmailId && oldEmail != '')
+            {
+                buildRow += '</p></BODY></HTML>';
+                this.processEmailData();
+                buildRow = '';
+                oldEmail = '';
+            }
+            
+            missingStatements += sKS_BR_MissingBankTransEmailData.MissingCount;
+            buildRow += '<p>' + "@SYS13342" + ':' + sKS_BR_MissingBankTransEmailData.Company + ';' + "@SYS1517" + ':' + sKS_BR_MissingBankTransEmailData.AccountID + ';' + "@SYS7399" + ':' + sKS_BR_MissingBankTransEmailData.Name + ';' + "@SYS92339" + ':'+ this.formatDate(sKS_BR_MissingBankTransEmailData.AccountStatementDate, SKS_EFT_DateSetting::DateRegional) ;// TFS 7330
+            if(sKS_BR_MissingBankTransEmailData.RegistrationNum)
+            {
+                buildRow +=  ';'+ "@SYS22457" + ':' + sKS_BR_MissingBankTransEmailData.RegistrationNum  ;
+            }
+            if(sKS_BR_MissingBankTransEmailData.IBAN)
+            {
+                buildRow += ';'+ "@SYS71686" + ':' + sKS_BR_MissingBankTransEmailData.IBAN ;
+            }
+            if(sKS_BR_MissingBankTransEmailData.SWIFTNo)
+            {
+                buildRow += ';' + "@SYS23725" + ':' + sKS_BR_MissingBankTransEmailData.SWIFTNo ;
+            }
+            if(sKS_BR_MissingBankTransEmailData.AccountNum)
+            {
+                buildRow += ';'+ "@SYS68772" + ':' + sKS_BR_MissingBankTransEmailData.AccountNum ;
+            }
+            buildRow += '</br>';
+            
+            oldEmail = sKS_BR_MissingBankTransEmailData.ReceipentEmailId;
+        }
+        if(buildRow)
+        {
+            buildRow += '</p></BODY></HTML>';
+            this.processEmailData();
+            buildRow = '';
+            oldEmail = '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatDate</Name>
+				<Source><![CDATA[
+    private str formatDate(Date _dateValue, SKS_EFT_DateSetting _datesetting)
+    {
+        if(_datesetting == SKS_EFT_DateSetting::DateYYYYMMDD)
+        {
+            return Date2Str(_dateValue, 321, DateDay::Digits2, DateSeparator::None,
+                                    DateMonth::Digits2, DateSeparator::None, DateYear::Digits4,DateFlags::None);
+        }
+        else if(_datesetting == SKS_EFT_DateSetting::DateRegional)
+        {
+            return Date2Str(_dateValue, -1, DateDay::Digits2, -1, DateMonth::Digits2, -1,
+                                    DateYear::Digits4,DateFlags::None);
+        }
+        else
+        {
+            return Date2Str(_dateValue, 321, DateDay::Digits2, DateSeparator::Hyphen,
+                                    DateMonth::Digits2, DateSeparator::Hyphen, DateYear::Digits4,DateFlags::None);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeTemplate</Name>
+				<Source><![CDATA[
+    public static void initializeTemplate()
+    {
+        SysEmailMessageTable SysEmailMessageTable;
+        SysEmailTable SysEmailTable;
+        ;
+        SysEmailTable.Description = 'MissingStatements';
+        SysEmailTable.EmailId = 'SKS_BR_Mis';
+        SysEmailTable.SenderAddr = 'noReply@mycompany.com';
+        SysEmailTable.DefaultLanguage = 'en-us';
+        SysEmailTable.SenderName = 'My Company';
+        SysEmailTable.Priority = eMailPriority::Normal;
+        SysEmailTable.BatchGroupId = '';
+        SysEmailTable.insert();
+    
+        SysEmailMessageTable.EmailId = 'SKS_BR_Mis';
+        SysEmailMessageTable.Mail =@'<BODY>';
+        SysEmailMessageTable.LanguageId = 'en-us';
+        SysEmailMessageTable.XSLTMail = '' ;
+        SysEmailMessageTable.LayoutType = SysEmailLayoutType::StaticLayout;
+        SysEmailMessageTable.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processEmailData</Name>
+				<Source><![CDATA[
+    public  void processEmailData()
+    {
+        SysEmailMessageTable                message;
+        str                                 messageBody;
+
+        emailTable = SysEmailTable::find('SKS_BR_Mis');
+        message = SysEmailMessageTable::find(emailTable.EmailId,emailTable.DefaultLanguage);
+        messageBody = message.Mail;
+
+        var mailer = SysMailerFactory::getNonInteractiveMailer();
+       
+        messageBody += buildRow;
+
+        if(mailer)
+        {
+            var messageBuilder = new SysMailerMessageBuilder();
+            // From
+            messageBuilder.setFrom(emailTable.SenderAddr,emailTable.SenderName); //10300 changes this code back (Overriding 7269)
+            // To
+            messageBuilder.addTo(oldEmail);
+            // Subject
+            messageBuilder.setSubject(strFmt("@SKS4370",missingStatements));
+            // Message
+            messageBuilder.setBody(messageBody);
+            // Send mail
+            try
+            {
+                mailer.sendNonInteractive(messageBuilder.getMessage());
+            }
+            catch(Exception::CLRError)
+            {
+                if(!exceptionFound)
+                {
+                    info("@SKS4423");
+                }
+                exceptionFound = true;
+            }
+        }
+        // Resetting the values after mail sent to the user
+        messageBody     = '';
+        missingStatements = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCompanies</Name>
+				<Source><![CDATA[
+    public  container getCompanies()
+    {
+        container       allCompanies;
+        CompanyInfo     companyInfo;
+
+        while select DataArea from companyInfo
+        {
+            allCompanies += companyInfo.DataArea;
+        }
+        return allCompanies;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>userEnabledCompanies</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the user enabled companies.
+    /// </summary>
+    /// <returns>
+    /// Return the user enabled companies.
+    /// </returns>
+    public static container userEnabledCompanies()
+    {
+        UserId userId = curUserId();
+
+        CompanyInfo companyInfo;
+        OMUserRoleOrganization oMUserRoleOrganization;
+        container compaines;
+
+        while select DataArea from companyInfo
+            exists join oMUserRoleOrganization
+            where oMUserRoleOrganization.OMInternalOrganization == companyInfo.RecId
+                && oMUserRoleOrganization.User == userId
+        {
+            compaines += companyInfo.DataArea;
+        }
+        return compaines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processData</Name>
+				<Source><![CDATA[
+    public  void processData(TransDate _stmtDate,container _company,boolean _isHierarchy)
+    {
+        SKS_EB_BankHolidayGroup         sKS_EB_BankHolidayGroup;
+        boolean                         statmentFound;
+        BankAccountStatement            bankAccountStatement;
+
+        
+        while select crosscompany:_company * from sKS_PP_BankScr
+            order by BREmail,DataAreaId //SKS_20603
+            where sKS_PP_BankScr.BRBatchJobId == locRefRecID
+                && sKS_PP_BankScr.BRNotifyStatements == NoYes::Yes
+        {
+            missingCountPerBank = 0; // TFS 7330
+            if(_isHierarchy && oldNotifiedEmail != sKS_PP_BankScr.BREmail && oldNotifiedEmail) //SKS_20603
+            {
+                notifiedEmail = oldNotifiedEmail; //SKS_20603
+                if(totalMissing)
+                {
+                    this.insertIntoSKS_BR_BankStatementsMonitor(curExt());
+                    this.processEmails();
+                    delete_from sKS_BR_MissingBankTransEmailData;
+                    newGuid = newGuid();
+                }
+                else
+                {
+                    totalFound   = 0;
+                    totalMissing = 0;
+                    totalSkipped = 0;
+                    totalBanks   = 0;
+                }
+            }
+            if(!_isHierarchy && ((oldNotifiedEmail != sKS_PP_BankScr.BREmail && oldNotifiedEmail && sKS_PP_BankScr.BREmail)  || (oldCompany != sKS_PP_BankScr.company() && oldCompany && sKS_PP_BankScr.RecId))) //SKS_20603
+            {
+                notifiedEmail = sKS_PP_BankScr.BREmail;
+                if(totalMissing)
+                {
+                    this.insertIntoSKS_BR_BankStatementsMonitor(oldCompany);
+                    this.processEmails();
+                    delete_from sKS_BR_MissingBankTransEmailData;
+                    newGuid = newGuid();
+                }
+                else
+                {
+                    totalFound   = 0;
+                    totalMissing = 0;
+                    totalSkipped = 0;
+                    totalBanks   = 0;
+                }
+            }
+            statmentFound = false;
+            totalBanks++;
+            skippedPerBank = 0;
+
+            if(!SysEmailTable::find('SKS_BR_Mis').RecId)
+            {
+                SKS_BR_MissingBankStmts::initializeTemplate();
+            }
+            if(!_stmtDate)
+            {
+                stmtDate = SKS_BR_MissingBankStmts::getStatementDate(jobDate, sKS_PP_BankScr.BRNotifyMinusDays); // TFS 7329
+            }
+            else
+            {
+                stmtDate = _stmtDate;
+            }
+            if(sKS_PP_BankScr.RecId)
+            {
+                sKS_EB_BankHolidayGroup = SKS_EB_BankHolidayGroup::findByHolidayGroup(sKS_PP_BankScr.BRBankHolidayGroupID);
+                bankAccountTable = BankAccountTable::findByCompany(sKS_PP_BankScr.company(), sKS_PP_BankScr.BankAccountId);
+                if(SKS_EB_BankHolidays::find(sKS_EB_BankHolidayGroup.GroupID, stmtDate).RecId != 0)
+                {
+                    skippedPerBank++;
+                    totalSkipped++;
+                }
+                else
+                {
+                    changecompany(sKS_PP_BankScr.company())
+                    {
+                        bankAccountStatement = null;
+                        while select * from bankAccountStatement
+                                where bankAccountStatement.AccountId ==  sKS_PP_BankScr.BankAccountId
+                                && bankAccountStatement.AccountStatementDate == stmtDate
+                        {
+                            statmentFound = true;                               
+                            // SKS_Bug_10543 Start
+                            if(sKS_PP_BankScr.BRCreateBankStatementsIfNoTrans == NoYes::Yes)
+                            {
+                                totalFound++;
+                            }
+                            else
+                            {
+                                totalMissing++;
+                                missingCountPerBank++;
+                                this.insertIntoSKS_BR_sKS_BR_MissingBankStatements();
+                            }
+                            // SKS_Bug_10543 End
+                        }
+                        if(!statmentFound)
+                        {
+                            totalMissing++;
+                            missingCountPerBank++;
+                            this.insertIntoSKS_BR_sKS_BR_MissingBankStatements();
+                        }
+                    }
+                }
+                // Inserts email information only for missing statements bank wise 
+                if( sKS_PP_BankScr.BRNotifyStatements == NoYes::Yes && missingCountPerBank ) // TFS 7330
+                {
+                    sKS_BR_MissingBankTransEmailData.ReceipentEmailId        = sKS_PP_BankScr.BREmail;
+                    sKS_BR_MissingBankTransEmailData.MissingCount            = missingCountPerBank;
+                    sKS_BR_MissingBankTransEmailData.AccountNum              = bankAccountTable.AccountNum;
+                    sKS_BR_MissingBankTransEmailData.Company                 = sKS_PP_BankScr.company();
+                    sKS_BR_MissingBankTransEmailData.AccountStatementDate    = stmtDate;
+                    sKS_BR_MissingBankTransEmailData.AccountID               = sKS_PP_BankScr.BankAccountId;
+                    sKS_BR_MissingBankTransEmailData.Name                    = bankAccountTable.Name;
+                    sKS_BR_MissingBankTransEmailData.IBAN                    = bankAccountTable.IBAN;
+                    sKS_BR_MissingBankTransEmailData.SWIFTNo                 = bankAccountTable.SWIFTNo;
+                    sKS_BR_MissingBankTransEmailData.RegistrationNum         = bankAccountTable.RegistrationNum;
+                    sKS_BR_MissingBankTransEmailData.insert();
+                    // resetting the value after inserting
+                    missingCountPerBank = 0;
+                }
+            }
+            oldNotifiedEmail = sKS_PP_BankScr.BREmail; //SKS_20603
+            oldCompany =  sKS_PP_BankScr.company();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getStatementDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// TFS 7329
+    /// </summary>
+    /// <returns>
+    /// Return the statement date.
+    /// </returns>
+    public static TransDate getStatementDate(date _JobDate, int _BRNotifyMinusDays)
+    {
+        int         locCounter = 0;
+        int         locActualOffset = 0;
+     
+        while(locCounter < _BRNotifyMinusDays
+            || dayOfWk(_JobDate - locActualOffset) == WeekDays::Saturday
+            || dayOfWk(_JobDate - locActualOffset) == WeekDays::Sunday)
+        {
+            locActualOffset++;
+            if (dayOfWk(_JobDate - locActualOffset) != WeekDays::Saturday
+                && dayOfWk(_JobDate - locActualOffset) != WeekDays::Sunday)
+                locCounter++;
+        }
+    
+        return _JobDate - locActualOffset;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

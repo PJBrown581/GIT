@@ -1,0 +1,1346 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocPrintMgmtUtilsUIHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class contains helper methods called from the Print management utils form.
+/// </summary>
+public class DocPrintMgmtUtilsUIHelper
+{
+    private DocPrintMgmtUtilsTmp tmpTable, callerRecord;
+    private Args args;
+    private FormDataSource callerDs;
+    private FormRun callerForm;
+    
+    #Task
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkCaller</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the caller.
+    /// </summary>
+    private void checkCaller()
+    {
+        if (args == null || args.caller() == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'No caller or invalid caller');
+        }
+
+        // We expect to be called from the Print mgmt utils form.
+        if (!(args.caller() is FormRun))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: caller must be form');
+        }
+
+        callerForm = args.caller();
+        if (callerForm.name() != formStr(DocPrintMgmtUtils))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid caller');
+        }
+        
+        if (callerForm.dataSource(1).cursor() is DocPrintMgmtUtilsTmp)
+        {
+            callerDs = callerForm.dataSource(1);
+        }
+        if (!callerDs)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid caller form datasources');
+        }
+
+        if (!args.record())
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: caller must provide record');
+        }
+
+        callerRecord = args.record() as DocPrintMgmtUtilsTmp;
+
+        if (formHasMethod(callerForm, formMethodStr(DocPrintMgmtUtils, getTmpTable)))
+        {
+            tmpTable = callerForm.getTmpTable();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>launchPrintMgmtSetup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepare the context for opening the Print mgmt settings form and open it.
+    /// When _filterByDocumentType is true, settings are displayed only for the given
+    /// document type. Otherwise, we initialize the context in the same way as standard.
+    /// </summary>
+    /// <param name = "_utilsRecord">DocPrintMgmtUtilsTmp record from which the document
+    /// type and node specific info is taken.</param>
+    /// <param name = "_callerForm">FormRun of the caller form (Print mgmt utils)</param>
+    /// <param name = "_filterByDocumentType">boolean which specifies how the
+    /// Print mgmt settings form is displayed - for the module of only for the document type.</param>
+    public static void launchPrintMgmtSetup(DocPrintMgmtUtilsTmp _utilsRecord, FormRun _callerForm, boolean _filterByDocumentType = false)
+    {
+        Common referencedTableBuffer;
+        PrintMgmtReportFormatCountryRegionId countryRegionId;
+
+        // Fetch the values needed for Print mgmt context (referencedTableBuffer, countryRegionId)
+        switch (_utilsRecord.DocInstanceNodeType)
+        {
+            /*
+            * ---------------------------------------------------------------------
+            * Module-level nodes: do nothing here, context will be correctly
+            * initialized in the call to initPrintMgmtSetupContextForNode() method
+            * below.
+            * ---------------------------------------------------------------------
+            */
+            case PrintMgmtNodeType::Sales:
+            case PrintMgmtNodeType::Purch:
+            case PrintMgmtNodeType::Project:
+            case PrintMgmtNodeType::WHS:
+            case PrintMgmtNodeType::TMS:
+            case PrintMgmtNodeType::Invent:
+                // do nothing
+                break;
+                    
+            /*
+            * ---------------------------------------------------------------------
+            * Account-level and Transaction-level nodes
+            * ---------------------------------------------------------------------
+            */
+            default:
+                DocPrintMgmtNodeInfo nodeInfo = DocPrintMgmtUtilsHelper::getNodeInfo(
+                                                        _utilsRecord.DocInstanceReferencedTableId,
+                                                        _utilsRecord.DocInstanceReferencedRecId,
+                                                        _utilsRecord.DataAreaId);
+                if (nodeInfo.parmIsValid())
+                {
+                    referencedTableBuffer = nodeInfo.parmReferencedRecord();
+                    countryRegionId = nodeInfo.parmCountryRegionId();
+                }
+        }
+
+        // Initialize the print mgmt context
+        PrintMgmtSetupContext setupContext = new PrintMgmtSetupContext();
+        setupContext.parmCaller(_callerForm);
+        setupContext.parmReferencedTableBuffer(referencedTableBuffer);
+        setupContext.parmCountryRegionId(countryRegionId);
+           
+        List documentTypes = new List(Types::Enum);
+        documentTypes.addEnd(_utilsRecord.DocInstanceDocumentType);
+        DocPrintMgmtHelper::initPrintMgmtSetupContextForNode(setupContext, _utilsRecord.DocInstanceNodeType,
+                                                                _filterByDocumentType, documentTypes);
+
+        PrintMgmt::launchSetup(setupContext);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markRecordForDeletion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Mark the given DocPrintMgmtUtils record and all its children records (records related
+    /// to its child settings) for deletion.
+    /// </summary>
+    /// <param name = "_utilsRecId">>RecId of the DocPrintMgmtUtils record to be marked for deletion.</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <returns>Number of child records affected.</returns>
+    private static int markRecordForDeletion(RecId _utilsRecId, DocPrintMgmtUtilsTmp _tmpTable)
+    {
+        int childRecordsUpdated = 0;
+        DocPrintMgmtUtilsTmp currentRecord = DocPrintMgmtUtilsTmp::find(_utilsRecId, _tmpTable, true);     
+
+        ttsbegin;
+
+        // Mark the given record for deletion
+        currentRecord.RecordStatus = DocPrintMgmtUtilsRecordStatus::MarkForDeletion;
+        currentRecord.update();
+
+        // If there are child records, mark them for deletion too.
+        // Children can exist on top-level Original / Copy document (DocInstance) settings.
+        // We recognize the top-level DocInstance settings by PrintMgmtSettings.Priority = 1.
+        // On such record we look for the records referring to the same DocInstance,
+        // but having PrintMgmtSettings.Priority > 1.
+        if (currentRecord.PrintSettingsPriorityId == 1)
+        {
+            RecId docInstanceRecId = currentRecord.DocInstanceRecId;
+            select firstonly PrintSettingsPriorityId from _tmpTable
+                order by PrintSettingsPriorityId desc
+                    where _tmpTable.DocInstanceRecId == docInstanceRecId;
+            int maxPriority = real2int(_tmpTable.PrintSettingsPriorityId);
+            while (maxPriority > 1)
+            {                
+                select firstonly forupdate _tmpTable 
+                    where _tmpTable.DocInstanceRecId == docInstanceRecId        // same DocInstance
+                        && _tmpTable.PrintSettingsPriorityId == maxPriority;    // higher priority
+                if (_tmpTable.RecId)
+                {
+                    // Priorities are not necessarily continuous. Some settings might have been deleted.
+                    _tmpTable.RecordStatus = DocPrintMgmtUtilsRecordStatus::MarkForDeletion;
+                    _tmpTable.update();
+
+                    childRecordsUpdated++;
+                }
+
+                maxPriority--;
+            }
+        }
+
+        ttscommit;
+
+        return childRecordsUpdated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasDirtyChildRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For a given DocPrintMgmtUtils check if it has dirty child records.
+    /// </summary>
+    /// <param name = "_utilsRecId">RecId of the DocPrintMgmtUtils record to be checked.</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <returns>True if record has dirty shild records, otherwise false.</returns>
+    private static boolean hasDirtyChildRecords(RecId _utilsRecId, DocPrintMgmtUtilsTmp _tmpTable)
+    {
+        DocPrintMgmtUtilsTmp currentRecord = DocPrintMgmtUtilsTmp::find(_utilsRecId, _tmpTable);
+        
+        // Only a record with PrintMgmtSettings.Priority = 1 can have children
+        if (currentRecord.PrintSettingsPriorityId > 1)
+        {
+            // Record doesn't have children
+            return false;
+        }
+
+        // This is record with children. Are there some dirty child records?
+        select count(RecId) from _tmpTable
+            where _tmpTable.DocInstanceRecId == currentRecord.DocInstanceRecId
+                && _tmpTable.PrintSettingsPriorityId > 1
+                && _tmpTable.RecordStatus == DocPrintMgmtUtilsRecordStatus::Dirty;
+
+        return _tmpTable.RecId > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasParentRecordMarkedForDeletion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For a given DocPrintMgmtUtils check if it has parent record marked for deletion.
+    /// </summary>
+    /// <param name = "_utilsRecId">RecId of the DocPrintMgmtUtils record to be checked.</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <returns>True if record has parent marked for deletion, otherwise false.</returns>
+    private static boolean hasParentRecordMarkedForDeletion(RecId _utilsRecId, DocPrintMgmtUtilsTmp _tmpTable)
+    {
+        DocPrintMgmtUtilsTmp currentRecord = DocPrintMgmtUtilsTmp::find(_utilsRecId, _tmpTable);
+        
+        // Only a record with PrintMgmtSettings.Priority > 1 can have parent
+        if (currentRecord.PrintSettingsPriorityId == 1)
+        {
+            // Record doesn't have parent
+            return false;
+        }
+
+        // This is a child record. Is its parent marked for deletion?
+        select firstonly RecId from _tmpTable
+            where _tmpTable.DocInstanceRecId == currentRecord.DocInstanceRecId
+                && _tmpTable.PrintSettingsPriorityId == 1
+                && _tmpTable.RecordStatus == DocPrintMgmtUtilsRecordStatus::MarkForDeletion;
+
+        return _tmpTable.RecId > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncFromTmpRecordToDatabase</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Synchronize the state and content of the given DocPrintMgmtUtils record with the database,
+    /// DocPrintMgmtUtils record being master.
+    /// 
+    /// If the DocPrintMgmtUtils record is marked as dirty, store the values from it to the database.
+    /// If needed, first sync the packed and unpacked values, then update the related PrintMgmtSettings 
+    /// table with the new print destination setting. Also mark the DocPrintMgmtUtils record as clean.
+    /// 
+    /// If the DocPrintMgmtUtils record is marked for deletion, delete the related PrintMgmtSettings
+    /// or PrintMgmtDocInstance record and their child records. Also delete the DocPrintMgmtUtils record.
+    /// </summary>
+    /// <param name = "_utilsRecId">RecId of the DocPrintMgmtUtils record which should be submitted 
+    /// to the database.</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <returns>
+    /// DocPrintMgmtUtilsSubmittingResult enum with the information about the result
+    /// of operation (updated, deleted, conflicted)
+    /// </returns>
+    private static DocPrintMgmtUtilsSubmittingResult syncFromTmpRecordToDatabase(RecId _utilsRecId, DocPrintMgmtUtilsTmp _tmpTable)
+    {
+        DocPrintMgmtUtilsTmp currentRecord = DocPrintMgmtUtilsTmp::find(_utilsRecId, _tmpTable, true);
+        DocPrintMgmtUtilsSubmittingResult submittingResult = DocPrintMgmtUtilsSubmittingResult::Conflicted;
+
+        if (currentRecord.RecordStatus == DocPrintMgmtUtilsRecordStatus::Dirty)
+        {
+            // Validate before submitting the dirty record
+            if (currentRecord.validate())
+            {
+                if (DocPrintMgmtUtilsUIHelper::saveFromTmpRecordToDatabase(currentRecord))
+                {
+                    submittingResult = DocPrintMgmtUtilsSubmittingResult::Updated;
+                }
+            }
+            else
+            {
+                submittingResult = DocPrintMgmtUtilsSubmittingResult::Skipped;
+                
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:InvalidRecordNotSubmitted", currentRecord.PrintSettingsDescriptionFull));
+            }
+        }
+        else if (currentRecord.RecordStatus == DocPrintMgmtUtilsRecordStatus::MarkForDeletion)
+        {
+            if (DocPrintMgmtUtilsUIHelper::deleteRecordInDatabaseAndDatasource(currentRecord, _tmpTable))
+            {
+                submittingResult = DocPrintMgmtUtilsSubmittingResult::Deleted;
+            }
+        }
+        else
+        {
+            // Clean record, should not happen, because we call this method only for non-clean records.
+            submittingResult = DocPrintMgmtUtilsSubmittingResult::Skipped;
+        }
+
+        return submittingResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveFromTmpRecordToDatabase</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Saves the changes from the specified staging record to the database.
+    /// </summary>
+    /// <param name = "_currentRecord">Current staging record</param>
+    /// <returns>True if the update was successful; otherwise false</returns>
+    private static boolean saveFromTmpRecordToDatabase(DocPrintMgmtUtilsTmp _currentRecord)
+    {
+        #OCCRetryCount
+        
+        boolean success = false;
+
+        // Make sure that packed and unpacked values are in sync.
+        if (_currentRecord.UnpackedSyncStatus == DocPrintMgmtUtilsUnpackedSyncStatus::NotSynced)
+        {
+            DocPrintMgmtUtilsHelper::packAndSavePrintDestinationSettings(_currentRecord);
+        }
+
+        // Mark the DocPrintMgmtUtilsTmp record as clean.
+        _currentRecord.RecordStatus = DocPrintMgmtUtilsRecordStatus::Clean;
+            
+        // Find the matching PrintMgmtSettings and update it.
+        // Implementation based on PrintMgmtSetupSettingsConditional::saveOnServer()
+        PrintMgmtSettings printSettings;
+        try
+        {       
+            // Does this record exist in the database?
+            select firstonly printSettings
+                where printSettings.RecId == _currentRecord.PrintMgmtSettingsRecId;
+            if (!printSettings.RecId)
+            {
+                // Someone deleted the record the user was editing
+                DocGlobalHelper::handleError(strFmt("@DocentricAX4:UpdateConflictRecordNotFound",
+                                                _currentRecord.PrintMgmtSettingsRecId,
+                                                _currentRecord.PrintSettingsDescriptionFull));
+            }
+            else
+            {
+                // Record exists in the database. Make sure that it isn't a newer version.
+                select forupdate firstonly printSettings
+                    where printSettings.RecId == _currentRecord.PrintMgmtSettingsRecId
+                        && printSettings.RecVersion == _currentRecord.PrintMgmtSettingsRecVersion;
+                if (!printSettings.RecId)
+                {
+                    // Someone changed the record the user was editing, DB version is newer
+                    //throw Exception::UpdateConflict;
+                    DocGlobalHelper::handleError(strFmt("@DocentricAX4:UpdateConflictNewerRecordInDatabase",
+                                                _currentRecord.PrintMgmtSettingsRecId,
+                                                _currentRecord.PrintSettingsDescriptionFull));
+                }
+                else
+                {
+                    ttsbegin;
+
+                    printSettings.PrintJobSettings = _currentRecord.PrintJobSettings;
+                    printSettings.update();
+            
+                    // Database record got new RecVersion, update it in the staging record
+                    printSettings.reread();
+                    _currentRecord.PrintMgmtSettingsRecVersion = printSettings.RecVersion;
+                    _currentRecord.update();
+
+                    ttscommit;
+
+                    success = true;
+                }
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+
+        return success;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteRecordInDatabaseAndDatasource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the specified record in the staging table and in the database.
+    /// </summary>
+    /// <param name = "_currentRecord">Current staging record</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form</param>
+    /// <returns>True if the deletion was successful; otherwise false</returns>
+    private static boolean deleteRecordInDatabaseAndDatasource(DocPrintMgmtUtilsTmp _currentRecord,  DocPrintMgmtUtilsTmp _tmpTable)
+    {
+        #OCCRetryCount
+
+        boolean success = false;
+
+        if (_currentRecord.PrintSettingsPriorityId == 1)
+        {
+            // Document instance setting
+            // Implementation based on PrintMgmtSetupDocInstance::deleteOnServer()
+            PrintMgmtDocInstance docInstance;
+
+            try
+            {
+                // Does this record exist in the database?
+                select forupdate firstonly docInstance
+                    where docInstance.RecId == _currentRecord.DocInstanceRecId;
+                if (!docInstance.RecId)
+                {
+                    // Someone deleted the record the user was editing
+                    DocGlobalHelper::handleError(strFmt("@DocentricAX4:DeleteConflictRecordNotFound",
+                                                'PrintMgmtDocInstance',
+                                                _currentRecord.DocInstanceRecId,
+                                                _currentRecord.PrintSettingsDescriptionFull));
+                }
+                else
+                {
+                    // Record exists in the database. Make sure that it isn't a newer version.
+                    select forupdate firstonly docInstance
+                        where docInstance.RecId == _currentRecord.DocInstanceRecId
+                            && docInstance.RecVersion == _currentRecord.DocInstanceRecVersion;
+                    if (!docInstance.RecId)
+                    {
+                        // Someone changed the record we want to delete, DB version is newer
+                        DocGlobalHelper::handleError(strFmt("@DocentricAX4:DeleteConflictNewerRecordInDatabase",
+                                                    'PrintMgmtDocInstance',
+                                                    _currentRecord.DocInstanceRecId,
+                                                    _currentRecord.PrintSettingsDescriptionFull));
+                    }
+                    else
+                    {
+                        ttsbegin;
+                        
+                        docInstance.delete(); // cascading delete will take care of associated Settings & IdentificationText
+
+                        DocPrintMgmtUtilsUIHelper::deleteRecordInDatasource(_currentRecord, _tmpTable);
+
+                        ttscommit;
+
+                        success = true;
+                    }
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+        }
+        else
+        {
+            // Conditional setting
+            // Implementation based on PrintMgmtSetupSettingsConditional::deleteOnServer()
+            PrintMgmtSettings printSettings;
+            
+            try
+            {
+                // Does this record exist in the database?
+                select forupdate firstonly printSettings
+                    where printSettings.RecId == _currentRecord.PrintMgmtSettingsRecId;
+                if(!printSettings.RecId)
+                {
+                    // Someone deleted the record the user was editing
+                    DocGlobalHelper::handleError(strFmt("@DocentricAX4:DeleteConflictRecordNotFound",
+                                                'PrintMgmtSettings',
+                                                _currentRecord.PrintMgmtSettingsRecId,
+                                                _currentRecord.PrintSettingsDescriptionFull));
+                }
+                else
+                {
+                    // Record exists in the database. Make sure that it isn't a newer version.
+                    select forupdate firstonly printSettings
+                        where printSettings.RecId == _currentRecord.PrintMgmtSettingsRecId
+                            && printSettings.RecVersion == _currentRecord.PrintMgmtSettingsRecVersion;
+                    if(!printSettings.RecId)
+                    {
+                        // Someone changed the record we want to delete, DB version is newer
+                        DocGlobalHelper::handleError(strFmt("@DocentricAX4:DeleteConflictNewerRecordInDatabase",
+                                                    'PrintMgmtSettings',
+                                                    _currentRecord.PrintMgmtSettingsRecId,
+                                                    _currentRecord.PrintSettingsDescriptionFull));
+                    }
+                    else
+                    {
+                        ttsbegin;
+
+                        printSettings.delete(); // cascading delete will take care of associated IdentificationText
+
+                        DocPrintMgmtUtilsUIHelper::deleteRecordInDatasource(_currentRecord, _tmpTable);
+
+                        ttscommit;
+
+                        success = true;
+                    }
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+        }  
+    
+        return success;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteRecordInDatasource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the specified record in the staging table.
+    /// </summary>
+    /// <param name = "_currentRecord">Current staging record</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form</param>
+    private static void deleteRecordInDatasource(DocPrintMgmtUtilsTmp _currentRecord,  DocPrintMgmtUtilsTmp _tmpTable)
+    { 
+        RecId currentRecordRecId = _currentRecord.RecId;
+
+        // If the record has child records, delete them from the Utils datasource.
+        // Only records with PrintSettingsPriorityId = 1 can have children.
+        if (_currentRecord.PrintSettingsPriorityId == 1)
+        {
+            RecId docInstanceRecId = _currentRecord.DocInstanceRecId;
+
+            select firstonly PrintSettingsPriorityId from _tmpTable
+                order by PrintSettingsPriorityId desc
+                    where _tmpTable.DocInstanceRecId == docInstanceRecId;
+            int maxPriority = real2int(_tmpTable.PrintSettingsPriorityId);
+            while (maxPriority > 1)
+            {   
+                select firstonly forupdate _tmpTable
+                    where _tmpTable.DocInstanceRecId == docInstanceRecId        // same DocInstance
+                        && _tmpTable.PrintSettingsPriorityId == maxPriority;    // higher priority
+                if (_tmpTable.RecId)
+                {
+                    // Priorities are not necessarily continuous. Some settings might have been deleted.
+                    _tmpTable.delete();
+                }
+
+                maxPriority--;
+            }
+        }
+        
+        // Now delete the record from the Utils datasource.
+        select firstonly forupdate _tmpTable where _tmpTable.RecId == currentRecordRecId;
+        _tmpTable.delete();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncFromDatabaseToTmpRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Synchronize the state and content of the given DocPrintMgmtUtils record with the database,
+    /// database record being master.
+    /// - If the DocPrintMgmtUtils record isn't found in the database, delete it from staging.
+    /// - If the DocPrintMgmtUtils record is found in the database, then:
+    ///   - If keep my changes: reread the values of Clean records, skip others.
+    ///   - If reject my changes: reread all records from the matching PrintMgmtSettings table.
+    ///  Mark all reloaded records as clean.
+    /// </summary>
+    /// <param name = "_utilsRecId">>RecId of the DocPrintMgmtUtils record to be synchronized.</param>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <param name = "_keepMyChanges">boolean: if true, touched records are not reloaded,
+    /// otherwise all records are reloaded.</param>
+    /// <returns>DocPrintMgmtUtilsReloadingResult information if the record was reloaded, deleted or skipped.</returns>
+    public static DocPrintMgmtUtilsReloadingResult syncFromDatabaseToTmpRecord(RecId _utilsRecId, DocPrintMgmtUtilsTmp _tmpTable, boolean _keepMyChanges)
+    {
+        DocPrintMgmtUtilsTmp currentRecord = DocPrintMgmtUtilsTmp::find(_utilsRecId, _tmpTable, true);      
+        DocPrintMgmtUtilsReloadingResult retval = DocPrintMgmtUtilsReloadingResult::Skipped;
+       
+        PrintMgmtSettings printMgmtSettings;
+        select firstonly printMgmtSettings where printMgmtSettings.RecId == currentRecord.PrintMgmtSettingsRecId;
+        if (printMgmtSettings)
+        {
+            // Record exists in DB, re-read it if needed (Clean records always, others only if Reread > Reject my changes)
+            if (!_keepMyChanges || (_keepMyChanges && currentRecord.RecordStatus == DocPrintMgmtUtilsRecordStatus::Clean))
+            {
+                ttsbegin;
+                currentRecord.rereadOneRecord(printMgmtSettings);
+                currentRecord.update();
+                ttscommit;
+
+                currentRecord.validate();
+
+                retval = DocPrintMgmtUtilsReloadingResult::Reloaded;
+            }
+        }
+        else
+        {
+            // Record doesn't exist in DB, delete it from staging.
+            DocPrintMgmtUtilsUIHelper::deleteRecordInDatasource(currentRecord, _tmpTable);
+
+            retval = DocPrintMgmtUtilsReloadingResult::Deleted;
+        }
+
+        return retval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCloseForm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if there are some non-clean (dirty or marked for deletion) records in staging.
+    /// If they exist, prompt the user for next action and return the user selection.
+    /// Method is called when user wants to close the form.
+    /// </summary>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <param name = "_isLicenseValid">boolean: true for the Full edition, otherwise False.</param>
+    /// <returns>True if the requested action can be performed, false otherwise.</returns>
+    public static boolean canCloseForm(DocPrintMgmtUtilsTmp _tmpTable, boolean _isLicenseValid = DocLicenseMng::isLicenseValid())
+    {
+        boolean canClose = true;
+
+        select count(RecId) from _tmpTable
+            where _tmpTable.RecordStatus != DocPrintMgmtUtilsRecordStatus::Clean;
+        if (_tmpTable.RecId != 0)
+        {
+            // There are some non-clean records.
+            // Prompt the user if he really wants to close the utils form, but provide different
+            // text for Full and Free edition users.
+            if (_isLicenseValid)
+            {
+                canClose = Box::yesNo(strFmt("@DocentricAX4:CanCloseUtilsFormDirtyRecordsWarningFull", _tmpTable.RecId), DialogButton::No, 
+                                        "@DocentricAX4:CanCloseUtilsFormDirtyRecordsWarningTitle");
+            }
+            else
+            {
+                canClose = Box::yesNoOnce("@DocentricAX4:CanCloseUtilsFormDirtyRecordsWarningTitle", 
+                                            "@DocentricAX4:CanCloseUtilsFormDirtyRecordsWarningFree", DialogButton::No);
+            }
+        }
+
+        return canClose;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndCleanupNonCleanRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if there are some dirty or marked for deletion records for the same document type
+    /// as on the currently selected record. If they exist, prompt the user for the next action
+    /// and execute it.
+    /// Method is called before we open the standard Print mgmt settings form,
+    /// because we must keep Utils form in sync with the standard Print mgmt settings. 
+    /// Sync is required only for the document type on the caller record. 
+    /// The following situations are possible:
+    ///     1. All records are clean: it is OK to open the Print mgmt settings form.
+    ///     2. There are some dirty or marked for deletion records: user is prompted to 
+    ///        (a) Submit them --> submit the dirty records, delete the records marked for deletion,
+    ///        (b) Restore them --> re-read the dirty records from the standard Print mgmt settings,
+    ///                             unmark the records marked for deletion, or 
+    ///        (c) Cancel the requested operation.
+    /// </summary>
+    /// <param name = "_tmpTable">DocPrintMgmtUtilsTmp buffer with temp data for utils form.</param>
+    /// <param name = "_documentType">PrintMgmtDocumentType document type of the current record.</param>
+    /// <returns>True if the requested action can be performed, false otherwise.</returns>
+    public static boolean checkAndCleanupNonCleanRecords(DocPrintMgmtUtilsTmp _tmpTable, PrintMgmtDocumentType _documentType)
+    {
+        DialogButton dlgBtn = DialogButton::Cancel;
+
+        select count(RecId) from _tmpTable 
+            where _tmpTable.RecordStatus != DocPrintMgmtUtilsRecordStatus::Clean
+                && _tmpTable.DocInstanceDocumentType == _documentType;
+        if (_tmpTable.RecId == 0)
+        {
+            // All records are clean, OK to proceed with the requested action.
+            return true;
+        }
+
+        // There are some non-clean records.
+        // Prompt user to Submit, Revert or Cancel opening the Print mgmt setup form
+        dlgBtn = Box::yesNoCancel(strFmt("@DocentricAX4:DirtyRecordsSubmitRevertCancel", _tmpTable.RecId, enum2Str(_documentType)), DialogButton::Yes, "@DocentricAX4:DirtyRecordsWarning");
+                     
+        if (dlgBtn == DialogButton::Cancel)
+        {
+            // Return false, so that caller can't execute the requested action.
+            return false;
+        }
+
+        // Submit or Revert action. Collect the records to be submitted/reverted.
+        Set recInfo = new Set(Types::Int64);
+        while select RecId, RecordStatus, PrintSettingsPriorityId from _tmpTable 
+            where _tmpTable.RecordStatus != DocPrintMgmtUtilsRecordStatus::Clean
+                && _tmpTable.DocInstanceDocumentType == _documentType
+        {
+            if (dlgBtn == DialogButton::Yes)
+            {
+                // Submit non-clean records
+                if (_tmpTable.RecordStatus == DocPrintMgmtUtilsRecordStatus::Dirty  // dirty record
+                    || _tmpTable.PrintSettingsPriorityId == 1   // parent marked for deletion
+                    || !DocPrintMgmtUtilsUIHelper::hasParentRecordMarkedForDeletion(_tmpTable.RecId, _tmpTable) // child marked for deletion, 
+                                                                                                                // its parent isn't marked for deletion
+                    )
+                {
+                    recInfo.add(_tmpTable.RecId);
+                }            
+            }
+            else
+            {
+                // Revert non-clean records
+                recInfo.add(_tmpTable.RecId);            
+            }
+        }
+        SetEnumerator se = recInfo.getEnumerator();
+        se.reset();
+
+        // Loop through the collected non-clean records and apply the requested action.
+        boolean canContinue = false;
+        int recordsProcessed = 0;
+        try
+        {
+            ttsbegin;
+            while (se.moveNext())
+            {
+                if (dlgBtn == DialogButton::Yes)
+                {
+                    // Submit non-clean records
+                    DocPrintMgmtUtilsUIHelper::syncFromTmpRecordToDatabase(se.current(), _tmpTable);
+                }
+                else
+                {
+                    // Revert non-clean records
+                    DocPrintMgmtUtilsUIHelper::syncFromDatabaseToTmpRecord(se.current(), _tmpTable, false);
+                }
+
+                recordsProcessed++;
+            }
+            ttscommit;
+
+            canContinue = true;
+        }
+        catch
+        {
+            if (dlgBtn == DialogButton::Yes)
+            {
+                DocGlobalHelper::handleError("@DocentricAX4:ErrorSubmittingRecords");
+            }
+            else
+            {
+                DocGlobalHelper::handleError("@DocentricAX4:ErrorRevertingRecords");
+            }
+        }
+        
+        return canContinue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markForDeleteAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Mark the selected records for deletion.
+    /// This method is called when the 'Mark for delete' button is clicked on the Print mgmt utils form.
+    /// It works for the multi-selected datasource, each of the selected records is processed.
+    /// If a dirty record is marked for deletion, its changes will be lost, so if such record
+    /// is "submitted", it menas it will be deleted in the database, and if it is "reverted", 
+    /// then it is re-read from the database. 
+    /// When a record is marked for deletion, all of its child records are also marked for deletion.
+    /// </summary>
+    private void markForDeleteAction()
+    {
+        this.checkCaller();
+
+        if (!Box::confirm("@DocentricAX4:MarkForDeleteConfirm"))
+        {
+            return;
+        }
+
+        // Loop through the multi-selected records and mark them for deletion.
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(callerDs);
+
+        int recordsProcessed = 0, childRecordsProcessed = 0;
+        DocPrintMgmtUtilsTmp utilsRecord = helper.getFirst();
+        try
+        {
+            ttsbegin;
+            while (utilsRecord.RecId != 0)
+            {
+                if (utilsRecord.RecordStatus != DocPrintMgmtUtilsRecordStatus::MarkForDeletion)
+                {
+                    childRecordsProcessed += DocPrintMgmtUtilsUIHelper::markRecordForDeletion(utilsRecord.RecId, tmpTable);
+                    recordsProcessed++; 
+                }
+                utilsRecord = helper.getNext();
+            }
+            ttscommit;
+
+            if (recordsProcessed > 0)
+            {
+                DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:MarkForDeleteSuccess", recordsProcessed, childRecordsProcessed));
+            }
+            else
+            {
+                DocGlobalHelper::handleInfo("@DocentricAX4:MarkForDeleteNoRecordMarked");
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:MarkForDeleteError");
+        }
+
+        // Show the modified data in the grid
+        callerForm.task(#taskRefresh);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSubmitRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the given record should be submitted to the database.
+    /// All selected dirty records can be submitted, without any other check.
+    /// If record is marked for deletion, then:
+    ///     - If a non-child record is marked for deletion, we will submit it (delete it).
+    ///     - If a child record is marked for deletion, then:
+    ///         - If its parent is also marked for deletion, then we won't submit it,
+    ///           because it will be deleted in the database through cascading from the parent,
+    ///           so we skip such records.
+    ///         - If its parent isn't marked for deletion, then we will submit it.
+    /// </summary>
+    /// <param name = "_utilsRecord">DocPrintMgmtUtilsTmp record from the utils tmp table.</param>
+    /// <returns>True if the given record should be submitted to the database, false otherwise</returns>
+    private boolean shouldSubmitRecord(DocPrintMgmtUtilsTmp _utilsRecord)
+    {
+        boolean shouldSubmitRecord = false;
+
+        if (_utilsRecord.RecordStatus == DocPrintMgmtUtilsRecordStatus::Dirty)
+        {
+            shouldSubmitRecord = true;
+        }
+        else if (_utilsRecord.RecordStatus == DocPrintMgmtUtilsRecordStatus::MarkForDeletion)
+        {
+            if (_utilsRecord.PrintSettingsPriorityId == 1)    
+            {
+                // This is a non-child record, OK to submit it
+                shouldSubmitRecord = true;
+            }
+            else if (!DocPrintMgmtUtilsUIHelper::hasParentRecordMarkedForDeletion(_utilsRecord.RecId, tmpTable))  
+            {
+                // This is a child record  whose parent isn't marked for deletion
+                shouldSubmitRecord = true;
+            }
+        }
+
+        return shouldSubmitRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitAction</Name>
+				<Source><![CDATA[
+    /// <summary> 
+    /// Submit the selected records to the database: 
+    /// - For dirty records: save the values from the record to the database.
+    /// - For records marked for deletion: delete the records from the database.
+    /// This method is called when the 'Submit' button is clicked on the Print mgmt utils form.
+    /// It works for the multi-selected datasource, each of the selected records is processed.
+    /// </summary>
+    private void submitAction()
+    {        
+
+        /*********************************   DOCENTRIC AX FREE EDITION LICENSE NOTICE   *********************************/
+        /*
+        In case that you are using Docentric AX Free Edition, changing these parts of the source code related to the licensing
+        is STRICTLY FORBIDDEN and DOES NOT COMPLY with Docentric AX Free Edition License, which you accepted by installing
+        the Docentric AX Free Edition product.
+        You must keep intact all parts of the source code related to the licensing of the full product version.
+        Read more: https://ax.docentric.com/free-edition-license/
+        */
+        /*********************************   DOCENTRIC AX FREE EDITION LICENSE NOTICE   *********************************/
+
+        // If the Submit button on Print management utilities is used, check the license. This feature cannot be used with Free Edition!
+        // This call will throw an exception if the license is not found or if the license is invalid, expired or insufficient.        
+        DocLicenseMng::checkLicense(DocConstant::FeaturePrintMgmtUtilsFullEdition, "@DocentricAX4:PrintMgmtUtilsLicenseError");
+
+
+        this.checkCaller();
+
+        if (!Box::confirm("@DocentricAX4:SubmitConfirm"))
+        {
+            return;
+        }
+
+        // Loop through the multi-selected records and create a Set of RecIds to be processed.
+        // It will be a common Set for dirty records and records marked for deletion.
+        Set recordsToSubmit = new Set(Types::Int64);
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(callerDs);
+        DocPrintMgmtUtilsTmp utilsRecord = helper.getFirst();
+        while (utilsRecord.RecId != 0)
+        {
+            if (this.shouldSubmitRecord(utilsRecord))
+            {
+                recordsToSubmit.add(utilsRecord.RecId);
+            }
+
+            utilsRecord = helper.getNext();
+        }
+
+        if (recordsToSubmit.elements() == 0)
+        {
+            DocGlobalHelper::handleInfo("@DocentricAX4:NothingToSubmit");
+            return;
+        }
+
+        // Process the records from the collected Set
+        int recordsProcessed, recordsUpdated, recordsDeleted, recordsConflicted, recordsSkipped = 0;
+        try
+        {
+            ttsbegin;
+
+            SetEnumerator se = recordsToSubmit.getEnumerator();
+            se.reset();
+            while (se.moveNext())
+            {
+                DocPrintMgmtUtilsSubmittingResult submittingResult = DocPrintMgmtUtilsUIHelper::syncFromTmpRecordToDatabase(se.current(), tmpTable);
+                recordsProcessed++;
+                switch (submittingResult)
+                {
+                    case DocPrintMgmtUtilsSubmittingResult::Updated:
+                        recordsUpdated++;
+                        break;
+                    
+                    case DocPrintMgmtUtilsSubmittingResult::Deleted:
+                        recordsDeleted++;
+                        break;
+                    
+                    case DocPrintMgmtUtilsSubmittingResult::Conflicted:
+                        recordsConflicted++;
+                        break;
+
+                    case DocPrintMgmtUtilsSubmittingResult::Skipped:
+                        recordsSkipped++;
+                        break;
+
+                    default:
+                        // do nothing
+                }
+
+                utilsRecord = helper.getNext();
+            }
+
+            ttscommit;
+
+            DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:SubmitSuccess", recordsProcessed, recordsUpdated, recordsDeleted, recordsConflicted, recordsSkipped));
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:SubmitError");
+        }
+
+        // Show the modified data in the grid
+        callerForm.task(#taskRefresh);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reloadSelectedRecordsAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reload the selected records from the database.
+    /// - If parameter _keepMyChanges is true, records that are Dirty or Marked for deletion
+    ///   are not reloaded. Only Clean selected records are reloaded. 
+    /// - If parameter _keepMyChanges is false, all selected records (Clean/Dirty/Marked for
+    ///   deletion) are reloaded.
+    /// - In both cases, if some of the selected records doesn't exist any longer in the database, 
+    ///   it is deleted from staging, too.
+    /// This method is called when the 'Reload > Reject my changes' or 'Reload > Keep my changes'
+    /// button is clicked on the Print mgmt utils form. It works for the multi-selected datasource, 
+    /// each of the selected records is processed.
+    /// </summary>
+    /// <param name = "_keepMyChanges">boolean if true, touched records are not reloaded,
+    /// otherwise all records are reloaded.</param>
+    private void reloadSelectedRecordsAction(boolean _keepMyChanges = true)
+    {
+        this.checkCaller();
+        
+        if (!Box::confirm(_keepMyChanges ? "@DocentricAX4:ReloadAndKeepMyChangesConfirm" : "@DocentricAX4:ReloadAndRejectMyChangesConfirm"))
+        {
+            return;
+        }
+
+        // Loop through the multi-selected records and reread them from the matching
+        // print management tables.
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(callerDs);
+
+        int recordsProcessed, recordsReloaded, recordsDeleted, recordsSkipped = 0;
+        DocPrintMgmtUtilsTmp utilsRecord = helper.getFirst();
+        try
+        {
+            ttsbegin;
+            while (utilsRecord.RecId != 0)
+            {
+                DocPrintMgmtUtilsReloadingResult reloadingResult = DocPrintMgmtUtilsUIHelper::syncFromDatabaseToTmpRecord(utilsRecord.RecId, tmpTable, _keepMyChanges);
+                recordsProcessed++;
+                switch (reloadingResult)
+                {
+                    case DocPrintMgmtUtilsReloadingResult::Reloaded:                        
+                        recordsReloaded++;
+                        break;
+                    
+                    case DocPrintMgmtUtilsReloadingResult::Deleted:
+                        recordsDeleted++;
+                        break;
+
+                    default:
+                        recordsSkipped++;
+                }
+
+                utilsRecord = helper.getNext();
+            }
+            ttscommit;
+
+            DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:ReloadSelectedRecordsSuccess", 
+                recordsProcessed, recordsReloaded, recordsDeleted, recordsSkipped));
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:ReloadSelectedRecordsError");
+        }
+
+        // Show the modified data in the grid
+        callerForm.task(#taskRefresh);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyWorkingCopyAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For the selected records apply the print destination settings from the working copy container.
+    /// This method is called when the 'Apply values from working copy' button is clicked 
+    /// on the Print mgmt utils form. It works for the multi-selected datasource, each 
+    /// of the selected records is processed.
+    /// </summary>
+    private void applyWorkingCopyAction()
+    {
+        this.checkCaller();        
+
+        if (!Box::confirm("@DocentricAX4:ApplyFromWorkingCopyConfirm"))
+        {
+            return;
+        }
+
+        // Loop through the multi-selected records and apply the working copy seeting to them.
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(callerDs);
+
+        container workingCopyPrintJobSettings = callerForm.getWorkingCopyPrintJobSettings();
+
+        int recordsProcessed = 0;
+        DocPrintMgmtUtilsTmp utilsRecord = helper.getFirst();
+        try
+        {
+            SRSPrintDestinationSettings pds = new SRSPrintDestinationSettings();
+            pds.unpack(workingCopyPrintJobSettings);
+
+            ttsbegin;
+            while (utilsRecord.RecId != 0)
+            {
+                DocPrintMgmtUtilsHelper::unpackPrintDestinationSettings(utilsRecord, pds);
+                utilsRecord.update();
+
+                recordsProcessed++;
+                utilsRecord = helper.getNext();
+            }
+            ttscommit;
+
+            DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:ApplyFromWorkingCopySuccess", recordsProcessed));
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:ApplyFromWorkingCopyError");
+        }
+
+        // Show the modified data in the grid
+        callerForm.task(#taskRefresh);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>editSettingsAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For the selected record open the print destination settings form where user
+    /// can edit the settings in the standard way.
+    /// This method is called when the 'Edit settings' button is clicked
+    /// on the Print mgmt utils form. It works only for 1 selected record.
+    /// </summary>
+    private void editSettingsAction()
+    {
+        this.checkCaller();        
+            
+        // Get the selected record from the caller
+        DocPrintMgmtUtilsTmp currentRecord = DocPrintMgmtUtilsTmp::find(callerRecord.RecId, tmpTable, true);
+
+        // Make sure that packed and unpacked values are in sync.
+        //if (currentRecord.UnpackedSyncStatus == DocPrintMgmtUtilsUnpackedSyncStatus::NotSynced)
+        //{
+        //    ttsbegin;
+        //    DocPrintMgmtUtilsHelper::packAndSavePrintDestinationSettings(currentRecord);
+        //    currentRecord.update();
+        //    ttscommit;
+        //}
+
+        SRSPrintDestinationSettings pds = new SRSPrintDestinationSettings();
+        pds.unpack(currentRecord.PrintJobSettings);
+
+        // Calculate the checksum of the initial print destination settings,
+        // but we must pack again the unpacked values instead of using immediatelly 
+        // the container from the database record. This way we make sure
+        // that checksum is calculated based on the same structure.
+        container initialPrintJobSettings = pds.pack();             
+        str printJobSettingsStr = con2base64str(initialPrintJobSettings);
+        str oldChecksum = DocGlobalHelper::computeChecksum(printJobSettingsStr, DocChecksumAlgorithmAX::SHA1);
+
+        // Open the print destination settings form.
+        boolean ok = DocPrintMgmtHelper::showSettingsDialog(pds, currentRecord.FormatName, currentRecord.DocInstanceDocumentType);
+            
+        // Print destination form closed, process the new setting.
+        if (ok)
+        {              
+            // Calculate the checksum of the print job settings after closing the form.
+            // If it is the same as prior to opening the form, then nothing was modified
+            // in the print destination and we don't need to update the record and mark it
+            // as dirty.
+            container printJobSettings = pds.pack();
+            printJobSettingsStr = con2base64str(printJobSettings);
+            str newChecksum = DocGlobalHelper::computeChecksum(printJobSettingsStr, DocChecksumAlgorithmAX::SHA1);
+
+            if (newChecksum != oldChecksum)
+            {
+                ttsbegin;
+                DocPrintMgmtUtilsHelper::unpackPrintDestinationSettings(currentRecord, pds);
+                currentRecord.update();
+                ttscommit;
+
+                // Show the modified data in the grid
+                callerForm.task(#taskRefresh);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSettingsAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate the selected records.
+    /// This method is called when the 'Validate' button is clicked on the Print mgmt utils form.
+    /// It works for the multi-selected datasource, each of the selected records is processed.
+    /// </summary>
+    private void validateSettingsAction()
+    {
+        this.checkCaller();
+
+        if (!Box::confirm("@DocentricAX4:ValidateConfirm"))
+        {
+            return;
+        }
+
+        // Loop through the multi-selected records and validate them.
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(callerDs);
+
+        int recordsProcessed = 0, validCount = 0, invalidCount = 0;
+        DocPrintMgmtUtilsTmp utilsRecord = helper.getFirst();
+        try
+        {
+            while (utilsRecord.RecId != 0)
+            {
+                boolean isValid = DocPrintMgmtUtilsHelper::validateUtilsRecord(utilsRecord.RecId, tmpTable);
+                recordsProcessed++;
+
+                if (isValid)
+                {
+                    validCount++;
+                }
+                else
+                {
+                    invalidCount++;
+                }
+
+                utilsRecord = helper.getNext();
+            }
+
+            if (recordsProcessed > 0)
+            {
+                DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:ValidationSuccess", recordsProcessed, validCount, invalidCount));
+            }
+            else
+            {
+                DocGlobalHelper::handleInfo("@DocentricAX4:ValidationNoRecordMarked");
+            }
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:ValidationError");
+        }
+
+        // Show the modified data in the grid
+        callerForm.task(#taskRefresh);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleUIActions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// We are using the helper methods in this class from different forms,
+    /// so we base the logic on the menu item used.
+    /// </summary>
+    public void handleUIActions()
+    {
+        switch (args.menuItemName())
+        {
+            case menuItemActionStr(DocPrintMgmtUtilsMarkForDelete):
+                // "Mark for delete" menu item
+                this.markForDeleteAction();
+                break;
+
+            case menuItemActionStr(DocPrintMgmtUtilsSubmit):
+                // "Submit" menu item 
+                this.submitAction();
+                break;
+
+            case menuItemActionStr(DocPrintMgmtUtilsReloadAndKeepMyChanges):
+                // "Reload > Keep my changes" menu item
+                this.reloadSelectedRecordsAction(true);
+                break;
+
+            case menuItemActionStr(DocPrintMgmtUtilsReloadAndRejectMyChanges):
+                // "Reload > Reject my changes" menu item
+                this.reloadSelectedRecordsAction(false);
+                break;
+
+            case menuItemActionStr(DocPrintMgmtUtilsApplyWorkingCopy):
+                // "Apply values from working copy" menu item
+                this.applyWorkingCopyAction();
+                break;
+
+            case menuItemActionStr(DocPrintMgmtUtilsEditSettings):
+                // "Edit settings" menu item
+                this.editSettingsAction();
+                break;
+
+            case menuItemActionStr(DocPrintMgmtUtilsValidate):
+                // "Validate" menu item
+                this.validateSettingsAction();
+                break;
+            
+            default:
+                return;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the instance of the DocPrintMgmtUtilsUIHelper class.
+    /// </summary>
+    /// <param name = "_args">An instance of the Args class</param>
+    protected void new (Args _args)
+    {
+        args = _args;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of the class and is run directly from a menu item.
+    /// </summary>
+    /// <param name = "_args">An instance of the Args class</param>
+    public static void main(Args _args)
+    {
+        DocPrintMgmtUtilsUIHelper uiHelper = new DocPrintMgmtUtilsUIHelper(_args);
+        uiHelper.handleUIActions();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

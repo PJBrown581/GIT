@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_ReadFileMT940</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_BR_ReadFileMT940 extends SKS_BR_ReadFileStructured
+{
+    #define.RecordCodeTransactionReferenceNumber('20')
+    #define.RecordCodeRelatedReference('21')
+    #define.RecordCodeAccountIdentification('25')
+    #define.RecordCodeStatementInformation('28C')
+    #define.RecordCodeCitibankStatementInformation('28')
+    #define.RecordCodeOpeningBalanceM('60M')
+    #define.RecordCodeOpeningBalanceF('60F')
+    #define.RecordCodeStatementLine('61')
+    #define.RecordCodeInformationToAccountOwner('86')
+    #define.RecordCodeClosingBalanceM('62M')
+    #define.RecordCodeClosingBalanceF('62F')
+    #define.RecordCodeClosingAvailableBalance('64')
+    #define.RecordCodeForwardAvailableBalance('65')
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>assignRecordsToCurrentStatement</Name>
+				<Source><![CDATA[
+    private void assignRecordsToCurrentStatement(BankAccountStatement _BankAccountStatement)
+    {
+        SKS_BR_BankTran locSKS_BR_BankTran;
+        ;
+
+        update_recordSet locSKS_BR_BankTran
+            setting OriginalStatementRecId = _BankAccountStatement.RecId,
+                    ImportedStatementNum = _BankAccountStatement.AccountStatementNum,
+                    ImportedStatementDate = _BankAccountStatement.AccountStatementDate
+            where locSKS_BR_BankTran.BankHeaderRecId == bankHeaderRecId
+                && locSKS_BR_BankTran.AccountId == _BankAccountStatement.AccountId
+                && locSKS_BR_BankTran.OriginalStatementRecId == 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertBankTran</Name>
+				<Source><![CDATA[
+    void insertBankTran(BankAccountTable _bankAccount,
+                        boolean doNotImport,
+                        dataareaid companyContext)
+    {
+        SKS_BR_BankTran companySKS_BR_BankTran;
+        ;
+
+        BankRecordReady = false;
+        // Time to write the transaction entry.
+        If(_bankAccount)
+        {
+            if(!doNotImport)
+            {
+                changeCompany(companyContext)
+                {
+                    if(!this.parseValue())
+                    {
+                        return;
+                    }
+
+                    companySKS_BR_BankTran = null;
+                    buf2buf(bankTRan, companySKS_BR_BankTran);
+                    companySKS_BR_BankTran.doInsert();
+                }
+            }
+            ImportCount++;
+        }
+        this.initSKS_BR_BankTran();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    boolean openFile()
+    {
+        gReadParseFile = new SKS_BR_ReadParseMT940(fileName, 'R', gBRPreReadScript, gBRPreReadScriptParams, gBRPostReadScript, gBRPostReadScriptParams,gSKS_BF_BankIntType);
+        if (!gReadParseFile || gReadParseFile.status() != IO_Status::Ok )
+        {
+            //file could not be opened
+            this.handleError(bankHeaderRecId, (strfmt("@SYS19312",fileName)), 0);
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readFile</Name>
+				<Source><![CDATA[
+    void readFile()
+    {
+        boolean doNotImport = false;
+        boolean ignoreThisTransaction = false;
+        boolean previousRecordInformationToAccountOwner = false;
+        boolean FileHeaderFound = false;
+        boolean AccountIdentifierFound = false;
+
+        date holdTransactionDate;
+
+        int locRecordCount = 0;
+
+        str locRecordCode, locPrimaryRecordCode;
+        str TransactionType;
+        str locDebitCreditFlag;
+        str companyContext = curExt();
+        str locTransactionReferenceNumber;
+        str value;
+        BankAccountTable bankAccountNbr;
+        int locLineNumberToInsert;
+
+        SKS_BR_TranTypeProcessing tranTypeProcessing;
+        BankAccountTable bankAccount;
+        SKS_BR_BankAcctStmt locSKS_BR_BankAcctStmt;
+        CompanyBankAccountId bankAccountId;
+        CurrencyCode locCurrencyCode, locTransCurrencyCode;
+        List locRecord;
+        BankAccountStatementNum locStatementNum;
+        BankAccountStatementNum importedAcctStatementNum;
+        date importedAcctStatementDate;
+        SKS_BR_BankTran     sKS_BR_BankTranDel;
+        SKS_PP_Bank     locSKS_PP_Bank; // 7526
+        ;
+
+        ImportCount = 0;
+        locRecordCount = 0;
+        locLineNumberToInsert = 0;
+        TransactionFound = false;
+        BankRecordReady = false;
+        if (!this.openFile())
+        {
+            return;
+        }
+        ttsbegin;
+        locSKS_BR_BankAcctStmt = new SKS_BR_BankAcctStmt();
+        this.initSKS_BR_BankTran();
+        while(gReadParseFile.status() == IO_status::Ok)
+        {
+            locRecord = gReadParseFile.listRead();
+            if(!locRecord)
+            {
+                continue;
+            }
+            if(locRecord.empty()) //skip blank records
+            {
+                continue;
+            }
+            locRecordCount = gReadParseFile.getStartingLineOfCurrentRecord();//count processed records
+            locRecordCode = this.getTagValue(locRecord, SKS_BR_MT940Field::Tag); // Get the record code
+            //the locPrimaryRecordCode is any code EXCEPT an 86.  This way, if we get an 86,
+            //we can see how to handle it by looking at the locPrimaryCode(which should still
+            //be set to the previous record's code
+            if(locRecordCode != #RecordCodeInformationToAccountOwner)
+            {
+                //We cannot write a transaction into the DB until we have all of it.
+                //As 86 lines constitute part of either 61 lines or 65 lines, it is
+                //necessary to wait until we have the next tag, to see of the records
+                //are complete.  it is also noteworthy that, the Supplimental Data field
+                //is already included in the 61 primary line.  IT is suffixed to the line
+                //preceeded by a carriage return.  There is no logic here for
+                //inserting a 65 line because the 65 lines are not used in ebanking at this
+                //time.
+                if(locPrimaryRecordCode == #RecordCodeStatementLine)
+                {
+                    // Populate User note here
+                    bankTran.TranDescriptionUser = bankTran.TranDescription;
+                    this.insertBankTran(bankAccount, (doNotImport || ignoreThisTransaction), companyContext);//if either doNotImport or ignoreThisTransaction says true, we don't want to import
+                }
+                locPrimaryRecordCode = locRecordCode;
+                bankTran.LineNumInFile = gReadParseFile.getStartingLineOfCurrentRecord();
+            }
+            //This code handles the possibility of an unknown number of 86 lines.  It will insert once it stops getting 86s.
+            if(previousRecordInformationToAccountOwner && locRecordCode != #RecordCodeInformationToAccountOwner)
+            {
+                BankRecordReady = true;
+                bankTran.TranDescriptionUser = bankTran.TranDescription;
+                this.insertBankTran(bankAccount, doNotImport, companyContext);
+                previousRecordInformationToAccountOwner = false;
+            }
+            //This is an optional field that no analagous field exist to for this data.
+            //if ( locRecordCode == #RecordCodeRelatedReference) //21 16x OPTIONAL
+            //{
+            //}
+            if ( locRecordCode == #RecordCodeTransactionReferenceNumber) //20 16x MANDITORY
+            {
+                FileHeaderFound = true;
+                // Get sender identification
+                locTransactionReferenceNumber = this.getTagValue(locRecord, SKS_BR_MT940Field::TransactionReferenceNumber);
+                // Set File Date here.
+                holdTransactionDate = DateTimeUtil::date(FileDateTime);
+            }
+            else if ( FileHeaderFound == true)
+            {
+                switch(locRecordCode)
+                {
+                    case #RecordCodeRelatedReference:
+                        //Optional Field.  No Analogous field in eBanking Suite
+                        continue;
+                    case #RecordCodeAccountIdentification:
+                        //if the account identifier changed, clear the persistant fields
+                        AccountIdentifierFound = true;
+                        //locAlternateAccountFormat = false;
+                        doNotImport = false;
+                        value = this.getTagValue(locRecord, SKS_BR_MT940Field::AccountIdentification);
+                        //The following handles an alternate format of the MT940 Account Identification record.
+                        if(strStartsWith(value, '/'))
+                        {
+                            while(strStartsWith(value, '/'))
+                                value = SKS_PP_StringFormats::strSub(value, 2);
+                            value = SKS_PP_StringFormats::strSub(value,1,strLen(value) - 3);
+                        }
+                        bankAccount = SKS_EB_Bank::getBankAccount(value);
+
+                        bankAccountNbr = bankAccount;
+                        bankAccountId = bankAccount.AccountID;
+                        companyContext = bankAccount.company();
+
+                        changeCompany(companyContext)
+                        {
+                            // Make sure this Bank Account is setup for eBankRec
+                            if(!this.validateAccountId(bankAccountId))
+                            {
+                                doNotImport = true;
+                            }
+                        }
+
+                        break;
+                    case #RecordCodeStatementInformation:
+                    case #RecordCodeCitibankStatementInformation:
+                        //we will always set a regular statment number; it is the spec and supersedes anything else if it exists,
+                        //but, if we have a CitiBank Id, and nothing else is set, we'll set it.
+
+                        //if this is a citibank id and a regular statement id already exists, skip it.
+                        if(locRecordCode == #RecordCodeCitibankStatementInformation && locStatementNum)
+                        {
+                            break;
+                        }
+                        value = this.getTagValue(locRecord, SKS_BR_MT940Field::StatementNumber);
+                        if(strContains(value, @'/'))
+                        {
+                            locStatementNum = SKS_PP_StringFormats::strSub(value, 1, SKS_PP_StringFormats::strIndexOf(value, @'/') - 1);
+                        }
+                        else
+                        {
+                            locStatementNum = value;
+                        }
+                        break;
+                    case #RecordCodeOpeningBalanceM:
+                    case #RecordCodeOpeningBalanceF:
+                        locCurrencyCode = this.getTagValue(locRecord, SKS_BR_MT940Field::Currency);
+                        break;
+                    case #RecordCodeStatementLine:
+                        if (doNotImport)
+                        {
+                            continue;
+                        }
+                        ignoreThisTransaction = False;
+                        if (AccountIdentifierFound == false)
+                        {
+                            // missing: 03
+                            this.FormatError( #RecordCodeAccountIdentifier, locRecordCount);
+                            return;
+                        }
+                        bankTran.AccountId = bankAccountId;
+                        locDebitCreditFlag = this.getTagValue(locRecord,SKS_BR_MT940Field::DebitCreditFlag);
+                        TransactionType = '';
+                        if(sks_br_fileformat.MT940_PreferredTransTypes == SKS_BR_MT940_PreferredTransTypes::CTC)
+                            TransactionType = this.getTagValue(locRecord, SKS_BR_MT940Field::CTCTranCode);
+                        if(TransactionType == '')
+                            TransactionType = this.getTagValue(locRecord, SKS_BR_MT940Field::TransactionTypeIDCode);
+
+                        if(sks_br_fileformat.DebitCreditTransTypeIdentifier)
+                        {
+                            if(strUpr(locDebitCreditFlag) == 'D' || strUpr(locDebitCreditFlag) == 'DR' || strUpr(locDebitCreditFlag) == 'RC' )
+                            {
+                                TransactionType = TransactionType + 'D';
+                            }
+                            else
+                            {
+                                TransactionType = TransactionType + 'C';
+                            }
+
+                        }
+                        bankTran.FileTranType = TransactionType;
+                        if(sks_pp_Setup.BREdition == SKS_BR_Edition::Advanced)
+                        {
+                            changeCompany(companyContext)
+                            {
+                                tranTypeProcessing = this.processTranType(bankTran.AccountId);
+                                if(tranTypeProcessing.getIgnoreTranType())
+                                {
+                                    ignoreThisTransaction = true;
+                                }
+                            }
+                            if(tranTypeProcessing.getErrorText() != '')
+                            {
+                                ttsabort;
+                                this.handleError(bankHeaderRecId, (strfmt("@SKS528", bankTran.FileTranType)), locRecordCount);
+                                ImportCount = 0;
+                                return;
+                            }
+
+                            bankTran.BankTranType = tranTypeProcessing.getBankTranType();
+
+                            SKS_BR_GLMappingRuleGroup mappingRuleGroup;
+
+                            select firstonly
+                                GLMatchOrCreate
+                            from mappingRuleGroup
+                            where mappingRuleGroup.RuleGroupId == tranTypeProcessing.getGLMappingRuleGroupId()
+                                && mappingRuleGroup.CCR_IsCCReconciliation == NoYes::No;    /// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+
+                            if (tranTypeProcessing.getMatchingRuleGroupId() || tranTypeProcessing.getGLMappingRuleGroupId())
+                            {
+                                bankTran.GLMappingRuleGroupId = tranTypeProcessing.getGLMappingRuleGroupId();
+                                bankTran.MatchingRuleGroupId = tranTypeProcessing.getMatchingRuleGroupId();
+                            }
+                            else // Bug 7219
+                            {
+                                bankTran.GLMappingRuleGroupId = '';
+                                bankTran.MatchingRuleGroupId = '';
+                                bankTran.GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLMatch;
+                            }
+                            bankTran.DefaultDimension = tranTypeProcessing.getDimension();
+                        }
+                        value = this.getTagValue(locRecord, SKS_BR_MT940Field::ValueDate);
+                        bankTran.TranDate = str2Date(SKS_PP_StringFormats::strSub(value,1,2) + @'/' +//year
+                        SKS_PP_StringFormats::strSub(value,3,2) + @'/'+//month
+                        SKS_PP_StringFormats::strSub(value,5,2),//day
+                        321);//format
+                        bankTran.ValueDate = bankTran.TranDate;
+                        if(strLen(locDebitCreditFlag) > 0)
+                        {
+                            TransactionFound = true;
+                            // Get transaction amount
+                            value = this.getTagValue(locRecord, SKS_BR_MT940Field::Amount);
+                            // vvv 12205 vvv
+                            value = strReplace(value, ',', '.') + '00';
+                            if(this.getTagValue(locRecord, SKS_BR_MT940Field::Currency) != '')
+                            {
+                                locTransCurrencyCode = this.getTagValue(locRecord, SKS_BR_MT940Field::Currency);
+                            }
+                            else
+                            {
+                                locTransCurrencyCode = locCurrencyCode;
+                            }
+                            // vvv 12191 vvv -- currency now rounds to the rounding specified in GL > Setup > Currency > Currencies -->
+                            bankTran.TranAmount = SKS_EB_Currency::formatStringToCurrency(value, locTransCurrencyCode, true);
+                            // ^^^ 12191 & 12205 ^^^
+                            //Revision 3326 -- Bank KBC:  CR = Credit Record / DR = Debit Record
+                            if(strUpr(locDebitCreditFlag) == 'D' || strUpr(locDebitCreditFlag) == 'DR' || strUpr(locDebitCreditFlag) == 'RC' )
+                            {
+                                bankTran.TranAmount = bankTran.TranAmount * -1;
+                            }
+                            value = this.getTagValue(locRecord, SKS_BR_MT940Field::BankReference); // Get Bank Reference number (banknum)
+                            bankTran.BankNum = this.parseRefernceNumber(value);
+                            bankTran.TranDescription = strRem(value, '\r\n') == ''? '' : 'BankNbr: ' + strRem(value, '\r\n');
+                            bankTran.TranDescriptionUser = bankTran.TranDescription;
+
+                            value = this.getTagValue(locRecord, SKS_BR_MT940Field::CustomerReference); // Get Customer Reference number (bankcustnum)
+                            bankTran.BankCustomerNum = this.parseRefernceNumber(value);
+                                                        
+                            //SKS 17411
+                            if (bankTran.BankCustomerNum != '')
+                            {
+                                bankTran.TranDescription = bankTran.TranDescription == '' ? 'BankCustNbr: ' + bankTran.BankCustomerNum : bankTran.TranDescription + ' ' + 'BankCustNbr: ' + bankTran.BankCustomerNum ; //SKS 16487
+                            }
+                            //bankTran.TranDescriptionUser = bankTran.TranDescriptionUser == '' ? bankTran.BankCustomerNum : bankTran.TranDescriptionUser + ' ' + bankTran.BankCustomerNum ;
+                            //SKS 17411
+
+                            //SKS 19242  TransactionType = this.getTagValue(locRecord, SKS_BR_MT940Field::CTCTranCode);
+                            bankTran.TranDescription = bankTran.TranDescription == '' ? this.getTagValue(locRecord, SKS_BR_MT940Field::SupplementaryDetails) : bankTran.TranDescription + ' ' + this.getTagValue(locRecord, SKS_BR_MT940Field::SupplementaryDetails);
+                            //bankTran.TranDescriptionUser = bankTran.TranDescriptionUser == '' ? this.getTagValue(locRecord, SKS_BR_MT940Field::SupplementaryDetails) : bankTran.TranDescriptionUser + ' ' + this.getTagValue(locRecord, SKS_BR_MT940Field::SupplementaryDetails);
+                            //SKS 19242
+
+                        }
+                        changeCompany(companyContext)
+                        {
+                            SKS_BR_ReadFile::setDefaultMatchGroup(bankTran);
+
+                            if(!this.parseValue())
+                            {
+                                return;
+                            }
+                        }
+
+                        // Update records here.
+                        break;
+                    case #RecordCodeInformationToAccountOwner:
+                        // Populate Original note
+                        bankTran.TranDescription =  strLen(bankTran.TranDescription) == 0 ? strRem(this.getTagValue(locRecord, SKS_BR_MT940Field::InformationToAccountOwner), '\r\n') : strRem(this.getTagValue(locRecord, SKS_BR_MT940Field::InformationToAccountOwner), '\r\n') + ' ' + bankTran.TranDescription;
+                        
+
+                        str RTRNvalue, EREFvalue, DDRvalue;
+                        int RTRNpos, EREFpos1, EREFpos2;
+
+                        DDRvalue = this.getTagValue(locRecord, SKS_BR_MT940Field::InformationToAccountOwner);
+
+                        EREFpos1 = strScan(DDRvalue, '/EREF/', 0, strLen(DDRvalue));
+
+                        if(EREFpos1)
+                        {
+                            EREFpos1 = EREFpos1 + 6;
+                            EREFpos2 = strScan(DDRvalue, '/', EREFpos1, strLen(DDRvalue));
+                            EREFvalue = subStr(DDRvalue, EREFpos1, EREFpos2-EREFpos1);
+                        }
+                        
+                        RTRNpos = strScan(DDRvalue, '/RTRN/', 0, strLen(DDRvalue));
+
+                        if(RTRNpos)
+                        {
+                            RTRNpos = RTRNpos + 6;
+                            RTRNvalue = subStr(DDRvalue, RTRNpos, 4);
+                        }
+
+                        bankTran.DDRReferenceNumber = EREFvalue;
+                        bankTran.DDRReasonCode = RTRNvalue;
+
+                        bankTran.DDRInboundReasonCodesRecId = SKS_BR_ReadFile::getDDRReasonCode(bankTran.DDRReasonCode, '');
+                        break;
+                        //take no action on an intermeidate closing balance line.
+                    case #RecordCodeClosingBalanceM:
+                        break;
+                    case #RecordCodeClosingBalanceF:
+                        if (AccountIdentifierFound == false)
+                        {
+                            // missing: 03
+                            this.FormatError( #RecordCodeAccountIdentifier, locRecordCount);
+                            return;
+                        }
+                        gBankAccountStatement = null;
+                        this.RecordCodeClosingBalance(locRecord, locCurrencyCode, bankAccountId);
+
+
+                        //Create Statement for Peroid's final Statement
+                        gBankAccountStatement.AccountId = bankAccountId;
+                        gBankAccountStatement.AccountStatementNum = locStatementNum;
+                        if (importedAcctStatementNum == '')
+                        {
+                            importedAcctStatementNum  = gBankAccountStatement.AccountStatementNum;
+                            importedAcctStatementDate = gBankAccountStatement.AccountStatementDate;
+                        }
+
+                        changeCompany(companyContext)
+                        {
+                            locSKS_PP_Bank  = null;
+                            select firstonly BRCreateBankStatements, BRCreateBankStatementsIfNoTrans from locSKS_PP_Bank where locSKS_PP_Bank.BankAccountId == gBankAccountStatement.AccountId; // 7526
+                            if((TransactionFound && locSKS_PP_Bank.BRCreateBankStatements) || locSKS_PP_Bank.BRCreateBankStatementsIfNoTrans)
+                            {
+                                gBankAccountStatement = locSKS_BR_BankAcctStmt.createBRStatement(gBankAccountStatement, bankHeaderRecId);
+                            }
+                            TransactionFound = false;
+                            //Assign all trans within this file, with this account to this statemet.
+                            if(gBankAccountStatement && gBankAccountStatement.SKS_BR_BankHeaderRecId > 0 && gBankAccountStatement.SKS_BR_BankHeaderRecId == bankHeaderRecId)//only set the originalstatementrecid if we created the statement
+                            {
+                                this.assignRecordsToCurrentStatement(gBankAccountStatement);
+                            }
+                            else if(gBankAccountStatement.RecId == 0 && locSKS_PP_Bank.BRCreateBankStatements == NoYes::Yes) // 7506 - deleting bank transaction if it found duplicate --> // 7526
+                            {
+                                ttsbegin;
+                                sKS_BR_BankTranDel.skipDataMethods(true);         //TAS_CAR
+                                delete_from sKS_BR_BankTranDel
+                                    where sKS_BR_BankTranDel.BankHeaderRecId == bankHeaderRecId
+                                        && sKS_BR_BankTranDel.ImportedStatementDate == dateNull()
+                                        && sKS_BR_BankTranDel.ImportedStatementNum == ''
+                                        && sKS_BR_BankTranDel.AccountId == bankAccountId;
+                                ttscommit;
+                                // 7506 <--
+                            }
+
+                        }
+
+                        break;
+                    case #RecordCodeClosingAvailableBalance:
+                        //ebanking suite currently does not support Closing Available Balances
+                        break;
+                    case #RecordCodeForwardAvailableBalance:
+                        //ebanking suite currently does not support Closing Available Balances
+                        break;
+                    default:
+                        break;
+                }
+
+
+            }
+            if (FileHeaderFound == false)
+            {
+                // missing: 01
+                this.FormatError( #RecordCodeFileHeader, locRecordCount);
+                return;
+            }
+
+        }
+        this.closeFile();
+
+        if(!this.readFileClosePreCommit())
+            return;
+
+        ttscommit;
+
+        this.readFileClosePostCommit();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RecordCodeClosingBalance</Name>
+				<Source><![CDATA[
+    private void RecordCodeClosingBalance(List _Record, CurrencyCode _CurrencyCode,CompanyBankAccountId _BankAccountId)
+    {
+        str locValue;
+        AmountCur locClosingBalance;
+        date AsOfDate;
+
+        //Get Closing Amount
+        locValue = strLRTrim(this.getTagValue(_Record, SKS_BR_MT940Field::Amount));
+        //if less than two decimal places
+        locValue = strReplace(locValue, ',', '.') + '00';
+        // vvv 12191 & 12205 vvvv
+        locClosingBalance = SKS_EB_Currency::formatStringToCurrency(locValue, _CurrencyCode, true);
+        // ^^^ 12191 & 12205 ^^^
+        if(strLRTrim(this.getTagValue(_Record, SKS_BR_MT940Field::DebitCreditFlag)) == 'D')
+            locClosingBalance = locClosingBalance * -1;
+
+        //Get Closing Date
+        locValue = this.getTagValue(_Record, SKS_BR_MT940Field::StatementDate);
+        AsOfDate = str2Date(SKS_PP_StringFormats::strSub(locValue,1,2) + @'/' +//year
+        SKS_PP_StringFormats::strSub(locValue,3,2) + @'/'+//month
+        SKS_PP_StringFormats::strSub(locValue,5,2),//day
+        321);//format
+        gBankAccountStatement.AccountStatementDate = AsOfDate;
+        this.createBankBalance(asOfDate, _BankAccountId, locClosingBalance);
+
+        gBankAccountStatement.EndingBalance = locClosingBalance;
+        gBankAccountStatement.CurrencyCode = _CurrencyCode;
+        gBankAccountStatement.AccountStatementDate = AsOfDate;
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

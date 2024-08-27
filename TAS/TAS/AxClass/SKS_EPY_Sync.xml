@@ -1,0 +1,2835 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EPY_Sync</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// ePay processing class
+/// </summary>
+class SKS_EPY_Sync extends SKS_EB_Batch
+{
+    //EPAY:  epay classes have been converted to stubs. In case of EPAY integration into AX7 restore these methods and fix any compatibility issues
+    #DEFINE.CurrentVersion(1)
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run(RefRecId    _BatchRecID = 0)
+    {
+
+        Batch bat;
+        RefRecId            locRefRecID;
+        SKS_EPY_Queue       locSKS_EPY_Queue;
+        SKS_EPY_QueueData   locSKS_EPY_QueueData;
+        SKS_EPY_Setup       locSKS_EPY_Setup;
+        SKS_EPY_QueueInfo   SKS_EPY_QueueInfo;
+        boolean             recordsFound = false;
+
+        SKS.ePayData.SKS_EPY_Return_In  SKS_EPY_Return_In;
+        System.Collections.IList    ePayPayments;
+        SKS.ePayData.Payment    SinglePayment;
+        LedgerJournalTable  lLedgerJournalTable;
+        str                 APIURL;
+        str                 locErrorMessage;
+        System.Exception    e;
+        str                 JSON;
+        ;
+
+        if(_BatchRecID == 0)
+        {
+            bat = this.parmCurrentBatch();
+            locRefRecID = bat.RecId;
+        }
+        else
+        {
+            locRefRecID = _BatchRecID;
+        }
+
+        try
+        {
+            While select crossCompany locSKS_EPY_Setup 
+                where locSKS_EPY_Setup.BatchJobId == locRefRecID 
+                    && locSKS_EPY_Setup.Activated == SKS_EPY_Activated::Activated
+            {
+                // ePay module not active
+                if(!SKS_PP_Setup::find().ModEPAY)
+                {
+                    return;
+                }
+
+                changecompany(locSKS_EPY_Setup.company())
+                {
+
+                    // Retrieve ePay payments
+                    APIURL = SKS_PP_StringFormats::strAssembleURL(locSKS_EPY_Setup.WebServLoc, '/paymentV1?status=1&pagesize=1');
+                    do
+                    {
+                        SKS_EPY_Return_In = SKS.ePay.ePayTokenCall::ePay_GET(APIURL, locSKS_EPY_Setup.ClientId, locSKS_EPY_Setup.Secret, SKS_PP_StringFormats::strAssembleURL(locSKS_EPY_Setup.WebServLoc,'Token'), false);
+
+                        if(sks_epy_return_in.ErrorDesc == 'Web exception code: 404;Description: Not Found' )
+                        {
+                            APIURL = SKS_PP_StringFormats::strAssembleURL(locSKS_EPY_Setup.WebServLoc, '/payment?status=1&pagesize=1');
+                            SKS_EPY_Return_In = SKS.ePay.ePayTokenCall::ePay_GET(APIURL, locSKS_EPY_Setup.ClientId, locSKS_EPY_Setup.Secret, SKS_PP_StringFormats::strAssembleURL(locSKS_EPY_Setup.WebServLoc,'Token'), false);
+                        }
+
+                        if (sks_epy_return_in.ErrorDesc != null)
+                        {
+                            locSKS_EPY_Queue = SKS_EPY_PaymentCreation::WriteToQueue(SKS_EPY_Return_In.get_invalue(), '', SKS_EPY_Status::Failed, SKS_EPY_Return_in.get_ErrorDesc(), '', 0,'');
+                            recordsFound = false;
+                        }
+                        else
+                        {
+                            if(sks_epy_return_in.InValue != '[]')
+                            {
+                                recordsFound = true;
+                                ePayPayments = SKS_EPY_Return_In.get_Payment();
+                                SinglePayment = ePayPayments.get_item(0);
+                                if(SinglePayment)
+                                {
+                                    //Write queue record
+                                    locSKS_EPY_Queue = SKS_EPY_PaymentCreation::WriteToQueue(SKS_EPY_Return_In.get_Invalue(), SinglePayment.get_customerID(), SKS_EPY_Status::Pending, SKS_EPY_Return_In.get_ErrorDesc(), SinglePayment.get_paymentID(), SinglePayment.get_Amount(), SinglePayment.get_CurrencyID());
+                                    try
+                                    {
+                                        SKS_EPY_PaymentCreation::CreatePaymentJournal(SinglePayment, locSKS_EPY_Setup, locSKS_EPY_Queue);
+                                        if (locSKS_EPY_Queue.Status == SKS_EPY_Status::Pending)
+                                        {
+                                            locSKS_EPY_Queue.Status = SKS_EPY_Status::Completed;
+                                        }
+
+                                        if(locSKS_EPY_Queue.JournalNum == '')
+                                        {
+                                            locSKS_EPY_Queue.JournalNum = sks_epy_queueInfo.GetJournalNum();
+                                        }
+                                        ttsbegin;
+                                        locSKS_EPY_Queue.SendReceiveDateTime = DateTimeUtil::utcNow();
+                                        locSKS_EPY_Queue.update();
+                                        ttscommit;
+                                    }
+                                    catch(Exception::Error)
+                                    {
+                                        ttsbegin;
+                                        locSKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+                                        locSKS_EPY_Queue.Action = SKS_EPY_Action::PmtFromEPay;
+                                        locSKS_EPY_Queue.JournalNum = '';
+                                        locSKS_EPY_Queue.update();
+                                        ttscommit;
+                                        SKS_EPY_PaymentCreation::UpdateEPayStatus(locSKS_EPY_Setup, false, e.Message, SinglePayment.Id);
+                                    }
+                                }
+                            }
+                            //EndTag payment retrieved
+                            else
+                            {
+                                recordsFound = false;
+                            }
+                        }
+                        //EndTag errordesc != null
+                    }
+                    while(recordsFound);
+
+                    if(locSKS_EPY_Setup.EPYAutoPost && locSKS_EPY_Setup.PaymentCreation == SKS_EPY_PaymCreation::PerDay)
+                    {
+                        while select lLedgerJournaltable where lLedgerJournaltable.SKS_EPY_EPayCreated == NoYes::yes && lLedgerJournalTable.Posted == NoYes::No
+                            && lLedgerJournalTable.createdDateTime < DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()), 0)
+                        {
+                            LedgerJournalPost::postJournal(lLedgerJournalTable, NoYes::No, NoYes::No, NoYes::Yes);
+                        }
+                    }
+
+                    // Send Currency
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Currency
+                        && locSKS_EPY_Queue.isPayLink == NoYes::No
+                    {
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncCurrency(locSKS_EPY_Queue, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+                    // Send Address
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Address
+                        && locSKS_EPY_Queue.isPayLink == NoYes::No
+                    {
+                        select firstonly * from locSKS_EPY_Queuedata where locSKS_EPY_QueueData.QueueRecId == locSKS_EPY_Queue.Recid;
+                        
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncAddress(locSKS_EPY_Queue, locSKS_EPY_QueueData, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+                    // Send Customer
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Customer
+                        && locSKS_EPY_Queue.isPayLink == NoYes::No
+                    {
+                        select firstonly * from locSKS_EPY_Queuedata where locSKS_EPY_QueueData.QueueRecId == locSKS_EPY_Queue.Recid;
+
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncCustomer(locSKS_EPY_Queue, locSKS_EPY_QueueData, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+                    // Send Invoice
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Invoice
+                        && locSKS_EPY_Queue.isPayLink == NoYes::No
+                        && locSKS_EPY_Queue.ChangeType != SKS_EPY_ChangeType::Updated
+                    {
+                        select firstonly * from locSKS_EPY_Queuedata where locSKS_EPY_QueueData.QueueRecId == locSKS_EPY_Queue.Recid;
+
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncInvoices(locSKS_EPY_Queue, locSKS_EPY_QueueData, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+
+                    // Send Project Invoice
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::ProjectInvoice
+                        && locSKS_EPY_Queue.ChangeType != SKS_EPY_ChangeType::Updated
+                    {
+                        select firstonly * from locSKS_EPY_Queuedata where locSKS_EPY_QueueData.QueueRecId == locSKS_EPY_Queue.Recid;
+
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncProjInvoices(locSKS_EPY_Queue, locSKS_EPY_QueueData, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+                    // Send payments
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Payment
+                        && (locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay || locSKS_EPY_Queue.Action == SKS_EPY_Action::PmtFromEPay)
+                        && locSKS_EPY_Queue.isPayLink == NoYes::No
+                    {
+                        if(locSKS_EPY_Queue.Action == SKS_EPY_Action::PmtFromEPay)
+                        {
+                            locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                            JSON = locSKS_EPY_Queue.DataStr ? locSKS_EPY_Queue.DataStr : con2Str(locSKS_EPY_Queue.data);
+                            SKS_EPY_Return_In = SKS.ePay.GetPayments::RetryPayment(JSON);
+
+                            if(SKS_EPY_Return_In.ErrorDesc == null)
+                            {
+
+                                ePayPayments = SKS_EPY_Return_In.get_Payment();
+                                SinglePayment = ePayPayments.get_item(0);
+                                locSKS_EPY_Queue = SKS_EPY_paymentCreation::CreatePaymentJournal(SinglePayment, locSKS_EPY_Setup, locSKS_EPY_Queue);
+                                ttsbegin;
+                                if (locSKS_EPY_Queue.Status == SKS_EPY_Status::Pending)
+                                {
+                                    locSKS_EPY_Queue.Status = SKS_EPY_Status::Completed;
+                                }
+                                locSKS_EPY_Queue.update();
+                                ttscommit;
+                            }
+                            else
+                            {
+                                ttsbegin;
+                                locSKS_EPY_Queue.ErrorWarning = SKS_EPY_Return_in.get_ErrorDesc();
+                                locSKS_EPY_Queue.status = SKS_EPY_Status::Failed;
+                                locSKS_EPY_Queue.update();
+                                ttscommit;
+                            }
+                        }
+                        else
+                        {                            
+                            locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                            locSKS_EPY_Queue = SKS_EPY_Sync::SyncPayment(locSKS_EPY_Queue);
+
+                            ttsbegin;
+                            locSKS_EPY_Queue.update();
+                            ttscommit;
+                        }
+                    }
+
+                    // Send Settlement
+                    while Select forupdate locSKS_EPY_Queue
+                    order by locSKS_EPY_Queue.recid asc
+                    where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                    && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                    && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Settlement
+                    && locSKS_EPY_Queue.isPayLink == NoYes::No
+                    {
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncSettlement(locSKS_EPY_Queue);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+                    // Send Project Invoice updates
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::ProjectInvoice
+                        && locSKS_EPY_Queue.ChangeType == SKS_EPY_ChangeType::Updated
+                    
+                    {
+                        select firstonly * from locSKS_EPY_Queuedata where locSKS_EPY_QueueData.QueueRecId == locSKS_EPY_Queue.Recid;
+
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncProjInvoices(locSKS_EPY_Queue, locSKS_EPY_QueueData, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+
+                    // Send Invoice updates
+                    while Select forupdate locSKS_EPY_Queue
+                        order by locSKS_EPY_Queue.recid asc
+                        where locSKS_EPY_Queue.Status == SKS_EPY_Status::New
+                        && locSKS_EPY_Queue.Action == SKS_EPY_Action::SendToEpay
+                        && locSKS_EPY_Queue.Entity == SKS_EPY_Entity::Invoice
+                        && locSKS_EPY_Queue.ChangeType == SKS_EPY_ChangeType::Updated
+                    
+                    {
+                        select firstonly * from locSKS_EPY_Queuedata where locSKS_EPY_QueueData.QueueRecId == locSKS_EPY_Queue.Recid;
+                        
+                        locSKS_EPY_Queue = SKS_EPY_QueueInfo::SetQueue(locSKS_EPY_Queue, SKS_EPY_Status::Pending, locSKS_EPY_Queue.PaymLineRecID);
+                        locSKS_EPY_Queue = SKS_EPY_Sync::SyncInvoices(locSKS_EPY_Queue, locSKS_EPY_QueueData, locSKS_EPY_Setup);
+
+                        ttsbegin;
+                        locSKS_EPY_Queue.update();
+                        ttscommit;
+                    }
+                }
+            }
+        }
+        catch(Exception::Error)
+        {
+            locErrorMessage = "@SKS3411";
+        }
+        catch(Exception::CLRError)
+        {
+
+            e = CLRInterop::getLastException();
+            locErrorMessage = "@SKS3412";
+
+        }
+        catch
+        {
+            locErrorMessage = "@SKS3413";
+        }
+
+        if(locErrorMessage)
+        {
+            if(locSKS_EPY_Queue)
+            {
+                select firstonly forupdate locSKS_EPY_Queue where locSKS_EPY_Queue.recid == locSKS_EPY_Queue.recid;
+                locSKS_EPY_Queue.ErrorWarning = "@SKS3414" + locErrorMessage;
+                locSKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+                ttsBegin;
+                locSKS_EPY_Queue.update();
+                ttsCommit;
+            }
+            else
+            {
+                error("@SKS3415" + locErrorMessage);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createEPayBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create batch for ePay
+    /// </summary>
+    /// <param name = "_element">_element</param>
+    /// <returns>rec id</returns>
+    public client static recid createEPayBatch( Object _element)
+    {
+        Dialog              dialog;
+        DialogField         dialogField;
+        Batch               locBatch;
+        BatchHeader         batHeader;
+        BatchCaption        locBatchCaption;
+        RunBaseBatch        rbbTask;
+        BatchInfo           batInfo;
+        SysRecurrenceData   recurData;
+        boolean             locBoolCreateBatch;
+
+        Args args = new Args();
+        FormRun formrun;
+        ;
+
+        // Create Default Bank Account Information dialog only if there is an element(this indicator tells if this is from a form).
+        if(_element)
+        {
+            dialog = new Dialog("@SYS114518");
+            dialogField = dialog.addField(extendedTypeStr(BatchCaption), "@SYS114518");
+        }
+        if(dialog)
+        {
+            locBoolCreateBatch = dialog.run();
+        }
+        else
+        {
+            locBoolCreateBatch = true;
+        }
+
+        if (locBoolCreateBatch)
+        {
+            rbbTask = new SKS_EPY_Sync();
+
+
+            if(dialog)
+            {
+                locBatchCaption = dialogField.value();
+            }
+            else
+            {
+                locBatchCaption = rbbTask.caption();
+            }
+            select firstOnly locBatch where locBatch.Caption == locBatchCaption;
+
+            if(locBatch && dialog)
+            {
+                error(strFmt("@SKS2463", locBatchCaption));
+                return 0;
+            }
+            else if(locBatch)
+            {
+                return locBatch.RecId;
+            }
+
+            ttsBegin;
+            batInfo = rbbTask.batchInfo();
+            batInfo.parmCaption(locBatchCaption);
+
+            batInfo.parmGroupId(''); // The "Empty batch group".
+
+
+            // Set recurrance
+            recurData = SysRecurrence::defaultRecurrence();
+            recurData = SKS_EB_Batch::setRecurrenceStartDateTimeAdjusted(recurData, DateTimeUtil::utcNow());
+            recurData = SysRecurrence::setRecurrenceUnit(recurData, SysRecurrenceUnit::Minute, 1);
+
+
+            batHeader = BatchHeader::construct();
+            batHeader.addTask(rbbTask);
+            batHeader.parmRecurrenceData(recurData);
+            batHeader.save();
+
+            //if being run from the ui, informa the user their batch is scheduled
+            if(dialog)
+            {
+                info(strFmt("@SKS2466", dialogField.value()));
+            }
+
+            ttsCommit;
+
+            if(dialog)
+            {
+                info("@SKS2464");
+                args.caller(_element);
+                args.parm(locBatchCaption);
+                args.name(formStr(BatchJob));
+                formRun = classFactory.formRunClass(args);
+                formRun.init();
+                formRun.run();
+                formRun.wait();
+            }
+            return locBatch.BatchJobId;
+
+        }
+        else
+        {
+            // If they just cancelled the dialog, then no error.
+            return 0;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Description
+    /// </summary>
+    /// <returns>class description</returns>
+    static client server ClassDescription description()
+    {
+        return "@SKS3289";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FindAndAdjust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find and adjust the amount
+    /// </summary>
+    /// <param name = "_RecID">_RecID</param>
+    /// <param name = "_Amount">_Amount</param>
+    /// <returns>amount</returns>
+    public static AmountCur FindAndAdjust(RefRecId    _RecID, amountcur _Amount)
+    {
+        CustVendPaymJournalFee  custVendPaymJournalFee;
+
+        select firstonly FeeValue from custVendPaymJournalFee where custVendPaymJournalFee.refrecid == _recid;
+        _amount += custVendPaymJournalFee.feevalue;
+        return _amount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetCurrency</Name>
+				<Source><![CDATA[
+    private static SKS.ePayData.Currency GetCurrency(refrecid   _initRecordRecId)
+    {
+        SKS.ePayData.Currency   ePayCurrency;
+        SKS_EPY_Currency    SKS_EPY_Currency;
+        ;
+        ePayCurrency = new SKS.ePayData.Currency();
+        select firstonly SKS_EPY_Currency where SKS_EPY_Currency.recid == _initRecordRecId;
+
+        ePayCurrency.set_IsFuncCurrency(SKS_EPY_Currency.FunctionalCurrency);
+        ePaycurrency.set_CurrencyID(SKS_EPY_Currency.CurrencyCode);
+        ePayCurrency.set_Description(SKS_EPY_Currency.Txt);
+        ePayCurrency.set_Symbol(SKS_EPY_Currency.Symbol);
+
+        return ePayCurrency;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustVendTransCashDisc</Name>
+				<Source><![CDATA[
+    private static server CustTransCashDisc getCustVendTransCashDisc(CustTransOpen _CustTransOpen)
+    {
+        LedgerJournalTrans lLedgerJournalTrans;
+        CustVendOpenTransManager lCustVendOpenTransManager;
+        CustTransCashDisc lCustVendTransCashDisc;
+        ;
+
+        // Need to construct a temporary LedgerJournalTrans to use in CustVendOpenTransManager
+        lLedgerJournalTrans.initValue();
+        lLedgerJournalTrans.TransDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+        lLedgerJournalTrans.parmAccount(_CustTransOpen.AccountNum, LedgerJournalACType::Cust);
+        // This needs set to some value.  If it is 0 an error will occur during debugging
+        lLedgerJournalTrans.RecId = 1;
+
+        lCustVendOpenTransManager = CustVendOpenTransManager::construct(lLedgerJournalTrans);
+        lCustVendTransCashDisc = lCustVendOpenTransManager.findApplicableCustVendTransCashDisc(_CustTransOpen);
+
+        return lCustVendTransCashDisc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEPayAddress</Name>
+				<Source><![CDATA[
+    private static SKS.ePayData.Address getEPayAddress(LogisticsPostalAddress _LogisticsPostalAddress, str _AddressName, str _AddressID, str _CustomerAccountNum)
+    {
+        SKS.ePayData.Address locAddress;
+        ;
+
+        locAddress = new SKS.ePayData.Address();
+        locAddress.set_CustomerNumber(_CustomerAccountNum);
+        locAddress.set_Name(_AddressName);
+        locAddress.set_AddressID(_AddressID);
+        locAddress.set_Address1(_LogisticsPostalAddress.Street);
+        locAddress.set_Address2('');
+        locAddress.set_Address3('');
+        locAddress.set_City(_LogisticsPostalAddress.City);
+        locAddress.set_State(_LogisticsPostalAddress.State);
+        locAddress.set_Zip(_LogisticsPostalAddress.ZipCode);
+        locAddress.set_Country(_LogisticsPostalAddress.CountryRegionId);
+        return locAddress;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SaveInvoiceToFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Name is legact from 2012 when we needed to save the pdf to a file.
+    /// Method creates the pdf for use on ePay
+    /// </summary>
+    /// <param name = "ePayPDFFileName">ePayPDFFileName</param>
+    /// <param name = "InvoiceRecId">InvoiceRecId</param>
+    /// <param name = "AccountNum">AccountNum</param>
+    /// <param name = "invoice">invoice</param>
+    /// <param name = "ePayInvFolderPath">ePayInvFolderPath</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <param name = "sks_epy_return_in">sks_epy_return_in</param>
+    /// <returns>Returns SKS_EPY_Return_In object</returns>
+    public static SKS.ePayData.SKS_EPY_Return_In SaveInvoiceToFile(str ePayPDFFileName, int64 InvoiceRecId, CustAccount AccountNum, InvoiceId invoice, str ePayInvFolderPath, SKS_EPY_Setup _SKS_EPY_Setup, SKS.ePayData.SKS_EPY_Return_In sks_epy_return_in)
+    {
+        #File
+        SKS_EPY_SaveInvoiceToFile   saveToFile;
+        str                         fileNameWithoutPath, newFileName, subdirectory;
+        System.String               subDirectoryDotNet;
+        CustInvoiceId               locCustInvoiceId;
+        CustTransOpen               CustTransOpen;
+        CustTrans                   CustTrans;
+        Common                      locCommon;
+        CustInvoiceJour             custInvoiceJour;
+        ProjInvoiceJour             locProjInvoiceJour;
+        DocuRef                     docuRef;
+        boolean                     deleteDocuRef = true;
+        System.Byte[] binData;
+        System.IO.MemoryStream stream;
+        SKS_EPY_Sync    sks_epy_sync = new SKS_EPY_Sync();
+        Custtransopen = CustTransOpen::find(InvoiceRecId);
+        CustTrans = CustTrans::find(CustTransOpen.RefRecId);
+
+        if(CustTrans.TransType == LedgerTransType::Project)
+        {
+            Select firstonly locProjInvoiceJour
+                where locProjInvoiceJour.LedgerVoucher == CustTrans.Voucher
+                    && locProjInvoiceJour.InvoiceAccount == CustTrans.AccountNum
+                    && locProjInvoiceJour.InvoiceDate == CustTrans.TransDate;
+            locCommon = locProjInvoiceJour;
+            locCustInvoiceId = locProjInvoiceJour.ProjInvoiceId;
+
+        }
+        else
+        {
+            custInvoiceJour = CustInvoiceJour::findFromCustTrans(CustTrans.Invoice, CustTrans.TransDate, CustTrans.AccountNum);
+            locCommon = custInvoiceJour;
+            locCustInvoiceId = custInvoiceJour.InvoiceId;
+        }
+        container reportBytes;
+        fileNameWithoutPath = SKS_EPY_Sync::CreatefileNameWithoutPath(AccountNum, Invoice, InvoiceRecId, CustTrans);
+
+        reportBytes = SKS_EPY_Sync.PreInvoiceCreationShell(fileNameWithoutPath);
+        if(!reportBytes)
+        {
+            saveToFile = SKS_EPY_SaveInvoiceToFile::construct();
+            saveToFile.parmCallerRecord(locCommon);
+            // saveToFile.parmFilePath(subDirectory);
+            saveToFile.parmFileName(fileNameWithoutPath);
+
+            try
+            {
+                newFileName = saveToFile.run();
+            }
+            catch(Exception::Error)
+            {
+                sks_epy_return_in.set_ErrorDesc(strFmt("@SKS3417", subDirectory, newFileName));
+                return sks_epy_return_in;
+            }
+            catch(Exception::CLRError)
+            {
+                SRSProxy::handleClrException(Exception::Error);
+                sks_epy_return_in.set_ErrorDesc(strFmt("@SKS3417", subDirectory, newFileName));
+                return sks_epy_return_in;
+            }
+
+            if (!strEndsWith(ePayPDFFileName, #pdf))
+            {
+                ePayPDFFileName = fileNameWithoutPath + #pdf;
+            }
+
+            select forupdate firstonly docuRef where docuRef.Name == fileNameWithoutPath;
+            reportBytes = DocumentManagement::getAttachmentAsContainer(DocuRef);
+        }
+        else
+        {
+            deleteDocuRef = false;
+        }
+
+        // Turn the Bytes into a stream
+        for(int i = 0; i < conLen(reportBytes); i++)
+        {
+            binData = conPeek(reportBytes,i+1);
+            stream = new System.IO.MemoryStream(binData);
+        }
+       
+        SKS_EPY_Return_In = SKS.ePay.ePayTokenCall::ePay_POST_PDF(SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc, 'uploadinvoicepdf?CustomerNumber=' + AccountNum
+                                                        + '&InvoiceNumber=' + invoice
+                                                        + '&DocumentDate=' + date2str(CustTrans.TransDate, 321, 2, 3, 2, 3, 4, dateflags::None)
+                                                        + '&Identity=' + int642str(CustTransOpen.recid)),
+                                                        _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                        'POST', SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc, 'token'), ePayPDFFileName,
+            System.IO.Path::Combine(ePayInvFolderPath, AccountNum + '\\'),  '',  bindata );
+
+        if(sks_epy_return_in.get_ErrorDesc() == null)
+        {
+            // let's go ahead and delete the subdirectory here.
+            try
+            {
+                if(deleteDocuRef)
+                {
+                    docuRef.delete();
+                }
+            }
+            catch(Exception::CLRError)
+            {
+                sks_epy_return_in.set_ErrorDesc(strFmt("@SKS3418", subDirectoryDotNet));
+                SRSProxy::handleClrException(Exception::Error);
+                return sks_epy_return_in;
+            }
+        }
+
+
+        return SKS_EPY_Return_In;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync Customer address
+    /// </summary>
+    /// <param name = "_SKS_EPY_Queue">_SKS_EPY_Queue</param>
+    /// <param name = "_SKS_EPY_QueueData">_SKS_EPY_QueueData</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <returns></returns>
+    public static server SKS_EPY_Queue SyncAddress(SKS_EPY_Queue _SKS_EPY_Queue,
+                                            SKS_EPY_QueueData _SKS_EPY_QueueData,
+                                            SKS_EPY_Setup _SKS_EPY_Setup)
+    {
+        SKS.ePayData.Address locAddress;
+        LogisticsPostalAddress locLogisticsPostalAddress;
+        LogisticsLocation   locLogisticsLocation;
+        SKS.ePayData.SKS_EPY_Return_In  SKS_EPY_Return_In;
+        str                 errortext;
+        ;
+
+        Select firstonly RecId, LocationID from locLogisticsLocation
+            where locLogisticsLocation.RecId == _SKS_EPY_QueueData.TableRecId
+            join locLogisticsPostalAddress
+            where locLogisticsPostalAddress.Location == locLogisticsLocation.RecId;
+
+
+        locAddress = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddress,
+                                                    locLogisticsLocation.LocationId,
+                                                    int642str(locLogisticsPostalAddress.RecId),
+                                                    _SKS_EPY_Queue.AccountNum);
+
+        if(strLen(_SKS_EPY_Setup.WebServLoc) > 0)
+        {
+            sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(locAddress,
+                                                        SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc,'customeraddress'),
+                                                        _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                        'POST', SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'token'), false);
+
+            if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+            {
+                errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                _SKS_EPY_Queue.ErrorWarning = errortext;
+                _SKS_EPY_Queue.status =  SKS_EPY_Status::Failed;
+            }
+            else
+            {
+                _SKS_EPY_Queue.status =  SKS_EPY_Status::Completed;
+            }
+        }
+        _SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+        return _SKS_EPY_Queue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncCurrency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync Currency record
+    /// </summary>
+    /// <param name = "_SKS_EPY_Queue">_SKS_EPY_Queue</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <returns>ePay queue record</returns>
+    public static SKS_EPY_Queue SyncCurrency(SKS_EPY_Queue _SKS_EPY_Queue,
+                                            SKS_EPY_Setup _SKS_EPY_Setup)
+    {
+        SKS.ePayData.SKS_EPY_Return_In  SKS_EPY_Return_In;
+        SKS.ePayData.Currency   ePayCurrency;
+        sks_epy_currency        sks_epy_currency;
+        str                 errortext;
+        str                 ePayMethod = 'POST';
+        if(strLen(_SKS_EPY_Setup.WebServLoc) > 0)
+        {
+
+            if(_SKS_EPY_Queue.changetype == sks_epy_changetype::deleted)
+            {
+                ePayMethod = 'DELETE';
+            }
+
+            epayCurrency = SKS_EPY_Sync::GetCurrency(_SKS_EPY_Queue.InitiatingRecId);
+
+            if(ePayMethod == 'DELETE')
+            {
+                sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(ePayCurrency,
+                                                            SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc,'currency?currencyID=' + _SKS_EPY_Queue.CurrencyCode),
+                                                            _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                            ePayMethod, SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'token'), false);
+            }
+            else
+            {
+                sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(ePayCurrency,
+                                                            SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc,'currency'),
+                                                            _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                            ePayMethod, SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'token'), false);
+            }
+
+            if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+            {
+                errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                _SKS_EPY_Queue.ErrorWarning = errortext;
+                _SKS_EPY_Queue.status = SKS_EPY_Status::failed;
+            }
+            else
+            {
+                _SKS_EPY_Queue.status = SKS_EPY_Status::Completed;
+
+                if(_SKS_EPY_Queue.changetype == SKS_EPY_ChangeType::Deleted)
+                {
+                    delete_from sks_epy_currency where sks_epy_currency.recid == _SKS_EPY_Queue.InitiatingRecId;
+                }
+
+            }
+        }
+        _SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+        return _SKS_EPY_Queue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncCustomer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync customer record
+    /// </summary>
+    /// <param name = "_SKS_EPY_Queue">_SKS_EPY_Queue</param>
+    /// <param name = "_SKS_EPY_QueueData">_SKS_EPY_QueueData</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <returns>ePay queue record</returns>
+    public static server SKS_EPY_Queue SyncCustomer(SKS_EPY_Queue _SKS_EPY_Queue, SKS_EPY_QueueData _SKS_EPY_QueueData, SKS_EPY_Setup _SKS_EPY_Setup)
+    {
+        real                    locDisc;
+        CustTable               locCustTable;
+        DirPartyTable           locDirPartyTable;
+        DirPartyLocation        locDirPartyLocation;
+        LogisticsLocation       locLogisticsLocation;
+        HcmWorker               locHcmWorker;
+        DirPartyLocationRole    locDirPartyLocationRole;
+        LogisticsLocationRole   locLogisticsLocationRole;
+        CustDefaultLocation     locCustDefaultLocation;
+        LogisticsElectronicAddressLocator locPhone;
+        SKS.ePayData.Customer       locCustomer;
+        LogisticsPostalAddress  locLogisticsPostalAddressPrimary,
+                                locLogisticsPostalAddressBilling,
+                                locLogisticsPostalAddressShipping;
+        SKS.ePayData.Address        locAddress, locAddressBilling, locAddressShipping;
+        SKS.ePayData.SKS_EPY_Return_In  SKS_EPY_Return_In;
+        str                     errortext;
+        str                     password;
+        ;
+
+        select firstonly RecId, party, accountnum, custgroup, PaymTermId, DlvMode, SalesDistrictId, MainContactWorker, VATNum, TaxGroup, CashDisc, Blocked, SKS_EPY_CustFilter, InvoiceAccount, SKS_EPY_PaymentType
+            from locCustTable
+            where locCustTable.RecId == _SKS_EPY_QueueData.TableRecId
+            join Name, Recid from locDirPartyTable
+                where locDirPartyTable.RecId == locCustTable.Party
+            outer join locDirPartyLocation
+                where locDirPartyLocation.Party == locCustTable.Party
+                    && locDirPartyLocation.IsPostalAddress == NoYes::Yes
+                    && locDirPartyLocation.IsPrimary == NoYes::Yes
+            outer join locLogisticsLocation
+                where locLogisticsLocation.RecId == locDirPartyLocation.Location
+            outer join locLogisticsPostalAddressPrimary
+                where locLogisticsPostalAddressPrimary.Location == locLogisticsLocation.Recid;
+
+        //Get Phone
+        locPhone = SKS_Table_LogisticsElectronicAddress::SKS_getContact(LogisticsElectronicAddressMethodType::Phone, locDirPartyTable.recid);
+
+        locCustomer = new SKS.ePayData.Customer();
+        Switch(locCustTable.SKS_EPY_PaymentType)
+        {
+            case SKS_EPY_PaymentType::None:
+                locCustomer.set_PaymentMethod('None');
+                break;
+            case SKS_EPY_PaymentType::ACH:
+                locCustomer.set_PaymentMethod('eCheck');
+                break;
+            case SKS_EPY_PaymentType::Card:
+                locCustomer.set_PaymentMethod('CC');
+                break;
+            case SKS_EPY_PaymentType::CardAndACH:
+                locCustomer.set_PaymentMethod('All');
+                break;
+        }
+        locCustomer.set_CustomerNumber(locCustTable.AccountNum);        
+        locCustomer.set_Name(subStr(locDirPartyTable.Name, 0, 65));
+        locCustomer.set_ClassID(locCustTable.CustGroup);
+        if(locCustTable.InvoiceAccount != '')
+        {
+            locCustomer.set_ParentCustomerNumber(locCustTable.invoiceAccount);
+        }
+        if(locLogisticsPostalAddressPrimary)
+        {
+            locAddress = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressPrimary,
+                                                        locLogisticsLocation.Description,
+                                                        locLogisticsLocation.LocationId,
+                                                        _SKS_EPY_Queue.AccountNum);
+
+            locAddress.set_Phone1(System.Text.RegularExpressions.Regex::Replace(locPhone, '[^0-9]',''));
+        }
+
+        if(locAddress == null)
+        {
+            _SKS_EPY_Queue.ErrorWarning = 'Can not add a customer without a primary address';
+            _SKS_EPY_Queue.status = SKS_EPY_Status::Failed;
+            return _SKS_EPY_Queue;
+        }
+        locCustomer.set_PrimaryAddress(locAddress);
+
+        select firstonly locDirPartyLocation
+            where locDirPartyLocation.Party == locDirPartyTable.RecId
+            join PartyLocation, RecId, locationrole from locDirPartyLocationRole
+                where locDirPartyLocationRole.PartyLocation == locDirPartyLocation.RecId
+            join locCustDefaultLocation
+                where locCustDefaultLocation.PartyLocationRole == locDirPartyLocationRole.RecId
+                    && locCustDefaultLocation.AccountNum == locCustTable.AccountNum
+            join RecId, type from locLogisticsLocationRole
+                where locLogisticsLocationRole.RecId == locDirPartyLocationRole.LocationRole
+                 && locLogisticsLocationRole.Type == LogisticsLocationRoleType::RemitTo
+            join locLogisticsPostalAddressBilling
+                where locLogisticsPostalAddressBilling.Location == locDirPartylocation.Location
+            join locLogisticsLocation
+                where locLogisticsLocation.recid == locDirPartyLocation.Location;
+
+
+        if(locLogisticsPostalAddressBilling)
+        {
+            locAddressBilling = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressBilling,
+                                                        locLogisticsLocation.Description,
+                                                        locLogisticsLocation.LocationId,
+                                                        _SKS_EPY_Queue.AccountNum);
+        }
+
+        if(locAddressBilling)
+        {
+            locCustomer.set_BillingAddress(locAddressBilling);
+        }
+        else
+        {
+            locCustomer.set_BillingAddress(locAddress);
+        }
+
+        select firstonly Party, RecId, location from locDirPartyLocation
+            where locDirPartyLocation.Party == locDirPartyTable.RecId
+            join partylocation, recid, locationrole from locDirPartyLocationRole
+                where locDirPartyLocationRole.PartyLocation == locDirPartyLocation.RecId
+            join partylocationrole, AccountNum from locCustDefaultLocation
+                where locCustDefaultLocation.PartyLocationRole == locDirPartyLocationRole.RecId
+                    && locCustDefaultLocation.AccountNum == locCustTable.AccountNum
+            join recid, type from locLogisticsLocationRole
+                where locLogisticsLocationRole.RecId == locDirPartyLocationRole.LocationRole
+                 && locLogisticsLocationRole.Type == LogisticsLocationRoleType::Delivery
+            join locLogisticsPostalAddressShipping
+                where locLogisticsPostalAddressShipping.Location == locDirPartylocation.Location
+            join locLogisticsLocation
+                where locLogisticsLocation.recid == locDirPartyLocation.Location;
+
+        if(locLogisticsPostalAddressShipping)
+        {
+            locAddressShipping = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressShipping,
+                                                                locLogisticsLocation.Description,
+                                                                locLogisticsLocation.LocationId,
+                                                                _SKS_EPY_Queue.AccountNum);
+        }
+
+        if(locAddressShipping)
+        {
+            locCustomer.set_ShippingAddress(locAddressShipping);
+        }
+        else
+        {
+            locCustomer.set_ShippingAddress(locAddress);
+        }
+
+        locCustomer.set_PaymentTerms(locCustTable.PaymTermId);
+        locCustomer.set_StatementName(locDirPartyTable.Name);
+        locCustomer.set_ShippingMethod(locCustTable.DlvMode);
+        locCustomer.set_SalesTerritoryID(locCustTable.SalesDistrictId);
+        select firstonly locHcmWorker where locHcmWorker.RecId == locCustTable.MainContactWorker;
+        if(locHcmWorker)
+        {
+            locCustomer.set_SalesPersonID(subStr(locHcmWorker.name(),0,25)); //Issue20915: Max length is 25 on ePay
+        }
+        if (strLen(locCustTable.VATNum) > 0)
+        {
+            locCustomer.set_TaxExempt(true);
+        }
+        else
+        {
+            locCustomer.set_TaxExempt(false);
+        }
+        locCustomer.set_TaxScheduleID(locCustTable.TaxGroup);
+        locDisc = CashDisc::find(locCustTable.CashDisc).Percent;
+        locCustomer.set_TradeDiscount(Global::real2double(locDisc));
+
+        if(locCustTable.Blocked == CustVendorBlocked::All)
+        {
+            locCustomer.set_OnHold(true);
+            locCustomer.set_Inactive(true);
+        }
+        else
+        {
+            locCustomer.set_OnHold(false);
+            locCustomer.set_Inactive(false);
+        }
+
+        if(locCustTable.SKS_EPY_CustFilter == SKS_EPY_CustFilter::No)
+        {
+            locCustomer.set_Deleted(1);
+        }
+        else
+        {
+            locCustomer.set_Deleted(0);
+        }
+
+        if(_SKS_EPY_Setup.CustAutoReg && _SKS_EPY_Queue.ChangeType == SKS_EPY_ChangeType::Created)
+        {
+            locCustomer.set_LoginID(locCustTable.AccountNum);
+            Password = _SKS_EPY_Setup.DefaultCustomerSecret;
+            locCustomer.set_Password(Password);
+        }
+
+        if(_SKS_EPY_Setup.NonPrimeEmail)
+        {
+            Name email;
+            email = SKS_Table_LogisticsElectronicAddress::SKS_getEmailContantByPurpose(_SKS_EPY_Setup.epayEmailPurpose, locDirPartyTable.RecId, locCustTable.Party);
+            if(email == '')
+            {
+                locCustomer.set_Email(SKS_Table_LogisticsElectronicAddress::SKS_getContact(LogisticsElectronicAddressMethodType::Email, locDirPartyTable.recid));
+            }
+            else
+            {
+                locCustomer.set_Email(email);
+            }
+        }
+        else
+        {
+            locCustomer.set_Email(SKS_Table_LogisticsElectronicAddress::SKS_getContact(LogisticsElectronicAddressMethodType::Email, locDirPartyTable.recid));
+        }
+
+        if(strLen(_SKS_EPY_Setup.WebServLoc) > 0)
+        {
+            SKS_EPY_Return_In = SKS.ePay.ePayTokenCall::ePay_POST_Object(locCustomer,
+                                                        SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'customer'),
+                                                        _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                        'POST', SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'token'), false);
+
+
+            if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+            {
+                errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                _SKS_EPY_Queue.ErrorWarning = errortext;
+                _SKS_EPY_Queue.status = SKS_EPY_Status::Failed;
+            }
+            else
+            {
+                _SKS_EPY_Queue.status = SKS_EPY_Status::Completed;
+            }
+
+        }
+        _SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+        return _SKS_EPY_Queue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncDocStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync docuement status
+    /// </summary>
+    /// <param name = "_doc">_doc</param>
+    /// <param name = "_url">_url</param>
+    /// <param name = "sks_epy_setup">sks_epy_setup</param>
+    /// <returns>epy return in class</returns>
+    public static server SKS.ePayData.SKS_EPY_Return_In SyncDocStatus(SKS.ePayData.Document _doc, str _url, SKS_EPY_Setup sks_epy_setup)
+    {
+        SKS.ePayData.SKS_EPY_Return_In sks_epy_return_in;
+
+        sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(_doc, _url, sks_epy_setup.ClientId, sks_epy_setup.Secret, 'PUT', SKS_PP_StringFormats::strAssembleURL(sks_epy_setup.WebServLoc ,'token'), false);
+
+        return sks_epy_return_in;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncInvoices</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync ePay Invoices
+    /// </summary>
+    /// <param name = "_SKS_EPY_Queue">_SKS_EPY_Queue</param>
+    /// <param name = "_SKS_EPY_QueueData">_SKS_EPY_QueueData</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <returns>ePay queue record</returns>
+    public static Server SKS_EPY_Queue SyncInvoices(SKS_EPY_Queue _SKS_EPY_Queue, SKS_EPY_QueueData _SKS_EPY_QueueData, SKS_EPY_Setup _SKS_EPY_Setup)
+    {
+        CurrencyExchangeHelper  locCurrencyExchangeHelper;
+        CustInvoiceJour         locCustInvoiceJour;
+        CustInvoiceTrans        locCustInvoiceTrans;
+        CustTransOpen           locCustTransOpen;
+        CustTrans               locCustTrans;
+        CustTable               locCustTable;
+        CustVendTransCashDisc   locCustVendTransCashDisc;
+        HcmWorker               locHcmWorker;
+        LogisticsPostalAddress  locLogisticsPostalAddressInvoice,
+                                locLogisticsPostalAddressTrans,
+                                locLogisticsPostalAddressBilling;
+        LogisticsLocation       locLogisticsLocationBilling;
+        MarkupTrans             locMarkupTrans;
+
+        RecId                   locCustTransRecid, locHcmWorkerRecId;
+        SKS_EPY_Charges         locSKS_EPY_Charges;
+        SKS_EPY_CustTransOpen   locSKS_EPY_CustTransOpen;
+
+        SKS.ePayData.Invoice        locInvoice;
+        SKS.ePayData.InvoiceEntry   locInvoiceItem;
+        SKS.ePayData.Address        locAddress, locShippingAddress;
+        SKS.ePayData.TermDiscounts          locTermDiscount;
+        SKS.ePayData.SKS_EPY_Return_In  SKS_EPY_Return_In;
+        int64                   locInvoiceItemCounter = 1;
+        AmountCur               amtFreightCur, amtMiscCur, amtTaxCur, amtTotalCur, salesPriceCur, unitPrice;
+        AmountMST               amtFreightMST, amtMiscMST, amtTaxMST, amtTotalMST;
+        boolean                 closedinvoice = false;
+        str                     errortext;
+        int64   identity;
+        boolean AlreadyMarked;
+        void sumCharges(SKS_EPY_ChargeType _SKS_EPY_ChargeType)
+        {
+            switch(_SKS_EPY_ChargeType)
+            {
+                case SKS_EPY_ChargeType::Misc:
+                    //because each charge can be in a different currency, it is necessary to convert each line to the base currency.
+                    amtMiscMST = amtMiscMST + locCurrencyExchangeHelper.calculateTransactionToAccounting(locMarkupTrans.CurrencyCode,
+                                                                                                                locMarkupTrans.Posted * -1,
+                                                                                                                true);
+                    //because each charge can be in a different currency, it is necessary to convert each line to the functional currency.
+                    amtMiscCur = amtMiscCur + locCurrencyExchangeHelper.calculateCurrencyToCurrency(locMarkupTrans.CurrencyCode,
+                                                                                                            locCustInvoicejour.CurrencyCode,
+                                                                                                            locMarkupTrans.Posted * -1,
+                                                                                                            true);
+                    break;
+                case SKS_EPY_ChargeType::Freight:
+                    //because each charge can be in a different currency, it is necessary to convert each line to the base currency.
+                    amtFreightMST = amtFreightMST + locCurrencyExchangeHelper.calculateTransactionToAccounting(locMarkupTrans.CurrencyCode,
+                                                                                                                locMarkupTrans.Posted * -1,
+                                                                                                                true);
+                    //because each charge can be in a different currency, it is necessary to convert each line to the functional currency.
+                    amtFreightCur = amtFreightCur + locCurrencyExchangeHelper.calculateCurrencyToCurrency(locMarkupTrans.CurrencyCode,
+                                                                                                            locCustInvoicejour.CurrencyCode,
+                                                                                                            locMarkupTrans.Posted * -1,
+                                                                                                            true);
+                    break;
+            }
+        }
+        ;
+               
+        locInvoice = new SKS.ePayData.Invoice();
+        locInvoiceItem = new SKS.ePayData.InvoiceEntry();
+
+        if(_SKS_EPY_QueueData.SourceTable == SKS_EPY_Table::CustTransOpen)
+        {
+            select firstonly crossCompany DueDate, CustTransOpenRefRecId, CustTransRefRecId from locSKS_EPY_CustTransOpen where locSKS_EPY_CustTransOpen.CustTransOpenRefRecId == _SKS_EPY_QueueData.TableRecId
+                outer join AmountCur, AmountMST, RecId from locCustTransOpen
+                    where locCustTransOpen.RecId == locSKS_EPY_CustTransOpen.CustTransOpenRefRecId;
+
+            SpecTrans lSpectrans = SpecTrans::findByRef(locCustTransOpen.company(), locCustTransOpen.TableId, locCustTransOpen.RecId);
+            if(lSpectrans)
+            {
+                _sks_epy_queue.ErrorWarning = "@SKS627" + '  ' + strFmt("@SYS76766", "@SYS96171", LedgerJournalTrans::findRecId(lSpectrans.SpecRecId,false).JournalNum);
+                _sks_epy_queue.Status = SKS_EPY_Status::Failed;
+                AlreadyMarked = true;
+            }
+
+            locCustTransRecid = locSKS_EPY_CustTransOpen.CustTransRefRecId;
+        }
+        else if(_SKS_EPY_QueueData.SourceTable == SKS_EPY_Table::CustTrans)
+        {
+            select firstonly crossCompany DueDate, CustTransOpenRefRecId, CustTransRefRecId from locSKS_EPY_CustTransOpen where locSKS_EPY_CustTransOpen.CustTransRefRecId == _SKS_EPY_QueueData.TableRecId;
+
+            locCustTransRecid = locSKS_EPY_CustTransOpen.CustTransRefRecId;
+            closedinvoice = true;
+        }
+
+        select firstonly crosscompany RecId, Invoice, OrderAccount, AccountNum, TransDate, AmountMST, AmountCur, Voucher, Txt, TransType, CurrencyCode from locCustTrans
+            where locCustTrans.RecId == locCustTransRecid
+            join CurrencyCode,DeliveryName,DeliveryPostalAddress,
+                    DlvMode,InvoiceDate,InvoiceID,
+                    InvoicePostalAddress,NumberSequenceGroup,Payment,
+                    PurchaseOrder,RecId, SalesId,SumTax,
+                    SumTaxMST,WorkerSalesTaker from locCustInvoiceJour
+                where locCustInvoiceJour.InvoiceId == locCustTrans.Invoice
+                    && locCustInvoiceJour.InvoiceAccount == locCustTrans.AccountNum
+                    && locCustInvoiceJour.InvoiceDate == locCustTrans.TransDate
+            join AccountNum, maincontactworker from locCustTable
+                where locCustTable.AccountNum == locCustTrans.AccountNum;
+        if( !locCustTrans)
+        {
+            _sks_epy_queue.ErrorWarning = strFmt('@SKS:InvoiceNotExist', locCustTransRecid);
+            _sks_epy_queue.Status = SKS_EPY_Status::Failed;
+        }
+        else if(!AlreadyMarked)
+        {
+            select crosscompany locLogisticsPostalAddressInvoice
+                where locLogisticsPostalAddressInvoice.RecId == locCustInvoiceJour.DeliveryPostalAddress;
+
+            if(SKS_EPY_Currency::findByCurrency(locCustTrans.CurrencyCode))
+            {
+                // Amount
+                amtTotalMST = locCustTrans.AmountMST;
+                locInvoice.set_Amount(real2double(amtTotalMST));
+                amtTotalCur = locCustTrans.AmountCur;
+                locInvoice.set_OriginatingAmount(real2double(amtTotalCur));
+
+                // Balance due
+                locInvoice.set_BalanceDue(real2double(locCustTransOpen.AmountMST));
+                locInvoice.set_OriginatingBalanceDue(real2double(locCustTransOpen.AmountCur));
+
+                // Batch number
+                locInvoice.set_BatchNumber(locCustTrans.Voucher);
+
+                select firstonly RecID from locLogisticsPostalAddressBilling
+                    where locLogisticsPostalAddressBilling.RecId == locCustInvoiceJour.InvoicePostalAddress
+                    join LocationId from locLogisticsLocationBilling
+                        where locLogisticsLocationBilling.recid == locLogisticsPostalAddressBilling.Location;
+                if(locLogisticsPostalAddressBilling)
+                {
+                    // Billing address name
+                    locInvoice.set_BillingAddressName(locLogisticsLocationBilling.LocationId);
+                }
+                else
+                {
+                    locInvoice.set_BillingAddressName('');
+                }
+
+                // Comments
+                locInvoice.set_Comments(locCustTrans.Txt);
+
+                // Created on
+                locInvoice.set_CreatedOn(SKS_PP_StringFormats::strDateYYYYMMDD(locCustTrans.TransDate, DateSeparator::Hyphen));
+
+                // Currency id
+                locInvoice.set_CurrencyID(locCustInvoiceJour.CurrencyCode);
+
+                // Customer number
+                locInvoice.set_CustomerNumber(locCustTrans.OrderAccount);
+
+                // Discount
+                // This is Trade discount, not Terms discount
+                locInvoice.set_Discount(0);
+                locInvoice.set_OriginatingDiscount(0);
+
+                locTermDiscount = new SKS.ePayData.TermDiscounts();
+
+                // Discount available
+                // Discard date (related to discount)
+                if(locCustTransOpen)
+                {
+                    // Determine discount
+                    locCustVendTransCashDisc = SKS_EPY_Sync::getCustVendTransCashDisc(locCustTransOpen);
+                    locTermDiscount.set_DiscountAvailableAmount(real2double(locCustVendTransCashDisc.CashDiscAmount));
+                    if(SKS_PP_StringFormats::strDateYYYYMMDD(locCustVendTransCashDisc.CashDiscDate, DateSeparator::Hyphen) == '')
+                    {
+                        locTermDiscount.set_DiscardDate(SKS_PP_StringFormats::strDateYYYYMMDD(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()), DateSeparator::Hyphen));
+                    }
+                    else
+                    {
+                        locTermDiscount.set_DiscardDate(SKS_PP_StringFormats::strDateYYYYMMDD(locCustVendTransCashDisc.CashDiscDate, DateSeparator::Hyphen));
+                    }
+                    locInvoice.addTermDiscount(locTermDiscount);
+                }
+
+                // DocTypeId
+                switch(locCustTrans.TransType)
+                {
+                    case LedgerTransType::Cust:
+                        locInvoice.set_DocTypeID('ARFT');
+                        break;
+                    case LedgerTransType::Sales:
+                        locInvoice.set_DocTypeID('SO');
+                        break;
+                }
+
+                // DocumentSource
+                locInvoice.set_DocumentSource('');
+
+                // Due on
+                locInvoice.set_DueOn(SKS_PP_StringFormats::strDateYYYYMMDD(locSKS_EPY_CustTransOpen.DueDate, DateSeparator::Hyphen));
+
+                if(!locCurrencyExchangeHelper)
+                {
+                    locCurrencyExchangeHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), locCustInvoicejour.InvoiceDate);
+                }
+
+                //Invoice level charges
+                //Retrieve all Freight charges that are declared in the SKS_EPY_Charges as
+                //for The JOURNAL(this is different from the trans lines' charges)
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by CurrencyCode
+                        where locMarkupTrans.Posted != 0
+                            && locMarkupTrans.TransTableID == locCustInvoiceJour.tableId
+                            && locMarkupTrans.TransRecID == locCustInvoiceJour.Recid
+                    join MarkupCode, ModuleType, SKS_EPY_ChargeType, RecId from locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                            && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Freight
+                {
+                    sumCharges(SKS_EPY_ChargeType::Freight);
+                }
+
+                //Retrieve all Misc charges that are declared in the SKS_EPY_Charges as
+                //for The JOURNAL(this is different from the trans lines' charges)
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by CurrencyCode
+                        where locMarkupTrans.Posted != 0
+                            && locMarkupTrans.TransTableID == locCustInvoiceJour.tableId
+                            && locMarkupTrans.TransRecID == locCustInvoiceJour.Recid
+                    join MarkupCode, ModuleType, SKS_EPY_ChargeType, RecId from locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                            && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Misc
+                {
+                    sumCharges(SKS_EPY_ChargeType::Misc);
+                }
+
+                //Retrieve all Misc charges that are declared in the SKS_EPY_Charges as
+                //for The JOURNAL(this is different from the trans lines' charges)
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by CurrencyCode
+                        where locMarkupTrans.Posted != 0
+                            && locMarkupTrans.TransTableID == locCustInvoiceJour.tableId
+                            && locMarkupTrans.TransRecID == locCustInvoiceJour.Recid
+                    notExists join MarkupCode,ModuleType,SKS_EPY_ChargeType, Recid from locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                {
+                    sumCharges(SKS_EPY_ChargeType::Misc);
+                }
+
+                // Freight
+                //Retrieve all charges that are declared in the SKS_EPY_Charges as Freight for Transaction lines
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by CurrencyCode
+                        where locMarkupTrans.Posted != 0
+                    join TableId, RecId, SalesId, InvoiceId, InvoiceDate, NumberSequenceGroup from locCustInvoiceTrans
+                        where locCustInvoiceTrans.TableId == locMarkupTrans.TransTableId
+                            && locCustInvoiceTrans.RecId == locMarkupTrans.TransRecId
+                            && locCustInvoiceTrans.SalesId == locCustInvoiceJour.SalesId
+                            && locCustInvoiceTrans.InvoiceId == locCustInvoiceJour.InvoiceId
+                            && locCustInvoiceTrans.InvoiceDate == locCustInvoiceJour.InvoiceDate
+                            && locCustInvoiceTrans.numberSequenceGroup == locCustInvoiceJour.numberSequenceGroup
+                    join MarkupCode, ModuleType, SKS_EPY_ChargeType, Recid from locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                            && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Freight
+                {
+                    sumCharges(SKS_EPY_ChargeType::Freight);
+                }
+
+                //Retrieve all charges that are declared in the SKS_EPY_Charges as Misc for Transaction lines
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by CurrencyCode
+                        where locMarkupTrans.Posted != 0
+                    join TableId, RecId, SalesId, InvoiceId, InvoiceDate, NumberSequenceGroup from locCustInvoiceTrans
+                        where locCustInvoiceTrans.TableId == locMarkupTrans.TransTableId
+                            && locCustInvoiceTrans.RecId == locMarkupTrans.TransRecId
+                            && locCustInvoiceTrans.SalesId == locCustInvoiceJour.SalesId
+                            && locCustInvoiceTrans.InvoiceId == locCustInvoiceJour.InvoiceId
+                            && locCustInvoiceTrans.InvoiceDate == locCustInvoiceJour.InvoiceDate
+                            && locCustInvoiceTrans.numberSequenceGroup == locCustInvoiceJour.numberSequenceGroup
+                    join MarkupCode, ModuleType, SKS_EPY_ChargeType from locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                            && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Freight
+                {
+                    sumCharges(SKS_EPY_ChargeType::Freight);
+                }
+
+                //Retrieve all charges that are declared in the SKS_EPY_Charges as Misc for Transaction lines
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by CurrencyCode
+                        where locMarkupTrans.Posted != 0
+                    join TableId, RecId, SalesId, InvoiceId, InvoiceDate, NumberSequenceGroup from locCustInvoiceTrans
+                        where locCustInvoiceTrans.TableId == locMarkupTrans.TransTableId
+                            && locCustInvoiceTrans.RecId == locMarkupTrans.TransRecId
+                            && locCustInvoiceTrans.SalesId == locCustInvoiceJour.SalesId
+                            && locCustInvoiceTrans.InvoiceId == locCustInvoiceJour.InvoiceId
+                            && locCustInvoiceTrans.InvoiceDate == locCustInvoiceJour.InvoiceDate
+                            && locCustInvoiceTrans.numberSequenceGroup == locCustInvoiceJour.numberSequenceGroup
+                    join MarkupCode, ModuleType, SKS_EPY_ChargeType from locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                            && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Misc
+                {
+                    SumCharges(SKS_EPY_ChargeType::Misc);
+                }
+
+                //Retrieve all the charges that are not declared in SKS_EPY_Charges for Transaction lines
+                while select CurrencyCode, sum(Posted) from locMarkupTrans
+                        group by currencyCode
+                        where locMarkupTrans.Posted != 0
+                    join TableId, RecId, SalesId, InvoiceId, InvoiceDate, NumberSequenceGroup from locCustInvoiceTrans
+                        where locCustInvoiceTrans.TableId == locMarkupTrans.TransTableId
+                            && locCustInvoiceTrans.RecId == locMarkupTrans.TransRecId
+                            && locCustInvoiceTrans.SalesId == locCustInvoiceJour.SalesId
+                            && locCustInvoiceTrans.InvoiceId == locCustInvoiceJour.InvoiceId
+                            && locCustInvoiceTrans.InvoiceDate == locCustInvoiceJour.InvoiceDate
+                            && locCustInvoiceTrans.numberSequenceGroup == locCustInvoiceJour.numberSequenceGroup
+                   notExists join locSKS_EPY_Charges
+                        where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                            && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                {
+                    SumCharges(SKS_EPY_ChargeType::Misc);
+                }
+
+
+                locInvoice.set_Freight(real2double(amtFreightMST)); //in base
+                locInvoice.set_OriginatingFreight(real2double(amtFreightCur)); //in currency
+                locInvoice.set_Misc(real2double(amtMiscMST));// in the base currency
+                locInvoice.set_OriginatingMisc(real2double(amtMiscCur)); // in the cust currency
+
+                // Functional Currency
+                locInvoice.set_FunctionalCurrencyID(CompanyInfoHelper::standardCurrency());
+
+                // Identity
+                if(!closedinvoice)
+                {
+                    locInvoice.set_Identity(int642str(_SKS_EPY_QueueData.TableRecId));
+                }
+                else
+                {
+                    locInvoice.set_Identity(int642str(locSKS_EPY_CustTransOpen.CustTransOpenRefRecId));
+                }
+
+                // Invoice number
+                if(strLen(locCustTrans.Invoice) > 0)
+                {
+                    locInvoice.set_InvoiceNumber(locCustTrans.Invoice);
+                }
+                else
+                {
+                    locInvoice.set_InvoiceNumber("@SYS14204");
+                }
+
+                // Invoice type
+                locInvoice.set_InvoiceType(3);
+
+                // OrigNumb
+                locInvoice.set_ORIGNUMB('');
+
+                // OrigType
+                locInvoice.set_ORIGTYPE(0);
+
+                // Payment terms
+                locInvoice.set_PaymentTerms(PaymTerm::find(locCustInvoiceJour.Payment).PaymTermId);
+
+                // PO number
+                locInvoice.set_PONumber(locCustInvoiceJour.PurchaseOrder);
+
+                // SalesPersonId
+                if(locCustInvoiceJour.WorkerSalesTaker)
+                {
+                    locHcmWorkerRecId = locCustInvoiceJour.WorkerSalesTaker;
+                }
+                else
+                {
+                    locHcmWorkerRecId = locCustTable.MainContactWorker;
+                }
+                select firstonly locHcmWorker where locHcmWorker.RecId == locHcmWorkerRecId;
+                if(locHcmWorker)
+                {
+                    locInvoice.set_SalesPersonID(locHcmWorker.name());
+                }
+
+                // ShippingMethod
+                locInvoice.set_ShippingMethod(locCustInvoiceJour.DlvMode);
+
+                // SiteId
+                locInvoice.set_SiteID('');
+
+                // Tax
+                amtTaxMST = real2double(locCustInvoiceJour.SumTaxMST);
+                locInvoice.set_Tax(real2double(amtTaxMST));
+                amtTaxCur = real2double(locCustInvoiceJour.SumTax);
+                locInvoice.set_OriginatingTax(real2double(amtTaxCur));
+
+                // Tracking number
+                locInvoice.set_Tracking_Number('');
+
+                // Subtotal
+                locInvoice.set_Subtotal(real2double(amtTotalMST - amtFreightMST - amtMiscMST - amtTaxMST));
+                locInvoice.set_OriginatingSubtotal(real2double(amtTotalCur - amtFreightCur - amtMiscCur - amtTaxCur));
+
+                if(locLogisticsPostalAddressInvoice)
+                {
+                    locShippingAddress = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressInvoice,
+                                                                        locCustInvoiceJour.DeliveryName,
+                                                                        int642str(locCustInvoiceJour.DeliveryPostalAddress),
+                                                                        _SKS_EPY_Queue.AccountNum);
+                    locInvoice.set_ShipToAddress(locShippingAddress);
+                }
+
+                locInvoice = SKS_EPY_Sync::InvoiceFieldOverWrite(locCustInvoiceJour, locInvoice);
+
+                // Line items
+                while select locCustInvoiceTrans
+                    where locCustInvoiceTrans.SalesId == locCustInvoiceJour.SalesId
+                    && locCustInvoiceTrans.InvoiceId == locCustInvoiceJour.InvoiceId
+                    && locCustInvoiceTrans.InvoiceDate == locCustInvoiceJour.InvoiceDate
+                    && locCustInvoiceTrans.numberSequenceGroup == locCustInvoiceJour.numberSequenceGroup
+                    outer join locLogisticsPostalAddressTrans
+                    where locCustInvoiceTrans.DeliveryPostalAddress == locLogisticsPostalAddressTrans.RecId
+
+                {
+                    locInvoiceItem = new SKS.ePayData.InvoiceEntry();
+
+                    // Description
+                    locInvoiceItem.set_Description(subStr(locCustInvoiceTrans.Name, 0, 100));
+
+                    // Extended Price
+                    locInvoiceItem.set_ExtendedPrice(real2double(locCustInvoiceTrans.LineAmountMST));
+                    locInvoiceItem.set_OriginatingExtendedPrice(real2double(locCustInvoiceTrans.LineAmount));
+
+                    // Invoice number
+                    locInvoiceItem.set_InvoiceNumber(locCustTrans.Invoice);
+
+                    // Invoice type
+                    locInvoiceItem.set_InvoiceType(locInvoice.get_InvoiceType());
+
+                    // Item code
+                    locInvoiceItem.set_ItemCode(locCustInvoiceTrans.ItemId);
+
+                    // Markdown
+                    locInvoiceItem.set_Markdown(0);
+                    locInvoiceItem.set_OriginatingMarkdown(0);
+
+                    // Markdown Percentage
+                    locInvoiceItem.set_MarkdownPercentage(0);
+
+                    // Non Inventory
+                    locInvoiceItem.set_NonInventory(locCustInvoiceTrans.StockedProduct);
+
+                    // Price level
+                    locInvoiceItem.set_PriceLevel('');
+
+                    // Quantity
+                    locInvoiceItem.set_Quantity(real2double(locCustInvoiceTrans.Qty));
+
+                    // Req Ship Date
+                    if(locCustInvoiceTrans.DlvDate)
+                    {
+                        locInvoiceItem.set_ReqShipDate(SKS_PP_StringFormats::strDateYYYYMMDD(locCustInvoiceTrans.DlvDate, DateSeparator::Hyphen));
+                    }
+                    else
+                    {
+                        locInvoiceItem.set_ReqShipDate(SKS_PP_StringFormats::strDateYYYYMMDD(locCustTrans.TransDate, DateSeparator::Hyphen));
+                    }
+
+                    // SalesPersonId
+                    locInvoiceItem.set_SalesPersonID(locInvoice.get_SalesPersonID());
+
+                    // Sequence
+                    locInvoiceItem.set_Sequence(locInvoiceItemCounter * 10);
+
+                    locInvoiceItemCounter++;
+
+                    // Shipping method
+                    locInvoiceItem.set_ShippingMethod(locInvoice.get_ShippingMethod());
+
+                    // Site id
+                    locInvoiceItem.set_SiteID('');
+
+                    // Tax Amount
+                    locInvoiceItem.set_TaxAmount(0);
+                    locInvoiceItem.set_OriginatingTaxAmount(0);
+
+                    // Taxable
+                    if(locCustInvoiceTrans.TaxGroup)
+                    {
+                        locInvoiceItem.set_Taxable(true);
+                    }
+                    else
+                    {
+                        locInvoiceItem.set_Taxable(false);
+                    }
+
+                    // Unit of measure
+                    locInvoiceItem.set_UnitOfMeasure(locCustInvoiceTrans.SalesUnit);
+
+                    if(locCustInvoiceTrans.PriceUnit)
+                    {
+                        // Unit price //NOT DISPLAYED ON THE INVOICE IN EPAY
+                        // Convert the transaction currency to the accounting currency for the Unit Price. The Sales Unit Price is farther down
+                        locCurrencyExchangeHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), locCustInvoicejour.InvoiceDate);
+                        unitPrice = locCurrencyExchangeHelper.calculateTransactionToAccounting(locCustInvoiceTrans.CurrencyCode,
+                                                                                 locCustInvoiceTrans.SalesPrice,
+                                                                                                        true);
+                        unitPrice = unitPrice / locCustInvoiceTrans.PriceUnit;
+                    }
+                    else
+                    {
+                        // Unit price //NOT DISPLAYED ON THE INVOICE IN EPAY
+                        // Convert the transaction currency to the accounting currency for the Unit Price. The Sales Unit Price is farther down
+                        locCurrencyExchangeHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), locCustInvoicejour.InvoiceDate);
+                        unitPrice = locCurrencyExchangeHelper.calculateTransactionToAccounting(locCustInvoiceTrans.CurrencyCode,
+                                                                                        locCustInvoiceTrans.SalesPrice,
+                                                                                        true);
+                    }
+
+                    locInvoiceItem.set_UnitPrice(real2double(unitPrice));
+                    //  The Sales Price is the Unit Price in the Transaction Currency.  We don't need to convert, just to round to the correct decimal places
+                    salesPriceCur = locCurrencyExchangeHelper.calculateCurrencyToCurrency(locCustInvoiceTrans.CurrencyCode,
+                                                                                        locCustInvoiceTrans.CurrencyCode,
+                                                                                        locCustInvoiceTrans.SalesPrice,
+                                                                                        true);
+                    locInvoiceItem.set_OriginatingUnitPrice(real2double(salesPriceCur));
+
+
+                    locAddress = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressTrans,
+                                                                locCustInvoiceJour.DeliveryName,
+                                                                int642str(locCustInvoiceTrans.DeliveryPostalAddress),
+                                                                _SKS_EPY_Queue.AccountNum);
+                    locInvoiceItem.set_ShipToAddress(locAddress);
+
+                    //Add the current invoice item to the list of items.
+                    locInvoice.addInvoiceItem(locInvoiceItem);
+                }
+
+                if(strLen(_SKS_EPY_Setup.WebServLoc) > 0)
+                {
+                    if(_SKS_EPY_Setup.sendPDF == NoYes::Yes && _SKS_EPY_Queue.ChangeType == SKS_EPY_ChangeType::Created)
+                    {
+                        identity = str2Int64(locInvoice.get_Identity());
+
+                        if(locCustTrans.AccountNum != locCustTrans.OrderAccount)
+                        {
+                            SKS_EPY_Return_In = SKS_EPY_Sync::SaveInvoiceToFile(_SKS_EPY_Setup.ePayPDFFilePath, Identity, locCustTrans.OrderAccount, locCustTrans.Invoice, _SKS_EPY_Setup.epayInvFolderPath, _SKS_EPY_Setup, SKS_EPY_Return_In);
+                        }
+                        else
+                        {
+                            SKS_EPY_Return_In = SKS_EPY_Sync::SaveInvoiceToFile(_SKS_EPY_Setup.ePayPDFFilePath, Identity, locCustTrans.AccountNum, locCustTrans.Invoice, _SKS_EPY_Setup.epayInvFolderPath, _SKS_EPY_Setup, SKS_EPY_Return_In);
+                        }
+
+                        if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+                        {
+                            errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                            _sks_epy_queue.ErrorWarning = errortext;
+                            _sks_epy_queue.Status = SKS_EPY_Status::PDFFailure;
+                        }
+                    }
+
+                    if (_sks_epy_queue.Status != SKS_EPY_Status::PDFFailure)
+                    {
+                        sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(locInvoice,
+                                                                SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc,'invoice'),
+                                                                _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                                'POST', SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'token'), false);
+
+                        if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+                        {
+                            errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                            _sks_epy_queue.ErrorWarning = errortext;
+                            _SKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+                        }
+                        else
+                        {
+                            _sks_epy_queue.Status = SKS_EPY_Status::Completed;
+                        }
+                    }
+                }
+            }     // if(SKS_EPY_Currency::findByCurrency(locCustTrans.CurrencyCode))
+            else
+            {
+                _sks_epy_queue.ErrorWarning ="@SKS:SKGePayInvCurr";
+                _sks_epy_queue.Status = SKS_EPY_Status::Failed;
+            }
+            if( SKS_EPY_Return_In)
+            {
+                _SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+            }
+        }   // if( !locCustTrans) else
+        return _SKS_EPY_Queue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncPayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync ePay payments
+    /// </summary>
+    /// <param name = "sks_epy_queue">sks_epy_queue</param>
+    /// <returns>ePay queue records</returns>
+    public static SKS_EPY_Queue SyncPayment(SKS_EPY_Queue   sks_epy_queue)
+    {
+        str url;
+        SKS_EPY_QueueData   sks_epy_queuedata;
+        CustTrans           custTrans;
+        CustTransOpen       custTransOpen;
+        LedgerJournalTrans  LedgerJournalTrans;             
+      
+        SKS.ePayData.Payment    ePayPaym = new SKS.ePayData.Payment();
+        SKS.ePayData.SKS_EPY_Return_In  sks_epy_return_in = new SKS.ePayData.SKS_EPY_Return_In();
+        SKS_EPY_Setup       sks_epy_setup;
+        AmountCur           Amount;
+        String50            PmtNum;
+        ;
+
+        try
+        {
+            select firstonly webservloc, clientid, secret from sks_epy_setup;
+            url = SKS_PP_StringFormats::strAssembleURL(sks_epy_setup.WebServLoc, '/payment');
+
+            select firstonly * from custTrans join sks_epy_queuedata
+                    where SKS_EPY_QUEUEDATA.QUEUERECID == sks_epy_queue.RecId
+                        && custTrans.RECID == sks_epy_queuedata.tablerecid;
+
+            if(sks_epy_queuedata.SourceTable == SKS_EPY_Table::CustTransOpen)
+            {
+                select firstonly * from custTransOpen where CustTransOpen.RefRecId == sks_epy_queuedata.TableRecId;
+                if(custTrans.Invoice == '')//We don't see a difference between a credit note and a fee since fee amounts are negative except that fees will have no invoice number.
+                {
+                    SKS_EPY_Queue.Status = SKS_EPY_Status::Obsolete;
+                    return SKS_EPY_Queue;
+                }
+                ePayPaym.set_Amount(real2double(CustTransOpen.AmountCur * -1));
+                ePayPaym.set_BalanceAmount(real2double(CustTransOpen.AmountCur * -1));
+                ePayPaym.set_OriginatingAmount(real2double(CustTransOpen.AmountCur * -1));
+                ePayPaym.set_CustomerID(CustTransOpen.AccountNum);
+                ePayPaym.set_CurrencyID(custTrans.CurrencyCode);
+                ePayPaym.set_PaymentNumber(custTrans.Invoice);
+                ePayPaym.set_CustomerNumber(custTrans.AccountNum);
+
+                if(custTrans.DocumentDate != Global::dateNull())
+                {
+                    ePayPaym.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.DocumentDate, DateSeparator::Hyphen));
+                }
+                else
+                {
+                    ePayPaym.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.TransDate, DateSeparator::Hyphen));
+                }
+
+                ePayPaym.set_CreatedOn(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.TransDate, DateSeparator::Hyphen));
+                ePayPaym.set_PaymentType(9);
+
+            }
+            else if(custTrans.CancelledPayment)
+            {
+                ePayPaym.set_CustomerID(custTrans.AccountNum);
+                ePayPaym.set_CurrencyID(custTrans.CurrencyCode);
+                ePayPaym.set_PaymentNumber(SKS_EPY_Queue.PaymNum);
+                ePayPaym.set_Amount(real2double(0));
+                ePayPaym.set_BalanceAmount(real2double(0));
+                ePayPaym.set_OriginatingAmount(real2double(0));
+                ePayPaym.set_CustomerNumber(custTrans.OrderAccount);
+                ePayPaym.set_CreatedOn(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.TransDate, DateSeparator::Hyphen));
+                ePayPaym.set_PaymentType(9);
+
+                if(custTrans.DocumentDate != Global::dateNull())
+                {
+                    ePayPaym.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.DocumentDate, DateSeparator::Hyphen));
+                }
+                else
+                {
+                    ePayPaym.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.TransDate, DateSeparator::Hyphen));
+                }
+            }
+            else//Regular payments
+            {
+                ePayPaym.set_CustomerID(custTrans.AccountNum);
+                ePayPaym.set_CurrencyID(custTrans.CurrencyCode);
+
+                select firstOnly SKS_EPY_PmtNbr from LedgerJournalTrans where LedgerJournalTrans.RecId == sks_epy_queue.PaymLineRecID;                
+                ePayPaym.set_PaymentNumber(LedgerJournalTrans.SKS_EPY_PmtNbr);
+                PmtNum = LedgerJournalTrans.SKS_EPY_PmtNbr;
+                select sum(AmountCurCredit), sum(AmountCurDebit) from LedgerJournalTrans where LedgerJournalTrans.SKS_EPY_PmtNbr == PmtNum;
+                Amount = LedgerJournalTrans.AmountCurCredit - LedgerJournalTrans.AmountCurDebit;
+                ePayPaym.set_Amount(real2double(Amount));
+                ePayPaym.set_BalanceAmount(real2double(Amount));
+                ePayPaym.set_OriginatingAmount(real2double(Amount));
+
+                ePayPaym.set_CustomerNumber(custTrans.OrderAccount);
+
+                if(custTrans.DocumentDate != Global::dateNull())
+                {
+                    ePayPaym.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.DocumentDate, DateSeparator::Hyphen));
+                }
+                else
+                {
+                    ePayPaym.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.TransDate, DateSeparator::Hyphen));
+                }
+
+                ePayPaym.set_CreatedOn(SKS_PP_StringFormats::strDateYYYYMMDD(custTrans.TransDate, DateSeparator::Hyphen));
+                ePayPaym.set_PaymentType(9);                
+
+                //ePayPaym.set_Invoices(SinglePayment.get_Invoices());
+                // invoice data
+                
+                //This trans rec will have the information we want. The rec found in the while select is the payment record
+                //while tmpCustTrans will have the invoice information
+                 
+                CustSettlement  custSettlement;
+                CustTrans       tmpCustTrans;
+                SKS.ePayData.InvoicePayment ePayInv;
+                Amount applyAmount, balanceAmount;
+
+                
+                select SKS_EPY_PMTNBR
+                    from LedgerJournalTrans
+                    where LedgerJournalTrans.RecId == sks_epy_queue.PaymLineRecID
+                    join RecId, Voucher, TransDate, TransType, accountnum
+                    from CustTrans
+                    where CustTrans.Voucher == LedgerJournalTrans.Voucher
+                        && CustTrans.TransDate == LedgerJournalTrans.TransDate
+                        && CustTrans.TransType == LedgerTransType::Payment
+                        && CustTrans.AccountNum == sks_epy_queue.accountnum
+                    join SettleAmountCur, UtilizedCashDisc, PennyDiff, SKS_EPY_TransOpenRecId, TransRecId
+                    from CustSettlement
+                    order by CustTrans.Recid
+                    where CustSettlement.OffsetRecid == CustTrans.RecId
+                    && CustSettlement.OffsetAccountNum == CustTrans.AccountNum
+                    && CustSettlement.CanBeReversed == NoYes::Yes;
+
+                while(LedgerJournalTrans)
+                {
+                    //This trans rec will have the information we want. The rec found in the while select is the payment record
+                    //while tmpCustTrans will have the invoice information
+                    tmpCustTrans = CustTrans::findByCompany(CustSettlement.company(), CustSettlement.TransRecId);
+                    
+                    if (ePayPaym.get_PaymentNumber() == '')
+                    {
+                        ePayPaym.set_PaymentNumber(tmpCustTrans.Invoice);
+                    }
+
+                    if(SKS_EPY_Sync::CustomProcessInvoice(tmpCustTrans))
+                    {
+                        //calculate the settlement amount for payment we are on
+                        Amount settlementAmount = (CustSettlement.SettleAmountCur - CustSettlement.UtilizedCashDisc) + CustSettlement.PennyDiff;
+
+                        str locStringGuid = int642str(CustSettlement.sks_epy_transopenrecid);
+
+                        ePayInv = new SKS.ePayData.InvoicePayment();
+                        ePayInv.set_Identity(locStringGuid);
+                        ePayInv.set_Amount(real2double(settlementAmount));
+                        ePayInv.set_PaymentAmount(real2double(settlementAmount));
+                        ePayInv.set_OriginatingAmount(real2double(settlementAmount));
+                        ePayInv.set_InvoiceNumber(tmpCustTrans.Invoice);
+                        ePayInv.set_PaymentNumber(ePayPaym.get_PaymentNumber());
+                        ePayInv.set_DocumentSource("@SKS3367");                    
+                        ePayInv.PaymentType = '9';
+                        ePayPaym.addInvoicePayment(ePayInv);
+                    }
+
+                    next LedgerJournalTrans;
+                }
+                
+            }          
+        }
+        catch(Exception::Error)
+        {
+            sks_epy_queue.ErrorWarning = "@SKS3368";
+            SKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+        }
+        sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(ePayPaym, url, sks_epy_setup.ClientId, sks_epy_setup.Secret, 'POST', SKS_PP_StringFormats::strAssembleURL(sks_epy_setup.WebServLoc ,'token'), false);
+
+        if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+        {
+            sks_epy_queue.ErrorWarning = sks_epy_return_in.get_ErrorDesc();
+            SKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+        }
+        else
+        {
+            SKS_EPY_Queue.Status = SKS_EPY_Status::Completed;
+        }
+        SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+        return SKS_EPY_Queue;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncProjInvoices</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync Project invoices
+    /// </summary>
+    /// <param name = "_SKS_EPY_Queue">_SKS_EPY_Queue</param>
+    /// <param name = "_SKS_EPY_QueueData">_SKS_EPY_QueueData</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <returns>ePay queue records</returns>
+    public static server SKS_EPY_Queue SyncProjInvoices(SKS_EPY_Queue _SKS_EPY_Queue, SKS_EPY_QueueData _SKS_EPY_QueueData, SKS_EPY_Setup _SKS_EPY_Setup)
+    {
+        CurrencyExchangeHelper  locCurrencyExchangeHelper;
+        ProjInvoiceJour         locProjInvoiceJour;
+        ProjFundingSource       locProjFundingSource;
+        ProjInvoiceItem         locProjInvoiceItem;
+        ProjInvoiceEmpl         locProjInvoiceEmpl;
+        ProjInvoiceCost         locProjInvoiceCost;
+        ProjInvoiceOnAcc        locProjInvoiceOnAcc;
+        ProjInvoiceRevenue      locProjInvoiceRevenue;
+        CustTransOpen           locCustTransOpen;
+        CustTrans               locCustTrans;
+        CustTable               locCustTable;
+        CustVendTransCashDisc   locCustVendTransCashDisc;
+        LogisticsPostalAddress  locLogisticsPostalAddressInvoice,
+                                locLogisticsPostalAddressTrans,
+                                locLogisticsPostalAddressBilling;
+        LogisticsLocation       locLogisticsLocationBilling;
+        MarkupTrans             locMarkupTrans;
+        RecId                   locCustTransRecid;
+        SKS_EPY_Charges         locSKS_EPY_Charges;
+        SKS_EPY_CustTransOpen   locSKS_EPY_CustTransOpen;
+
+        SKS.ePayData.Invoice        locInvoice;
+        SKS.ePayData.InvoiceEntry   locInvoiceItem;
+        SKS.ePayData.TermDiscounts  locTermDiscount;
+        SKS.ePayData.Address        locAddress, locShippingAddress;
+        SKS.ePayData.SKS_EPY_Return_In  SKS_EPY_Return_In;
+        int64                   locInvoiceItemCounter = 1;
+        AmountCur               amtFreightCur, amtMiscCur, amtTaxCur, amtTotalCur, salesPriceCur, unitPrice;
+        AmountMST               amtFreightMST, amtMiscMST, amtTaxMST, amtTotalMST;
+        boolean                 closedinvoice = false;
+        str                     errortext;
+        int64                   identity;
+        void sumCharges(SKS_EPY_ChargeType _SKS_EPY_ChargeType)
+        {
+            switch(_SKS_EPY_ChargeType)
+            {
+                case SKS_EPY_ChargeType::Misc:
+                    //because each charge can be in a different currency, it is necessary to convert each line to the base currency.
+                    amtMiscMST = amtMiscMST + locCurrencyExchangeHelper.calculateTransactionToAccounting(locMarkupTrans.CurrencyCode,
+                                                                                                                    locMarkupTrans.Posted * -1,
+                                                                                                                    true);
+
+                    //because each charge can be in a different currency, it is necessary to convert each line to the functional currency.
+                    amtMiscCur = amtMiscCur + locCurrencyExchangeHelper.calculateCurrencyToCurrency(locMarkupTrans.CurrencyCode,
+                                                                                                            locProjInvoiceJour.CurrencyId,
+                                                                                                            locMarkupTrans.Posted * -1,
+                                                                                                            true);
+
+                    break;
+                case SKS_EPY_ChargeType::Freight:
+                    //because each charge can be in a different currency, it is necessary to convert each line to the base currency.
+                    amtFreightMST = amtFreightMST + locCurrencyExchangeHelper.calculateTransactionToAccounting(locMarkupTrans.CurrencyCode,
+                                                                                                                locMarkupTrans.Posted * -1,
+                                                                                                                true);
+                    //because each charge can be in a different currency, it is necessary to convert each line to the functional currency.
+                    amtFreightCur = amtFreightCur + locCurrencyExchangeHelper.calculateCurrencyToCurrency(locMarkupTrans.CurrencyCode,
+                                                                                                            locProjInvoiceJour.CurrencyID,
+                                                                                                            locMarkupTrans.Posted * -1,
+                                                                                                            true);
+                    break;
+            }
+        }
+
+        void addinTransLineMarkups(MarkupTransRefTableId _MarkupTransRefTableId, MarkupTransRefRecId _MarkupTransRefRecId)
+        {
+            // Freight
+            //Retrieve all charges that are declared in the SKS_EPY_Charges as Freight for Transaction lines
+            while select CurrencyCode, sum(Posted) from locMarkupTrans
+                    group by CurrencyCode
+                    where locMarkupTrans.Posted != 0
+                    && locMarkupTrans.TransTableId == _MarkupTransRefTableId
+                    && locMarkupTrans.TransRecId == _MarkupTransRefRecId
+                join MarkupCode, ModuleType, SKS_EPY_ChargeType, Recid from locSKS_EPY_Charges
+                    where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                        && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                        && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Freight
+            {
+                sumCharges(SKS_EPY_ChargeType::Freight);
+            }
+
+            //Retrieve all charges that are declared in the SKS_EPY_Charges as Misc for Transaction lines
+            while select CurrencyCode, sum(Posted) from locMarkupTrans
+                    group by CurrencyCode
+                    where locMarkupTrans.Posted != 0
+                        && locMarkupTrans.TransTableId == _MarkupTransRefTableId
+                        && locMarkupTrans.TransRecId == _MarkupTransRefRecId
+                join MarkupCode, ModuleType, SKS_EPY_ChargeType from locSKS_EPY_Charges
+                    where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                        && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                        && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Misc
+            {
+                SumCharges(SKS_EPY_ChargeType::Misc);
+            }
+            //Retrieve all the charges that are not declared in SKS_EPY_Charges for Transaction lines
+            while select CurrencyCode, sum(Posted) from locMarkupTrans
+                    group by currencyCode
+                    where locMarkupTrans.Posted != 0
+                        && locMarkupTrans.TransTableId == _MarkupTransRefTableId
+                        && locMarkupTrans.TransRecId == _MarkupTransRefRecId
+               notExists join locSKS_EPY_Charges
+                    where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                        && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+            {
+                SumCharges(SKS_EPY_ChargeType::Misc);
+            }
+        }
+
+        void setTransLineValues(str TranName, AmountMST TranLineAmtMST, real TranExchgRate,
+                                str TranItemID, NoYes TranStockedProduct, real TranQty,
+                                date TranDlvDate, str TranSalesPersonID,
+                                str TranUnitOfMeasure, CurrencyCode TranCurrencyCode,
+                                real TranUnitPrice,
+                                LogisticsPostalAddressRecId TranDeliveryPostalAddress,
+                                TaxGroup _TaxGroup)
+        {
+            locInvoiceItem = new SKS.ePayData.InvoiceEntry();
+
+            // Description            
+            locInvoiceItem.set_Description(subStr(TranName, 0, 100));
+
+            // Extended Price
+            locInvoiceItem.set_ExtendedPrice(real2double(TranLineAmtMST));
+            locInvoiceItem.set_OriginatingExtendedPrice(real2double(TranExchgRate * TranLineAmtMST));
+
+            // Invoice number
+            locInvoiceItem.set_InvoiceNumber(locProjInvoiceJour.ProjInvoiceId);
+
+            // Invoice type
+            locInvoiceItem.set_InvoiceType(locInvoice.get_InvoiceType());
+
+            // Item code
+            locInvoiceItem.set_ItemCode(TranItemID);
+
+            // Markdown
+            locInvoiceItem.set_Markdown(0);
+            locInvoiceItem.set_OriginatingMarkdown(0);
+
+            // Markdown Percentage
+            locInvoiceItem.set_MarkdownPercentage(0);
+
+            // Non Inventory
+            locInvoiceItem.set_NonInventory(TranStockedProduct);
+
+            // Price level
+            locInvoiceItem.set_PriceLevel('');
+
+            // Quantity
+            locInvoiceItem.set_Quantity(real2double(TranQty));
+
+            // Req Ship Date
+            if(TranDlvDate)
+            {
+                locInvoiceItem.set_ReqShipDate(SKS_PP_StringFormats::strDateYYYYMMDD(TranDlvDate, DateSeparator::Hyphen));
+            }
+
+            // SalesPersonId
+            locInvoiceItem.set_SalesPersonID(subStr(TranSalesPersonID, 0, 24));//ePay only accepts 25 characters
+
+            // Sequence
+            locInvoiceItem.set_Sequence(locInvoiceItemCounter * 10);
+            locInvoiceItemCounter++;
+
+            // Shipping method
+            locInvoiceItem.set_ShippingMethod(locInvoice.get_ShippingMethod());
+
+            // Site id
+            locInvoiceItem.set_SiteID('');
+
+            // Tax Amount
+            locInvoiceItem.set_TaxAmount(0);
+            locInvoiceItem.set_OriginatingTaxAmount(0);
+
+            // Taxable
+            if(_TaxGroup)
+            {
+                locInvoiceItem.set_Taxable(true);
+            }
+            else
+            {
+                locInvoiceItem.set_Taxable(false);
+            }
+
+            // Unit of measure
+            locInvoiceItem.set_UnitOfMeasure(TranUnitOfMeasure);
+
+            // Unit price //NOT DISPLAYED ON THE INVOICE IN EPAY
+            // Convert the transaction currency to the accounting currency for the Unit Price. The Sales Unit Price is farther down
+            locCurrencyExchangeHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), locProjInvoiceJour.InvoiceDate);
+            unitPrice = locCurrencyExchangeHelper.calculateTransactionToAccounting(TranCurrencyCode,
+                                                                                TranUnitPrice,
+                                                                                true);
+
+            locInvoiceItem.set_UnitPrice(real2double(unitPrice));
+            //  The Sales Price is the Unit Price in the Transaction Currency.  We don't need to convert, just to round to the correct decimal places
+            salesPriceCur = locCurrencyExchangeHelper.calculateCurrencyToCurrency(TranCurrencyCode,
+                                                                                TranCurrencyCode,
+                                                                                TranUnitPrice,
+                                                                                true);
+            locInvoiceItem.set_OriginatingUnitPrice(real2double(salesPriceCur));
+
+            if(TranDeliveryPostalAddress)
+            {
+                locAddress = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressTrans,
+                                                                locProjInvoiceJour.DeliveryName,
+                                                                int642str(TranDeliveryPostalAddress),
+                                                                _SKS_EPY_Queue.AccountNum);
+            }
+            if(locAddress)
+            {
+                locInvoiceItem.set_ShipToAddress(locAddress);
+            }
+            //Add the current invoice item to the list of items.
+            locInvoice.addInvoiceItem(locInvoiceItem);
+        }
+        ;
+
+
+        locInvoice = new SKS.ePayData.Invoice();
+        locInvoiceItem = new SKS.ePayData.InvoiceEntry();
+        if(_SKS_EPY_QueueData.SourceTable == SKS_EPY_Table::CustTransOpen)
+        {
+            select firstonly crossCompany DueDate, CustTransOpenRefRecId, CustTransRefRecId from locSKS_EPY_CustTransOpen where locSKS_EPY_CustTransOpen.CustTransOpenRefRecId == _SKS_EPY_QueueData.TableRecId
+                outer join AmountCur, AmountMST, RecId from locCustTransOpen
+                    where locCustTransOpen.RecId == locSKS_EPY_CustTransOpen.CustTransOpenRefRecId;
+            locCustTransRecid = locSKS_EPY_CustTransOpen.CustTransRefRecId;
+        }
+        else if(_SKS_EPY_QueueData.SourceTable == SKS_EPY_Table::CustTrans)
+        {
+            select firstonly crossCompany DueDate, CustTransOpenRefRecId, CustTransRefRecId from locSKS_EPY_CustTransOpen where locSKS_EPY_CustTransOpen.CustTransRefRecId == _SKS_EPY_QueueData.TableRecId;
+
+            locCustTransRecid = locSKS_EPY_CustTransOpen.CustTransRefRecId;
+            closedinvoice = true;
+        }
+        select firstonly crosscompany RecId, Invoice, AccountNum, TransDate, AmountMST, AmountCur, Voucher, Txt, TransType, OrderAccount, CurrencyCode from locCustTrans
+            where locCustTrans.RecId == locCustTransRecid
+            join locProjInvoiceJour
+                where locProjInvoiceJour.LedgerVoucher == locCustTrans.Voucher
+                    && locProjInvoiceJour.InvoiceAccount == locCustTrans.AccountNum
+                    && locProjInvoiceJour.InvoiceDate == locCustTrans.TransDate
+            join AccountNum, maincontactworker from locCustTable
+                where locCustTable.AccountNum == locCustTrans.AccountNum;
+
+        if(locProjInvoiceJour.DeliveryPostalAddress)
+        {
+            select crosscompany locLogisticsPostalAddressInvoice
+                where locLogisticsPostalAddressInvoice.RecId == locProjInvoiceJour.DeliveryPostalAddress;
+        }
+
+        if(SKS_EPY_Currency::findByCurrency(locCustTrans.CurrencyCode))
+        {
+            // Amount
+            amtTotalMST = locCustTrans.AmountMST;
+            locInvoice.set_Amount(real2double(amtTotalMST));
+            amtTotalCur = locCustTrans.AmountCur;
+            locInvoice.set_OriginatingAmount(real2double(amtTotalCur));
+
+            // Balance due
+            locInvoice.set_BalanceDue(real2double(locCustTransOpen.AmountMST));
+            locInvoice.set_OriginatingBalanceDue(real2double(locCustTransOpen.AmountCur));
+
+            // Batch number
+            locInvoice.set_BatchNumber(locCustTrans.Voucher);
+
+            //We only need this once
+            select firstonly locProjFundingSource
+                where locProjFundingSource.ContractId == locProjInvoiceJour.ProjInvoiceProjId
+                    && locProjFundingSource.CustAccount == locProjInvoiceJour.InvoiceAccount;
+
+            if(locProjFundingSource)
+            {
+                locLogisticsPostalAddressBilling = LogisticsPostalAddress::findByLocation(locProjFundingSource.InvoiceLocation);
+                if(locLogisticsPostalAddressBilling)
+                {
+                    // Billing address name
+                    locInvoice.set_BillingAddressName(locLogisticsLocationBilling.LocationId);
+                }
+                else
+                {
+                    locInvoice.set_BillingAddressName('');
+                }
+            }
+
+            // Comments
+            locInvoice.set_Comments(locCustTrans.Txt);
+
+            // Created on
+            locInvoice.set_CreatedOn(SKS_PP_StringFormats::strDateYYYYMMDD(locCustTrans.TransDate, DateSeparator::Hyphen));
+
+            // Currency id
+            locInvoice.set_CurrencyID(locProjInvoiceJour.CurrencyId);
+
+            // Customer number
+            locInvoice.set_CustomerNumber(locCustTrans.OrderAccount);
+
+            // Discount
+            // This is Trade discount, not Terms discount
+            locInvoice.set_Discount(0);
+            locInvoice.set_OriginatingDiscount(0);
+
+            // Discount available
+            // Discard date (related to discount)
+            locTermDiscount = new SKS.ePayData.TermDiscounts();
+            // Discount available
+            // Discard date (related to discount)
+            if(locCustTransOpen)
+            {
+                // Determine discount
+                locCustVendTransCashDisc = SKS_EPY_Sync::getCustVendTransCashDisc(locCustTransOpen);
+                locTermDiscount.set_DiscountAvailableAmount(real2double(locCustVendTransCashDisc.CashDiscAmount));
+                if(SKS_PP_StringFormats::strDateYYYYMMDD(locCustVendTransCashDisc.CashDiscDate, DateSeparator::Hyphen) == '')
+                {
+                    locTermDiscount.set_DiscardDate(SKS_PP_StringFormats::strDateYYYYMMDD(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()), DateSeparator::Hyphen));
+                }
+                else
+                {
+                    locTermDiscount.set_DiscardDate(SKS_PP_StringFormats::strDateYYYYMMDD(locCustVendTransCashDisc.CashDiscDate, DateSeparator::Hyphen));
+                }
+                locInvoice.addTermDiscount(locTermDiscount);
+            }
+
+            // DocTypeId
+            locInvoice.set_DocTypeID('PROJ');
+
+
+            // DocumentSource
+            locInvoice.set_DocumentSource('');
+
+            // Due on
+            locInvoice.set_DueOn(SKS_PP_StringFormats::strDateYYYYMMDD(locSKS_EPY_CustTransOpen.DueDate, DateSeparator::Hyphen));
+
+            if(!locCurrencyExchangeHelper)
+                locCurrencyExchangeHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), locProjInvoiceJour.InvoiceDate);
+
+
+            // Sum all Project Invoice LEVEL freight(Not Details) (you don't need to go back to Sales order for this)
+            while select CurrencyCode, sum(Posted) from locMarkupTrans
+                    Group By CurrencyCode
+                    where locMarkupTrans.TransTableId == locProjInvoiceJour.TableId
+                        && locMarkupTrans.TransRecId == locProjInvoiceJour.RecId
+                        && locMarkupTrans.Posted != 0
+                join MarkupCode, ModuleType, SKS_EPY_ChargeType, RecId from locSKS_EPY_Charges
+                    where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                        && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                        && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Freight
+            {
+                sumCharges(SKS_EPY_ChargeType::Freight);
+            }
+
+            // Sum all Project Invoice LEVEL misc charges (NOT DETAILS)(you don't need to go back to Sales order for this)
+            while select CurrencyCode, sum(Posted) from locMarkupTrans
+                    Group by CurrencyCode
+                    where locMarkupTrans.TransTableId == locProjInvoiceJour.TableId
+                        && locMarkupTrans.TransRecId == locProjInvoiceJour.RecId
+                        && locMarkupTrans.Posted != 0
+                join MarkupCode, ModuleType, SKS_EPY_ChargeType, RecId from locSKS_EPY_Charges
+                    where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                        && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+                        && locSKS_EPY_Charges.SKS_EPY_ChargeType == SKS_EPY_ChargeType::Misc
+            {
+                sumCharges(SKS_EPY_ChargeType::Misc);
+            }
+
+            // Sum all the Project Invoice level charges that have not been setup in the ePay charges form.
+            // as we have no category for these we will place them in the Misc categry too.
+            while select CurrencyCode, sum(Posted) from locMarkupTrans
+                    group by CurrencyCode
+                    where locMarkupTrans.TransTableId == locProjInvoiceJour.TableId
+                        && locMarkupTrans.TransRecId == locProjInvoiceJour.RecId
+                        &&locMarkupTrans.Posted != 0
+                notExists join MarkupCode,ModuleType,SKS_EPY_ChargeType, Recid from locSKS_EPY_Charges
+                    where locSKS_EPY_Charges.MarkupCode == locMarkupTrans.MarkupCode
+                        && locSKS_EPY_Charges.ModuleType == locMarkupTrans.ModuleType
+            {
+                sumCharges(SKS_EPY_ChargeType::Misc);
+            }
+
+
+            // Functional Currency
+            locInvoice.set_FunctionalCurrencyID(locProjInvoiceJour.CurrencyId);
+
+            // Identity
+            if(!closedinvoice)
+            {
+                locInvoice.set_Identity(int642str(_SKS_EPY_QueueData.TableRecId));
+            }
+            else
+            {
+                locInvoice.set_Identity(int642str(locSKS_EPY_CustTransOpen.CustTransOpenRefRecId));
+            }
+
+            // Invoice number
+            if(strLen(locCustTrans.Invoice) > 0)
+            {
+                locInvoice.set_InvoiceNumber(locCustTrans.Invoice);
+            }
+            else
+            {
+                locInvoice.set_InvoiceNumber("@SYS14204");
+            }
+
+            // Invoice type
+            locInvoice.set_InvoiceType(3);
+
+            // OrigNumb
+            locInvoice.set_ORIGNUMB('');
+
+            // OrigType
+            locInvoice.set_ORIGTYPE(0);
+
+            // Payment terms
+            locInvoice.set_PaymentTerms(PaymTerm::find(locProjInvoiceJour.Payment).PaymTermID);
+
+            // PO number
+            locInvoice.set_PONumber(locProjFundingSource.CustPurchaseOrder);
+
+            //Not applicable to Project Invoice Header level
+            locInvoice.set_SalesPersonID('');
+
+            // ShippingMethod
+            locInvoice.set_ShippingMethod(locProjInvoiceJour.DlvMode);
+
+            // SiteId
+            locInvoice.set_SiteID('');
+
+            amtTaxMST = locProjInvoiceJour.SumTax;
+            locInvoice.set_Tax(real2double(amtTaxMST));
+            amtTaxCur = locProjInvoiceJour.ExchRate * locProjInvoiceJour.SumTax;
+            locInvoice.set_OriginatingTax(real2double(amtTaxCur));
+
+            // Tracking number
+            locInvoice.set_Tracking_Number('');
+
+            if(locLogisticsPostalAddressInvoice)
+            {
+                locShippingAddress = SKS_EPY_Sync::getEPayAddress(locLogisticsPostalAddressInvoice,
+                                                                    locProjInvoiceJour.DeliveryName,
+                                                                    int642str(locProjInvoiceJour.DeliveryPostalAddress),
+                                                                    _SKS_EPY_Queue.AccountNum);
+                locInvoice.set_ShipToAddress(locShippingAddress);
+            }
+
+            // Line items
+            while select CurrencyId, DataAreaId, DlvDate, InventTransId, ItemID,
+                    LineAmount, PriceUnit, Qty, RecId, SalesId,
+                    SalesUnit, TaxGroupId, TXT
+                from locProjInvoiceItem
+                where locProjInvoiceItem.ProjInvoiceId == locProjInvoiceJour.ProjInvoiceId
+                    && locProjInvoiceItem.InvoiceDate == locProjInvoiceJour.InvoiceDate
+            {
+
+                setTransLineValues(locProjInvoiceItem.Txt,
+                    locProjInvoiceItem.LineAmount,
+                    locProjInvoiceJour.exchRate,
+                    locProjInvoiceItem.ItemID,
+                    InventModelGroup::find(InventModelGroupItem::findByItemIdLegalEntity(locProjInvoiceItem.ItemId, locProjInvoiceItem.DataAreaId).ModelGroupId).StockedProduct,
+                    locProjInvoiceItem.Qty,
+                    locProjInvoiceItem.DlvDate != dateNull() ? locProjInvoiceItem.DlvDate : locProjInvoiceItem.salesLine().ShippingDateRequested,
+                    SalesTable::find(locProjInvoiceItem.SalesId).SalesName,
+                    locProjInvoiceItem.SalesUnit,
+                    locProjInvoiceItem.CurrencyId,
+                    locProjInvoiceItem.PriceUnit,
+                    locProjInvoiceJour.DeliveryPostalAddress,
+                    locProjInvoiceItem.TaxGroupId);
+                addinTransLineMarkups(locProjInvoiceItem.TableId, locProjInvoiceItem.RecId);
+            }
+
+            while select CategoryId, CurrencyId,LineAmount, Qty, RecId,
+                    TaxGroupId, TransDate, Worker
+                from locProjInvoiceEmpl
+                where locProjInvoiceEmpl.ProjInvoiceId == locProjInvoiceJour.ProjInvoiceId
+                    && locProjInvoiceEmpl.InvoiceDate == locProjInvoiceJour.InvoiceDate
+            {
+                setTransLineValues(HcmWorker::worker2Name(locProjInvoiceEmpl.Worker),
+                                    locProjInvoiceEmpl.LineAmount,
+                                    locProjInvoiceJour.ExchRate,
+                                    locProjInvoiceEmpl.CategoryId,
+                                    NoYes::No,
+                                    locProjInvoiceEmpl.Qty,
+                                    locProjInvoiceEmpl.TransDate,
+                                    HcmWorker::worker2Name(locProjInvoiceEmpl.Worker),
+                                    "@SYS1151",
+                                    locProjInvoiceEmpl.CurrencyId,
+                                    locProjInvoiceEmpl.Qty > 0 ? locProjInvoiceEmpl.LineAmount / locProjInvoiceEmpl.Qty : locProjInvoiceEmpl.LineAmount,
+                                    locProjInvoiceJour.DeliveryPostalAddress,
+                                    locProjInvoiceEmpl.TaxGroupId);
+                addinTransLineMarkups(locProjInvoiceEmpl.TableId, locProjInvoiceEmpl.RecId);
+
+            }
+            while select CategoryId, CurrencyId, DataAreaId,
+                    LineAmount, Qty, TransDate,
+                    TaxGroupId, Txt, TableId, Worker, RecId
+                from locProjInvoiceCost
+                where locProjInvoiceCost.ProjInvoiceId == locProjInvoiceJour.ProjInvoiceId
+                    && locProjInvoiceCost.InvoiceDate == locProjInvoiceJour.InvoiceDate
+            {
+                setTransLineValues(locProjInvoiceCost.txt,
+                                    locProjInvoiceCost.LineAmount,
+                                    locProjInvoiceJour.ExchRate,
+                                    locProjInvoiceCost.CategoryId,
+                                    NoYes::No,
+                                    locProjInvoiceCost.Qty,
+                                    locProjInvoiceCost.TransDate,
+                                    HcmWorker::worker2Name(locProjInvoiceCost.Worker),
+                                    locProjInvoiceCost.CategoryId,
+                                    locProjInvoiceCost.CurrencyId,
+                                    locProjInvoiceCost.Qty > 0 ? locProjInvoiceCost.LineAmount / locProjInvoiceCost.Qty : locProjInvoiceCost.LineAmount,
+                                    locProjInvoiceJour.DeliveryPostalAddress,
+                                    locProjInvoiceCost.TaxGroupId);
+                addinTransLineMarkups(locProjInvoiceCost.TableId, locProjInvoiceCost.RecId);
+            }
+            while select Amount, DataAreaId,Qty, RecId, TransDate, TaxGroupId, Txt, CurrencyID, TableId from locProjInvoiceOnAcc
+                where locProjInvoiceOnAcc.ProjInvoiceId == locProjInvoiceJour.ProjInvoiceId
+                    && locProjInvoiceOnAcc.InvoiceDate == locProjInvoiceJour.InvoiceDate
+            {
+                setTransLineValues(locProjInvoiceOnAcc.Txt,
+                                    locProjInvoiceOnAcc.Amount,
+                                    locProjInvoiceJour.ExchRate,
+                                    '',
+                                    NoYes::No,
+                                    locProjInvoiceOnAcc.Qty,
+                                    locProjInvoiceOnAcc.TransDate,
+                                    ''/*OnAcc items have no salesid, so no sales person is associated with them*/,
+                                    ''/*OnAcc items have no Unit Of Measure*/, locProjInvoiceOnAcc.CurrencyId,
+                                    locProjInvoiceOnAcc.Qty > 0 ? locProjInvoiceOnAcc.Amount / locProjInvoiceOnAcc.Qty : locProjInvoiceOnAcc.Amount,
+                                    locProjInvoiceJour.DeliveryPostalAddress,
+                                    locProjInvoiceOnAcc.TaxGroupId);
+                addinTransLineMarkups(locProjInvoiceOnAcc.TableId, locProjInvoiceOnAcc.RecId);
+            }
+            while select CategoryId,CurrencyId,LineAmount,Qty,Recid,TaxGroupId,TransDate,TXT, Worker, TableId from locProjInvoiceRevenue
+                where locProjInvoiceRevenue.ProjInvoiceId == locProjInvoiceJour.ProjInvoiceId
+                    && locProjInvoiceRevenue.InvoiceDate == locProjInvoiceJour.InvoiceDate
+            {
+                setTransLineValues(locProjInvoiceRevenue.txt,
+                                    locProjInvoiceRevenue.LineAmount,
+                                    locProjInvoiceJour.ExchRate,
+                                    locProjInvoiceRevenue.CategoryId,
+                                    NoYes::No,
+                                    locProjInvoiceRevenue.qty,
+                                    locProjInvoiceRevenue.TransDate,
+                                    HcmWorker::worker2Name(locProjInvoiceRevenue.Worker),
+                                    '',
+                                    locProjInvoiceRevenue.CurrencyId,
+                                    locProjInvoiceRevenue.Qty > 0 ? locProjInvoiceRevenue.LineAmount / locProjInvoiceRevenue.Qty : locProjInvoiceRevenue.LineAmount,
+                                    locProjInvoiceJour.DeliveryPostalAddress,
+                                    locProjInvoiceRevenue.TaxGroupId);
+                addinTransLineMarkups(locProjInvoiceRevenue.TableId, locProjInvoiceRevenue.RecId);
+            }
+
+            // Subtotal
+            locInvoice.set_Subtotal(real2double(amtTotalMST - amtFreightMST - amtMiscMST - amtTaxMST));
+            locInvoice.set_OriginatingSubtotal(real2double(amtTotalCur - amtFreightCur - amtMiscCur - amtTaxCur));
+
+            locInvoice.set_Freight(real2double(amtFreightMST)); //in base
+            locInvoice.set_OriginatingFreight(real2double(amtFreightCur)); //in currency
+            locInvoice.set_Misc(real2double(amtMiscMST));// in the base currency
+            locInvoice.set_OriginatingMisc(real2double(amtMiscCur)); // in the cust currency
+            locInvoice = SKS_EPY_Sync::ProjectInvoiceFieldOverwrite(locCustTransRecid, locProjInvoiceJour, locInvoice);
+            if(strLen(_SKS_EPY_Setup.WebServLoc) > 0)
+            {
+                if(_SKS_EPY_Setup.sendPDF == NoYes::Yes && _SKS_EPY_Queue.ChangeType == SKS_EPY_ChangeType::Created)
+                {
+                    identity = str2Int64(locInvoice.get_Identity());
+
+                    if(locCustTrans.AccountNum != locCustTrans.OrderAccount)
+                    {
+                        SKS_EPY_Return_In = SKS_EPY_Sync::SaveInvoiceToFile(_SKS_EPY_Setup.ePayPDFFilePath, Identity, locCustTrans.OrderAccount, locCustTrans.Invoice, _SKS_EPY_Setup.epayInvFolderPath, _SKS_EPY_Setup, SKS_EPY_Return_In);
+                    }
+                    else
+                    {
+                        SKS_EPY_Return_In = SKS_EPY_Sync::SaveInvoiceToFile(_SKS_EPY_Setup.ePayPDFFilePath, Identity, locCustTrans.AccountNum, locCustTrans.Invoice, _SKS_EPY_Setup.epayInvFolderPath, _SKS_EPY_Setup, SKS_EPY_Return_In);
+                    }
+
+                    if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+                    {
+                        errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                        _sks_epy_queue.ErrorWarning = errortext;
+                        _sks_epy_queue.Status = SKS_EPY_Status::PDFFailure;
+                    }
+                }
+
+                if (_sks_epy_queue.Status != SKS_EPY_Status::PDFFailure)
+                {
+                    sks_epy_return_in = SKS.ePay.ePayTokenCall::ePay_POST_Object(locInvoice,
+                                                            SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc,'invoice'),
+                                                            _SKS_EPY_Setup.ClientId, _SKS_EPY_Setup.Secret,
+                                                            'POST', SKS_PP_StringFormats::strAssembleURL(_SKS_EPY_Setup.WebServLoc ,'token'), false);
+
+                    if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+                    {
+                        errortext = SKS_EPY_Return_In.get_ErrorDesc();
+                        _sks_epy_queue.ErrorWarning = errortext;
+                        _SKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+                    }
+                    else
+                    {
+                        _sks_epy_queue.Status = SKS_EPY_Status::Completed;
+                    }
+                }
+            }
+        }
+        else
+        {
+            _sks_epy_queue.ErrorWarning ="@SKS:SKGePayInvCurr";
+            _sks_epy_queue.Status = SKS_EPY_Status::Failed;
+        }
+        _SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+        return _SKS_EPY_Queue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SyncSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sync ePay Settlements
+    /// </summary>
+    /// <param name = "sks_epy_queue">sks_epy_queue</param>
+    /// <returns>ePay queue record</returns>
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Necessary to allow the processing of every CustSettlement record(inner loop) for every ePay event data record(outer loop)")]
+    public static SKS_EPY_Queue SyncSettlement(SKS_EPY_Queue sks_epy_queue)
+    {
+        CustSettlement  CustSettlement;
+        CustTrans       CustTrans;
+        CustTrans       tmpCustTrans;
+        LedgerJournalTrans LedgerJournalTrans;
+        real            applyAmount;
+        real            balanceAmount;
+        real            settlementAmount;
+        SKS_EPY_Setup   sks_epy_setup;
+        SKS.ePayData.InvoicePayment ePayInv;
+        SKS.ePayData.Payment ePayPayment;
+        SKS.ePayData.SKS_EPY_Return_In SKS_EPY_Return_In;
+        str             errortext;
+        str             locStringGuid;
+        str             url;
+        System.Double   DblApplyAmount;
+        System.Double   DblBalanceAmount;
+        CustTable       lCustTable;
+
+        select firstonly webservloc, clientid, secret from sks_epy_setup;
+        url = SKS_PP_StringFormats::strAssembleURL(sks_epy_setup.WebServLoc, '/Payment');
+        ePayPayment = new SKS.ePayData.Payment();
+
+        select firstonly SKS_EPY_PMTNBR
+        from LedgerJournalTrans
+        where LedgerJournalTrans.RecId == sks_epy_queue.PaymLineRecID
+        join CurrencyCode, AccountNum, DocumentDate, TransDate, Invoice, CancelledPayment, Sum(AmountCur)
+        from CustTrans
+        join AccountNum, SKS_EPY_CustFilter
+        from lCustTable
+        group by
+            LedgerJournalTrans.SKS_EPY_PMTNBR,
+            CustTrans.CurrencyCode,
+            CustTrans.AccountNum,
+            CustTrans.DocumentDate,
+            CustTrans.TransDate,
+            CustTrans.Invoice,
+            CustTrans.CancelledPayment,
+            lcusttable.SKS_EPY_CustFilter
+            where CustTrans.Voucher == LedgerJournalTrans.Voucher
+            && CustTrans.TransDate == LedgerJournalTrans.TransDate
+            && CustTrans.TransType == LedgerTransType::Payment
+            && lCustTable.AccountNum == CustTrans.AccountNum
+            && lCustTable.SKS_EPY_CustFilter != SKS_EPY_CustFilter::No
+            && lCustTable.SKS_EPY_CustFilter != SKS_EPY_CustFilter::NotSet;
+
+        if(CustTrans.DocumentDate != Global::dateNull())
+        {
+            ePayPayment.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(CustTrans.DocumentDate, DateSeparator::Hyphen));
+        }
+        else
+        {
+            ePayPayment.set_DocumentDate(SKS_PP_StringFormats::strDateYYYYMMDD(CustTrans.TransDate, DateSeparator::Hyphen));
+        }
+
+
+        balanceAmount += -1 * CustTrans.AmountCur;
+        ePayPayment.set_PaymentNumber(LedgerJournalTrans.SKS_EPY_PmtNbr);
+        ePayPayment.set_CreatedOn(SKS_PP_StringFormats::strDateYYYYMMDD(CustTrans.TransDate, DateSeparator::Hyphen));
+        ePayPayment.set_CurrencyID(CustTrans.CurrencyCode);
+        ePayPayment.set_CustomerID(CustTrans.AccountNum);
+        ePayPayment.set_CustomerNumber(CustTrans.AccountNum);
+        ePayPayment.set_PaymentType(9);        
+
+        if (CustTrans.CancelledPayment)
+        {
+            ePayPayment.set_BalanceAmount(real2double(0));
+            ePayPayment.set_Amount(real2double(0));
+            ePayPayment.set_OriginatingAmount(real2double(0));
+            ePayPayment.set_AppliedAmount(real2double(0));
+        }
+        else
+        {
+            //While select logic is mimicking the logic found in CustPaymentJournalDP's fetch method
+            //Finding invoice payments to add to ePay
+            select SKS_EPY_PMTNBR
+            from LedgerJournalTrans
+            where LedgerJournalTrans.RecId == sks_epy_queue.PaymLineRecID
+            join RecId, Voucher, TransDate, TransType, accountnum
+            from CustTrans
+            where CustTrans.Voucher == LedgerJournalTrans.Voucher
+                && CustTrans.TransDate == LedgerJournalTrans.TransDate
+                && CustTrans.TransType == LedgerTransType::Payment
+                && CustTrans.AccountNum == sks_epy_queue.accountnum
+            join SettleAmountCur, UtilizedCashDisc, PennyDiff, SKS_EPY_TransOpenRecId, TransRecId
+            from CustSettlement
+            order by CustTrans.Recid
+            where CustSettlement.OffsetRecid == CustTrans.RecId
+                && CustSettlement.OffsetAccountNum == CustTrans.AccountNum
+                && CustSettlement.CanBeReversed == NoYes::Yes;
+
+            while(LedgerJournalTrans)
+            {
+                //This trans rec will have the information we want. The rec found in the while select is the payment record
+                //while tmpCustTrans will have the invoice information
+                tmpCustTrans = CustTrans::findByCompany(CustSettlement.company(), CustSettlement.TransRecId);
+
+                if (ePayPayment.get_PaymentNumber() == '')
+                {
+                    ePayPayment.set_PaymentNumber(tmpCustTrans.Invoice);
+                }
+                if(SKS_EPY_Sync::CustomProcessInvoice(tmpCustTrans))
+                {
+                    //calculate the settlement amount for payment we are on
+                    settlementAmount = (CustSettlement.SettleAmountCur - CustSettlement.UtilizedCashDisc) + CustSettlement.PennyDiff;
+
+                    locStringGuid = int642str(CustSettlement.sks_epy_transopenrecid);
+
+                    ePayInv = new SKS.ePayData.InvoicePayment();
+                    ePayInv.set_Identity(locStringGuid);
+                    ePayInv.set_Amount(real2double(settlementAmount));
+                    ePayInv.set_PaymentAmount(real2double(settlementAmount));
+                    ePayInv.set_OriginatingAmount(real2double(settlementAmount));
+                    ePayInv.set_InvoiceNumber(tmpCustTrans.Invoice);
+                    ePayInv.set_PaymentNumber(ePayPayment.get_PaymentNumber());
+                    ePayInv.set_DocumentSource("@SKS3367");
+                    ePayInv.PaymentType = '9';
+                    ePayPayment.set_CustomerNumber(tmpCustTrans.OrderAccount);
+                    ePayPayment.addInvoicePayment(ePayInv);
+                    applyAmount += settlementAmount;
+                    balanceAmount -= settlementAmount;
+                }
+
+                next LedgerJournalTrans;
+            }
+
+            // change additional amount
+            // calculate fee amount
+            CustVendPaymJournalFee    custVendPaymJournalFee;
+          
+            select firstonly custVendPaymJournalFee
+                join ledgerJournalTrans
+                where ledgerJournalTrans.RecId == sks_epy_queue.PaymLineRecID 
+                    && custVendPaymJournalFee.refrecid ==  ledgerJournalTrans.RecId;
+
+            if(custVendPaymJournalFee)
+            {
+                applyAmount += abs(custVendPaymJournalFee.FeeValue);    
+            }
+            else
+            {
+                applyAmount = applyAmount + balanceAmount;
+            }
+
+            DblApplyAmount = real2double(applyAmount);
+            DblBalanceAmount = real2double(balanceAmount);
+
+            ePayPayment.set_BalanceAmount(DblBalanceAmount);
+            ePayPayment.set_Amount(DblApplyAmount);
+            ePayPayment.set_OriginatingAmount(DblApplyAmount);
+            ePayPayment.set_AppliedAmount(DblApplyAmount);
+        }
+
+        SKS_EPY_Return_In = SKS.ePay.ePayTokenCall::ePay_POST_Object(ePayPayment, url, sks_epy_setup.ClientId, sks_epy_setup.Secret, 'POST', SKS_PP_StringFormats::strAssembleURL(sks_epy_setup.WebServLoc ,'token'), false);
+
+        if(SKS_EPY_Return_In.get_ErrorDesc() != null)
+        {
+            errortext = SKS_EPY_Return_In.get_ErrorDesc();
+            sks_epy_queue.ErrorWarning = errortext;
+            SKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+        }
+        else
+        {
+            SKS_EPY_Queue.status = SKS_EPY_Status::Completed;
+        }
+        SKS_EPY_Queue.DataStr = SKS_EPY_Return_In.JSON;
+        return sks_epy_queue;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>TestConnection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Test Connection
+    /// </summary>
+    /// <param name = "_webServLoc">_webServLoc</param>
+    /// <param name = "_clientId">_clientId</param>
+    /// <param name = "_secret">_secret</param>
+    /// <returns>boolean</returns>
+    public static boolean TestConnection(SKS_EPY_WebServLoc _webServLoc, SKS_EPY_ClientID _clientId, SKS_EPY_Secret _secret)
+    {
+        SKS.ePayData.SKS_EPY_Return_In  locSKS_EPY_Return_In = new SKS.ePayData.SKS_EPY_Return_In();
+        SKS.ePayData.Token token;
+        boolean result = false;
+        str errMessage;
+
+        token = SKS.ePay.ePayToken::ePayRetrieveToken(
+            SKS_PP_StringFormats::strAssembleURL(_webServLoc,'token'),
+            _clientId,
+            _secret,
+            'POST',
+            locSKS_EPY_Return_In,
+            false);
+
+        if(locSKS_EPY_Return_In.get_ErrorDesc() != null)
+        {
+            errMessage = locSKS_EPY_Return_In.get_ErrorDesc();
+            error(strFmt("@SKS3432", errMessage));
+            result = false;
+        }
+        else
+        {
+            info("@SKS3431");
+            result = true;
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InvoiceFieldOverwrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SIGNATURE IS LOCKED BY CUSTOMIZATION
+    /// </summary>
+    /// <param name = "_CustInvoiceJour">_CustInvoiceJour</param>
+    /// <param name = "_Invoice">_Invoice</param>
+    /// <returns>Invoice</returns>
+    public static SKS.ePayData.Invoice InvoiceFieldOverwrite(CustInvoiceJour   _CustInvoiceJour, SKS.ePayData.Invoice _Invoice)
+    {
+        //Below assignments are to avoid BP errors
+        CustInvoiceJour   CustInvoiceJour = _CustInvoiceJour;
+        CustInvoiceJour = CustInvoiceJour;
+
+        SKS.ePayData.Invoice Invoice = _Invoice;
+        Invoice = Invoice;
+
+        return _Invoice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjectInvoiceFieldOverwrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SIGNATURE IS LOCKED BY CUSTOMIZATION
+    /// </summary>
+    /// <param name = "_CustTransRecId"> Custtrans/CusttransOpen recid</param>
+    /// <param name = "_ProjInvoiceJour">ProjInvoiceJour record</param>
+    /// <param name = "_Invoice">Invoice record</param>
+    /// <returns>Invoice record</returns>
+    public static SKS.ePayData.Invoice ProjectInvoiceFieldOverwrite(RecId _CustTransRecId, ProjInvoiceJour _ProjInvoiceJour, SKS.ePayData.Invoice _Invoice)
+    {
+        return _Invoice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PreInvoiceCreationShell</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SIGNATURE IS LOCKED BY CUSTOMIZATION
+    /// </summary>
+    /// <param name = "fileNameWithoutPath">File name without path</param>
+    /// <returns>Returns file as container</returns>
+    public container PreInvoiceCreationShell(str fileNameWithoutPath)
+    {
+        container reportBytes;
+        return reportBytes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreatefileNameWithoutPath</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SIGNATURE IS LOCKED BY CUSTOMIZATION
+    /// </summary>
+    public static str CreatefileNameWithoutPath(CustAccount _AccountNum, InvoiceId _invoice, refrecid _Invoicerecid, CustTrans _CustTrans)
+    {
+        return strFmt(_AccountNum + '.' + _invoice + '.' + int642str(_Invoicerecid));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustomProcessInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SIGNATURE IS LOCKED BY CUSTOMIZATION
+    /// </summary>
+    public static boolean CustomProcessInvoice(CustTrans _CustTrans)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

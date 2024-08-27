@@ -1,0 +1,454 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_SalesOrderPrePayment</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_SalesOrderPrePayment
+{
+    const str constSaleTxnType = 'Sale';
+
+    Common                          callerRecord;
+    LedgerJournalTable              ledgerJournalTable;
+    LedgerJournalTrans              ledgerJournalTrans;
+    SalesTable                      salesTable;
+    SKS_CC_CustPaymTable            sKS_CC_CustPaymTable;
+    String255                       payFabricTransactionKey;
+    AmountCur                       prePayAmount;
+    PaymMode                        paymMode;
+    CurrencyCode                    currencyCode;
+    LedgerDimensionValueSet         defaultDimension;
+    CreditCardProcessors            creditCardProcessor;
+    CreditCardProviderCaptureResult captureResult;
+    SKS_CC_eCommIntegrationHandler  eCommIntHandler;
+    CustTable                       custTable;
+    CreditCardTypeName              creditCardTypeName;
+    LedgerJournalEngine_CustPayment ledgerJournalEngine;
+    CreditCardCust                  creditCardCust;
+    str                             requestXmlStr;
+    CreditCardAuthTrans             creditCardAuthTransApproval;
+    CreditCardAuthorization         authorizationCode;
+    CustAccount                     custAccount;
+    boolean                         isCreditCardCharged;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmPrePayAmount</Name>
+				<Source><![CDATA[
+    public AmountCur parmPrePayAmount(AmountCur _prePayAmount = prePayAmount)
+    {
+        prePayAmount = _prePayAmount;
+        return prePayAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCreditCardCust</Name>
+				<Source><![CDATA[
+    public void setCreditCardCust(CreditCardCust _creditCardCust)
+    {
+        creditCardCust = _creditCardCust;
+        creditCardTypeName = creditCardCust.CreditCardTypeName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    protected void createJournal()
+    {
+        LedgerJournalName       ledgerJournalName;
+        CustParameters          custParameters = CustParameters::find();
+        SKS_PP_Setup            sks_PP_Setup = SKS_PP_Setup::find();
+        CustPaymModeTable       custPaymModeTable;
+
+        // create journal table
+        ledgerJournalTable.initValue();
+
+        ledgerJournalTable.JournalNum  = JournalTableData::newTable(ledgerJournalTable).nextJournalId();
+        ledgerJournalTable.JournalName = CreditCardTypeSetup::find(creditCardProcessor, creditCardTypeName).PaymentJournal;
+
+        if (!ledgerJournalTable.JournalName)
+        {
+            throw error(strFmt("@SKS:SKGCCCannotFindJournalNameForPrePayJournal", tableId2PName(callerRecord.TableId), callerRecord.RecId, creditCardTypeName));
+        }
+
+        ledgerJournalTable.initFromLedgerJournalName();
+        ledgerJournalName = LedgerJournalName::find(ledgerJournalTable.JournalName);
+
+        if (sks_PP_Setup.CCUsePaymModeForSOPrePay && callerRecord.TableId == tableNum(SalesTable) && salesTable.PaymMode)
+        {
+            paymMode = salesTable.PaymMode;
+        }
+        else
+        {
+            paymMode = sks_PP_Setup.CCPLPrePaymentPaymMode;
+        }
+
+        if (!paymMode)
+        {
+            throw error(strFmt("@SKS:SKGCCCannotFindPaymModeForPrePayJournal", tableId2PName(callerRecord.TableId), callerRecord.RecId));
+        }
+
+        custPaymModeTable = CustPaymModeTable::find(PaymMode);
+
+        if (custPaymModeTable.offsetLedgerDimension())
+        {
+            ledgerJournalTable.OffsetLedgerDimension = custPaymModeTable.offsetLedgerDimension();
+            ledgerJournalTable.OffsetAccountType = custPaymModeTable.AccountType;
+        }
+        else if (ledgerJournalName.OffsetLedgerDimension)
+        {
+            ledgerJournalTable.OffsetLedgerDimension = ledgerJournalName.OffsetLedgerDimension;
+            ledgerJournalTable.OffsetAccountType = ledgerJournalName.OffsetAccountType;
+        }
+
+        ledgerJournalTable.DefaultDimension = defaultDimension;
+
+        ledgerJournalTable.insert();
+
+        // create journal line
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+
+        ledgerJournalEngine.newJournalActive(ledgerJournalTable);
+        ledgerJournalEngine.initValue(ledgerJournalTrans);
+
+        ledgerJournalTrans.parmAccount(CustTable.AccountNum);
+        ledgerJournalTrans.DefaultDimension = defaultDimension;
+        ledgerJournalEngine.initFromCustTable(ledgerJournalTrans);
+
+        ledgerJournalTrans.TransDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        ledgerJournalTrans.CurrencyCode = currencyCode;
+        ledgerJournalEngine.currencyModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.PaymMode = custPaymModeTable.PaymMode;
+        ledgerJournalTrans.BankTransType = custPaymModeTable.BankTransType;
+
+        ledgerJournalTrans.AmountCurDebit  = 0;
+        ledgerJournalTrans.AmountCurCredit = abs(prePayAmount);        
+
+        // make sure offset account setting are getting from journal table,
+        // if that in journal table is empty getting from cust parameter table
+        if (ledgerJournalTable.parmOffsetLedgerDimension())
+        {
+            if (ledgerJournalTable.OffsetAccountType == LedgerJournalACType::Ledger)
+            {
+                ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+                ledgerJournalTrans.parmOffsetLedgerDimension(
+                ledgerJournalTrans.getOffsetLedgerDimensionForLedgerType(ledgerJournalTable.parmOffsetLedgerDimension(), ledgerJournalTrans.getOffsetCompany()));
+            }
+            else
+            {
+                ledgerJournalTrans.parmOffsetAccount(ledgerJournalTable.parmOffsetAccount(), ledgerJournalTable.OffsetAccountType);
+            }
+        }
+        else
+        {
+            if (custParameters.CreditCardPostingAccountType == LedgerJournalACType::Ledger)
+            {
+                ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+                ledgerJournalTrans.parmOffsetLedgerDimension(
+                ledgerJournalTrans.getOffsetLedgerDimensionForLedgerType(custParameters.parmCreditCardPostingLedgerDimension(), ledgerJournalTrans.getOffsetCompany()));
+            }
+            else
+            {
+                ledgerJournalTrans.parmOffsetAccount(custParameters.parmCreditCardPostingAccount(), custParameters.CreditCardPostingAccountType);
+            }
+        }
+
+        if (!ledgerJournalTrans.parmOffsetLedgerDimension())
+        {
+            throw error("@SYS122148");
+        }
+
+        ledgerJournalEngine.initOffsetDefaultDimension(ledgerJournalTrans);
+        ledgerJournalTrans.PaymReference = authorizationCode;
+        ledgerJournalTrans.DocumentNum = creditCardTypeName;
+
+        if (sks_PP_Setup.CCPLSetJournalLineAsPrePay == NoYes::Yes)
+        {
+            ledgerJournalTrans.Prepayment = NoYes::Yes;
+            ledgerJournalTrans.modifiedField(fieldnum(LedgerJournalTrans, Prepayment));
+            ledgerJournalEngine.clearTaxAmountCache(ledgerJournalTrans);
+            ledgerJournalEngine.initCustPostingProfile(ledgerJournalTrans);
+        }        
+
+        ledgerJournalTrans.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRecord</Name>
+				<Source><![CDATA[
+    protected void initRecord(Common _record)
+    {
+        callerRecord = _record;
+        switch(_record.TableId)
+        {
+            case tableNum(SalesTable):
+                salesTable = _record;
+                custTable = salesTable.custTable_InvoiceAccount();
+                currencyCode = SalesTable.CurrencyCode;                
+                defaultDimension = salesTable.DefaultDimension;
+                custAccount = custTable.AccountNum;
+                break;
+            default:
+                throw error(Error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        ledgerJournalEngine = new LedgerJournalEngine_CustPayment();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    protected boolean validate()
+    {
+        boolean ret = true;
+
+        boolean isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+        if (!isPayFabricActiveProcessor)
+        {
+            ret = checkFailed("@SKS:SKGCCPayFabricNotActivePaymProc");
+        }        
+
+        if (salesTable.SalesStatus == SalesStatus::Invoiced || salesTable.SalesStatus == SalesStatus::Canceled)
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCInvalidSOStatusForPrePay", salesTable.SalesId, enum2Str(salesTable.SalesStatus)));
+        }
+
+        if (salesTable.SalesType == SalesType::ReturnItem)
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCInvalidSOTypeForPrePay", salesTable.SalesId, enum2Str(salesTable.SalesType)));
+        }
+
+        if (salesTable.ProjId)
+        {
+            ret = checkFailed(strFmt("@SKS:SKGCCInvalidSOWithProjIdForPrePay", salesTable.SalesId, salesTable.ProjId));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    void postJournal()
+    {
+        Args args = new Args();
+
+        args.record(ledgerJournalTable);
+        LedgerJournalPost::main(args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCreditCardCustPayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates and processes one or more credit card payments.
+    /// </summary>
+    /// <returns>
+    ///    An amount representing the total amount of the credit card payment.
+    /// </returns>
+    protected AmountCur createCreditCardCustPayment()
+    { 
+        SKS_CC_ProcessCapture           ccProcPaym;
+        AmountCur paymentAmt;
+
+        sKS_CC_CustPaymTable.initValue();
+        sKS_CC_CustPaymTable.CreditCardCustRefId = creditCardCust.RecId;
+        sKS_CC_CustPaymTable.CreditCardTypeName = creditCardCust.CreditCardTypeName;
+        sKS_CC_CustPaymTable.CreditCardTransAmountCur = prePayAmount;
+        sKS_CC_CustPaymTable.CreditCardTransStatus = CreditCardProcessorStatus::NA;
+        sKS_CC_CustPaymTable.CreditCardTransStatusOrig = sKS_CC_CustPaymTable.CreditCardTransStatus;
+        sKS_CC_CustPaymTable.CreditCardTransType = SKS_CC_CreditCardTransType::Capture;
+        sKS_CC_CustPaymTable.CreditCardTransTypeOrig = sKS_CC_CustPaymTable.CreditCardTransType;
+        sKS_CC_CustPaymTable.CustAccount = ledgerJournalTrans.accountDisplay();
+        sKS_CC_CustPaymTable.CreditCardTransOrigin = SKS_CC_CreditCardTransOrigin::JournalLine;
+        sKS_CC_CustPaymTable.CreditCardCurrency = ledgerJournalTrans.CurrencyCode;
+        sKS_CC_CustPaymTable.RefTableId = ledgerJournalTrans.TableId;
+        sKS_CC_CustPaymTable.RefRecId = ledgerJournalTrans.RecId;
+        sKS_CC_CustPaymTable.RefOriginId = ledgerJournalTrans.JournalNum;        
+        sKS_CC_CustPaymTable.insert();        
+
+        ccProcPaym = SKS_CC_ProcessCapture::construct();
+        ccProcPaym.parmCallerCustPaymTable(sKS_CC_CustPaymTable);
+        ccProcPaym.parmCallerCustTable(custTable);
+        ccProcPaym.parmIsSendEmail(false);
+        ccProcPaym.parmIsRefund(false);
+        
+        ccProcPaym.run();
+
+        paymentAmt = SKS_CC_CustPaymTable::getCreditCardAmountCharged(ledgerJournalTrans.TableId, ledgerJournalTrans.RecId);
+
+        return paymentAmt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    void run()
+    {
+        if (!this.validate())
+        {
+            throw error(strFmt("@SKS:SKGCCSOPrePayValidationsHaveFailed", salesTable.SalesId));
+        }        
+        
+        try
+        {
+            creditCardProcessor = CreditCardProcessors::findActiveProcessor();
+
+            ttsbegin;
+            this.createJournal();
+            this.createCreditCardCustPayment();
+            isCreditCardCharged = true;
+
+            this.postJournal();
+            this.markPrePaymentForSettlementAgainstCallerRecord();
+            ttscommit;
+        }
+        catch(Exception::Error)
+        {
+            this.handleErrorDuringPosting();
+        }
+        catch(Exception::CLRError)
+        {
+            this.handleErrorDuringPosting();
+        }
+
+        info(strFmt("@SKS:SKGCCPrePaySuccessMsg", salesTable.SalesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleErrorDuringPosting</Name>
+				<Source><![CDATA[
+    protected void handleErrorDuringPosting()
+    {
+        ttsabort;
+
+        if (isCreditCardCharged)
+        {
+            CreditCardAuthTrans creditCardAuthTransToVoid;
+        
+            select firstonly1 creditCardAuthTransToVoid
+                order by LineNum desc
+                where creditCardAuthTransToVoid.SKS_CC_CustPaymTable == sKS_CC_CustPaymTable.RecId
+                        && (creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::AuthorizeAndCapture ||
+                            creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::CaptureAfterAuthorize)
+                        && !creditCardAuthTransToVoid.ApprovalExpired
+                        && !creditCardAuthTransToVoid.ApprovalVoid
+                        && creditCardAuthTransToVoid.ProcessorStatus == CreditCardProcessorStatus::Approved;
+
+            if (creditCardAuthTransToVoid)
+            {
+                const str constCapture = 'Capture';
+                boolean voidOK = SKS_CC_CreditCardProcess::sKS_CC_DoVoidCapture(creditCardAuthTransToVoid, false, strFmt("@SKS6494", constCapture, creditCardAuthTransToVoid.Authorization));
+                if (voidOK)
+                {
+                    info(strFmt("@SKS6495", constCapture, creditCardAuthTransToVoid.Authorization));
+                }
+                else
+                {
+                    error(strFmt("@SKS6496", strLwr(constCapture), creditCardAuthTransToVoid.Authorization));
+                }
+            }
+        }
+
+        throw error(strFmt("@SKS:SKGCCErrorMsgWhileProcessPrepayment", salesTable.SalesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markPrePaymentForSettlementAgainstCallerRecord</Name>
+				<Source><![CDATA[
+    protected void markPrePaymentForSettlementAgainstCallerRecord()
+    {
+        CustTransOpen               custTransOpen;
+        CustTrans                   custTrans;        
+        CustVendOpenTransManager    manager;       
+        
+        if (salesTable)
+        {
+            salesTable.selectForUpdate(true);
+            manager = CustVendOpenTransManager::construct(salesTable);            
+        }
+
+        if (ledgerJournalTrans.CustTransId)
+        {
+            select firstonly custTransOpen
+            exists join custTrans
+                where custTransOpen.AccountNum  == custTrans.AccountNum
+                    && custTransOpen.RefRecId   == custTrans.RecId
+                    && custTrans.RecId          == ledgerJournalTrans.CustTransId;
+        }
+        else
+        {
+            select firstonly custTransOpen
+            exists join custTrans
+                where custTransOpen.AccountNum  == custTrans.AccountNum
+                    && custTransOpen.RefRecId    == custTrans.RecId
+                    && custTrans.Voucher         == ledgerJournalTrans.Voucher
+                    && custTrans.AccountNum      == custTable.AccountNum
+                    && custTrans.TransDate       == ledgerJournalTrans.TransDate;
+        }
+
+        if (!custTransOpen)
+        {
+            throw error(strFmt("@SKS:SKGCCCannotFindCustOpenTransForPrePayJournal", tableId2PName(callerRecord.TableId), callerRecord.RecId));
+        }
+        
+        manager.parmSkipPrePaymentSettlementWarning(true);
+        manager.updateTransMarked(custTransOpen, true);
+
+        manager.updateOriginatorForMarkedTrans();        
+        manager.updateSpecTransWithSelectedDate();        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_SalesOrderPrePayment construct(Common _record)
+    {
+        if (!_record)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        SKS_CC_SalesOrderPrePayment prePaymentJournal = new SKS_CC_SalesOrderPrePayment();
+
+        prePaymentJournal.initRecord(_record);
+
+        return prePaymentJournal;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

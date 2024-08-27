@@ -1,0 +1,2182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PP_Upgrade</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class SKS_PP_Upgrade
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkForUpgrade</Name>
+				<Source><![CDATA[
+    //Check for current version of eBanking software and run upgrade if it is needed
+    //Return true only if the calling form needs to be closed because user selected not to run the upgrade
+    static boolean checkForUpgrade()
+    {
+        SKS_PP_Setup    lSetup;
+        DialogButton diagBut;
+        ;
+
+        if (SKS_PP_Upgrade::isCurrentVersion())
+        {
+            return false;
+        }
+        else
+        {
+            SKS_EFT_FileFormat lSKS_EFT_FileFormat;
+            select firstonly crosscompany Selected, FormatGroupCodeSource from lSKS_EFT_FileFormat where
+            lSKS_EFT_FileFormat.Selected == NoYes::Yes &&
+            lSKS_EFT_FileFormat.FormatGroupCodeSource == SKS_EB_CodeSource::D365;
+
+            if(lSKS_EFT_FileFormat)
+            {
+                Box::warning(strFmt("@SKS:SKGD365FormatsUpgrade", SKS_PP_Sys::getSKSVersion()), "@SKS311");
+            }
+
+            SKS_EB_FileStorage locSKS_EB_FileStorage;
+            select firstonly SKS_EB_BankIntegOpt, FileStorageType from locSKS_EB_FileStorage;
+
+            if(locSKS_EB_FileStorage.SKS_EB_BankIntegOpt != SKS_EB_BankIntegOpt::BankFabricEnumValue && locSKS_EB_FileStorage.FileStorageType == SKS_EB_FileStorageType::FileHub)
+            {
+                SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType::FileHubLocal);
+                fileHub.parmThrowErrorIfException(false);
+
+                str FileHubRequiredVersion = SKS_PP_Sys::getFileHubRequiredVersion();
+                SKG_File.Models.SKGFileHubVersionModel locSKGFileHubVersionModel = fileHub.callFileHubVersion(); 
+                if(locSKGFileHubVersionModel.Response.HasException)
+                {
+                    if(strContains(locSKGFileHubVersionModel.Response.Exception,'404')) //FileHub method doesn't exist
+                    {
+                        Box::stop(strFmt("@SKS:SKGUpgradeFileHubError",FileHubRequiredVersion,FileHubRequiredVersion));
+                        return true;
+                    }
+                    else // Exception that is not a 404
+                    {
+                        Box::stop("@SKS:SKGFileHubMessagePrefix" + locSKGFileHubVersionModel.Response.Exception + "@SKS:SKGFileHubMessageSuffix");
+                        return true;
+                    }
+                }
+                else if(locSKGFileHubVersionModel.Response.FileHubFileVersion !=  FileHubRequiredVersion) //FileHub method  exists but returns wrong version
+                {
+                    Box::stop(strFmt("@SKS:SKGUpgradeFileHubError",FileHubRequiredVersion,FileHubRequiredVersion));
+                    return true;
+                }
+            }
+
+            diagBut = Box::okCancel(
+            "@SKS977",
+            DialogButton::Cancel,
+            "@SKS311");
+            if  (diagBut == DialogButton::Ok)
+            {
+                //Find a setup marked as Upgrade
+                select firstonly crosscompany lSetup where lSetup.UpgradeInProgress == NoYes::Yes;
+                if(lSetup)
+                {
+                    //Setup is marked as upgrading, exit
+                    info("@SKS:SKGEBUpgradeProcessing");
+                    return true;
+                }
+                else
+                {
+                    SysOperationSandbox::callStaticMethod(classNum(SKS_PP_Upgrade),
+                        staticMethodStr(SKS_PP_Upgrade, runUpgrade),
+                        conNull(),
+                        "@SKS:SKGUpgradingTAS",
+                        "@SKS978");
+                    return false;
+                }
+            }
+            else
+            {
+                return true;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ClearOldPPSelects</Name>
+				<Source><![CDATA[
+    public static void ClearOldPPSelects()
+    {
+        BankChequeTable locBankChequeTable;
+        locBankChequeTable.skipDataMethods(true);
+        update_recordset locBankChequeTable
+            setting SKS_PP_Selected = false
+            where locBankChequeTable.SKS_PP_Selected == true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creatematchingrulesrecords</Name>
+				<Source><![CDATA[
+    private static void creatematchingrulesrecords(SKS_PP_Setup _sks_pp_setup)
+    {
+        int stepcnt;
+        SKS_LB_LookupOptions    lookupoptions;
+        SKS_LB_MatchingGroups   matchinggroups;
+        SKS_LB_MatchingRules    matchingrules;
+        SKS_LB_Bank             sks_lb_bank;
+        ;
+
+        if(_sks_pp_setup.MatchingRulesGroupId == '')
+        {
+            select firstonly RecId from matchinggroups where matchinggroups.groupid == 'Default_' + _sks_pp_setup.company();
+
+            if(matchinggroups.RecId)
+            {
+                return;
+            }
+
+            matchingGroups.groupid = 'Default_' + _sks_pp_setup.company();
+            matchingGroups.insert();
+
+            _sks_pp_setup.MatchingRulesGroupId = 'Default_' + _sks_pp_setup.company();
+            stepcnt = 1;
+            while select lookupfieldtype from lookupoptions order by lookupoptions.lookuporder where lookupoptions.lookuporder != 0 && lookupoptions.dataAreaId == _sks_pp_setup.dataAreaId
+            {
+                //add lookupoptions to new matchimng rules table
+                switch(lookupoptions.lookupfieldtype)
+                {
+                    case SKS_LB_MatchType::InvoiceNumber:
+                        matchingRules.groupid = 'Default_' + _sks_pp_setup.company();
+                        matchingRules.lookupType = SKS_LB_MatchType::InvoiceNumber;
+                        matchingRules.SearchType = SKS_LB_SearchType::Exact;
+                        matchingRules.Step = stepcnt;
+                        matchingRules.insert();
+                        stepcnt++;
+                        matchingRules.groupid = 'Default_' + _sks_pp_setup.company();
+                        matchingRules.lookupType = SKS_LB_MatchType::InvoiceNumber;
+                        matchingRules.SearchType = SKS_LB_SearchType::EndsWith;
+                        matchingRules.Step = stepcnt;
+                        matchingRules.insert();
+                        stepcnt++;
+                        break;
+
+                    default:
+                        matchingRules.groupid = 'Default_' + _sks_pp_setup.company();
+                        matchingRules.lookupType = lookupoptions.lookupfieldtype;
+                        matchingRules.SearchType = SKS_LB_SearchType::StartsWith;
+                        matchingRules.Step = stepcnt;
+                        matchingRules.insert();
+                        stepcnt++;
+                        matchingRules.groupid = 'Default_' + _sks_pp_setup.company();
+                        matchingRules.lookupType = lookupoptions.lookupfieldtype;
+                        matchingRules.SearchType = SKS_LB_SearchType::EndsWith;
+                        matchingRules.Step = stepcnt;
+                        matchingRules.insert();
+                        stepcnt++;
+                        break;
+                }
+            }
+
+            update_recordset sks_lb_bank
+                setting MatchingRulesGroupId = 'Default_' + _sks_pp_setup.company();
+
+            matchingRules.skipDataMethods(true);
+            update_recordSet matchingRules
+                setting searchtype = SKS_LB_SearchType::NotApplicable
+                where matchingRules.lookuptype == sks_lb_matchtype::Custom;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>EFTFormatUpdate</Name>
+				<Source><![CDATA[
+    private static server void EFTFormatUpdate()
+    {
+        SKS_EFT_FileFormat SKS_EFT_FileFormat;
+        SKS_EFT_InboundFileGroups locSKS_EFT_InboundFileGroups;
+        SKS_EFT_InboundFileFormat locSKS_EFT_InboundFileFormat;
+
+        select firstonly forUpdate SKS_EFT_FileFormat
+          where
+            SKS_EFT_FileFormat.FormatId == 'US-ACH' &&
+            SKS_EFT_FileFormat.EDI != NoYes::Yes;
+
+        if(SKS_EFT_FileFormat)
+        {
+            SKS_EFT_FileFormat.EDI = NoYes::Yes;
+            SKS_EFT_FileFormat.update();
+        }
+
+        select firstonly recid from locSKS_EFT_InboundFileFormat where locSKS_EFT_InboundFileFormat.Selected == NoYes::Yes;
+
+        if(!locSKS_EFT_InboundFileFormat)
+        {
+            update_recordset locSKS_EFT_InboundFileFormat
+                setting Selected = NoYes::Yes
+                join locSKS_EFT_InboundFileGroups
+                where locSKS_EFT_InboundFileGroups.InboundFormatId1 == locSKS_EFT_InboundFileFormat.FormatId;
+
+            update_recordset locSKS_EFT_InboundFileFormat
+                setting Selected = NoYes::Yes
+                join locSKS_EFT_InboundFileGroups
+                where locSKS_EFT_InboundFileGroups.InboundFormatId2 == locSKS_EFT_InboundFileFormat.FormatId;
+
+            update_recordset locSKS_EFT_InboundFileFormat
+                setting Selected = NoYes::Yes
+                join locSKS_EFT_InboundFileGroups
+                where locSKS_EFT_InboundFileGroups.InboundFormatId3 == locSKS_EFT_InboundFileFormat.FormatId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCurrentVersion</Name>
+				<Source><![CDATA[
+    static boolean isCurrentVersion()
+    {
+        SKS_PP_Setup pp_Setup;
+        ;
+
+        select firstonly RegVersion from pp_Setup;
+
+        if(pp_Setup && pp_Setup.RegVersion == SKS_PP_Sys::getSKSVersion())
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runUpgrade</Name>
+				<Source><![CDATA[
+    static void runUpgrade(container _args)
+    {
+        SKS_PP_Setup lSetup;
+        setPrefix('Upgrade');
+        SKS_Import_EFTFormats importMetaData;
+
+        importMetaData = new SKS_Import_EFTFormats();
+
+        //no setup being upgraded, mark this one to block other users
+        // 21771 - Cache disabled for this query to prevent possible update conflict errors caused by old RecVersion.
+        lSetup.disableCache(true);
+
+        select firstonly forupdate lSetup;
+        ttsbegin;
+        lSetup.UpgradeInProgress = NoYes::Yes;
+        lSetup.update();
+        ttscommit;
+
+        //Initialization needs to iterate over all companies that have the centralized payment purpose
+        SKS_LB_SecondaryMatch::initializeInvoiceMatchTable();
+        SKS_PP_Upgrade::matchingGroupsSplit();
+
+        //See if there are any D365 formats
+        SKS_EFT_FileFormat lSKS_EFT_FileFormat;
+        select firstonly crosscompany FormatGroupCodeSource from lSKS_EFT_FileFormat where
+            lSKS_EFT_FileFormat.FormatGroupCodeSource == SKS_EB_CodeSource::D365;
+
+        CompanyInfo companyInfo;
+
+        while select DataArea from companyInfo
+        {
+            changecompany(CompanyInfo.DataArea)
+            {
+                //AX passes table buffers by reference. Since SKS_PP_Setup is passed into multiple methods
+                // and modified in those methods, it is updated at the bottom of the changecompany so that
+                // all changes to the table are committed at once instead of being updated per method which
+                // can cause conflicts later in the process.
+                SKS_PP_Setup pp_Setup;
+
+                select forupdate pp_Setup where pp_Setup.RegVersion != SKS_PP_Sys::getSKSVersion();
+
+                if(!pp_Setup)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    setPrefix(curExt());
+
+                    //Import EFT Formats data. This is intentionally done prior to ttsbegin
+                    //First Import BankFabric MetaData and then D365
+                    SKS_EFT_BankFabricMetadata::loadMetaDataList('*', SKS_EFT_APIFormatType::File);     //BankFabric
+
+                    //Only run BankFabric API if EFT is setup for BankFabric. API is not supported on FileHub
+                    SKS_EB_FileStorage locSKS_EB_FileStorage;
+                    select firstonly StorageOption_APEFTFXDD from locSKS_EB_FileStorage;
+                    if(locSKS_EB_FileStorage.StorageOption_APEFTFXDD == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+                    {
+                        SKS_EFT_BankFabricMetadata::loadMetaDataList('*', SKS_EFT_APIFormatType::API);     //BankFabric APIs
+                    }
+
+                    if(lSKS_EFT_FileFormat) // If D365 formats exist, run code to add/update D365 formats
+                    {
+                        importMetaData.importEFTFormatData();               //D365
+                    }
+
+                    ttsbegin;
+
+                    str oldVersion = pp_setup.RegVersion;
+
+                    SKS_PP_Upgrade::InitializeEmailTemplates();
+
+                    SKS_EB_NumberSequenceCreate numberSequenceCreate = new SKS_EB_NumberSequenceCreate();
+                    numberSequenceCreate.run(pp_Setup);
+
+                    
+                    SKS_PP_Upgrade::UpdateLBMatching(pp_Setup);
+                   
+                    SKS_PP_Upgrade::UpgradeWriteOffRules(pp_Setup);
+
+                    
+                    // Update IHB Interest calculation data
+                    SKS_PP_Upgrade::updateIHB_InterestCalcFrequency();
+                    SKS_PP_Upgrade::updateIHB_InterestCalcMethod();
+                    SKS_PP_Upgrade::updateIHB_InterestDaysCalcMethod();
+                    SKS_PP_Upgrade::updateIHB_BankAccountTrans();
+                    SKS_PP_Upgrade::updateIHB_SKS_BR_BankTran();
+
+                    //Registration notification
+                    SKS_PP_Upgrade::updateRegNotify();
+
+                    SKS_PP_Upgrade::ePayupgrade();
+                    
+                    SKS_BR_EnhancedMatchingMapping::checkForEnhancementRecords(pp_setup.BRDateTolerance);
+                    SKS_CCR_EnhancedMatchingMapping::checkForEnhancementRecords(pp_setup.BRDateTolerance);  //SKS_FDD_13903
+                    
+                    if(oldVersion)
+                    {
+                        //setup default email address group entry
+                        SKS_PP_Upgrade::updateAPEFTEmail();
+                        SKS_PP_Upgrade::updateDDEmail();
+                        SKS_PP_Upgrade::updateCreateSendCompany(); //FDD-10590
+                        SKS_PP_Upgrade::UpdateFileSelectionForMC(); //FDD-10590
+
+                        // Update EFT format data
+                        SKS_PP_Upgrade::EFTFormatUpdate();
+
+                        // Update format validation 
+                        SKS_PP_Upgrade::updateFormatValidation(oldVersion);
+
+                        //upgrade the relationships between Bank Cheques and their assocaiated
+                        SKS_PP_Upgrade::UpgradePPFileRelationships();
+                        SKS_PP_Upgrade::UpgradePPInsertChkCuryCodes();
+                        SKS_PP_Upgrade::ClearOldPPSelects();
+
+                        //update BR related updates
+                        
+                        SKS_PP_Upgrade::UpdateBR(oldVersion, pp_setup);
+                        
+                        SKS_PP_Upgrade::UpdateCCR(oldVersion, pp_setup);    //SKS_FDD_13903
+                        
+                        SKS_BR_EnhancedMatchingMapping::upgradeMatches(oldVersion);
+                        
+                        SKS_CCR_EnhancedMatchingMapping::upgradeMatches(oldVersion);     //SKS_FDD_13903
+
+                        //update Analysis type field on Remit text analysis rule - 10187
+                        SKS_PP_Upgrade::updateAnalysisType();
+
+                        //Credit Card related updates
+                        SKS_PP_Upgrade::UpdateCC(oldVersion, pp_Setup);
+
+                        // IHB upgrade on Vendor e banking payment spec
+                        SKS_PP_Upgrade::updateVendorBankAccountOnPaymSpec(); // SKS 9536
+                        
+                        SKS_PP_Upgrade::UpdateEPayPaymentType(pp_Setup);
+
+                        SKS_PP_Upgrade::updateFileRetention(oldVersion, pp_setup);
+
+                        //Update payment calendar dates
+                        SKS_PP_Upgrade::UpdatePaymentCalendarRunTime();
+
+                        SKS_PP_Upgrade::CleanFileDetailValidate();
+
+                        //update APEFT and DD Relocation logic
+                        SKS_PP_Upgrade::updateAPAREFTRelocation(); //FDD-14181- Bank to bank transfer
+
+                        //update country IBANRequired
+                        SKS_PP_Upgrade::updateCountryIBANRequired(); //DevOps-21270- File format payment specification field validation enhancements
+
+                        //update TAS PRA Invoice Match Hierachy purpose
+                        SKS_PP_Upgrade::updateTASPRAInvoiceMatchHierachyPurpose(); //SKS_DevOps_21921
+                    }
+
+                    pp_Setup.RegVersion = SKS_PP_Sys::getSKSVersion();
+                    if(pp_Setup.HelpAccessKey == '')
+                    {
+                        pp_Setup.HelpAccessKey = 'Zf37uufViTzz1R0HpYDvkwZtJvAyVY9K41HnlM0uwyTmgTUvHn';
+                        pp_Setup.baseHelpURL = 'https://www.manula.com/manuals/sk-global-software/';
+                    }
+                    pp_setup.update();
+
+                    if(oldVersion)
+                    {
+                        //update workflow and autopost entries
+                         SKS_PP_Upgrade::updateBRWorkflowAutoPostFields(); //DevOps-13662
+                    }
+
+                    ttscommit;
+                    //ttsabort;      // todo:remove
+
+                    info("@SKS978");
+                }
+                catch
+                {
+                    continue;
+                }               
+            }
+        }
+
+        //Unflag the Upgrade field 
+        select firstonly forupdate lSetup where lSetup.UpgradeInProgress == NoYes::Yes;
+        ttsbegin;
+        lSetup.UpgradeInProgress = NoYes::No;
+        lSetup.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFormatValidation</Name>
+				<Source><![CDATA[
+    private static void updateFormatValidation(str _previousTASVersion)
+    {
+        if(SKS_PP_Sys::isVerALessThanVerB(_previousTASVersion,'10.9.1.'))
+        {
+            SKS_EFT_Setup eft_setup;
+            eft_setup.skipDataMethods(true);
+            eft_setup.skipEvents(true);
+
+            update_recordset eft_setup setting
+                APFormatValidProposal = NoYes::Yes,
+                APFormatValidJournal = NoYes::Yes,
+                APFormatValidCreateSend = NoYes::Yes,
+                DDFormatValidProposal = NoYes::Yes,
+                DDFormatValidJournal = NoYes::Yes,
+                DDFormatValidCreateSend = NoYes::Yes;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchingGroupsSplit</Name>
+				<Source><![CDATA[
+    private static void matchingGroupsSplit()
+    {
+        SKS_LB_MatchingGroups   matchingGroupsTable;
+        
+        select matchingGroupsTable where matchingGroupsTable.MatchingRulesGroupType == SKS_LB_MatchingRulesGroupType::BR;
+        if(!matchingGroupsTable)
+        {
+            SKS_SplitARBRMatchingGroups::splitARBRMatchingGroups();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAPAREFTRelocation</Name>
+				<Source><![CDATA[
+    private static void updateAPAREFTRelocation()
+    {
+        SKS_EFT_FileFormat locSKS_EFT_FileFormat;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+
+        while select forupdate locSKS_EB_CommProcess where ((locSKS_EB_CommProcess.Module == SKS_EB_Module::APEFT
+            || locSKS_EB_CommProcess.Module == SKS_EB_Module::AREFT) && locSKS_EB_CommProcess.Direction == SKS_EB_Direction::InboundRelocation)
+        {
+            if (locSKS_EB_CommProcess.Module == SKS_EB_Module::APEFT)
+            {
+                select firstonly InboundFileGroupId from locSKS_EFT_FileFormat where locSKS_EFT_FileFormat.formatid == locSKS_EB_CommProcess.RelocEFTFormatId;
+                locSKS_EB_CommProcess.RelocInboundFileGroupId = locSKS_EFT_FileFormat.InboundFileGroupId;
+            }
+            else
+            {
+                select firstonly SKS_DD_InboundFileGroupId from locSKS_EFT_FileFormat where locSKS_EFT_FileFormat.formatid == locSKS_EB_CommProcess.RelocEFTFormatId;
+                locSKS_EB_CommProcess.RelocInboundFileGroupId = locSKS_EFT_FileFormat.SKS_DD_InboundFileGroupId;
+            }
+
+            locSKS_EB_CommProcess.Module = SKS_EB_Module::ElectronicFundsFileRelocation;
+            ttsbegin;
+            locSKS_EB_CommProcess.doUpdate();
+            ttscommit;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAPEFTEmail</Name>
+				<Source><![CDATA[
+    private static void updateAPEFTEmail()
+    {
+        SKS_EFT_EmailPurpose locSKS_EFT_EmailPurpose;
+        SKS_EFT_Setup locSKS_EFT_Setup;
+        SKS_EB_Vendor locSKS_EB_Vendor;
+
+        select firstonly
+              ModAPEFT
+            , EmailContactPurpose
+            , APTemplateAttachment
+            , APSRS1Attachment
+            , APSRS2Attachment
+            , APSRS1EmailSSRS
+            , APSRS1FileName
+            , APSRS1FileType
+            , APSRS2EmailSSRS
+            , APSRS2FileName
+            , APSRS2FileType
+        from locSKS_EFT_Setup;
+
+        if(locSKS_EFT_Setup.ModAPEFT == NoYes::Yes)
+        {
+            select firstOnly forupdate locSKS_EFT_EmailPurpose;
+            if(!locSKS_EFT_EmailPurpose)
+            {
+                if(locSKS_EFT_Setup.EmailContactPurpose != '')
+                {
+                    locSKS_EFT_EmailPurpose = null;
+                    locSKS_EFT_EmailPurpose.SKS_EB_ContactPurpose = locSKS_EFT_Setup.EmailContactPurpose;
+                    locSKS_EFT_EmailPurpose.SKS_EB_OrderHierarchy = 1;
+                    locSKS_EFT_EmailPurpose.SKS_EFT_EmailAddressType = SKS_EFT_EmailAddressType::VendorContactPurpose;
+                    locSKS_EFT_EmailPurpose.insert();
+                }
+                else
+                {
+                    locSKS_EFT_EmailPurpose = null;
+                    locSKS_EFT_EmailPurpose.SKS_EB_OrderHierarchy = 1;
+                    locSKS_EFT_EmailPurpose.SKS_EFT_EmailAddressType = SKS_EFT_EmailAddressType::VendorPrimaryContact;
+                    locSKS_EFT_EmailPurpose.insert();
+                }
+            }
+        }
+
+        update_recordset locSKS_EB_Vendor
+            setting
+                 APTemplateFromSetup          = NoYes::Yes
+                ,APTemplateAttachment         = locSKS_EFT_Setup.APTemplateAttachment
+                ,APSRS1Attachment             = locSKS_EFT_Setup.APSRS1Attachment
+                ,APSRS2Attachment             = locSKS_EFT_Setup.APSRS2Attachment
+                ,EMTemplateWithAttachFromBank = NoYes::Yes
+                ,APSRS1EMTemplateFromSetup    = NoYes::Yes
+                ,APSRS1EmailSSRS              = locSKS_EFT_Setup.APSRS1EmailSSRS
+                ,APSRS1FileName               = locSKS_EFT_Setup.APSRS1FileName
+                ,APSRS1FileType               = locSKS_EFT_Setup.APSRS1FileType
+                ,APSRS2EMTemplateFromSetup    = NoYes::Yes
+                ,APSRS2EmailSSRS              = locSKS_EFT_Setup.APSRS2EmailSSRS
+                ,APSRS2FileName               = locSKS_EFT_Setup.APSRS2FileName
+                ,APSRS2FileType               = locSKS_EFT_Setup.APSRS2FileType
+            where locSKS_EB_Vendor.EMTemplateWithAttachFromBank == NoYes::No
+                  && locSKS_EB_Vendor.EMTemplateAttach == '';
+
+        update_recordset locSKS_EB_Vendor
+            setting APTemplateAttachment = NoYes::Yes
+            where locSKS_EB_Vendor.EMAttachNbrDocs > 0
+                  && locSKS_EB_Vendor.EMTemplateWithAttachFromBank == NoYes::No
+                  && locSKS_EB_Vendor.EMTemplateAttach == '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDDEmail</Name>
+				<Source><![CDATA[
+    private static void updateDDEmail()
+    {
+        SKS_LB_Depositor locSKS_LB_Depositor;
+        SKS_EFT_Setup locSKS_EFT_Setup;
+
+        select firstonly
+              SKS_DDR_TemplateAttachment
+            , SKS_DDR_SRS1Attachment
+            , SKS_DDR_SRS2Attachment
+            , AREMTemplateAttach
+            , ARAENTemplateAttach
+            , AREMAttachNbrDocs
+            , AREMAttachFileName
+            , AREMAttachFileExt
+            , AREMAttachInclDate
+            , AREMAttachInclCust
+            , SKS_DDR_SRS1AdvancedEmailSSRS
+            , SKS_DDR_SRS1EmailSSRS
+            , SKS_DDR_SRS1FileName
+            , SKS_DDR_SRS1FileType
+            , SKS_DDR_SRS2AdvancedEmailSSRS
+            , SKS_DDR_SRS2EmailSSRS
+            , SKS_DDR_SRS2FileName
+            , SKS_DDR_SRS2FileType
+        from locSKS_EFT_Setup;
+
+        update_recordset locSKS_LB_Depositor
+            setting
+                SKS_DDR_TemplateFromSetup        = NoYes::Yes
+                ,SKS_DDR_TemplateAttachment      = locSKS_EFT_Setup.SKS_DDR_TemplateAttachment
+                ,SKS_DDR_SRS1Attachment          = locSKS_EFT_Setup.SKS_DDR_SRS1Attachment
+                ,SKS_DDR_SRS2Attachment          = locSKS_EFT_Setup.SKS_DDR_SRS2Attachment
+                ,EMTemplateWithAttachFromBank    = NoYes::Yes
+                ,EMTemplateFromSetup             = NoYes::Yes
+                ,SKS_DDR_SRS1EMTemplateFromSetup = NoYes::Yes
+                ,SKS_DDR_SRS1AdvancedEmailSSRS   = locSKS_EFT_Setup.SKS_DDR_SRS1AdvancedEmailSSRS
+                ,SKS_DDR_SRS1EmailSSRS           = locSKS_EFT_Setup.SKS_DDR_SRS1EmailSSRS
+                ,SKS_DDR_SRS1FileName            = locSKS_EFT_Setup.SKS_DDR_SRS1FileName
+                ,SKS_DDR_SRS1FileType            = locSKS_EFT_Setup.SKS_DDR_SRS1FileType
+                ,SKS_DDR_SRS2EMTemplateFromSetup = NoYes::Yes
+                ,SKS_DDR_SRS2AdvancedEmailSSRS   = locSKS_EFT_Setup.SKS_DDR_SRS2AdvancedEmailSSRS
+                ,SKS_DDR_SRS2EmailSSRS           = locSKS_EFT_Setup.SKS_DDR_SRS2EmailSSRS
+                ,SKS_DDR_SRS2FileName            = locSKS_EFT_Setup.SKS_DDR_SRS2FileName
+                ,SKS_DDR_SRS2FileType            = locSKS_EFT_Setup.SKS_DDR_SRS2FileType
+            where locSKS_LB_Depositor.EMTemplateWithAttachFromBank == NoYes::No
+                  && locSKS_LB_Depositor.EMTemplateAttach == '';
+
+        update_recordset locSKS_LB_Depositor
+            setting SKS_DDR_TemplateAttachment = NoYes::Yes
+            where locSKS_LB_Depositor.EMTemplateWithAttachFromBank == NoYes::No
+                  && locSKS_LB_Depositor.EMTemplateAttach == ''
+                  && locSKS_LB_Depositor.EMAttachNbrDocs > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateBankArchive</Name>
+				<Source><![CDATA[
+    private server static void UpdateBankArchive(SKS_PP_Setup _SKS_PP_Setup)
+    {
+        SKS_LB_Bank lSKS_LB_Bank;
+        SKS_PP_Bank lSKS_PP_Bank;
+        ;
+
+        update_recordSet lSKS_PP_Bank
+            setting PPArchive = _SKS_PP_Setup.PPArchive,
+                    PPArchivePath = _SKS_PP_Setup.PPPathArchive
+            where   lSKS_PP_Bank.PPFromSetup == NoYes::Yes &&
+                    (lSKS_PP_Bank.PPArchive != _SKS_PP_Setup.PPArchive ||
+                    lSKS_PP_Bank.PPArchivePath != _SKS_PP_Setup.PPPathArchive);
+
+        update_recordSet lSKS_LB_Bank
+            setting LBArchive = _SKS_PP_Setup.LBArchive,
+                    LBArchivePath = _SKS_PP_Setup.LBPathArchive
+            where   lSKS_LB_Bank.LBFromSetup == NoYes::Yes &&
+                    (lSKS_LB_Bank.LBArchive != _SKS_PP_Setup.LBArchive ||
+                    lSKS_LB_Bank.LBArchivePath != _SKS_PP_Setup.LBPathArchive);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateFileSelectionForMC</Name>
+				<Source><![CDATA[
+    private static void UpdateFileSelectionForMC()
+    {
+        SKS_EFT_Setup locSKS_EFT_Setup;
+        SKS_EFT_FilePmtSelection locSKS_EFT_FilePmtSelection;
+
+        select firstonly DataAreaId from locSKS_EFT_Setup where locSKS_EFT_Setup.ModAPEFT || locSKS_EFT_Setup.ModAREFT;
+
+        if(locSKS_EFT_Setup.DataAreaId)
+        {
+            update_recordset locSKS_EFT_FilePmtSelection
+                setting Company = locSKS_EFT_Setup.DataAreaId
+                where locSKS_EFT_FilePmtSelection.Company == '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateBR</Name>
+				<Source><![CDATA[
+    private static void UpdateBR(str _previousTASVersion, SKS_PP_Setup _sks_pp_setup)
+    {
+        SKS_BR_BankTran locSKS_BR_BankTran, locZBAParentLookupSKS_BR_BankTran, locZBAParentSKS_BR_BankTran;
+        SKS_BR_FileFormat locSKS_BR_FileFormat;
+        BankAccountStatement locBankAccountStatement;
+        int64 locZBAParentID;
+        LedgerJournalName       locLedgerJournalName;
+        SKS_BR_ClickNMatchSessions locSKS_BR_ClickNMatchSessions; //13563
+        SKS_PP_Setup locSKS_PP_Setup;
+        
+        delete_from locSKS_BR_ClickNMatchSessions;//13563
+
+        if(_sks_pp_setup.BRGLCreationCompany == '')
+        {
+            _sks_pp_setup.BRGLCreationCompany = _sks_pp_setup.company();
+        }
+
+        changecompany(_sks_pp_setup.BRGLCreationCompany)
+        {
+            locLedgerJournalName = LedgerJournalName::find(_sks_pp_setup.BRJournalName, true);
+            if(locLedgerJournalName)
+            {
+                locLedgerJournalName.SKS_BR_AutoPost = _sks_pp_setup.BRAutomaticallyPostGL;
+                locLedgerJournalName.update();
+            }
+            locLedgerJournalName = null;
+        }
+
+        //Beause the GL Mapping tab, on imported br trans, and the unmatched br trans depends the GL Created companies to display the journal now
+        //  that field must be populated during upgrade so past imported trans don't  cause a "company not found" x++ error
+
+        locSKS_BR_BankTran.skipDataMethods(true);
+        update_recordset locSKS_BR_BankTran
+            setting GLCreationCompany = locSKS_BR_BankTran.company()
+            where locSKS_BR_BankTran.GLCreationCompany == '';
+
+
+        //Because older ebanking had a fixed Comma delimiter, and newer versions allow the user to specify, if
+        //  a BR format exists that is set to delimited(formerly labeled CSV) but has no delimter in the field, it
+        //  must be an old CSV, so specify the csv on upgrade.
+        update_recordset locSKS_BR_FileFormat
+            setting FileFieldDelimiter = ','
+            where locSKS_BR_FileFormat.FileType == SKS_BR_FileType::CSV
+                && locSKS_BR_FileFormat.FileFieldDelimiter == ''
+                && locSKS_BR_FileFormat.CCR_IsCCRFormat == NoYes::No; // SKS_FDD_13903
+
+        //ISSUE 7156 -->
+        //set the "Remove leading zeroes" flage to true, when upgrading to a version that that supports leading zeroes
+        if((SKS_PP_Sys::isVerALessThanVerB(_previousTASVersion,'10.1.5.')) || (SKS_PP_Sys::isVerAEqualToVerB(_previousTASVersion,'10.1.5.')))
+        {
+            update_recordset locSKS_BR_FileFormat
+                setting RemoveLeadingZeros = NoYes::Yes;
+        }
+        //<-- ISSUE 7156
+
+        //VSTS 11947
+        update_recordset locSKS_BR_FileFormat
+            setting EndBalanceTypeCode = 'CLBD' //this is the default ending balance type code.
+            where locSKS_BR_FileFormat.FileType == SKS_BR_FileType::CAMT_053_001_02
+                  && locSKS_BR_FileFormat.UpdateEndBalance == NoYes::Yes
+                  && locSKS_BR_FileFormat.EndBalanceTypeCode == '';
+
+        //Additional fields were added in 9.0.0.7 and these need to be initialized.  Post-9.0.0.7 fields should have been set during import, so this ahould never fire if you are upgrading from a post 9.0 build
+        if(SKS_PP_Sys::getSKSMajorVersion(_previousTASVersion) < 9)
+        {
+            
+		    locSKS_BR_BankTran.skipDataMethods(true);
+
+            update_recordset locSKS_BR_BankTran
+                        setting GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLCreate
+                        where locSKS_BR_BankTran.GLMappingRuleGroupId != ''
+                        && locSKS_BR_BankTran.ZBAParentRecid == 0                        
+                        && locSKS_BR_BankTran.GLMatchOrCreate == 0;
+
+            update_recordset locSKS_BR_BankTran
+                        setting GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLMatch
+                        where locSKS_BR_BankTran.MatchingRuleGroupId != ''
+                        && locSKS_BR_BankTran.ZBAParentRecid == 0                        
+                        && locSKS_BR_BankTran.GLMatchOrCreate == 0;
+
+            update_recordset locSKS_BR_BankTran
+                        setting GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLMatch
+                        where locSKS_BR_BankTran.GLMappingRuleGroupId == ''
+                            && locSKS_BR_BankTran.MatchingRuleGroupId == ''
+                            && locSKS_BR_BankTran.ManualReconciliationID != emptyGuid()
+                            && locSKS_BR_BankTran.ZBAParentRecid == 0                            
+                            && locSKS_BR_BankTran.GLMatchOrCreate == 0;
+
+            update_recordset locSKS_BR_BankTran
+                        setting TranDescriptionUser = locSKS_BR_BankTran.TranDescription
+                        where locSKS_BR_BankTran.TranDescriptionUser == ''
+                        && locSKS_BR_BankTran.TranDescription != '';
+
+            update_recordset locSKS_BR_BankTran
+                        setting Matched = NoYes::Yes,
+                                MatchIndicator = SKS_BR_MatchIndicator::Green
+                        where locSKS_BR_BankTran.ManualReconciliationID != emptyGuid();
+            
+            update_recordset locSKS_BR_BankTran
+                        setting ImportedStatementDate = locBankAccountStatement.AccountStatementDate,
+                                ImportedStatementNum = locBankAccountStatement.AccountStatementNum
+                        join locBankAccountStatement where locBankAccountStatement.RecId == locSKS_BR_BankTran.OriginalStatementRecId
+                        && locSKS_BR_BankTran.OriginalStatementRecId > 0;
+          
+            locZBAParentID = 0;
+
+            // don't change this order.  Because the ZBAs will have ZBAParentRecids, and the parents will be indistinguishable from oter GLMapping
+            //    rules, we will first set the parents to be GLMapping, but when we process the ZBAChildren afterwards,we will know their
+            //    parents and be able to reset them to ZBA accounts.
+            while select forupdate locSKS_BR_BankTran
+                    where locSKS_BR_BankTran.ZBAParentRecid > 0                        
+                    && locSKS_BR_BankTran.GLMatchOrCreate == 0//if it has already been set, then do not upgrade it.  THis goes for ZBA too.
+            {
+                //set ZBA parent to GLCreateSweepAndMatchZBA
+                if(locZBAParentID != locSKS_BR_BankTran.ZBAParentRecid && locSKS_BR_BankTran.ZBAParentRecid > 0)
+                {
+                    locZBAParentID = locSKS_BR_BankTran.ZBAParentRecid;
+                    select firstonly crosscompany DataAreaId, RecId  from locZBAParentLookupSKS_BR_BankTran
+                                where locZBAParentLookupSKS_BR_BankTran.Recid == locSKS_BR_BankTran.ZBAParentRecid;
+
+                    if(locZBAParentLookupSKS_BR_BankTran)
+                    {
+                        changecompany(locZBAParentLookupSKS_BR_BankTran.company())
+                        {
+                            //This cannot be an Update_recordset, becuse update recordsets cannot be rolled back.  If the upgrade process fails
+                            //  EVERYTHING needs to be abortable.
+                            locZBAParentSKS_BR_BankTran = null;
+                            select firstonly forupdate locZBAParentSKS_BR_BankTran where locZBAParentSKS_BR_BankTran.RecId == locZBAParentLookupSKS_BR_BankTran.Recid;
+                            locZBAParentSKS_BR_BankTran.GLMatchOrCreate = SKS_BR_GLMatchOrCreate::GLCreateSweepAndMatchZBA;
+                            if(locZBAParentSKS_BR_BankTran.validateWrite())
+                            {
+                                locZBAParentSKS_BR_BankTran.update();
+                            }
+                        }
+                    }
+                }
+                //THis line is based on the bahavior of newly imported ZBA Trans.  Both parent and child's GLMatchorCreate are set to ZBA
+                locSKS_BR_BankTran.GLMatchorCreate = SKS_BR_GLMatchOrCreate::GLCreateSweepAndMatchZBA;
+
+                if(locSKS_BR_BankTran.validateWrite())
+                {
+                    locSKS_BR_BankTran.update();
+                }
+            }
+        }
+
+        locSKS_PP_Setup = null;
+        while select forupdate crosscompany * from locSKS_PP_Setup where locSKS_PP_Setup.ModBR == NoYes::Yes && locSKS_PP_Setup.BREdition != SKS_BR_Edition::Advanced
+        {
+            changecompany(locSKS_PP_Setup.company())
+            {
+                locSKS_PP_Setup.BREdition = SKS_BR_Edition::Advanced;
+                ttsbegin;
+                locSKS_PP_Setup.doUpdate();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateCC</Name>
+				<Source><![CDATA[
+    private static void UpdateCC(str _previousTASVersion, SKS_PP_Setup _SKS_PP_Setup)
+    {
+        if(SKS_PP_Sys::getSKSMajorVersion(_previousTASVersion) < 9)
+        {
+            _SKS_PP_Setup.CCCustCrdrCrdARSync = NoYes::Yes;
+        }
+
+        boolean needsPayLinkUpdate, needsSetupUpdate;
+
+        SKS_CC_PayLinkQueue payLinkQueueCheck;        
+
+        if (_SKS_PP_Setup.CCPayLinkEnumUpgraded == NoYes::No)
+        {
+            needsSetupUpdate = true;
+        
+            select firstonly1 RecId from payLinkQueueCheck;
+            if (payLinkQueueCheck.RecId)
+            {
+                needsPayLinkUpdate = true;
+            }
+        }
+        else
+        {
+            select firstonly1 RecId from payLinkQueueCheck
+                where payLinkQueueCheck.Status == 0;
+
+            if (payLinkQueueCheck.RecId)
+            {
+                needsPayLinkUpdate = true;
+            }
+        }
+
+        if (needsPayLinkUpdate || needsSetupUpdate)
+        {
+            if (needsPayLinkUpdate)
+            {
+                SKS_CC_PayLinkProcessStatusEnumUpdForConv::updatePayLinkQueue();
+            }
+        
+            if (needsSetupUpdate)
+            {
+                _SKS_PP_Setup.CCPayLinkEnumUpgraded = NoYes::Yes;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateEPayPaymentType</Name>
+				<Source><![CDATA[
+    private static void UpdateEPayPaymentType(SKS_PP_Setup sks_pp_setup)
+    {
+        SKS_EPY_Setup SKS_EPY_Setup;
+
+        if(sks_pp_setup.ModEPAY == NoYes::Yes)
+        {
+            select firstonly forupdate PaymentType from SKS_EPY_Setup where SKS_EPY_Setup.PaymentType == SKS_EPY_PaymentType::Blank;
+
+            if(SKS_EPY_Setup)
+            {
+                ttsBegin;
+                SKS_EPY_Setup.PaymentType = SKS_EPY_PaymentType::CardAndACH;
+                SKS_EPY_Setup.update();
+                ttsCommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateLBMatching</Name>
+				<Source><![CDATA[
+    private static void UpdateLBMatching(SKS_PP_Setup _sks_pp_setup)
+    {
+        SKS_LB_LookupOptions    sks_lb_lookupOptions;
+        SKS_LB_MatchingGroups   matchingGroups;
+        SKS_LB_MatchingRules    matchingRules;
+        SKS_LB_Bank             sks_lb_bank;
+        ;
+
+        select firstonly matchingGroups where matchingGroups.groupid == 'Default';
+
+        ttsBegin;
+
+        if(!matchingGroups)
+        {
+            matchingGroups.GroupId = 'Default';
+            matchingGroups.Description = 'Invoice number search only';
+            matchingGroups.insert();
+
+            matchingRules.groupid = 'Default';
+            matchingRules.lookupType = SKS_LB_MatchType::InvoiceNumber;
+            matchingRules.SearchType = SKS_LB_SearchType::EndsWith;
+            matchingRules.Step = 1;
+            matchingRules.insert();
+
+            matchingRules.groupid = 'Default';
+            matchingRules.lookupType = SKS_LB_MatchType::InvoiceNumber;
+            matchingRules.SearchType = SKS_LB_SearchType::StartsWith;
+            matchingRules.Step = 2;
+            matchingRules.insert();
+
+        }
+
+        if(_sks_pp_setup.MatchingRulesGroupId == '')
+        {
+            ttscommit;
+            return;
+        }
+
+        select firstonly sks_lb_bank;
+        if(_sks_pp_setup.ModLockbox == noyes::no && !sks_lb_bank)
+        {
+            ttscommit;
+            return;
+        }
+        else
+        {
+            select firstonly sks_lb_lookupOptions where sks_lb_lookupOptions.LookupFieldType == SKS_LB_MatchType::InvoiceNumber
+                && sks_lb_lookupOptions.lookuporder == 1;
+
+            if(sks_lb_lookupOptions)
+            {
+                select firstonly sks_lb_lookupOptions where sks_lb_lookupOptions.LookupFieldType != SKS_LB_MatchType::InvoiceNumber && sks_lb_lookupOptions.lookuporder != 0;
+
+                if(!sks_lb_lookupOptions)
+                {
+                    //master default
+                    _sks_pp_setup.MatchingRulesGroupId = 'Default';
+
+                    update_recordset sks_lb_bank
+                    setting MatchingRulesGroupId = 'Default';
+                }
+                else
+                {
+                    //create new matching rules group
+                    sks_pp_upgrade::creatematchingrulesrecords(_sks_pp_setup);
+                }
+            }
+            else
+            {
+                //create new matching rules group
+                sks_pp_upgrade::creatematchingrulesrecords(_sks_pp_setup);
+            }
+        }
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpgradePPFileRelationships</Name>
+				<Source><![CDATA[
+    public static void UpgradePPFileRelationships()
+    {
+        //The cross companies are left in this method because
+        // the loop is looking for the positive pay file from the perspective
+        // of the check which either could be in any company. Since
+        // this will only need to be run once and for upgrading from old
+        // versions, it's not likely for this method to run in the first place.
+
+        SKS_PP_FileDetail locSKS_PP_FileDetail;
+        SKS_PP_File locSKS_PP_File;
+        BankChequeTable locSelBankChequeTable;
+        container companies;
+
+
+        select firstonly locSKS_PP_FileDetail
+            join keepDelete from locSKS_PP_File;
+
+        if(locSKS_PP_FileDetail)
+        {
+            Select Firstonly crossCompany locSelBankChequeTable
+            where locSelBankChequeTable.ChequeNum == locSKS_PP_FileDetail.ChkRefNbr
+                        && locSelBankChequeTable.SKS_PP_FileNbr == locSKS_PP_FileDetail.FileNbr
+                        && locSelBankChequeTable.dataAreaId == locSKS_PP_FileDetail.ChkCpnyId
+                        && locSelBankChequeTable.SKS_PP_File_RecId != 0;
+        }
+
+        if(locSelBankChequeTable)
+        {
+            return;
+        }
+
+        while select forUpdate crossCompany  locSelBankChequeTable
+            where locSelBankChequeTable.SKS_PP_FileNbr != ''
+                && locSelBankChequeTable.SKS_PP_File_RecId == 0
+        {
+            changeCompany(locSelBankChequeTable.company())
+            {
+                //Order of precedence for matching
+                //  1.  A file Detail exists in any company taht points specifically at our BankCheque based on ChequeNum, AccountID, and Company.
+                //  2.  In the cheque's company, A NOT PROCESSED file exists with our number
+                //  3.  In the cheque's Organizational Hierarchy, a NOT PROCESSED file exists with our number
+                //  4.  In the cheque's company, a file exists with our number
+                //  5.  In the cheque's Organizational Hierarchy, a file exists with our number
+                companies = SKS_EB_VirtualCompany::getPosPayCompanies();
+                locSKS_PP_FileDetail = null; //any buffer that could potentially change companies must be nulled between queries;
+                locSKS_PP_File = null; //any buffer that could potentially change companies must be nulled between queries;
+                //First,look for anything in the entire system that points to this ChequeNum/AccountID/DataAreaId combo.
+                select firstonly crossCompany FileNbr from locSKS_PP_FileDetail
+                    where locSKS_PP_FileDetail.ChkCpnyId == locSelBankChequeTable.dataAreaId
+                        && locSKS_PP_FileDetail.ChkRefNbr == locSelBankChequeTable.ChequeNum
+                        && locSKS_PP_FileDetail.ChkBankAcct == locSelBankChequeTable.AccountID
+                        && locSKS_PP_FileDetail.FileNbr == locSelBankChequeTable.SKS_PP_FileNbr // we know the file number already
+                    join RecId, FileNbr from locSKS_PP_File
+                         where locSKS_PP_FileDetail.FileNbr == locSKS_PP_File.FileNbr;
+                //If a file detail wasn't found that specifically pointed to this cheque, then it is probably becuse the cheque
+                //  was manually selected for PP and doesn't have a SKS_PP_FIleDetail line created yet. (manual cheques don't
+                //  get a SKS_PP_FileDetail until they are actually sent through the Create & Send process).  So, just look for a file in the current
+                //  company that has our file number.  Thus we are looking for a notProcessed file with our file number in our cheque's company.
+                if(!locSKS_PP_File)
+                {
+                    Select firstonly RecId, FileNbr from locSKS_PP_File
+                         where locSKS_PP_File.FileNbr == locSelBankChequeTable.SKS_PP_FileNbr
+                            && locSKS_PP_File.KeepDelete == SKS_PP_FileStatus::NotProcessed;
+                }
+                //If no cheque was found with an exactly mathcing fileDet line AND no cheque was found with our number in the current company, then cheque the org hierarchy.  Maybe someone is creating these
+                //  manually in a different company and rounding up all the cheques into that company to be sent.  that SHOULD always
+                //  keep the items within the org hierarchy.
+                if(!locSKS_PP_FIle)
+                {
+                    Select firstonly crossCompany:companies RecId, FileNbr from locSKS_PP_File
+                         where locSKS_PP_FileDetail.FileNbr == locSKS_PP_File.FileNbr
+                         && locSKS_PP_File.KeepDelete == SKS_PP_FileStatus::NotProcessed;
+                }
+                //unable to find a not-processed file, let's see if we can find one that matches that is processed, in our company
+                if(!locSKS_PP_File)
+                {
+                    Select firstonly RecId, FileNbr from locSKS_PP_File
+                         where locSKS_PP_File.FileNbr == locSelBankChequeTable.SKS_PP_FileNbr;
+                }
+                //If no cheque was found with an exactly mathcing fileDet line AND no cheque was found with our number and NotProcessed in the current company,
+                //  then cheque the org hierarchy for any status with our number.
+                if(!locSKS_PP_FIle)
+                {
+                    Select firstonly crossCompany:companies RecId, FileNbr from locSKS_PP_File
+                         where locSKS_PP_FileDetail.FileNbr == locSKS_PP_File.FileNbr;
+                }
+                //IF a File was found, set the SKS_PP_File_RecID
+                if(locSKS_PP_File)
+                {
+                    locSelBankChequeTable.SKS_PP_File_RecId = locSKS_PP_File.RecId;
+                }
+                //Else, no file was found, and we need to clear the file number so the Update doesn't pick this record up every time it runs
+                else
+                {
+                    locSelBankChequeTable.SKS_PP_FileNbr = '';
+                }
+                locSelBankChequeTable.SKS_PP_LastFileNbr = '';//DEPRICATED FIELD as of 8.8.0.x
+                locSelBankChequeTable.SKS_PP_SelectedFileNbr = '';//DEPRICATED FIELD as of 8.8.0.x
+                locSelBankChequeTable.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpgradePPInsertChkCuryCodes</Name>
+				<Source><![CDATA[
+    private static void UpgradePPInsertChkCuryCodes()
+    {
+        SKS_PP_FileDetail locSKS_PP_FileDetail;
+        SKS_PP_FileDetail locUpgradeSKS_PP_FileDetail;
+        BankChequeTable locBankChequeTable;
+
+        //if no SKS_PP_FileDetail records exist then there is nothing to upgrades, so exit.
+        select firstOnly recid from locSKS_PP_FileDetail;
+        if(!locSKS_PP_FileDetail)
+        {
+            return;
+        }
+
+        //crosscompany activity requires the buffer to be nulled to enusure correct behavior.
+        locSKS_PP_FileDetail = null;
+        //if SKS_PP_FileDetail.chkCuryCode is set in any record then this upgrade has already been preformed and is unnecessary, so exit.
+        select firstOnly recid from locSKS_PP_FileDetail where locSKS_PP_FileDetail.ChkCuryCode != '';
+        if(locSKS_PP_FileDetail)
+        {
+            return;
+        }
+
+        //crosscompany activity requires the buffer to be nulled to enusure correct behavior.
+        locSKS_PP_FileDetail = null;
+        while select ChkBankAcct, ChkCpnyId, ChkRefNbr, DataAreaId, RecId
+            from locSKS_PP_FileDetail where locSKS_PP_FileDetail.RecSection == SKS_PP_RecSection::Payments
+        {
+            changeCompany(locSKS_PP_FileDetail.ChkCpnyId)
+            {
+                //crosscompany activity requires the buffer to be nulled to enusure correct behavior.
+                locBankChequeTable = null;
+                select firstonly CurrencyCode, RecId from locBankChequeTable
+                    where locBankChequeTable.AccountID == locSKS_PP_FileDetail.ChkBankAcct
+                        && locBankChequeTable.ChequeNum ==  locSKS_PP_FileDetail.ChkRefNbr;
+            }
+
+            if(locBankChequeTable)
+            {
+                //crosscompany activity requires the buffer to be nulled to enusure correct behavior.
+                locUpgradeSKS_PP_FileDetail = null;
+                Select firstonly forupdate locUpgradeSKS_PP_FileDetail
+                    where locUpgradeSKS_PP_FileDetail.RecId == locSKS_PP_FileDetail.RecId;
+                locUpgradeSKS_PP_FileDetail.ChkCuryCode = locBankChequeTable.CurrencyCode;
+                locUpgradeSKS_PP_FileDetail.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpgradeWriteOffRules</Name>
+				<Source><![CDATA[
+    private static void UpgradeWriteOffRules(SKS_PP_Setup _sks_pp_setup)
+    {
+        SKS_LB_Setup_AutoCRParms    SKS_LB_Setup_AutoCRParms;
+        SKS_LB_WriteoffRules        SKS_LB_WriteOffRules;
+        SKS_LB_WriteoffDetails      SKS_LB_WriteoffDetails;
+        RecordInsertList            WriteOffList = new RecordInsertList(tableNum(SKS_LB_WriteoffDetails));
+
+        if(_sks_pp_setup.LBWriteOffId == '')
+        {
+            return;
+        }
+
+        select firstonly SKS_LB_WriteoffRules where SKS_LB_WriteoffRules.writeoffid == 'Default'+ curext();
+
+        if(!SKS_LB_WriteoffRules)
+        {
+            SKS_LB_WriteoffRules.WriteoffId = 'Default' + curext();
+            SKS_LB_WriteoffRules.write();
+
+            while select CustomerCompany, AutoCRLedgerDimension, AutoCROffsetLedgerDimension from SKS_LB_Setup_AutoCRParms
+            {
+                SKS_LB_WriteoffDetails.SKS_LB_WriteoffRules = SKS_LB_WriteoffRules.WriteoffId;
+                SKS_LB_WriteoffDetails.CustomerCompany = SKS_LB_Setup_AutoCRParms.CustomerCompany;
+                SKS_LB_WriteoffDetails.CRLedgerDimension = SKS_LB_Setup_AutoCRParms.AutoCRLedgerDimension;
+                SKS_LB_WriteoffDetails.ThresholdAmount = 9999.99;
+                SKS_LB_WriteoffDetails.AutoCR = _sks_pp_setup.AutoCRCreateCR;
+                SKS_LB_WriteoffDetails.AutoRev = _sks_pp_setup.AutoCRAutoRev;
+                SKS_LB_WriteoffDetails.RevLedgerDimension = SKS_LB_Setup_AutoCRParms.AutoCRLedgerDimension;
+                SKS_LB_WriteoffDetails.RevOffsetLedgerDimension = SKS_LB_Setup_AutoCRParms.AutoCROffsetLedgerDimension;
+                WriteOffList.add(SKS_LB_WriteoffDetails);
+            }
+
+            WriteOffList.insertDatabase();
+
+            _sks_pp_setup.lbwriteoffid = SKS_LB_WriteoffRules.writeoffid;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIHB_InterestCalcFrequency</Name>
+				<Source><![CDATA[
+    public static void updateIHB_InterestCalcFrequency()
+    {
+        SKS_IHB_InterestCalcFrequency   iHBInterestCalcFrequency;
+
+        select firstonly RecId from iHBInterestCalcFrequency;
+        if (iHBInterestCalcFrequency.RecId == 0)
+        {
+            iHBInterestCalcFrequency.InterestCalcFreq   = SKS_IHB_InterestCalcFreq::Month;
+            iHBInterestCalcFrequency.insert();
+            iHBInterestCalcFrequency.InterestCalcFreq   = SKS_IHB_InterestCalcFreq::Annual;
+            iHBInterestCalcFrequency.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIHB_InterestCalcMethod</Name>
+				<Source><![CDATA[
+    public static void updateIHB_InterestCalcMethod()
+    {
+        SKS_IHB_InterestCalcMethod   iHBInterestCalcMethod;
+
+        select firstonly RecId from iHBInterestCalcMethod;
+        if (iHBInterestCalcMethod.RecId == 0)
+        {
+            iHBInterestCalcMethod.InterestCalcMethod = SKS_IHB_InterestCalcMeth::Compound; //FDD-11448
+            iHBInterestCalcMethod.insert();
+            iHBInterestCalcMethod.InterestCalcMethod = SKS_IHB_InterestCalcMeth::Noncompounded; //FDD-11448 --->
+            iHBInterestCalcMethod.insert(); //<--- FDD-11448
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIHB_InterestDaysCalcMethod</Name>
+				<Source><![CDATA[
+    public static void updateIHB_InterestDaysCalcMethod()
+    {
+        SKS_IHB_InterestDaysCalcMethod  iHBInterestDaysCalcMethod;
+
+        select firstonly RecId from iHBInterestDaysCalcMethod;
+        if (iHBInterestDaysCalcMethod.RecId == 0)
+        {
+            iHBInterestDaysCalcMethod.InterestDaysCalcMethod = SKS_IHB_InterestDaysCalcMeth::act360;
+            iHBInterestDaysCalcMethod.insert();
+            iHBInterestDaysCalcMethod.InterestDaysCalcMethod = SKS_IHB_InterestDaysCalcMeth::act365;
+            iHBInterestDaysCalcMethod.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIHB_SKS_BR_BankTran</Name>
+				<Source><![CDATA[
+    public static void updateIHB_SKS_BR_BankTran()
+    {
+        SKS_BR_BankTran locBankTran;
+
+        ttsbegin;
+        // update Value date field
+	locBankTran.skipDataMethods(true);
+        update_recordset locBankTran
+            setting ValueDate = locBankTran.TranDate
+            where locBankTran.ValueDate == datenull();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIHB_BankAccountTrans</Name>
+				<Source><![CDATA[
+    public static void updateIHB_BankAccountTrans()
+    {
+        BankAccountTrans locBankAccountTrans;
+
+        ttsbegin;
+        // update Value date field
+	locBankAccountTrans.skipDataMethods(true);
+        update_recordset locBankAccountTrans
+            setting SKS_IHB_ValueDate = locBankAccountTrans.TransDate
+            where locBankAccountTrans.SKS_IHB_ValueDate == datenull();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVendorBankAccountOnPaymSpec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update Payment specification for the vendor bank account
+    /// </summary>
+    /// SKS 9536
+    public static void updateVendorBankAccountOnPaymSpec()
+    {
+        VendBankAccount     vendBankAccount;
+        SKS_EFT_VendorPaym  lSKS_EFT_VendorPaym;
+
+        while select VendAccount, VendBankAccountId, VendCompany from lSKS_EFT_VendorPaym
+            group by lSKS_EFT_VendorPaym.VendAccount,
+                     lSKS_EFT_VendorPaym.VendBankAccountId,
+                     lSKS_EFT_VendorPaym.VendCompany
+        {
+            select crosscompany vendBankAccount
+                where vendBankAccount.VendAccount == lSKS_EFT_VendorPaym.VendAccount
+                    && vendBankAccount.AccountID == lSKS_EFT_VendorPaym.VendBankAccountId
+                    && vendBankAccount.DataAreaId == lSKS_EFT_VendorPaym.VendCompany;
+
+            if(vendBankAccount.RecId)
+            {
+                ttsbegin;
+                SKS_PP_Upgrade::updateIntermediaryOnPaymSpec(vendBankAccount);
+                SKS_PP_Upgrade::updateCreditPartOnPaymSpec(vendBankAccount);
+                SKS_PP_Upgrade::updateBeneficiarynPaymSpec(vendBankAccount);
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCreditPartOnPaymSpec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update for Intermediary
+    /// </summary>
+    /// <param name = "_vendBankAccount"></param>
+    /// 9536 - data upgrade for Vendor bank account and payment spec
+    public static void updateCreditPartOnPaymSpec(VendBankAccount     _vendBankAccount)
+    {
+        SKS_EFT_VendorPaym  sks_EFT_VendorPaymFirstLine;
+        SKS_EFT_VendorPaym  sks_EFT_VendorPaymFirstLoc;
+        VendBankAccount     vendBankAccountLocUpt;
+        SKS_EFT_VendorPaym  sks_EFT_VendorPaymUpdate;
+        RecIdCount countTotalRecord;
+        RecIdCount countGroupTotal;
+
+        select count(RecId) from sks_EFT_VendorPaymFirstLine
+            where sks_EFT_VendorPaymFirstLine.VendAccount ==  _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymFirstLine.VendBankAccountId == _vendBankAccount.AccountID
+                && sks_EFT_VendorPaymFirstLine.WCrePartyUseVendBankAcc == NoYes::Yes;
+
+        countTotalRecord = sks_EFT_VendorPaymFirstLine.RecId;
+
+        select firstOnly * from sks_EFT_VendorPaymFirstLine
+            where sks_EFT_VendorPaymFirstLine.VendAccount ==  _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymFirstLine.VendBankAccountId == _vendBankAccount.AccountID
+                && sks_EFT_VendorPaymFirstLine.WCrePartyUseVendBankAcc == NoYes::Yes;
+
+        select count(RecId) from sks_EFT_VendorPaymFirstLoc
+            group by VendAccount, VendBankAccountId, WCrePartyBankId, WCrePartySwift, WCrePartyAcct, WCrePartyBankName, WCrePartyName,
+                        WCrePartyAddr, WCrePartyCity, WIntBankCity, WCrePartyCountryRegionId
+            where sks_EFT_VendorPaymFirstLoc.VendAccount               == sks_EFT_VendorPaymFirstLine.VendAccount
+                && sks_EFT_VendorPaymFirstLoc.VendBankAccountId        == sks_EFT_VendorPaymFirstLine.VendBankAccountId
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyBankId          == sks_EFT_VendorPaymFirstLine.WCrePartyBankId
+                && sks_EFT_VendorPaymFirstLoc.WCrePartySwift           == sks_EFT_VendorPaymFirstLine.WCrePartySwift
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyAcct            == sks_EFT_VendorPaymFirstLine.WCrePartyAcct
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyBankName        == sks_EFT_VendorPaymFirstLine.WCrePartyBankName
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyName            == sks_EFT_VendorPaymFirstLine.WCrePartyName
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyAddr            == sks_EFT_VendorPaymFirstLine.WCrePartyAddr
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyCity            == sks_EFT_VendorPaymFirstLine.WCrePartyCity
+                && sks_EFT_VendorPaymFirstLoc.WCrePartyCountryRegionId == sks_EFT_VendorPaymFirstLine.WCrePartyCountryRegionId;
+
+        countGroupTotal = sks_EFT_VendorPaymFirstLoc.RecId;
+
+        if(countGroupTotal == countTotalRecord)
+        {
+            changecompany(_vendBankAccount.company())
+            {
+                vendBankAccountLocUpt = _vendBankAccount;
+                vendBankAccountLocUpt.selectForUpdate(true);
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyBankId          = sks_EFT_VendorPaymFirstLine.WCrePartyBankId;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartySwift           = sks_EFT_VendorPaymFirstLine.WCrePartySwift;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyAcct            = sks_EFT_VendorPaymFirstLine.WCrePartyAcct;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyBankName        = sks_EFT_VendorPaymFirstLine.WCrePartyBankName;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyName            = sks_EFT_VendorPaymFirstLine.WCrePartyName;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyAddr            = sks_EFT_VendorPaymFirstLine.WCrePartyAddr;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyCity            = sks_EFT_VendorPaymFirstLine.WCrePartyCity;
+                vendBankAccountLocUpt.SKS_IHB_WCrePartyCountryRegionId = sks_EFT_VendorPaymFirstLine.WCrePartyCountryRegionId;
+                vendBankAccountLocUpt.doUpdate();
+            }
+        }
+        else
+        {
+            update_recordset sks_EFT_VendorPaymUpdate
+                setting WCrePartyUseVendBankAcc = NoYes::No
+                where sks_EFT_VendorPaymUpdate.VendAccount == _vendBankAccount.VendAccount
+                     && sks_EFT_VendorPaymUpdate.VendBankAccountId == _vendBankAccount.AccountID;
+        }
+
+        update_recordset sks_EFT_VendorPaymUpdate
+            setting WCrePartyUseVendBankAcc = NoYes::Yes
+                where sks_EFT_VendorPaymUpdate.VendAccount           == _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymUpdate.VendBankAccountId        == _vendBankAccount.AccountID
+                && sks_EFT_VendorPaymUpdate.WCrePartyBankId          == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartySwift           == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartyAcct            == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartyBankName        == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartyName            == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartyAddr            == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartyCity            == ''
+                && sks_EFT_VendorPaymUpdate.WCrePartyCountryRegionId == '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIntermediaryOnPaymSpec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update for Credit party
+    /// </summary>
+    /// <param name = "_vendBankAccount"></param>
+    /// 9536 - data upgrade for Vendor bank account and payment spec
+    public static void updateIntermediaryOnPaymSpec(VendBankAccount _vendBankAccount)
+    {
+        SKS_EFT_VendorPaym sks_EFT_VendorPaymFirstLine;
+        SKS_EFT_VendorPaym sks_EFT_VendorPaymFirstLoc;
+        VendBankAccount vendBankAccountLocUpt;
+        SKS_EFT_VendorPaym sks_EFT_VendorPaymUpdate;
+        RecIdCount countTotalRecord;
+        RecIdCount countGroupTotal;
+
+        select count(RecId) from sks_EFT_VendorPaymFirstLine
+            where sks_EFT_VendorPaymFirstLine.VendAccount ==  _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymFirstLine.VendBankAccountId == _vendBankAccount.AccountID
+                && sks_EFT_VendorPaymFirstLine.WIntUseVendBankAcc == NoYes::Yes;
+
+        countTotalRecord = sks_EFT_VendorPaymFirstLine.RecId;
+
+        select firstOnly * from sks_EFT_VendorPaymFirstLine
+            where sks_EFT_VendorPaymFirstLine.VendAccount ==  _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymFirstLine.VendBankAccountId == _vendBankAccount.AccountID
+                && sks_EFT_VendorPaymFirstLine.WIntUseVendBankAcc == NoYes::Yes;
+
+        select count(RecId) from sks_EFT_VendorPaymFirstLoc
+            group by VendAccount, VendBankAccountId, WIntBankId, WIntBankSwift, WIntBankAcct, WIntBankName, WIntBankBranch,
+                        WIntBankAddr, WIntBankAddr2, WIntBankCity, WIntBankCountryRegionId
+            where sks_EFT_VendorPaymFirstLoc.VendAccount               == sks_EFT_VendorPaymFirstLine.VendAccount
+                && sks_EFT_VendorPaymFirstLoc.VendBankAccountId        == sks_EFT_VendorPaymFirstLine.VendBankAccountId
+                && sks_EFT_VendorPaymFirstLoc.WIntBankId               == sks_EFT_VendorPaymFirstLine.WIntBankId
+                && sks_EFT_VendorPaymFirstLoc.WIntBankSwift            == sks_EFT_VendorPaymFirstLine.WIntBankSwift
+                && sks_EFT_VendorPaymFirstLoc.WIntBankAcct             == sks_EFT_VendorPaymFirstLine.WIntBankAcct
+                && sks_EFT_VendorPaymFirstLoc.WIntBankName             == sks_EFT_VendorPaymFirstLine.WIntBankName
+                && sks_EFT_VendorPaymFirstLoc.WIntBankBranch           == sks_EFT_VendorPaymFirstLine.WIntBankBranch
+                && sks_EFT_VendorPaymFirstLoc.WIntBankAddr             == sks_EFT_VendorPaymFirstLine.WIntBankAddr
+                && sks_EFT_VendorPaymFirstLoc.WIntBankAddr2            == sks_EFT_VendorPaymFirstLine.WIntBankAddr2
+                && sks_EFT_VendorPaymFirstLoc.WIntBankCity             == sks_EFT_VendorPaymFirstLine.WIntBankCity
+                && sks_EFT_VendorPaymFirstLoc.WIntBankCountryRegionId  == sks_EFT_VendorPaymFirstLine.WIntBankCountryRegionId;
+
+        countGroupTotal = sks_EFT_VendorPaymFirstLoc.RecId;
+
+        if(countGroupTotal == countTotalRecord)
+        {
+            changecompany(_vendBankAccount.company())
+            {
+                vendBankAccountLocUpt = _vendBankAccount;
+                vendBankAccountLocUpt.selectForUpdate(true);
+                vendBankAccountLocUpt.SKS_IHB_WIntBankId              = sks_EFT_VendorPaymFirstLine.WIntBankId;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankSwift           = sks_EFT_VendorPaymFirstLine.WIntBankSwift;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankAcct            = sks_EFT_VendorPaymFirstLine.WIntBankAcct;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankName            = sks_EFT_VendorPaymFirstLine.WIntBankName;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankBranch          = sks_EFT_VendorPaymFirstLine.WIntBankBranch;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankAddr            = sks_EFT_VendorPaymFirstLine.WIntBankAddr;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankAddr2           = sks_EFT_VendorPaymFirstLine.WIntBankAddr2;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankCity            = sks_EFT_VendorPaymFirstLine.WIntBankCity;
+                vendBankAccountLocUpt.SKS_IHB_WIntBankCountryRegionId = sks_EFT_VendorPaymFirstLine.WIntBankCountryRegionId;
+                vendBankAccountLocUpt.doUpdate();
+            }
+        }
+        else
+        {
+            update_recordset sks_EFT_VendorPaymUpdate
+                setting WIntUseVendBankAcc = NoYes::No
+                where sks_EFT_VendorPaymUpdate.VendAccount == _vendBankAccount.VendAccount
+                     && sks_EFT_VendorPaymUpdate.VendBankAccountId == _vendBankAccount.AccountID;
+        }
+
+        update_recordset sks_EFT_VendorPaymUpdate
+            setting WIntUseVendBankAcc = NoYes::Yes
+                where sks_EFT_VendorPaymUpdate.VendAccount           == _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymUpdate.VendBankAccountId        == _vendBankAccount.AccountID
+                && sks_EFT_VendorPaymUpdate.WIntBankId               == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankSwift            == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankAcct             == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankName             == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankBranch           == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankAddr             == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankAddr2            == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankCity             == ''
+                && sks_EFT_VendorPaymUpdate.WIntBankCountryRegionId  == '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBeneficiarynPaymSpec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update for Beneficiary bank
+    /// </summary>
+    /// <param name = "_vendBankAccount"></param>
+    /// 9536 - data upgrade for Vendor bank account and payment spec
+    public static void updateBeneficiarynPaymSpec(VendBankAccount _vendBankAccount)
+    {
+        SKS_EFT_VendorPaym  sks_EFT_VendorPaymUpdate;
+
+        update_recordset sks_EFT_VendorPaymUpdate
+            setting WBeneUseVendBankAcc = NoYes::Yes
+                where sks_EFT_VendorPaymUpdate.VendAccount    == _vendBankAccount.VendAccount
+                && sks_EFT_VendorPaymUpdate.VendBankAccountId == _vendBankAccount.AccountID
+                 && sks_EFT_VendorPaymUpdate.WBenBankName     == _vendBankAccount.SKS_IHB_WCrePartyName
+                 && sks_EFT_VendorPaymUpdate.WBenBankAddr     == _vendBankAccount.SKS_IHB_WCrePartyAddr
+                 && sks_EFT_VendorPaymUpdate.WBenBankCity     == _vendBankAccount.SKS_IHB_WCrePartyCity
+                 && sks_EFT_VendorPaymUpdate.WBenBankCountryRegionId == _vendBankAccount.SKS_IHB_WCrePartyCountryRegionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAnalysisType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update analysis type base on parse rule setup
+    /// </summary>
+    /// 10187
+    private static void updateAnalysisType()
+    {
+        SKS_LB_RemitTxtAnalysis remitTxtAnalysis;
+        SKS_LB_RemitTxtParse remitTxtParse;
+
+        // update as customer invoice when Customer matching type is set
+        update_recordset remitTxtAnalysis
+            setting AnalysisType = SKS_LB_AnalysisType::Customer
+           join remitTxtParse where remitTxtParse.SKS_LB_RemitTxtAnalysis == remitTxtAnalysis.RuleId
+             && remitTxtParse.CustMatchType != SKS_LB_CustMatchType::Balnk;
+
+        // update as customer invoice when Customer matching type is not set
+        update_recordset remitTxtAnalysis
+            setting AnalysisType = SKS_LB_AnalysisType::CustomerInvoice
+            join remitTxtParse where remitTxtParse.SKS_LB_RemitTxtAnalysis == remitTxtAnalysis.RuleId
+                                     && remitTxtParse.CustMatchType == SKS_LB_CustMatchType::Balnk;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRegNotify</Name>
+				<Source><![CDATA[
+    private static void updateRegNotify()
+    {
+        SKS_EB_RegNotify lSKS_EB_RegNotify;
+        str locRegVersion;
+        int locDotIdx, locDotIdx2, locDotIdx3;
+        int locMajorVer;
+        int locMinorVer;
+        int locSubVer;
+
+        // Data is not company specific so no need for crosscompany query
+        select firstonly forupdate lSKS_EB_RegNotify;
+
+        if(!lSKS_EB_RegNotify)
+        {
+            lSKS_EB_RegNotify.Reminder1Days = 60;
+            lSKS_EB_RegNotify.Reminder1Repeat = 3;
+            lSKS_EB_RegNotify.Reminder1Text = 'Renewal Notice for your Treasury Automation Suite from SK Global Software.  This is a friendly reminder that your subscription will expire on %ExpireDate%.  An email reminder is also being sent to %NotifyEmail%.';
+
+            lSKS_EB_RegNotify.Reminder2Days = 30;
+            lSKS_EB_RegNotify.Reminder2Repeat = 4;
+            lSKS_EB_RegNotify.Reminder2Text = 'Payment Request for your Treasury Automation Suite from SK Global Software.  Please review your records and submit payment for your subscription renewal - it will expire on %ExpireDate%.  At that time the software will no longer function.  An email reminder is also being sent to %NotifyEmail%.';
+
+            lSKS_EB_RegNotify.ReminderFinalDays = 7;
+            lSKS_EB_RegNotify.ReminderFinalRepeat = 3;
+            lSKS_EB_RegNotify.ReminderFinalText = 'URGENT Payment Request for your Treasury Automation Suite from SK Global Software.  Your subscription will expire on %ExpireDate%. Please contact SK Global or your Registered Microsoft Partner to make payment.  At that time the software will no longer function (no data will be lost).  An email reminder is also being sent to %NotifyEmail%.';
+
+            lSKS_EB_RegNotify.ReminderOverRepeat = 4;
+            lSKS_EB_RegNotify.ReminderOverText = 'CRITICALLY URGENT! - Payment is required as soon as possible for your Treasury Automation Suite from SK Global Software.  Please contact SK Global or your Registered Microsoft Partner to make payment immediately if you would like the continued use of the software. Your subscription expired on %ExpireDate%.  Your TAS software will no longer operate when your current grace period ends (no data will be lost).  Email reminders have been sent to %NotifyEmail%.';
+
+            lSKS_EB_RegNotify.UserCountPercent = 90;
+            lSKS_EB_RegNotify.UserCountRepeat = 3;
+            lSKS_EB_RegNotify.UserCountText = "@SKS:SKGUserCountIsCloseToLimit";
+
+            lSKS_EB_RegNotify.EmailCC = 'accounting@sksoft.com';
+            lSKS_EB_RegNotify.EmailReplyTo = 'accounting@sksoft.com';
+            lSKS_EB_RegNotify.EmailSubject = 'SK Global Treasury Automation Suite license notification';
+
+            lSKS_EB_RegNotify.insert();
+        }
+        else
+        {
+            locRegVersion = SKS_PP_Setup::find().RegVersion;
+            locDotIdx = SKS_PP_StringFormats::strIndexOf(locRegVersion, '.');
+            locDotIdx2 = SKS_PP_StringFormats::strIndexOf(locRegVersion, '.', locDotIdx + 1);
+            locDotIdx3 = SKS_PP_StringFormats::strIndexOf(locRegVersion, '.', locDotIdx2 + 1);
+            locMajorVer = str2Int(subStr(locRegVersion, 1, locDotIdx - 1));
+            locMinorVer = str2Int(SKS_PP_StringFormats::strSub(locRegVersion, locDotIdx + 1, locDotIdx2 - 1));
+            locSubVer = str2Int(SKS_PP_StringFormats::strSub(locRegVersion, locDotIdx2 + 1, locDotIdx3 - 1));
+
+            if( locMajorVer < 11)
+            {
+                lSKS_EB_RegNotify.UserCountExceededText = strFmt("@SKS:SKGRegNotifyFormUserCountExceeded");
+            }
+            else if(locMajorVer == 11 &&
+                locMinorVer < 6)
+            {
+                lSKS_EB_RegNotify.UserCountExceededText = strFmt("@SKS:SKGRegNotifyFormUserCountExceeded");
+            }
+            else if(locMajorVer == 11 &&
+                locMinorVer == 6 &&
+                locSubVer < 7)
+            {
+                lSKS_EB_RegNotify.UserCountExceededText = strFmt("@SKS:SKGRegNotifyFormUserCountExceeded");
+            }
+            ttsbegin;
+                lSKS_EB_RegNotify.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ePayUpgrade</Name>
+				<Source><![CDATA[
+    Private static void ePayUpgrade()
+    {
+        SKS_EPY_Currency    sks_epy_currency;
+        CurrencyCode        Currencycode;
+        Currency            Currency;
+        ;
+        currencycode = CompanyInfoHelper::standardCurrency();
+
+        select firstonly sks_epy_currency where sks_epy_currency.CurrencyCode == currencycode;
+        if(!sks_epy_currency)
+        {
+            select firstonly symbol, Txt from Currency where Currency.CurrencyCode == currencycode;
+            sks_epy_currency.currencyCode = currencycode;
+            sks_epy_currency.txt = Currency.Txt;
+            sks_epy_currency.functionalCurrency = true;
+            sks_epy_currency.symbol = Currency.Symbol;
+            sks_epy_currency.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCreateSendCompany</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update Create and send company for the TAS parameters - APEFT+/Direct Debit Setup
+    /// </summary>
+    /// FDD-10590 data upgrade for TAS parameters
+    private static void updateCreateSendCompany()
+    {
+        SKS_EFT_Setup lSKS_EFT_Setup;
+
+        select firstonly forupdate APCreateSendCompany from lSKS_EFT_Setup
+            where lSKS_EFT_Setup.APCreateSendLeter == NoYes::Yes
+                  && lSKS_EFT_Setup.APCreateSendCompany == '';
+
+        if (lSKS_EFT_Setup)
+        {
+            lSKS_EFT_Setup.APCreateSendCompany = curExt();
+            lSKS_EFT_Setup.update();
+        }
+
+        select firstonly forupdate ARCreateSendCompany from lSKS_EFT_Setup
+            where lSKS_EFT_Setup.ARCreateSendLater == NoYes::Yes
+                  && lSKS_EFT_Setup.ARCreateSendCompany == '';
+
+        if (lSKS_EFT_Setup)
+        {
+            lSKS_EFT_Setup.ARCreateSendCompany = curExt();
+            lSKS_EFT_Setup.update();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InitializeEmailTemplates</Name>
+				<Source><![CDATA[
+    private static void InitializeEmailTemplates()
+    {
+        SysEmailTable sysEmailTable;
+
+        //add the EFT eMail templates if they don't already exist
+        select firstonly sysEmailTable where sysEmailTable.EmailId == 'SKS_EFT';
+        if (!sysEmailTable)
+        {
+            SKS_EFT_SendMail::initializeTemplates();
+        }
+
+        // add the EFT eMail templates if they don't already exist
+        select firstonly sysEmailTable where sysEmailTable.EmailId == 'SKS_EFTAR' || sysEmailTable.EmailId == 'SKS_DD';
+        if (!sysEmailTable)
+        {
+            SKS_EFT_SendMail::initializeARTemplates();
+        }
+
+        //SKS_Bug_9586 -->
+        // add the direct debit mandates eMail without attachment templates if they don't already exist.
+        select firstonly RecId from sysEmailTable where sysEmailTable.EmailId == 'SKS_DD_SRS';
+        if (!sysEmailTable.RecId)
+        {
+            SKS_EFT_SendMail::initializeTemplateWithOutAttachments();
+        }
+        //SKS_Bug_9586 <--
+
+        // add the direct debit mandates eMail without attachment templates if they don't already exist.
+        select firstonly RecId from sysEmailTable where sysEmailTable.EmailId == 'SKS_EFT_SRS';
+        if (!sysEmailTable.RecId)
+        {
+            SKS_EFT_SendMail::initializeAPTemplateWithOutAttachments();
+        }
+
+        // FDD 9848 OD InterestCalculation -->
+        // add the Interest note eMail templates if they don't already exist
+        select firstonly RecId from sysEmailTable where sysEmailTable.EmailId == 'SKS_ODNote';
+        if (!sysEmailTable.RecId)
+        {
+            SKS_EFT_SendMail::initializeIHBInterestNoteTemplate();
+        }
+        // FDD 9848 OD InterestCalculation <--
+
+        // SKS FDD9652-->
+        // add the IHB eMail templates if they don't already exist.
+        select firstonly RecId from sysEmailTable where sysEmailTable.EmailId == 'IHB_Stmt';
+        if (!sysEmailTable.RecId)
+        {
+            SKS_EFT_SendMail::initializeIHBTemplate();
+        }
+        // SKS FDD9652<--
+
+        // add the direct debit mandate automation eMail templates if they don't already exist
+        select firstonly sysEmailTable where sysEmailTable.EmailId == 'SKS_DD_Ori';
+        if (!sysEmailTable)
+        {
+            SKS_DD_MandateAutomationProcess::initializeOriginalTemplate();
+        }
+
+        select firstonly sysEmailTable where sysEmailTable.EmailId == 'SKS_DD_Rm1';
+        if (!sysEmailTable)
+        {
+            SKS_DD_MandateAutomationProcess::initializeReminder1Template();
+        }
+
+        select firstonly sysEmailTable where sysEmailTable.EmailId == 'SKS_DD_Rm2';
+        if (!sysEmailTable)
+        {
+            SKS_DD_MandateAutomationProcess::initializeReminder2Template();
+        }
+
+        // 20083 - adds BR missing statements template if not exist
+        select firstonly RecId from sysEmailTable where sysEmailTable.EmailId == 'SKS_BR_Mis';
+        if (!sysEmailTable.RecId)
+        {
+            SKS_BR_MissingBankStmts::initializeTemplate();
+        }
+
+        // <15478>
+        // CC Receipt email template
+        select firstonly sysEmailTable where sysEmailTable.EmailId == 'SKS_CC_RCT';
+        if (!sysEmailTable)
+        {
+            SKS_EFT_SendMail::initializeSKSCCRCPTTemplate();
+        }
+        // </15478>
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdatePaymentCalendarRunTime</Name>
+				<Source><![CDATA[
+    public static void UpdatePaymentCalendarRunTime()
+    {
+        SKS_EFTAP_PaymentCalendar   SKS_EFTAP_PaymentCalendar;
+
+        ttsbegin;
+        while select forupdate SKS_EFTAP_PaymentCalendar where SKS_EFTAP_PaymentCalendar.rundateutc == utcDateTimeNull() && SKS_EFTAP_PaymentCalendar.Complete == NoYes::No
+        {
+            SKS_EFTAP_PaymentCalendar.RunDateUTC = DateTimeUtil::anyToDateTime(SKS_EFTAP_PaymentCalendar.RunDate);
+            SKS_EFTAP_PaymentCalendar.TimezoneRuleId = DateTimeUtil::getUserPreferredTimeZone();
+            SKS_EFTAP_PaymentCalendar.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFileRetention</Name>
+				<Source><![CDATA[
+    private static void updateFileRetention(str _previousTASVersion, SKS_PP_Setup _sks_pp_setup)
+    {
+        if(!SKS_PP_Sys::isVerAGreaterThanVerB(_previousTASVersion,'10.2.8.'))
+        {
+            SKS_EFT_Setup eft_setup;
+
+            select firstonly forupdate APPurgeFiles, APPeriodsRet, ARPurgeFiles, ARPeriodsRet from eft_setup;
+
+            if(_sks_pp_setup.PPFilePeriodsRet < 12)
+            {
+                _sks_pp_setup.PPPurgeFiles = NoYes::Yes;
+            }
+
+            if(_sks_pp_setup.LBFilePeriodsRet < 12)
+            {
+                _sks_pp_setup.LBPurgeFiles = NoYes::Yes;
+            }
+
+            if(eft_setup.APPeriodsRet < 12)
+            {
+                eft_setup.APPurgeFiles = NoYes::Yes;
+            }
+
+            if(eft_setup.ARPeriodsRet < 12)
+            {
+                eft_setup.ARPurgeFiles = NoYes::Yes;
+            }
+
+            eft_setup.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CleanFileDetailValidate</Name>
+				<Source><![CDATA[
+    private static void CleanFileDetailValidate()
+    {
+        //setTmp() seems to always set the same record id (2928) which can
+        //cause problems as validation records were not always deleted after a validation run
+        SKS_EFT_FileDetail fileDetail;
+
+        delete_from fileDetail where fileDetail.RecordSection == SKS_EFT_RecordSection::EFTValidate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateCCR</Name>
+				<Source><![CDATA[
+    //SKS_FDD_13903     Begin-->
+    private static void UpdateCCR(str _previousTASVersion, SKS_PP_Setup _sks_pp_setup)
+    {
+        SKS_CCR_BankTran locSKS_CCR_BankTran;
+        SKS_BR_FileFormat locSKS_BR_FileFormat;
+        BankAccountStatement locBankAccountStatement;
+        int64 locZBAParentID;
+        LedgerJournalName       locLedgerJournalName;
+        SKS_BR_ClickNMatchSessions locSKS_BR_ClickNMatchSessions; //13563
+        
+        delete_from locSKS_BR_ClickNMatchSessions;//13563
+
+        if(_sks_pp_setup.CCRGLCreationCompany == '')
+        {
+            _sks_pp_setup.CCRGLCreationCompany = _sks_pp_setup.company();
+        }
+
+        changecompany(_sks_pp_setup.CCRGLCreationCompany)
+        {
+            locLedgerJournalName = LedgerJournalName::find(_sks_pp_setup.CCRJournalName, true);
+            if(locLedgerJournalName)
+            {
+                locLedgerJournalName.SKS_CCR_AutoPost = _sks_pp_setup.CCRAutomaticallyPostGL;
+                locLedgerJournalName.update();
+            }
+            locLedgerJournalName = null;
+        }
+
+        /*
+        //Beause the GL Mapping tab, on imported br trans, and the unmatched br trans depends the GL Created companies to display the journal now
+        //  that field must be populated during upgrade so past imported trans don't  cause a "company not found" x++ error
+        update_recordset locSKS_CCR_BankTran
+            setting GLCreationCompany = locSKS_CCR_BankTran.company()
+            where locSKS_CCR_BankTran.GLCreationCompany == '';*/
+
+        //Because older ebanking had a fixed Comma delimiter, and newer versions allow the user to specify, if
+        //  a BR format exists that is set to delimited(formerly labeled CSV) but has no delimter in the field, it
+        //  must be an old CSV, so specify the csv on upgrade.
+        update_recordset locSKS_BR_FileFormat
+            setting FileFieldDelimiter = ','
+            where locSKS_BR_FileFormat.CCR_FileType == SKS_CCR_FileType::Delimited
+                && locSKS_BR_FileFormat.FileFieldDelimiter == ''
+                && locSKS_BR_FileFormat.CCR_IsCCRFormat == NoYes::Yes; // SKS_FDD_13903
+
+        //ISSUE 7156 -->
+        //set the "Remove leading zeroes" flage to true, when upgrading to a version that that supports leading zeroes
+        if((SKS_PP_Sys::isVerALessThanVerB(_previousTASVersion,'10.1.5.')) || (SKS_PP_Sys::isVerAEqualToVerB(_previousTASVersion,'10.1.5.')))
+        {
+            update_recordset locSKS_BR_FileFormat
+                setting RemoveLeadingZeros = NoYes::Yes;
+        }
+        //<-- ISSUE 7156
+
+        /*
+        //VSTS 11947
+        update_recordset locSKS_BR_FileFormat
+            setting EndBalanceTypeCode = 'CLBD' //this is the default ending balance type code.
+            where locSKS_BR_FileFormat.FileType == SKS_BR_FileType::CAMT_053_001_02
+                  && locSKS_BR_FileFormat.UpdateEndBalance == NoYes::Yes
+                  && locSKS_BR_FileFormat.EndBalanceTypeCode == '';*/
+
+        //Additional fields were added in 9.0.0.7 and these need to be initialized.  Post-9.0.0.7 fields should have been set during import, so this ahould never fire if you are upgrading from a post 9.0 build
+        if(SKS_PP_Sys::getSKSMajorVersion(_previousTASVersion) < 9)
+        {
+            locSKS_CCR_BankTran.skipDataMethods(true);
+
+            update_recordset locSKS_CCR_BankTran
+                        setting TranDescriptionUser = locSKS_CCR_BankTran.TranDescription
+                        where locSKS_CCR_BankTran.TranDescriptionUser == ''
+                        && locSKS_CCR_BankTran.TranDescription != '';
+
+            update_recordset locSKS_CCR_BankTran
+                        setting Matched = NoYes::Yes,
+                                MatchIndicator = SKS_BR_MatchIndicator::Green
+                        where locSKS_CCR_BankTran.ManualReconciliationID != emptyGuid();
+
+            update_recordset locSKS_CCR_BankTran
+                        setting  MatchIndicator = SKS_BR_MatchIndicator::Red
+                        where locSKS_CCR_BankTran.ManualReconciliationID == emptyGuid();
+
+            update_recordset locSKS_CCR_BankTran
+                        setting ImportedStatementDate = locBankAccountStatement.AccountStatementDate,
+                                ImportedStatementNum = locBankAccountStatement.AccountStatementNum
+                        join locBankAccountStatement where locBankAccountStatement.RecId == locSKS_CCR_BankTran.OriginalStatementRecId
+                        && locSKS_CCR_BankTran.OriginalStatementRecId > 0;
+
+            update_recordset locSKS_CCR_BankTran
+                        setting GLMatchOrCreate = SKS_CCR_GLMatchOrCreate::GLCreate
+                        where locSKS_CCR_BankTran.GLMappingRuleGroupId != ''                        
+                            && locSKS_CCR_BankTran.GLMatchOrCreate == 0;
+
+            update_recordset locSKS_CCR_BankTran
+                        setting GLMatchOrCreate = SKS_CCR_GLMatchOrCreate::GLMatch
+                        where locSKS_CCR_BankTran.MatchingRuleGroupId != ''                        
+                            && locSKS_CCR_BankTran.GLMatchOrCreate == 0;
+
+            update_recordset locSKS_CCR_BankTran
+                        setting GLMatchOrCreate = SKS_CCR_GLMatchOrCreate::GLMatch
+                        where locSKS_CCR_BankTran.GLMappingRuleGroupId == ''
+                            && locSKS_CCR_BankTran.MatchingRuleGroupId == ''
+                            && locSKS_CCR_BankTran.ManualReconciliationID != emptyGuid()                            
+                            && locSKS_CCR_BankTran.GLMatchOrCreate == 0;
+
+            locZBAParentID = 0;
+        }
+        
+        //19498 we are adding a date format field.  We need to initialize it for versions of TAS that existed prior to this field's existance. 
+        if(SKS_PP_SYS::isVerALessThanVerB(_sks_pp_setup.RegVersion, '11.5.3.00'))
+        {
+            update_recordset locSKS_BR_FileFormat
+                    setting CCR_Adyen_DateFormatInFiles = SKS_EB_DateFormat::YMD
+                    where locSKS_BR_FileFormat.CCR_FileType == SKS_CCR_FileType::Adyen
+                        && locSKS_BR_FileFormat.CCR_Adyen_DateFormatInFiles == SKS_EB_DateFormat::Blank;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCountryIBANRequired</Name>
+				<Source><![CDATA[
+    private static void updateCountryIBANRequired()
+    {
+        LogisticsAddressCountryRegion locLogisticsAddressCountryRegion;
+
+        while select ISOcode, SKS_IBANReqd from locLogisticsAddressCountryRegion
+            where locLogisticsAddressCountryRegion.SKS_IBANReqd == NoYes::No
+        {
+            boolean isCountryIBANReqd;
+
+            switch(locLogisticsAddressCountryRegion.ISOcode)
+            {
+                case "AL":
+                case "AD":
+                case "AT":
+                case "AZ":
+                case "BH":
+                case "BY":
+                case "BE":
+                case "BA":
+                case "BR":
+                case "BG":
+                case "CR":
+                case "HR":
+                case "CY":
+                case "CZ":
+                case "DK":
+                case "DO":
+                case "EG":
+                case "SV":
+                case "EE":
+                case "FO":
+                case "FI":
+                case "FR":
+                case "GE":
+                case "DE":
+                case "GI":
+                case "GR":
+                case "GL":
+                case "GT":
+                case "VA":
+                case "HU":
+                case "IS":
+                case "IQ":
+                case "IE":
+                case "IL":
+                case "IT":
+                case "JO":
+                case "KZ":
+                case "XK":
+                case "KW":
+                case "LV":
+                case "LB":
+                case "LY":
+                case "LI":
+                case "LT":
+                case "LU":
+                case "MT":
+                case "MR":
+                case "MU":
+                case "MD":
+                case "MC":
+                case "ME":
+                case "NL":
+                case "MK":
+                case "NO":
+                case "PK":
+                case "PS":
+                case "PL":
+                case "PT":
+                case "QA":
+                case "RO":
+                case "LC":
+                case "SM":
+                case "ST":
+                case "SA":
+                case "RS":
+                case "SC":
+                case "SK":
+                case "SI":
+                case "ES":
+                case "SD":
+                case "SE":
+                case "CH":
+                case "TL":
+                case "TN":
+                case "TR":
+                case "UA":
+                case "AE":
+                case "GB":
+                case "VG":
+                    isCountryIBANReqd = true;
+                    break;
+            }
+
+            if(isCountryIBANReqd)
+            {
+                ttsbegin;
+                locLogisticsAddressCountryRegion.selectForUpdate(true);
+                locLogisticsAddressCountryRegion.SKS_IBANReqd = NoYes::Yes;
+                locLogisticsAddressCountryRegion.update();
+                ttscommit;
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBRWorkflowAutoPostFields</Name>
+				<Source><![CDATA[
+    private static void updateBRWorkflowAutoPostFields()
+    {
+        SKS_PP_Setup locSetUp, locSetUpUpdate;
+
+        locSetUp = null;
+
+        while select forupdate crosscompany locSetUp where locSetUp.ModBR == NoYes::Yes && locSetUp.BRManualJournalName == ""
+        {
+            changecompany(locSetUp.company())
+            {
+                ttsbegin;
+                locSetUp.BRAutoSubmitWorkFlow = NoYes::No;
+                locSetUp.BRManualEntry = NoYes::Yes;
+                locSetUp.BRDefaultFromImportJournal = NoYes::Yes;
+                locSetUp.BRManualJournalName = locSetUp.BRJournalName;
+                locSetUp.BRAutoPostManualEntries = NoYes::Yes;
+                locSetUp.BRAutoPostCustSettlement = NoYes::Yes;
+
+                locSetUp.doUpdate();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTASPRAInvoiceMatchHierachyPurpose</Name>
+				<Source><![CDATA[
+    //SKS_DevOps_21921 Start
+    private static void updateTASPRAInvoiceMatchHierachyPurpose()
+    {
+        void createOMHierarchy(OMHierarchyType _OMHierarchyType, anytype _hierarchyPurpose, anytype _isDefault)
+        {
+            OMHierarchyPurpose      hierarchyPurpose;
+
+            hierarchyPurpose.selectForUpdate(true);
+
+            select count(RecId) from hierarchyPurpose
+                where hierarchyPurpose.HierarchyType == _OMHierarchyType.RecId &&
+                hierarchyPurpose.HierarchyPurpose == HierarchyPurpose::SKS_PRA_InvoiceMatch;
+
+            if(hierarchyPurpose.RecId <= 0)
+            {
+                ttsbegin;
+                hierarchyPurpose.clear();
+                hierarchyPurpose.IsImmutable = NoYes::No;
+                hierarchyPurpose.HierarchyType = _OMHierarchyType.RecId;
+                hierarchyPurpose.HierarchyPurpose = _hierarchyPurpose;
+                hierarchyPurpose.insert();
+                ttscommit;
+            }
+        }
+
+        
+        OMHierarchyPurpose lOMHierarchyPurpose;
+        OMHierarchyType lOMHierarchyType;
+
+        while select lOMHierarchyPurpose where lOMHierarchyPurpose.HierarchyPurpose == HierarchyPurpose::CentralizedPayments
+            join lOMHierarchyType where lOMHierarchyType.RecId == lOMHierarchyPurpose.HierarchyType
+        {
+
+            //Create assortment hierarchy
+            createOMHierarchy(lOMHierarchyType, HierarchyPurpose::SKS_PRA_InvoiceMatch, 0);
+        }
+    }
+
+    //SKS_DevOps_21921 End
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

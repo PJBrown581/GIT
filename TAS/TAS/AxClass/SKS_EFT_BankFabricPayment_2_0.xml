@@ -1,0 +1,1711 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_BankFabricPayment_2_0</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Collections;
+
+/// <summary>
+/// Class for creating payment files using BankFabric library
+/// </summary>
+class SKS_EFT_BankFabricPayment_2_0 extends SKS_EFT_BankFabricPayment
+{      
+    public EFT.DataContract_2_0.PaymentFile paymentFile;
+    public EFT.DataContract_2_0.Payment payment;
+
+    SKS_EFT_FileDetail lSKS_EFT_FileDetail;
+    SKS_EFT_FileDetail_PaymentLine lSKS_EFT_FileDetail_PaymentLine;
+    SKS_EFT_FileDetail_BankAccount gSKS_EFT_FileDetail_BankAccount;
+    SKS_EFT_FileDetail_CustAddress gSKS_EFT_FileDetail_CustAddress;
+    SKS_EFT_FileDetail_Addresses gSKS_EFT_FileDetail_CustBankAddresses, gSKS_EFT_FileDetail_BankAddresses, gSKS_EFT_FileDetail_VendCountryAddresses, gSKS_EFT_FileDetail_Addresses, gSKS_EFT_FileDetail_VendBankAddress;
+    SKS_EFT_FileDetail_VendAddress gSKS_EFT_FileDetail_VendAddress;
+    SKS_EFT_FileDetail_BenBank gSKS_EFT_FileDetail_BenBank;
+    SKS_EFT_FileDetail_Mandate gSKS_EFT_FileDetail_Mandate;
+    SKS_EFT_FileDetail_Intermediary gSKS_EFT_FileDetail_Intermediary;
+    SKS_EFT_FileDetail_CreditParty gSKS_EFT_FileDetail_CreditParty;
+    SKS_EFT_FileDetail_AddendaHeader gSKS_EFT_FileDetail_AddendaHeader;
+    sKS_EFT_FileDetail_Instructions gsKS_EFT_FileDetail_Instructions;
+    SKS_EFT_EDI gSKS_EFT_EDI;
+    ledgerJournalTrans gledgerJournalTrans;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>sendPayments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Entry point for creating payment files using BankFabric library
+    /// </summary>
+    /// <returns>Response will contain exceptions if any errors occurred during processing</returns>
+    protected SKG_File.Models.SKGResponseModel sendPayments()
+    {
+        SKG_File.Models.SKGResponseModel response;        
+
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(gSKS_EFT_File.BFBankIntegration);
+
+        //fileHub.parmThrowErrorIfException(false);
+
+        EFT.DataContract_2_0.PaymentFile paymentData = this.buildPaymentFileData();
+        if(gErrorText != '')
+        {
+            response = new SKG_File.Models.SKGResponseModel();
+            response.SetException(gErrorText);
+        }
+        else
+        {
+            str strPaymentData = SKS_EFT_BankFabricPayment::serializeObject(paymentData.GetType(), paymentData);
+            if(gSKS_EFT_File.APIFormatType == SKS_EFT_APIFormatType::API)
+            {
+                response = fileHub.callPaymentCreate(strPaymentData, gSKS_EFT_File, paymentData.FormatGroup, paymentData.FormatGroupVersion, paymentData.DataContractVersion);
+            }
+            else
+            {
+                response = fileHub.callPayment(strPaymentData, gSKS_EFT_File, paymentData.FormatGroup, paymentData.FormatGroupVersion, paymentData.DataContractVersion, paymentData.XOther.FileCRLF,gCompareFiles);
+                
+                mBFNewFileName = fileHub.getBFNewFileName();
+                mBFNewCtrlFileName = fileHub.getBFNewControlFileName();
+            }
+
+        }
+        return response;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPaymentFileData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build payment file 
+    /// </summary>
+    protected EFT.DataContract_2_0.PaymentFile buildPaymentFileData()
+    {
+        paymentFile = new EFT.DataContract_2_0.PaymentFile();
+
+        SKS_PP_Setup lSKS_PP_Setup;
+        select firstonly RegCustomerID from lSKS_PP_Setup;
+
+        // Payment file
+        paymentFile.FileNumber = gSKS_EFT_File.FileNbr;
+        paymentFile.FormatGroup = gSKS_EFT_FileFormat.FormatGroup;
+        paymentFile.FormatGroupVersion = gSKS_EFT_FileFormat.FormatGroupVersion;
+        if(gSKS_EFT_FileFormat.FormatGroupDataContractVersion)
+        {
+            paymentFile.DataContractVersion = gSKS_EFT_FileFormat.FormatGroupDataContractVersion;
+        }
+        else
+        {
+            paymentFile.DataContractVersion = '1.0';
+        }
+        paymentFile.TASSerialNumber = lSKS_PP_Setup.RegCustomerID;
+
+        // DD and BTB transfer in are treated like DD. 
+        // AP, Customer reimbursement and BTB transfer out are treated like AP
+        if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AR || 
+            (gSKS_EFT_File.EFTFileType == SKS_EFT_Module::BTB && gSKS_EFT_File.TransferDirection == SKS_BTB_TransferType::Transfer_in))
+        {
+            paymentFile.Module = EFT.DataContract_2_0.Module::DirectDebit;
+        }
+        else
+        {
+            paymentFile.Module = EFT.DataContract_2_0.Module::AccountsPayable;
+        }
+        paymentFile.RecordLength = gSKS_EFT_FileFormat.RecordLength;
+
+        // Initialize EDI class
+        if(gSKS_EFT_FileFormat.EDI)
+        {
+            if(paymentFile.Module == EFT.DataContract_2_0.Module::AccountsPayable)
+            {
+                SKS_EFT_FileDetail_AddendaDetailConfig lSKS_EFT_FileDetail_AddendaDetailConfig = SKS_EFT_FileDetail_AddendaDetailConfig::find(lSKS_EFT_FileDetail.RecId);
+                gSKS_EFT_EDI = new SKS_EFT_EDI(gSKS_EFT_File.FormatId, lSKS_EFT_FileDetail.PaymSpec, lSKS_EFT_FileDetail_AddendaDetailConfig.EDI820Layout, gSKS_EFT_File.RecId);
+            }
+            else
+            {
+                gSKS_EFT_EDI = new SKS_EFT_EDI(gSKS_EFT_File.FormatId, lSKS_EFT_FileDetail.PaymSpec, '', gSKS_EFT_File.RecId);
+            }
+            gSKS_EFT_EDI.setEFTFileId(num2str(gSKS_EFT_FileFormat.NextFileId,0,0,0,0));
+            this.paymentFileEDIEnvelope();
+        }
+        this.paymentFileXOther();
+
+        this.paymentFileBankHolidays();
+
+        this.buildPayments();
+
+        return paymentFile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paymentFileBankHolidays</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bank holidays
+    /// </summary>
+    protected void paymentFileBankHolidays()
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentBankHoliday> bankHolidays = new Generic.List<EFT.DataContract_2_0.PaymentBankHoliday>();
+        EFT.DataContract_2_0.PaymentBankHoliday bankHoliday;
+
+        str bankHolidayGroup;
+        if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AR)
+        {
+            bankHolidayGroup = gSKS_EFTAR_Bank.BankHolidayGroupId;
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::BTB)
+        {
+            bankHolidayGroup = gSKS_EFTBTB_Bank.BankHolidayGroupId;
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::CNP)
+        {
+            bankHolidayGroup = gSKS_EFTCNP_Bank.BankHolidayGroupId;
+        }
+        else
+        {
+            bankHolidayGroup = gSKS_EFTAP_Bank.BankHolidayGroupId;
+        }
+
+        if(bankHolidayGroup != '')
+        {
+            SKS_EB_BankHolidays lSKS_EB_BankHolidays;
+            SKS_EFT_FileDetail locSKS_EFT_FileDetail;
+            SKS_EB_Date minPmtDate;
+            SKS_EB_Date maxPmtDate;
+
+            select minof(EffectiveDate) from locSKS_EFT_FileDetail where locSKS_EFT_FileDetail.FileRecId == gSKS_EFT_File.RecId &&
+            locSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+            locSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+            minPmtDate = locSKS_EFT_FileDetail.EffectiveDate - 7;
+
+            select maxOf(EffectiveDate) from locSKS_EFT_FileDetail where locSKS_EFT_FileDetail.FileRecId == gSKS_EFT_File.RecId &&
+            locSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+            locSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+            maxPmtDate = locSKS_EFT_FileDetail.EffectiveDate + 7;
+
+            while select lSKS_EB_BankHolidays
+                where lSKS_EB_BankHolidays.GroupID == bankHolidayGroup &&
+                lSKS_EB_BankHolidays.HolidayDate >= minPmtDate && 
+                lSKS_EB_BankHolidays.HolidayDate <= maxPmtDate
+            {
+                bankHoliday = new EFT.DataContract_2_0.PaymentBankHoliday();
+                bankHoliday.HolidayDate = lSKS_EB_BankHolidays.HolidayDate;
+                bankHolidays.Add(bankHoliday);
+            }
+        }
+
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = bankHolidays;
+        paymentFile.BankHolidays = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paymentFileEDIEnvelope</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// EDI envelope
+    /// </summary>
+    protected void paymentFileEDIEnvelope()
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentEDIEnvelope> ediEnvelopes = new Generic.List<EFT.DataContract_2_0.PaymentEDIEnvelope>();
+        EFT.DataContract_2_0.PaymentEDIEnvelope ediEnvelope;
+
+        //ISA
+        ediEnvelope = new EFT.DataContract_2_0.PaymentEDIEnvelope();
+        ediEnvelope.Segment = EFT.DataContract_2_0.EDISegment::ISA;
+        ediEnvelope.Value = gSKS_EFT_EDI.buildISA();
+        ediEnvelopes.Add(ediEnvelope);
+
+        //GS
+        ediEnvelope = new EFT.DataContract_2_0.PaymentEDIEnvelope();
+        ediEnvelope.Segment = EFT.DataContract_2_0.EDISegment::GS;
+        ediEnvelope.Value = gSKS_EFT_EDI.buildGS();
+        ediEnvelopes.Add(ediEnvelope);
+
+        //GE
+        ediEnvelope = new EFT.DataContract_2_0.PaymentEDIEnvelope();
+        ediEnvelope.Segment = EFT.DataContract_2_0.EDISegment::GE;
+        gSKS_EFT_EDI.setTranSetCount(1); //This value will need changed in the format
+        ediEnvelope.Value = gSKS_EFT_EDI.buildGE();
+        ediEnvelopes.Add(ediEnvelope);
+
+        //IEA
+        ediEnvelope = new EFT.DataContract_2_0.PaymentEDIEnvelope();
+        ediEnvelope.Segment = EFT.DataContract_2_0.EDISegment::IEA;
+        gSKS_EFT_EDI.setFunctionalGroupCount(1); //This value may need changed in the format
+        ediEnvelope.Value = gSKS_EFT_EDI.buildIEA();
+        ediEnvelopes.Add(ediEnvelope);
+
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = ediEnvelopes;
+        paymentFile.EDIEnvelopes = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paymentFileXOther</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Payment file XOther
+    /// </summary>
+    protected void paymentFileXOther()
+    {
+        // Payment file xOther
+        EFT.DataContract_2_0.PaymentFilexOther paymentFileXOther = new EFT.DataContract_2_0.PaymentFilexOther();
+        this.setPaymentFileXOther(paymentFileXOther);
+                                
+        if(gSKS_EFT_FileFormat.EDI)
+        {
+            paymentFileXOther.EDISeparator = gSKS_EFT_EDI.getDataElementSeparator();
+            paymentFileXOther.EDISegmentTerminator = gSKS_EFT_EDI.getSegmentTerminator();
+        }
+
+        paymentFile.XOther = paymentFileXOther;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPaymentFileXOther</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Payment file XOther fields
+    /// </summary>
+    protected void setPaymentFileXOther(EFT.DataContract_2_0.PaymentFilexOther paymentFileXOther)
+    {
+        // From bank
+        if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AR)
+        {
+            //paymentFile.ACHFileIdModifier = gSKS_EFTAR_Bank.ACHFileIDModifier;
+            paymentFileXOther.ACHIncludeOffset = gSKS_EFTAR_Bank.ARACHInclCR;
+            paymentFileXOther.BlockFill = gSKS_EFTAR_Bank.FillBlock;
+            paymentFileXOther.FileCRLF = gSKS_EFTAR_Bank.FileCrLf;
+            paymentFileXOther.ACHFileIdModifier = gSKS_EFTAR_Bank.ACHFileIDModifier;
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::BTB)
+        {
+            paymentFileXOther.ACHIncludeOffset = gSKS_EFTBTB_Bank.BBACHInclDR;
+            paymentFileXOther.BlockFill = gSKS_EFTBTB_Bank.FillBlock;
+            paymentFileXOther.FileCRLF = gSKS_EFTBTB_Bank.FileCrLf;
+            paymentFileXOther.ACHFileIdModifier = gSKS_EFTBTB_Bank.ACHFileIDModifier;
+            paymentFileXOther.BankToBankTransfer = true;
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::CNP)
+        {
+            paymentFileXOther.ACHIncludeOffset = gSKS_EFTCNP_Bank.CNPACHInclDR;
+            paymentFileXOther.BlockFill = gSKS_EFTCNP_Bank.FillBlock;
+            paymentFileXOther.FileCRLF = gSKS_EFTCNP_Bank.FileCrLf;
+            paymentFileXOther.ACHFileIdModifier = gSKS_EFTCNP_Bank.ACHFileIDModifier;
+        }
+        else
+        {
+            //paymentFile.ACHFileIdModifier = gSKS_EFTAP_Bank.ACHFileIDModifier;
+            paymentFileXOther.ACHIncludeOffset = gSKS_EFTAP_Bank.APACHInclDR;
+            paymentFileXOther.BlockFill = gSKS_EFTAP_Bank.FillBlock;
+            paymentFileXOther.FileCRLF = gSKS_EFTAP_Bank.FileCrLf;
+            paymentFileXOther.ACHFileIdModifier = gSKS_EFTAP_Bank.ACHFileIDModifier;
+        }
+        paymentFileXOther.ControlFileFormatId = gSKS_EFT_File.ControlFileFormatId;
+        paymentFileXOther.CompanyName = CompanyInfo::find().Name();
+        paymentFileXOther.NextFileId = gNextFileId;
+        paymentFileXOther.NextSequenceNumber = gNextSequenceNumber;
+        paymentFileXOther.PaymentFileKey = gSKS_EFT_File.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPayments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Payments
+    /// </summary>
+    protected void buildPayments()
+    {
+        Generic.List<EFT.DataContract_2_0.Payment> Payments = new Generic.List<EFT.DataContract_2_0.Payment>();
+
+        while select lSKS_EFT_FileDetail where lSKS_EFT_FileDetail.FileRecId == gSKS_EFT_File.RecId &&
+            lSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+            lSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary
+            outer join lSKS_EFT_FileDetail_PaymentLine where
+                lSKS_EFT_FileDetail_PaymentLine.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_BankAccount where
+                gSKS_EFT_FileDetail_BankAccount.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_CustAddress where
+                gSKS_EFT_FileDetail_CustAddress.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_VendAddress where
+                gSKS_EFT_FileDetail_VendAddress.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_BenBank where
+                gSKS_EFT_FileDetail_BenBank.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_Intermediary where
+                gSKS_EFT_FileDetail_Intermediary.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_CreditParty where
+                gSKS_EFT_FileDetail_CreditParty.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gsKS_EFT_FileDetail_Instructions where
+                gsKS_EFT_FileDetail_Instructions.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_AddendaHeader where 
+                gSKS_EFT_FileDetail_AddendaHeader.RefRecId == lSKS_EFT_FileDetail.RecId
+            outer join gSKS_EFT_FileDetail_CustBankAddresses where
+                (gSKS_EFT_FileDetail_CustBankAddresses.RefRecId == lSKS_EFT_FileDetail.RecId &&
+                gSKS_EFT_FileDetail_CustBankAddresses.AddressType == SKS_EFT_AddressType::CustBankAddress)
+            outer join gSKS_EFT_FileDetail_BankAddresses where
+                (gSKS_EFT_FileDetail_BankAddresses.RefRecId == lSKS_EFT_FileDetail.RecId &&
+                gSKS_EFT_FileDetail_BankAddresses.AddressType == SKS_EFT_AddressType::BankAddress)
+            outer join gSKS_EFT_FileDetail_VendCountryAddresses where
+                (gSKS_EFT_FileDetail_VendCountryAddresses.RefRecId == lSKS_EFT_FileDetail.RecId &&
+                gSKS_EFT_FileDetail_VendCountryAddresses.AddressType == SKS_EFT_AddressType::VendCountryAddress)
+            outer join gSKS_EFT_FileDetail_VendBankAddress where
+                (gSKS_EFT_FileDetail_VendBankAddress.RefRecId == lSKS_EFT_FileDetail.RecId &&
+                gSKS_EFT_FileDetail_VendBankAddress.AddressType == SKS_EFT_AddressType::VendBankAddress)
+
+        {
+            payment = new EFT.DataContract_2_0.Payment();
+            
+            gSKS_EFT_FileFormatPaymSpec = null;
+            gSKS_EFT_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(lSKS_EFT_FileDetail.PaymentCompany,lSKS_EFT_FileDetail.FormatId,lSKS_EFT_FileDetail.PaymSpec);
+
+            gledgerJournalTrans = null;
+            select firstonly crosscompany BankTransType from gledgerJournalTrans
+                            where gledgerJournalTrans.RecId == lSKS_EFT_FileDetail.PaymentLineRecId;
+
+            payment.APIGroupType = gSKS_EFT_FileFormatPaymSpec.APIGroupType;
+            payment.APIGroupName = gSKS_EFT_FileFormatPaymSpec.APIGroupName;
+
+            payment.BankPurposeCode = lSKS_EFT_FileDetail_PaymentLine.BankCentralBankPurposeCode;
+            payment.BankPurposeName = lSKS_EFT_FileDetail_PaymentLine.BankCentralBankPurposeName;
+            payment.BankPurposeText = lSKS_EFT_FileDetail_PaymentLine.BankCentralBankPurposeText;
+            if(gSKS_EFT_FileDetail_AddendaHeader.CompanyID != '')
+            {
+                payment.CompanyId = gSKS_EFT_FileDetail_AddendaHeader.CompanyID;
+            }
+            else
+            {
+                payment.CompanyId = lSKS_EFT_FileDetail.FileACHCompanyId;
+            }
+            if(gSKS_EFT_FileDetail_AddendaHeader.CompanyName != '')
+            {
+                payment.CompanyName = gSKS_EFT_FileDetail_AddendaHeader.CompanyName;
+            }
+            else
+            {
+                payment.CompanyName = lSKS_EFT_FileDetail.FileACHCompanyName;
+            }
+            payment.CurrencyCode = lSKS_EFT_FileDetail.PaymentCurrencyCode;
+            payment.EffectiveDate = lSKS_EFT_FileDetail.EffectiveDate;
+            payment.FormatId = lSKS_EFT_FileDetail.FormatId;
+            payment.ISORemittanceType = gSKS_EFT_FileFormatPaymSpec.RemitType;
+            payment.PaymentDescription = lSKS_EFT_FileDetail_PaymentLine.TransactionTxt;
+            payment.PaymentId = lSKS_EFT_FileDetail.PaymId;
+            payment.PaymentKey = lSKS_EFT_FileDetail.RecId;
+            payment.PaymentNotes = lSKS_EFT_FileDetail.PaymentNotes;
+            payment.PaymentReference = lSKS_EFT_FileDetail.PaymentReference;
+            payment.PaymentSpec = lSKS_EFT_FileDetail.PaymSpec;
+            if(gSKS_EFT_FileDetail_AddendaHeader.CompanyDescription != '')
+            {
+                payment.PaymentSpecName = gSKS_EFT_FileDetail_AddendaHeader.CompanyDescription;
+            }
+            else
+            {
+                payment.PaymentSpecName = lSKS_EFT_FileDetail.PaymSpecName;
+            }
+
+            if(lSKS_EFT_FileDetail.RecordType == SKS_EFT_RecordType::PreNote)
+            {
+                payment.Prenote = true;
+            }
+            payment.TransactionCode = lSKS_EFT_FileDetail.TransactionCode;
+
+            payment.PaymentAmountCur = lSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur;
+            if(lSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur < 0)
+            {
+                payment.DebitCredit = EFT.DataContract_2_0.DebitCreditType::Credit;
+                payment.PaymentAmountCur = payment.PaymentAmountCur * -1;
+            }
+            else if(lSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur > 0)
+            {
+                payment.DebitCredit = EFT.DataContract_2_0.DebitCreditType::Debit;
+
+            }
+            else if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+            {
+                payment.DebitCredit = EFT.DataContract_2_0.DebitCreditType::Debit; // DD prenote
+            }
+            else
+            {
+                payment.DebitCredit = EFT.DataContract_2_0.DebitCreditType::Credit; // AP prenote
+            }
+
+            this.paymentXOther();
+            this.codeLookup();
+            this.codeLookupBank();
+            this.payment_Extras();
+            this.debtor();
+            this.debtorAccount();
+            this.debtorAgent();
+            this.directDebitInfo();
+            this.creditor();
+            this.creditorAccount();
+            this.creditorAgent();
+            this.creditParty();
+            this.intermediary();
+            this.instructions();
+            this.taxWithholding();
+            this.taxWithholdTH();
+            if(gSKS_EFT_FileFormatPaymSpec.InvoiceDetail)
+            {
+                this.invoices();
+            }
+            this.addendaLines();
+
+            Payments.Add(payment);
+        }
+        if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AR)
+        {
+            this.characterReplacement(paymentFile, gSKS_EFTAR_Bank.CharacterReplacementGroupId);
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::BTB)
+        {
+            this.characterReplacement(paymentFile, gSKS_EFTBTB_Bank.CharacterReplacementGroupId);
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::CNP)
+        {
+            this.characterReplacement(paymentFile, gSKS_EFTCNP_Bank.CharacterReplacementGroupId);
+        }
+        else
+        {
+            this.characterReplacement(paymentFile, gSKS_EFTAP_Bank.CharacterReplacementGroupId);
+        }
+
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = Payments;
+        paymentFile.Payments = asObject;
+
+        this.fileHeader(paymentFile);
+        this.fileTrailer(paymentFile);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>codeLookup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Code lookup
+    /// </summary>
+    protected void codeLookup() 
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentExtra> lookups = new Generic.List<EFT.DataContract_2_0.PaymentExtra>();
+        EFT.DataContract_2_0.PaymentExtra lookup;
+
+        SKS_EFT_FileDetail_Extra lSKS_EFT_FileDetail_Extra;
+        while select lSKS_EFT_FileDetail_Extra where lSKS_EFT_FileDetail_Extra.RefRecId == lSKS_EFT_FileDetail.RecId && lSKS_EFT_FileDetail_Extra.CodeLookupType == SKS_EFT_CodeLookupType::CodeLookup
+        {
+            lookup = new EFT.DataContract_2_0.PaymentExtra();
+            lookup.Key = lSKS_EFT_FileDetail_Extra.FieldName;
+            lookup.Value = lSKS_EFT_FileDetail_Extra.Value;
+            lookups.Add(lookup);
+        }
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = lookups;
+        payment.CodeLookups = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>codeLookupBank</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Code lookup bank
+    /// </summary>
+    protected void codeLookupBank()
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentExtra> lookups = new Generic.List<EFT.DataContract_2_0.PaymentExtra>();
+        EFT.DataContract_2_0.PaymentExtra lookup;
+
+        SKS_EFT_FileDetail_Extra lSKS_EFT_FileDetail_Extra;
+        while select lSKS_EFT_FileDetail_Extra where lSKS_EFT_FileDetail_Extra.RefRecId == lSKS_EFT_FileDetail.RecId && lSKS_EFT_FileDetail_Extra.CodeLookupType == SKS_EFT_CodeLookupType::CodeLookupBank
+        {
+            lookup = new EFT.DataContract_2_0.PaymentExtra();
+            lookup.Key = lSKS_EFT_FileDetail_Extra.FieldName;
+            lookup.Value = lSKS_EFT_FileDetail_Extra.Value;
+            lookups.Add(lookup);
+        }
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = lookups;
+        payment.CodeLookupsBank = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>payment_Extras</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Payment extra key value pairs
+    /// </summary>
+    protected void payment_Extras()
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentExtra> lookups = new Generic.List<EFT.DataContract_2_0.PaymentExtra>();
+        EFT.DataContract_2_0.PaymentExtra lookup;
+
+        SKS_EFT_FileDetail_Extra lSKS_EFT_FileDetail_Extra;
+        while select lSKS_EFT_FileDetail_Extra where lSKS_EFT_FileDetail_Extra.RefRecId == lSKS_EFT_FileDetail.RecId && lSKS_EFT_FileDetail_Extra.CodeLookupType == SKS_EFT_CodeLookupType::Extra
+        {
+            lookup = new EFT.DataContract_2_0.PaymentExtra();
+            lookup.Key = lSKS_EFT_FileDetail_Extra.FieldName;
+            lookup.Value = lSKS_EFT_FileDetail_Extra.Value;
+            lookups.Add(lookup);
+        }
+                
+        
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::AccountsPayable)
+        {
+            str dbtrAgtName = LogisticsLocation::find(gSKS_EFT_FileDetail_BankAddresses.Location).Description;
+
+            if(dbtrAgtName)
+            {
+                lookup = new EFT.DataContract_2_0.PaymentExtra();
+                lookup.Key = 'DbtrAgtNm';
+                lookup.Value = dbtrAgtName;
+                lookups.Add(lookup);
+            }
+        }
+
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = lookups;
+        payment.Payment_Extras = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paymentXOther</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Payment XOther
+    /// </summary>
+    protected void paymentXOther()
+    {
+        // Payment file xOther
+        EFT.DataContract_2_0.PaymentxOther paymentXOther = new EFT.DataContract_2_0.PaymentxOther();
+
+        paymentXOther.ACHImmDest = lSKS_EFT_FileDetail.FileACHImmDest;
+        paymentXOther.ACHImmDestName = lSKS_EFT_FileDetail.FileACHImmDestName;
+        paymentXOther.ACHImmOrigin = lSKS_EFT_FileDetail.FileACHImmOrigin;
+        paymentXOther.ACHImmOriginName = lSKS_EFT_FileDetail.FileACHImmOriginName;
+        paymentXOther.ACHOrigDfi = lSKS_EFT_FileDetail.BankOrigDFI;
+        paymentXOther.ACHOrigDfiName = gSKS_EFT_FileDetail_BankAccount.ACHOrigDFIName;
+        paymentXOther.AddendaSpec = gSKS_EFT_FileFormatPaymSpec.AddendaSpec;
+        paymentXOther.AlternateReference = lSKS_EFT_FileDetail.PaymentVoucher;
+        paymentXOther.DocumentNumber = lSKS_EFT_FileDetail.DocumentNum;
+        paymentXOther.JournalNumber = lSKS_EFT_FileDetail.PaymentJournalNum;
+        paymentXOther.MethodOfPayment = lSKS_EFT_FileDetail.PaymMode;
+        paymentXOther.RFCNumber_MX = lSKS_EFT_FileDetail.Rfc_MX;
+        paymentXOther.TransactionDate = lSKS_EFT_FileDetail.PaymentTransDate;
+        paymentXOther.AddendaType = gSKS_EFT_FileDetail_AddendaHeader.AddendaType;
+
+        if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AR)
+        {
+            paymentXOther.InternalContactName = gSKS_EFTAR_Bank.SKS_DDR_ContactName;
+            paymentXOther.InternalContactEmail = gSKS_EFTAR_Bank.SKS_DDR_ContactEmail;
+            paymentXOther.InternalContactPhone = gSKS_EFTAR_Bank.SKS_DDR_ContactPhone;
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::BTB)
+        {
+            paymentXOther.InternalContactName = gSKS_EFTBTB_Bank.BBContactName;
+            paymentXOther.InternalContactEmail = gSKS_EFTBTB_Bank.BBContactEmail;
+            paymentXOther.InternalContactPhone = gSKS_EFTBTB_Bank.BBContactPhone;
+        }
+        else if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::CNP)
+        {
+            paymentXOther.InternalContactName = gSKS_EFTCNP_Bank.CNPContactName;
+            paymentXOther.InternalContactEmail = gSKS_EFTCNP_Bank.CNPContactEmail;
+            paymentXOther.InternalContactPhone = gSKS_EFTCNP_Bank.CNPContactPhone;
+        }
+        else
+        {
+            paymentXOther.InternalContactName = gSKS_EFTAP_Bank.APContactName;
+            paymentXOther.InternalContactEmail = gSKS_EFTAP_Bank.APContactEmail;
+            paymentXOther.InternalContactPhone = gSKS_EFTAP_Bank.APContactPhone;
+
+            changecompany(lSKS_EFT_FileDetail.PaymentCompany)
+            {
+                paymentFormatCodeSets_W paymentFormatCodeSets_W;
+                ledgerJournalTrans_W ledgerJournalTrans_W;
+
+                select firstonly ledgerJournalTrans_W where ledgerJournalTrans_W.LedgerJournalTrans == gledgerJournalTrans.RecId;
+
+                if(ledgerJournalTrans_W)
+                {
+                    select firstonly Code from paymentFormatCodeSets_W where
+                        paymentFormatCodeSets_W.RecId == ledgerJournalTrans_W.ServiceLevel;
+                    paymentXOther.FormatCodeServiceLevel = paymentFormatCodeSets_W.Code;
+
+                    select firstonly Code from paymentFormatCodeSets_W where
+                        paymentFormatCodeSets_W.RecId == ledgerJournalTrans_W.CategoryPurpose;
+                    paymentXOther.FormatCodeCategoryPurpose = paymentFormatCodeSets_W.Code;
+
+                    select firstonly Code from paymentFormatCodeSets_W where
+                        paymentFormatCodeSets_W.RecId == ledgerJournalTrans_W.LocalInstrument;
+                    paymentXOther.FormatCodeLocalInstrument = paymentFormatCodeSets_W.Code;
+                }
+            }
+        }
+
+        paymentXOther.BankTransactionType = gledgerJournalTrans.BankTransType;
+
+        if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AP && substr(lSKS_EFT_FileDetail.PaymSpec,1,3) == 'IAT')
+        {
+            changecompany(lSKS_EFT_FileDetail.PaymentCompany)
+            {
+                SKS_EFT_BankGateway lSKS_EFT_BankGateway;
+                lSKS_EFT_BankGateway = SKS_EFT_BankGateway::find(lSKS_EFT_FileDetail.BankAccountId, lSKS_EFT_FileDetail.PaymMode, lSKS_EFT_FileDetail.DepCountryRegionId);
+                paymentXOther.ACHGatewayDestCntryCurrencyCode = lSKS_EFT_BankGateway.DestCntryCurrenceyCode;
+                paymentXOther.ACHGatewayFxIndicator = lSKS_EFT_BankGateway.FXIndicator;
+                paymentXOther.ACHGatewayOperId = lSKS_EFT_BankGateway.GatewayOperID;
+            }
+        }
+
+        payment.XOther = paymentXOther;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>debtor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Debtor
+    /// </summary>
+    protected void debtor()
+    {
+        EFT.DataContract_2_0.PaymentDebtor debtor = new EFT.DataContract_2_0.PaymentDebtor();
+        EFT.DataContract_2_0.PaymentDebtorXOther debtorxOther = new EFT.DataContract_2_0.PaymentDebtorXOther();
+        EFT.DataContract_2_0.PaymentPostalAddress debtorAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther debtorAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+        CustTable   lCustTable;
+        DirPartyTable  lDirPartyTable;
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            debtor.Id = lSKS_EFT_FileDetail.AccountNum;
+            debtor.Name = lSKS_EFT_FileDetail.AccountName;
+
+            debtorAddress.AddressLine1 = gSKS_EFT_FileDetail_CustAddress.CustAddr;
+            debtorAddress.AddressLine2 = gSKS_EFT_FileDetail_CustAddress.CustAddr2;
+            debtorAddress.TownName = gSKS_EFT_FileDetail_CustAddress.CustCity;
+            debtorAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_CustAddress.CustCountryRegionId);
+            debtorAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_CustAddress.CustCountryRegionId).CountryRegionId;
+            debtorAddress.CountrySubDivision = gSKS_EFT_FileDetail_CustAddress.CustState;
+            debtorAddress.PostCode = gSKS_EFT_FileDetail_CustAddress.CustZipPostal;
+
+            lCustTable = CustTable::findByCompany(lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum);
+
+            select firstonly * from lDirPartyTable where lDirPartyTable.RecId == lCustTable.Party;
+
+            debtorxOther.Language = lDirPartyTable.LanguageId;
+        }
+        else
+        {
+            debtor.BICOrBEI = gSKS_EFT_FileDetail_BankAccount.WOrdPartySWIFTNo;
+            debtor.Id = gSKS_EFT_FileDetail_BankAccount.WOrdPartyId;
+            debtor.Name = gSKS_EFT_FileDetail_BankAccount.WOrdPartyName;
+
+            debtorAddress.AddressLine1 = gSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr;
+            debtorAddress.AddressLine2 = gSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr2;
+            debtorAddress.TownName = gSKS_EFT_FileDetail_BankAccount.WOrdPartyCity;
+            debtorAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_BankAccount.WOrdPartyCountryRegionId);
+            debtorAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_BankAccount.WOrdPartyCountryRegionId).CountryRegionId;
+            debtorAddress.CountrySubDivision = gSKS_EFT_FileDetail_BankAccount.WOrdPartyState;
+            debtorAddress.PostCode = gSKS_EFT_FileDetail_BankAccount.WOrdPartyZipCode;
+
+            debtorAddressxOther.CountryName = gSKS_EFT_FileDetail_BankAccount.WOrdPartyCountryName;
+
+            debtorxOther.TaxId = lSKS_EFT_FileDetail.CoRegNum;
+        }
+        debtor.XOther = debtorxOther;
+        debtorAddress.XOther = debtorAddressxOther; 
+        debtor.PostalAddress = debtorAddress;
+        payment.Debtor = debtor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>debtorAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Debtor account
+    /// </summary>
+    protected void debtorAccount()
+    {
+        EFT.DataContract_2_0.PaymentDebtorAccount debtorAccount = new EFT.DataContract_2_0.PaymentDebtorAccount();
+        EFT.DataContract_2_0.PaymentDebtorAccountXOther debtorAccountxOther = new EFT.DataContract_2_0.PaymentDebtorAccountXOther();
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            debtorAccount.BankAccountNumber = lSKS_EFT_FileDetail.DepBankAcct;
+            debtorAccount.BankAccountType = this.getBankAccountType(lSKS_EFT_FileDetail.DepBankAcctType);
+            debtorAccount.CurrencyCode = lSKS_EFT_FileDetail.DepBankCurrency;
+            debtorAccount.IBAN = lSKS_EFT_FileDetail.DepBankIBAN;
+        }
+        else
+        {
+            debtorAccount.BankAccountNumber = lSKS_EFT_FileDetail.BankBankAcct;
+            debtorAccount.BankAccountType = this.getBankAccountType(lSKS_EFT_FileDetail.BankAcctType);
+            debtorAccount.CurrencyCode = lSKS_EFT_FileDetail.CurrencyCode;
+            debtorAccount.IBAN = lSKS_EFT_FileDetail.BankBankIBAN;
+            debtorAccountxOther.BankAccountId = lSKS_EFT_FileDetail.BankAccountId;
+        }
+        debtorAccount.XOther = debtorAccountxOther;
+        payment.DebtorAccount = debtorAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBankAccountType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bank account type
+    /// </summary>
+    protected EFT.DataContract_2_0.BankAccountTypes getBankAccountType(BankAccountType _bankAccountType)
+    {
+        EFT.DataContract_2_0.BankAccountTypes retVal;
+
+        switch(_bankAccountType)
+        {
+            case BankAccountType::CheckingAccount:
+                retVal = EFT.DataContract_2_0.BankAccountTypes::CheckingAccount;
+                break;
+            case BankAccountType::SavingsAccount:
+                retVal = EFT.DataContract_2_0.BankAccountTypes::SavingsAccount;
+                break;
+            case BankAccountType::FinancialInstitutionAccount:
+                retVal = EFT.DataContract_2_0.BankAccountTypes::FinancialInstitutionAccount;
+                break;
+            case BankAccountType::LoanAccount:
+                retVal = EFT.DataContract_2_0.BankAccountTypes::LoanAccount;
+                break;
+        }
+
+        return retVal;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>debtorAgent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Debtor agent
+    /// </summary>
+    protected void debtorAgent()
+    {
+        EFT.DataContract_2_0.PaymentDebtorAgent debtorAgent = new EFT.DataContract_2_0.PaymentDebtorAgent();
+        EFT.DataContract_2_0.PaymentDebtorAgentXOther debtorAgentxOther = new EFT.DataContract_2_0.PaymentDebtorAgentXOther();
+        EFT.DataContract_2_0.PaymentPostalAddress debtorAgentAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther debtorAgentAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            debtorAgent.BankSortCode = '';
+            debtorAgent.Name = gSKS_EFT_FileDetail_CustBankAddresses.Name;
+            debtorAgent.RoutingNumber = lSKS_EFT_FileDetail.DepBankTransit;
+            debtorAgent.RoutingNumberType = lSKS_EFT_FileDetail.DepBankCodeType;
+            debtorAgent.SWIFTCode = lSKS_EFT_FileDetail.DepSwiftNo;
+
+            debtorAgentAddress.AddressLine1 = gSKS_EFT_FileDetail_CustBankAddresses.Addr;
+            debtorAgentAddress.AddressLine2 = gSKS_EFT_FileDetail_CustBankAddresses.Addr2;
+            debtorAgentAddress.TownName = gSKS_EFT_FileDetail_CustBankAddresses.City;
+            debtorAgentAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_CustBankAddresses.CountryRegionId);
+            debtorAgentAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_CustBankAddresses.CountryRegionId).CountryRegionId;
+            debtorAgentAddress.CountrySubDivision = gSKS_EFT_FileDetail_CustBankAddresses.State;
+            debtorAgentAddress.PostCode = gSKS_EFT_FileDetail_CustBankAddresses.ZipCode;
+
+            debtorAgentxOther.Phone = gSKS_EFT_FileDetail_CustBankAddresses.Phone;
+            debtorAgentxOther.PhoneExtension = gSKS_EFT_FileDetail_CustBankAddresses.PhoneLocal;
+
+        }
+        else
+        {
+            debtorAgent.BankSortCode = lSKS_EFT_FileDetail.BankBankSortCode;
+            debtorAgent.RoutingNumber = lSKS_EFT_FileDetail.BankBankTransit;
+            debtorAgent.RoutingNumberType = lSKS_EFT_FileDetail.BankBankCodeType;
+            debtorAgent.SWIFTCode = lSKS_EFT_FileDetail.BankBankSwiftNo;
+
+            debtorAgentAddress.AddressLine1 = gSKS_EFT_FileDetail_BankAddresses.Addr;
+            debtorAgentAddress.AddressLine2 = gSKS_EFT_FileDetail_BankAddresses.Addr2;
+            debtorAgentAddress.TownName = gSKS_EFT_FileDetail_BankAddresses.City;
+            debtorAgentAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_BankAddresses.CountryRegionId);
+            debtorAgentAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_BankAddresses.CountryRegionId).CountryRegionId;
+            debtorAgentAddress.CountrySubDivision = gSKS_EFT_FileDetail_BankAddresses.State;
+            debtorAgentAddress.PostCode = gSKS_EFT_FileDetail_BankAddresses.ZipCode;
+
+            debtorAgent.Name = gSKS_EFT_FileDetail_BankAddresses.Name;
+        }
+
+        debtorAgent.XOther = debtorAgentxOther;
+        debtorAgent.PostalAddress = debtorAgentAddress;
+        debtorAgentAddress.XOther = debtorAgentAddressxOther;
+
+        payment.DebtorAgent = debtorAgent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>companyInfoPostalAddress</Name>
+				<Source><![CDATA[
+    private void companyInfoPostalAddress()
+    {
+        EFT.DataContract_2_0.PaymentCompanyInfo companyInfo = new EFT.DataContract_2_0.PaymentCompanyInfo();
+        EFT.DataContract_2_0.PaymentPostalAddress companyInfoAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther companyInfoAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::AccountsPayable)
+        {
+            companyInfoAddress.AddressLine1 = gSKS_EFT_FileDetail_Addresses.Addr;
+            companyInfoAddress.AddressLine2 = gSKS_EFT_FileDetail_Addresses.Addr2;
+            companyInfoAddress.TownName = gSKS_EFT_FileDetail_Addresses.City;
+            companyInfoAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_Addresses.CountryRegionId);
+            companyInfoAddress.CountrySubDivision = gSKS_EFT_FileDetail_Addresses.State;
+            companyInfoAddress.PostCode = gSKS_EFT_FileDetail_Addresses.ZipCode;
+            companyInfoAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_Addresses.CountryRegionId).CountryRegionId;
+        }
+        else if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            companyInfoAddress.AddressLine1 = gSKS_EFT_FileDetail_BankAccount.Addr;
+            companyInfoAddress.AddressLine2 = gSKS_EFT_FileDetail_BankAccount.Addr2;
+            companyInfoAddress.TownName = gSKS_EFT_FileDetail_BankAccount.City;
+            companyInfoAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_BankAccount.CountryRegionId);
+            companyInfoAddress.CountrySubDivision = gSKS_EFT_FileDetail_BankAccount.State;
+            companyInfoAddress.PostCode = gSKS_EFT_FileDetail_BankAccount.ZipPostal;
+            companyInfoAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_BankAccount.CountryRegionId).CountryRegionId;
+        }
+        CompanyInfo.PostalAddress = companyInfoAddress;
+        companyInfoAddress.XOther = companyInfoAddressxOther;
+        paymentFile.CompanyInfo = CompanyInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creditor
+    /// </summary>
+    protected void creditor()
+    {
+        EFT.DataContract_2_0.PaymentCreditor creditor = new EFT.DataContract_2_0.PaymentCreditor();
+        EFT.DataContract_2_0.PaymentCreditorXOther creditorxOther = new EFT.DataContract_2_0.PaymentCreditorXOther();
+        EFT.DataContract_2_0.PaymentPostalAddress creditorAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther creditorAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            creditor.Id = lSKS_EFT_FileDetail.FileACHCompanyId;
+            creditor.Name = lSKS_EFT_FileDetail.FileACHCompanyName;
+
+            creditorAddress.AddressLine1 = gSKS_EFT_FileDetail_BankAccount.Addr;
+            creditorAddress.AddressLine2 = gSKS_EFT_FileDetail_BankAccount.Addr2;
+            creditorAddress.TownName = gSKS_EFT_FileDetail_BankAccount.City;
+            creditorAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_BankAccount.CountryRegionId);
+            creditorAddress.CountrySubDivision = gSKS_EFT_FileDetail_BankAccount.State;
+            creditorAddress.StreetName = gSKS_EFT_FileDetail_BankAccount.Street;
+            creditorAddress.PostCode = gSKS_EFT_FileDetail_BankAccount.ZipPostal;
+            creditorAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_BankAccount.CountryRegionId).CountryRegionId;
+        }
+        else
+        {
+            switch(gsks_eft_FileDetail_AddendaHeader.AccountIDOvr)
+            {
+                case SKS_EFT_AddendaOverwrite::AccountName:
+                    creditor.Id = lSKS_EFT_FileDetail.AccountName;
+                    break;
+                case SKS_EFT_AddendaOverwrite::AccountNum:
+                    creditor.Id = lSKS_EFT_FileDetail.AccountNum;
+                    break;
+                case SKS_EFT_AddendaOverwrite::BeneName:
+                    creditor.Id = gSKS_EFT_FileDetail_VendAddress.BeneName;
+                    break;
+                case SKS_EFT_AddendaOverwrite::Fixed:
+                    creditor.Id = gsks_eft_FileDetail_AddendaHeader.IdentificationFixedValue;
+                    break;
+                default:
+                    creditor.Id = lSKS_EFT_FileDetail.AccountNum;
+                    break;
+            }
+            
+            switch(gsks_eft_FileDetail_AddendaHeader.RecCompany)
+            {
+                case SKS_EFT_AddendaOverwrite::AccountName:
+                    creditor.Name = lSKS_EFT_FileDetail.AccountName;
+                    break;
+                case SKS_EFT_AddendaOverwrite::AccountNum:
+                    creditor.Name = lSKS_EFT_FileDetail.AccountNum;
+                    break;
+                case SKS_EFT_AddendaOverwrite::BeneName:
+                    creditor.Name = gSKS_EFT_FileDetail_VendAddress.BeneName;
+                    break;
+                case SKS_EFT_AddendaOverwrite::Fixed:
+                    creditor.Name = gsks_eft_FileDetail_AddendaHeader.RecCompanyFixedValue;
+                    break;
+                default:
+                    creditor.Name = gSKS_EFT_FileDetail_VendAddress.BeneName;
+                    break;
+            }
+            
+            creditor.VATNum = lSKS_EFT_FileDetail.VATNum;
+            creditorAddress.AddressLine1 = gSKS_EFT_FileDetail_VendAddress.BeneAddr;
+            creditorAddress.AddressLine2 = gSKS_EFT_FileDetail_VendAddress.BeneAddr2;
+            creditorAddress.TownName = gSKS_EFT_FileDetail_VendAddress.BeneCity;
+            creditorAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_VendAddress.BeneCountryRegionId);
+            creditorAddress.CountrySubDivision = gSKS_EFT_FileDetail_VendAddress.BeneState;
+            creditorAddress.StreetName = gSKS_EFT_FileDetail_VendAddress.BeneStreet;
+            creditorAddress.BuildingNumber = gSKS_EFT_FileDetail_VendAddress.BeneStreetNumber;
+            creditorAddress.PostCode = gSKS_EFT_FileDetail_VendAddress.BeneZipPostal;
+                        
+            creditorAddressxOther.AddressLine3 = gSKS_EFT_FileDetail_VendAddress.BeneAddr3;
+            creditorAddressxOther.BuildingCompliment = gSKS_EFT_FileDetail_VendAddress.BeneBuildingCompliment;
+            creditorAddressxOther.County = gSKS_EFT_FileDetail_VendAddress.BeneCounty;
+            creditorAddressxOther.DistrictName = gSKS_EFT_FileDetail_VendAddress.BeneDistrictName;
+            creditorAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_VendAddress.BeneCountryRegionId).CountryRegionId;
+
+            creditorxOther.ERPCompany = lSKS_EFT_FileDetail.AccountCompany;
+            creditorxOther.ExternalIdentifier = lSKS_EFT_FileDetail.VendYourAccountNum;
+            creditorxOther.Fax = gSKS_EFT_FileDetail_VendAddress.Fax;
+
+            VendTable lVendTable = VendTable::findByCompany(lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum);
+            creditorxOther.TaxWithholdGroup = lVendTable.TaxWithholdGroup;
+
+            Generic.List<EFT.DataContract_2_0.PaymentEmailAddress> PaymentEmailAddresses = new Generic.List<EFT.DataContract_2_0.PaymentEmailAddress>();
+            if(gSKS_EFT_FileDetail_VendAddress.Locator || gSKS_EFT_FileDetail_VendAddress.LocationName)
+            {
+                EFT.DataContract_2_0.PaymentEmailAddress emailp = new EFT.DataContract_2_0.PaymentEmailAddress();
+                emailp.EmailIdentifer = 'Primary';
+                emailp.EmailAddress = gSKS_EFT_FileDetail_VendAddress.Locator;
+                emailp.EmailName = gSKS_EFT_FileDetail_VendAddress.LocationName;
+                PaymentEmailAddresses.Add(emailp);
+            }
+            SKS_EB_Vendor lSKS_EB_Vendor = SKS_EB_Vendor::findByCompany(lSKS_EFT_FileDetail.PaymentCompany, lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum);
+
+            if(lSKS_EB_Vendor.EM1Vendor)
+            {
+                SKS_EFT_VendorPaym lSKS_EFT_VendorPaym;
+                lSKS_EFT_VendorPaym = SKS_EFT_VendorPaym::findbycompany(lSKS_EFT_FileDetail.PaymentCompany ? lSKS_EFT_FileDetail.PaymentCompany :
+                                    lSKS_EFT_FileDetail.DataAreaId, lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum,
+                                    lSKS_EFT_FileDetail.PaymMode, lSKS_EFT_FileDetail.PaymSpec, lSKS_EFT_FileDetail.DepBankAccountId);
+
+                container email = SKS_EFT_VendorLoad::primaryEmail(lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum, lSKS_EFT_VendorPaym.WBeneRemittanceLocation);
+                DirPartyContactInfoview mDirPartyContactInfoview = conPeek(email,2);
+
+                if(mDirPartyContactInfoview.Locator)
+                {
+                    EFT.DataContract_2_0.PaymentEmailAddress email1 = new EFT.DataContract_2_0.PaymentEmailAddress();
+                    email1.EmailIdentifer = 'EMail1';
+                    email1.EmailAddress = mDirPartyContactInfoview.Locator;
+                    email1.EmailName = mDirPartyContactInfoview.LocationName;
+                    PaymentEmailAddresses.Add(email1);
+                }
+            }
+
+            if(lSKS_EB_Vendor.EM2Addr || lSKS_EB_Vendor.EM2Name)
+            {
+                EFT.DataContract_2_0.PaymentEmailAddress email2 = new EFT.DataContract_2_0.PaymentEmailAddress();
+                email2.EmailIdentifer = 'EMail2';
+                email2.EmailAddress = lSKS_EB_Vendor.EM2Addr;
+                email2.EmailName = lSKS_EB_Vendor.EM2Name;
+                PaymentEmailAddresses.Add(email2);
+            }
+
+            if(lSKS_EB_Vendor.EM3Addr || lSKS_EB_Vendor.EM3Name)
+            {
+                EFT.DataContract_2_0.PaymentEmailAddress email3 = new EFT.DataContract_2_0.PaymentEmailAddress();
+                email3.EmailIdentifer = 'EMail3';
+                email3.EmailAddress = lSKS_EB_Vendor.EM3Addr;
+                email3.EmailName = lSKS_EB_Vendor.EM3Name;
+                PaymentEmailAddresses.Add(email3);
+            }
+
+            if(lSKS_EB_Vendor.EM4Addr || lSKS_EB_Vendor.EM4Name)
+            {
+                EFT.DataContract_2_0.PaymentEmailAddress email4 = new EFT.DataContract_2_0.PaymentEmailAddress();
+                email4.EmailIdentifer = 'EMail4';
+                email4.EmailAddress = lSKS_EB_Vendor.EM4Addr;
+                email4.EmailName = lSKS_EB_Vendor.EM4Name;
+                PaymentEmailAddresses.Add(email4);
+            }
+
+            // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+            System.Object asObject = PaymentEmailAddresses;
+            creditorxOther.PaymentEmailAddresses = asObject;
+
+        }
+        creditor.XOther = creditorxOther;
+        creditorAddress.XOther = creditorAddressxOther;
+        creditor.PostalAddress = creditorAddress;
+        payment.Creditor = creditor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditorAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creditor Account
+    /// </summary>
+    protected void creditorAccount()
+    {
+        EFT.DataContract_2_0.PaymentCreditorAccount creditorAccount = new EFT.DataContract_2_0.PaymentCreditorAccount();
+        EFT.DataContract_2_0.PaymentCreditorAccountXOther creditorAccountxOther = new EFT.DataContract_2_0.PaymentCreditorAccountXOther();
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            creditorAccount.BankAccountNumber = lSKS_EFT_FileDetail.BankBankAcct;
+            creditorAccount.BankAccountType = this.getBankAccountType(lSKS_EFT_FileDetail.BankAcctType);
+            creditorAccount.IBAN = lSKS_EFT_FileDetail.BankBankIBAN;
+            creditorAccountxOther.BankAccountId = lSKS_EFT_FileDetail.BankAccountId;
+        }
+        else
+        {
+            creditorAccount.BankAccountNumber = lSKS_EFT_FileDetail.DepBankAcct;
+            creditorAccount.BankAccountType = this.getBankAccountType(lSKS_EFT_FileDetail.DepBankAcctType);
+            creditorAccount.IBAN = lSKS_EFT_FileDetail.DepBankIBAN;
+
+            if(gSKS_EFT_File.EFTFileType == SKS_EFT_Module::AP)
+            {
+                VendTable lVendTable = VendTable::findByCompany(lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum);
+                DirOrganization lDirOrganization;
+    
+                select firstonly OrgNumber from lDirOrganization where lDirOrganization.RecId == lVendTable.Party;
+                creditorAccountxOther.OrganizationNumber = lDirOrganization.OrgNumber;
+            }
+        }
+
+        creditorAccount.XOther = creditorAccountxOther;
+        payment.CreditorAccount = creditorAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditorAgent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creditor Agent
+    /// </summary>
+    protected void creditorAgent()
+    {
+        EFT.DataContract_2_0.PaymentCreditorAgent creditorAgent = new EFT.DataContract_2_0.PaymentCreditorAgent();
+        EFT.DataContract_2_0.PaymentPostalAddress creditorAgentAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther creditorAgentAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+        EFT.DataContract_2_0.PaymentCreditorAgentXOther creditorAgentxOther = new EFT.DataContract_2_0.PaymentCreditorAgentXOther();
+        SKS_EFT_VendorPaym lSKS_EFT_VendorPaym;
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::DirectDebit)
+        {
+            creditorAgent.Branch = '';
+            creditorAgent.CurrencyCode = lSKS_EFT_FileDetail.CurrencyCode;
+            creditorAgent.RoutingNumber = lSKS_EFT_FileDetail.BankBankTransit;
+            creditorAgent.RoutingNumberType = lSKS_EFT_FileDetail.BankBankCodeType;
+            creditorAgent.SWIFTCode = lSKS_EFT_FileDetail.BankBankSwiftNo;
+
+            creditorAgentAddress.AddressLine1 = gSKS_EFT_FileDetail_BankAddresses.Addr;
+            creditorAgentAddress.AddressLine2 = gSKS_EFT_FileDetail_BankAddresses.Addr2;
+            creditorAgentAddress.TownName = gSKS_EFT_FileDetail_BankAddresses.City;
+            creditorAgentAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_BankAddresses.CountryRegionId);
+            creditorAgentAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_BankAddresses.CountryRegionId).CountryRegionId;
+            creditorAgentAddress.CountrySubDivision = gSKS_EFT_FileDetail_BankAddresses.State;
+            creditorAgentAddress.PostCode = gSKS_EFT_FileDetail_BankAddresses.ZipCode;
+            creditorAgent.Name = gSKS_EFT_FileDetail_BankAddresses.Name;
+        }
+        else
+        {
+            creditorAgent.Branch = gSKS_EFT_FileDetail_BenBank.BenBankBranch;
+            creditorAgent.CurrencyCode = lSKS_EFT_FileDetail.DepBankCurrency;
+            creditorAgent.Name = gSKS_EFT_FileDetail_BenBank.BenBankName;
+            creditorAgent.RoutingNumber = lSKS_EFT_FileDetail.DepBankTransit;
+            creditorAgent.RoutingNumberType = lSKS_EFT_FileDetail.DepBankCodeType;
+            creditorAgent.SWIFTCode = lSKS_EFT_FileDetail.DepSwiftNo;
+
+            creditorAgentAddress.AddressLine1 = gSKS_EFT_FileDetail_BenBank.BenBankAddr;
+            creditorAgentAddress.TownName = gSKS_EFT_FileDetail_BenBank.BenBankCity;
+            creditorAgentAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_BenBank.BenBankCountryRegionId);
+            creditorAgentAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_BenBank.BenBankCountryRegionId).CountryRegionId;
+
+            lSKS_EFT_VendorPaym = SKS_EFT_VendorPaym::findbycompany(lSKS_EFT_FileDetail.PaymentCompany ? lSKS_EFT_FileDetail.PaymentCompany :
+                lSKS_EFT_FileDetail.DataAreaId, lSKS_EFT_FileDetail.AccountCompany, lSKS_EFT_FileDetail.AccountNum,
+                lSKS_EFT_FileDetail.PaymMode, lSKS_EFT_FileDetail.PaymSpec, lSKS_EFT_FileDetail.DepBankAccountId);
+
+            if(lSKS_EFT_VendorPaym.WBeneUseVendBankAcc == NoYes::Yes)
+            {
+                creditorAgentAddress.CountrySubDivision = gSKS_EFT_FileDetail_VendBankAddress.State;
+                creditorAgentAddress.PostCode = gSKS_EFT_FileDetail_VendBankAddress.ZipCode;
+            }
+
+            creditorAgentxOther.BankId = gSKS_EFT_FileDetail_BenBank.BenBankAcct;
+        }
+
+        creditorAgent.PostalAddress = creditorAgentAddress;
+        creditorAgentAddress.XOther = creditorAgentAddressxOther;
+        creditorAgent.XOther = creditorAgentxOther;
+        payment.CreditorAgent = creditorAgent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>directDebitInfo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Direct Debit Info
+    /// </summary>
+    protected void directDebitInfo()
+    {
+        EFT.DataContract_2_0.PaymentDirectDebitInfo directDebitInfo = new EFT.DataContract_2_0.PaymentDirectDebitInfo();
+        directDebitInfo.DirectDebitId = gSKS_EFT_FileDetail_Mandate.DirectDebitId;
+        directDebitInfo.MandateReference = gSKS_EFT_FileDetail_Mandate.MandateReference;
+        directDebitInfo.MandateScheme = gSKS_EFT_FileDetail_Mandate.MandateScheme;
+        directDebitInfo.MandatePaymentType = gSKS_EFT_FileDetail_Mandate.MandatePaymentType;
+        directDebitInfo.MandateSequenceType = gSKS_EFT_FileDetail_Mandate.MandateSequenceType;
+        directDebitInfo.MandateSignatureDate = gSKS_EFT_FileDetail_Mandate.SignatureDate;
+
+        payment.DirectDebitInfo = directDebitInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>intermediary</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Intermediary
+    /// </summary>
+    protected void intermediary()
+    {
+        EFT.DataContract_2_0.PaymentIntermediary intermediary = new EFT.DataContract_2_0.PaymentIntermediary();
+        EFT.DataContract_2_0.PaymentPostalAddress intermediaryAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther intermediaryAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+
+        intermediary.Account = gSKS_EFT_FileDetail_Intermediary.IntBankAcct;
+        intermediary.BankId = gSKS_EFT_FileDetail_Intermediary.IntBankId;
+        intermediary.Branch = gSKS_EFT_FileDetail_Intermediary.IntBankBranch;
+        intermediary.Name = gSKS_EFT_FileDetail_Intermediary.IntBankName;
+        intermediary.SWIFTCode = gSKS_EFT_FileDetail_Intermediary.IntBankSwift;
+
+        intermediaryAddress.AddressLine1 = gSKS_EFT_FileDetail_Intermediary.IntBankAddr;
+        intermediaryAddress.AddressLine2 = gSKS_EFT_FileDetail_Intermediary.IntBankAddr2;
+        intermediaryAddress.TownName = gSKS_EFT_FileDetail_Intermediary.IntBankCity;
+        intermediaryAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_Intermediary.IntBankCountryRegionId);
+        intermediaryAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_Intermediary.IntBankCountryRegionId).CountryRegionId;
+
+        intermediary.PostalAddress = intermediaryAddress;
+        intermediaryAddress.XOther = intermediaryAddressxOther;
+        payment.Intermediary = intermediary;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditParty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Credit Party
+    /// </summary>
+    protected void creditParty()
+    {
+        EFT.DataContract_2_0.PaymentCreditParty creditParty = new EFT.DataContract_2_0.PaymentCreditParty();
+        EFT.DataContract_2_0.PaymentCreditPartyXOther creditPartyxOther = new EFT.DataContract_2_0.PaymentCreditPartyXOther();
+        EFT.DataContract_2_0.PaymentPostalAddress creditPartyAddress = new EFT.DataContract_2_0.PaymentPostalAddress();
+        EFT.DataContract_2_0.PaymentPostalAddressxOther creditPartyAddressxOther = new EFT.DataContract_2_0.PaymentPostalAddressxOther();
+
+        creditPartyxOther.Account = gSKS_EFT_FileDetail_CreditParty.CrePartyAcct;
+        creditPartyxOther.BankId = gSKS_EFT_FileDetail_CreditParty.CrePartyBankId;
+        creditPartyxOther.BankName = gSKS_EFT_FileDetail_CreditParty.CrePartyBankName;
+        creditPartyxOther.Name = gSKS_EFT_FileDetail_CreditParty.CrePartyName;
+        creditPartyxOther.SWIFTCode = gSKS_EFT_FileDetail_CreditParty.CrePartySwift;
+
+        creditPartyAddress.AddressLine1 = gSKS_EFT_FileDetail_CreditParty.CrePartyAddr;
+        creditPartyAddress.TownName = gSKS_EFT_FileDetail_CreditParty.CrePartyCity;
+        creditPartyAddress.Country = SKS_EFT_BankFabricPayment::getLogisticsAddressCountryISO(gSKS_EFT_FileDetail_CreditParty.CrePartyCountryRegionId);
+        creditPartyAddressxOther.CountryISO3 = LogisticsAddressCountryRegion::findByISOCode(gSKS_EFT_FileDetail_CreditParty.CrePartyCountryRegionId).CountryRegionId;
+
+        creditPartyxOther.PostalAddress = creditPartyAddress;
+        creditPartyAddress.XOther = creditPartyAddressxOther;
+        creditParty.XOther = creditPartyxOther;
+
+        payment.CreditParty = creditParty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taxWithholding</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Tax Withholding
+    /// </summary>
+    protected void taxWithholding()
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentTaxWithholding> taxWithholdings = new Generic.List<EFT.DataContract_2_0.PaymentTaxWithholding>();
+
+        EFT.DataContract_2_0.PaymentTaxWithholding taxWithholding;
+        EFT.DataContract_2_0.PaymentTaxWithholdingXOther taxWithholdingXOther;
+
+        SKS_EFT_FileDetail_TaxWHTrans gSKS_EFT_FileDetail_TaxWHTrans;
+        while select gSKS_EFT_FileDetail_TaxWHTrans where
+                gSKS_EFT_FileDetail_TaxWHTrans.RefRecId == lSKS_EFT_FileDetail.RecId
+        {
+            taxWithholding = new EFT.DataContract_2_0.PaymentTaxWithholding();
+            taxWithholdingXOther = new EFT.DataContract_2_0.PaymentTaxWithholdingXOther();
+
+            taxWithholdingXOther.Category = gSKS_EFT_FileDetail_TaxWHTrans.TaxWithholdRevenueCode;
+            taxWithholdingXOther.CategoryDetails = gSKS_EFT_FileDetail_TaxWHTrans.TWHItemGrpHeading_TH_Name;
+            taxWithholdingXOther.TaxAmount = gSKS_EFT_FileDetail_TaxWHTrans.TaxWithholdAmount;
+            taxWithholdingXOther.TaxableBaseAmount = gSKS_EFT_FileDetail_TaxWHTrans.InvoiceCurUpdatedWithholdBaseAmount;
+            taxWithholdingXOther.TaxRate = gSKS_EFT_FileDetail_TaxWHTrans.TaxWithholdValue;
+            taxWithholdingXOther.CurrencyCode = gSKS_EFT_FileDetail_TaxWHTrans.InvoiceCurrency;
+
+            if(lSKS_EFT_FileDetail.AccountCompany != '')
+            {
+                changeCompany(lSKS_EFT_FileDetail.AccountCompany)
+                {
+                    TaxWithholdTrans lTaxWithholdTrans;
+                    select firstonly TaxWithholdSlipNum_TH
+                      from lTaxWithholdTrans where lTaxWithholdTrans.RecId == gSKS_EFT_FileDetail_TaxWHTrans.TaxWHTransRecId;
+
+                    taxWithholdingXOther.SlipNumber = lTaxWithholdTrans.TaxWithholdSlipNum_TH;
+                }
+            }
+
+            if(lSKS_EFT_FileDetail.PaymentCompany != '')
+            {
+                changeCompany(lSKS_EFT_FileDetail.PaymentCompany)
+                {
+                    TaxWithholdGroupData lTaxWithholdGroupData;
+                    select firstonly TaxWithholdCode from lTaxWithholdGroupData where lTaxWithholdGroupData.TaxWithholdGroup == gLedgerJournalTrans.TaxWithholdGroup;
+                    taxWithholdingXOther.Code = lTaxWithholdGroupData.TaxWithholdCode;
+                }
+            }
+
+            taxWithholding.XOther = taxWithholdingXOther;
+
+            taxWithholdings.Add(taxWithholding);
+        }
+
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = taxWithholdings;
+        payment.TaxWithholdings = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taxWithholdTH</Name>
+				<Source><![CDATA[
+    protected void taxWithholdTH()
+    {
+        EFT.DataContract_2_0.PaymentTaxWithholdTH taxWithholdTH = new EFT.DataContract_2_0.PaymentTaxWithholdTH();
+        EFT.DataContract_2_0.PaymentTaxWithholdTHXOther taxWithholdTHXOther = new EFT.DataContract_2_0.PaymentTaxWithholdTHXOther();
+
+        changecompany(lSKS_EFT_FileDetail.PaymentCompany)
+        {
+            SKS_EFT_TH_WithHoldingTaxFields mSKS_EFT_TH_WithHoldingTaxFields = new SKS_EFT_TH_WithHoldingTaxFields();
+    
+            // Get SKS_EFT_THWitholdingTaxFields
+            mSKS_EFT_TH_WithHoldingTaxFields.getSKS_EFT_TH_WithHoldingTaxFields(lSKS_EFT_FileDetail.PaymentLineRecId);
+
+            if(mSKS_EFT_TH_WithHoldingTaxFields.RecordsFound())
+            {
+                taxWithholdTHXOther.BranchNumber = mSKS_EFT_TH_WithHoldingTaxFields.BranchNumber();
+                taxWithholdTHXOther.CertificateDate = mSKS_EFT_TH_WithHoldingTaxFields.CertificateDate();
+                taxWithholdTHXOther.CertificateNumber = mSKS_EFT_TH_WithHoldingTaxFields.CertificateNumber();
+                taxWithholdTHXOther.InvoiceCurUpdatedWithholdBaseAmount = mSKS_EFT_TH_WithHoldingTaxFields.InvoiceCurUpdatedWithholdBaseAmount();
+                taxWithholdTHXOther.InvoiceDate = mSKS_EFT_TH_WithHoldingTaxFields.InvoiceDate();
+                taxWithholdTHXOther.InvoiceReceiptDate = mSKS_EFT_TH_WithHoldingTaxFields.InvoiceReceiptDate();
+                taxWithholdTHXOther.PaymentGrossUpOtherDetail = mSKS_EFT_TH_WithHoldingTaxFields.PaymentGrossUpOtherDetail();
+                taxWithholdTHXOther.PaymentGrossUpType = mSKS_EFT_TH_WithHoldingTaxFields.PaymentGrossUpType();
+                taxWithholdTHXOther.RealVendName = mSKS_EFT_TH_WithHoldingTaxFields.RealVendName();
+                taxWithholdTHXOther.TaxInvoiceReceiptDate = mSKS_EFT_TH_WithHoldingTaxFields.TaxInvoiceReceiptDate();
+                taxWithholdTHXOther.TaxNatureOfAddress = mSKS_EFT_TH_WithHoldingTaxFields.TaxNatureOfAddress();
+                taxWithholdTHXOther.TaxRegNum = mSKS_EFT_TH_WithHoldingTaxFields.TaxRegNum();
+            }
+        }
+        taxWithholdTH.XOther = taxWithholdTHXOther;
+        payment.TaxWithholdTH = taxWithholdTH;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>invoices</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Invoices
+    /// </summary>
+    protected void invoices()
+    {
+        Generic.List<EFT.DataContract_2_0.PaymentInvoice> Invoices = new Generic.List<EFT.DataContract_2_0.PaymentInvoice>();
+        if(lSKS_EFT_FileDetail.RecordSummary == SKS_EFT_RecordSummary::Payment)
+        {
+            SKS_EFT_FileDetail invSKS_EFT_FileDetail;
+
+            while select invSKS_EFT_FileDetail
+               where invSKS_EFT_FileDetail.RecordSummaryRecId == lSKS_EFT_FileDetail.RecId &&
+                     invSKS_EFT_FileDetail.InvoiceNumber != ''
+            {
+                Invoices.Add(this.setInvoiceFields(invSKS_EFT_FileDetail));
+            }
+        }
+        else
+        {
+            if(lSKS_EFT_FileDetail.InvoiceNumber != '')
+            {
+                Invoices.Add(this.setInvoiceFields(lSKS_EFT_FileDetail));
+            }
+        }
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = Invoices;
+        payment.Invoices = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setInvoiceFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Invoice fields
+    /// </summary>
+    protected EFT.DataContract_2_0.PaymentInvoice setInvoiceFields(SKS_EFT_FileDetail _invSKS_EFT_FileDetail)
+    {
+        EFT.DataContract_2_0.PaymentInvoice invoice = new EFT.DataContract_2_0.PaymentInvoice();
+        EFT.DataContract_2_0.PaymentInvoiceXOther invoicexOther = new EFT.DataContract_2_0.PaymentInvoiceXOther();
+        VendInvoiceJour     vendInvoiceJour;
+        CustTransOpen       lCustTransOpen;
+        VendTransOpen       lVendTransOpen;
+        invoice.CurrencyCode = _invSKS_EFT_FileDetail.InvoiceCurrencyCode;
+
+        int multiplier = 1;
+        if(_invSKS_EFT_FileDetail.Module == SKS_EFT_Module::AP || _invSKS_EFT_FileDetail.Module == SKS_EFT_Module::CNP
+            || (_invSKS_EFT_FileDetail.Module == SKS_EFT_Module::BTB && gSKS_EFT_File.TransferDirection == SKS_BTB_TransferType::Transfer_out))
+        {
+            multiplier = -1;
+        }
+        invoice.DiscountAmountPmtCur = _invSKS_EFT_FileDetail.InvoiceDiscAmountPmtCur * multiplier;
+        invoice.InvoiceDate = _invSKS_EFT_FileDetail.InvoiceDate;
+        invoice.InvoiceDescription = _invSKS_EFT_FileDetail.InvoiceTransactionTxt;
+        invoice.InvoiceNumber = _invSKS_EFT_FileDetail.InvoiceNumber;
+        invoice.PaymentId = _invSKS_EFT_FileDetail.PaymId;
+        invoice.PONumber = _invSKS_EFT_FileDetail.PurchId;
+        invoice.SettleAmountInvCur = _invSKS_EFT_FileDetail.InvoiceSettleAmountCur * multiplier;
+        invoice.SettleAmountPmtCur = _invSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur * multiplier;
+
+
+        if(paymentFile.Module == EFT.DataContract_2_0.Module::AccountsPayable)
+        {
+            if(_invSKS_EFT_FileDetail.InvoiceNumber)
+            {
+                vendInvoiceJour.clear();
+
+                changecompany(_invSKS_EFT_FileDetail.InvoiceCompany)
+                {
+                    select firstOnly SumTax from  vendInvoiceJour
+                        where vendInvoiceJour.InvoiceAccount    ==  _invSKS_EFT_FileDetail.AccountNum &&
+                        vendInvoiceJour.InvoiceDate      ==  _invSKS_EFT_FileDetail.InvoiceDate &&
+                        vendInvoiceJour.InvoiceId         ==  _invSKS_EFT_FileDetail.InvoiceNumber;
+
+                    if(!vendInvoiceJour)
+                    {
+                        select firstOnly SumTax from  vendInvoiceJour
+                            where vendInvoiceJour.InvoiceAccount    ==  _invSKS_EFT_FileDetail.AccountNum &&
+                            vendInvoiceJour.DocumentDate            ==  _invSKS_EFT_FileDetail.InvoiceDate &&
+                            vendInvoiceJour.InvoiceId               ==  _invSKS_EFT_FileDetail.InvoiceNumber;
+                    }
+                }
+
+                invoicexOther.VATAmount = vendInvoiceJour.SumTax;
+            }
+
+            select firstonly crossCompany DueDate from lVendTransOpen
+                where lVendTransOpen.RefRecId == _invSKS_EFT_FileDetail.VendTransRecId;
+
+            if(lVendTransOpen)
+            {
+                invoicexOther.InvoiceDueDate = lVendTransOpen.DueDate;
+            }
+        }
+        else
+        {
+            select firstonly crossCompany DueDate from lCustTransOpen
+                where lCustTransOpen.RefRecId == _invSKS_EFT_FileDetail.VendTransRecId;
+
+            if(lCustTransOpen)
+            {
+                invoicexOther.InvoiceDueDate = lCustTransOpen.DueDate;
+            }
+        }
+        invoice.XOther = invoicexOther;
+        return invoice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Instructions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instructions
+    /// </summary>
+    protected void Instructions()
+    {
+        EFT.DataContract_2_0.PaymentInstructions instructions = new EFT.DataContract_2_0.PaymentInstructions();
+        EFT.DataContract_2_0.PaymentInstructionsXOther instructionsXOther = new EFT.DataContract_2_0.PaymentInstructionsXOther();
+
+        EFT.DataContract_2_0.PaymentBankInstructions paymentBankInstructions = new EFT.DataContract_2_0.PaymentBankInstructions();
+        paymentBankInstructions.Line1 = gsKS_EFT_FileDetail_Instructions.BankInst1;
+        paymentBankInstructions.Line2 = gsKS_EFT_FileDetail_Instructions.BankInst2;
+        paymentBankInstructions.Line3 = gsKS_EFT_FileDetail_Instructions.BankInst3;
+        paymentBankInstructions.Line4 = gsKS_EFT_FileDetail_Instructions.BankInst4;
+        paymentBankInstructions.Line5 = gsKS_EFT_FileDetail_Instructions.BankInst5;
+        paymentBankInstructions.Line6 = gsKS_EFT_FileDetail_Instructions.BankInst6;
+
+        EFT.DataContract_2_0.PaymentPaymentInstructions paymentPaymentInsructions = new EFT.DataContract_2_0.PaymentPaymentInstructions();
+        paymentPaymentInsructions.Line1 = gsKS_EFT_FileDetail_Instructions.PmtInstText1;
+        paymentPaymentInsructions.Line2 = gsKS_EFT_FileDetail_Instructions.PmtInstText2;
+        paymentPaymentInsructions.Line3 = gsKS_EFT_FileDetail_Instructions.PmtInstText3;
+        paymentPaymentInsructions.Line4 = gsKS_EFT_FileDetail_Instructions.PmtInstText4;
+
+        instructionsXOther.BankInstruction = paymentBankInstructions;
+        instructionsXOther.PaymentInstruction = paymentPaymentInsructions;
+
+        instructions.XOther = instructionsXOther;
+
+        payment.Instructions = instructions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addendaLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Addenda lines
+    /// </summary>
+    protected void addendaLines()
+    {
+        if(gSKS_EFT_FileFormatPaymSpec.AddendaSpec || gSKS_EFT_FileFormatPaymSpec.PaymSpec == 'CCD+' || gSKS_EFT_FileFormatPaymSpec.PaymSpec == 'PPD+' || gSKS_EFT_FileFormatPaymSpec.PaymSpec == 'IATB')
+        {
+            SKS_EFT_Addenda lSKS_EFT_Addenda = new SKS_EFT_Addenda();
+            lSKS_EFT_Addenda.setAddendaHeaderFormats(gSKS_EFT_FileDetail_AddendaHeader); //FDD-10590
+            lSKS_EFT_Addenda.setFileFormatPaymSpec(gSKS_EFT_FileFormatPaymSpec);
+            lSKS_EFT_Addenda.setFile(gSKS_EFT_File);
+            lSKS_EFT_Addenda.setFileDetail(lSKS_EFT_FileDetail);
+
+            Generic.List<EFT.DataContract_2_0.PaymentAddendaLine> addendaLines = new Generic.List<EFT.DataContract_2_0.PaymentAddendaLine>();
+            EFT.DataContract_2_0.PaymentAddendaLine addendaLine = new EFT.DataContract_2_0.PaymentAddendaLine();
+
+            addendaLine.Value = lSKS_EFT_Addenda.buildAddenda();
+            addendaLines.Add(addendaLine);
+
+            // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+            System.Object asObject = addendaLines;
+            payment.AddendaLines = asObject;
+        }
+        else if(gSKS_EFT_FileFormatPaymSpec.FormatId == 'US-ACH' && gSKS_EFT_FileFormatPaymSpec.PaymSpec == 'CTX')
+        {
+            this.addendaLines_CTX();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addendaLines_CTX</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CTX Addenda lines
+    /// </summary>
+    protected void addendaLines_CTX()
+    {
+        SKS_EFT_EDI sks_eft_edi;
+        str ediError;
+        int ctxAddendaMod;
+        int length;
+        str mCTXString = '';
+        int mCTXAddenda = 0;
+
+        sks_eft_edi = new SKS_EFT_EDI(lSKS_EFT_FileDetail.FormatId, lSKS_EFT_FileDetail.PaymSpec, lSKS_EFT_FileDetail.EDI820Layout, lSKS_EFT_FileDetail.FileRecId, lSKS_EFT_FileDetail); 
+
+        // Check for error text to make sure class could be created
+        ediError = sks_eft_edi.getErrorText();
+    
+        // If no error, build EDI data
+        if(ediError == '')
+        {
+            mCTXString = sks_eft_edi.build_CTX(lSKS_EFT_FileDetail);
+            if(mCTXString == '')
+            {
+                ediError = sks_eft_edi.getErrorText();
+                if(ediError == '')
+                {
+                    ediError = "@SKS2103";
+                }
+            }
+            else
+            {
+                // Determine how many addenda records will be created
+                // EDI data is broken into 80 character chunks
+                length = strLen(mCTXString);
+                mCTXAddenda = length div 80;
+                ctxAddendaMod = length mod 80;
+    
+                if(ctxAddendaMod > 0)
+                {
+                    mCTXAddenda++;
+                }
+    
+                if(mCTXAddenda > 9999)
+                {
+                    ediError = "@SKS2104";
+                }
+                else
+                {
+                    Generic.List<EFT.DataContract_2_0.PaymentAddendaLine> addendaLines = new Generic.List<EFT.DataContract_2_0.PaymentAddendaLine>();
+                    EFT.DataContract_2_0.PaymentAddendaLine addendaLine;
+
+                    int pos = 1;
+                    int addendaSequence = 1;
+                    while(mCTXAddenda >= addendaSequence)
+                    {
+                        addendaLine = new EFT.DataContract_2_0.PaymentAddendaLine();
+                        addendaLine.Value = subStr(mCTXString, pos, 80);
+                        addendaLines.Add(addendaLine);
+
+                        pos = pos + 80;
+                        addendaSequence++;
+                    }
+
+                    // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+                    System.Object asObject = addendaLines;
+                    payment.AddendaLines = asObject;
+                }
+            }
+        }
+    
+        if(ediError != '')
+        {
+            gErrorText = strFmt("@SKS2105", lSKS_EFT_FileDetail.PaymentReference, ediError); // Add context to the error
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>characterReplacement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Character replacement
+    /// </summary>
+    protected void characterReplacement(EFT.DataContract_2_0.PaymentFile _paymentFile, SKS_EB_CRGroupId _groupId)
+    {
+        if(_groupId)
+        {
+            SKS_EB_CharacterReplacementGroups ReplacementGroups;
+            SKS_EB_CharacterReplacementValues ReplacementValues;
+
+            select firstonly RemoveDiacritics from ReplacementGroups where ReplacementGroups.GroupId == _groupId;
+            if(ReplacementGroups)
+            {
+                EFT.DataContract_2_0.PaymentCharacterReplacement characterReplace = new EFT.DataContract_2_0.PaymentCharacterReplacement();
+                characterReplace.RemoveDiacritics = ReplacementGroups.RemoveDiacritics;
+
+                Generic.List<EFT.DataContract_2_0.PaymentCharacterFromTo> CharacterFromTos = new Generic.List<EFT.DataContract_2_0.PaymentCharacterFromTo>();
+
+                while select ReplacementValues where ReplacementValues.GroupId == _groupId
+                {
+                    EFT.DataContract_2_0.PaymentCharacterFromTo fromTo = new EFT.DataContract_2_0.PaymentCharacterFromTo();
+                    fromTo.FromCharacter = ReplacementValues.FromCharacter;
+                    fromTo.ToCharacter = ReplacementValues.ToCharacter;
+                    fromTo.ToCharacterType = ReplacementValues.ToCharacterType;
+                    CharacterFromTos.Add(fromTo);
+                }
+
+                // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+                System.Object asObject = CharacterFromTos;
+                characterReplace.CharacterFromToPairs = asObject;
+                _paymentFile.CharacterReplacement = characterReplace;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fileHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// File header
+    /// </summary>
+    protected void fileHeader(EFT.DataContract_2_0.PaymentFile _paymentFile)
+    {
+        System.Collections.Generic.List<EFT.DataContract_2_0.PaymentHeaderTrailer> Headers = new System.Collections.Generic.List<EFT.DataContract_2_0.PaymentHeaderTrailer>();
+        int htorder = 0;
+        while select ValueString from lSKS_EFT_FileDetail
+            where lSKS_EFT_FileDetail.FileRecId == gSKS_EFT_File.RecId &&
+                  lSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Header
+        {
+            htorder++;
+            EFT.DataContract_2_0.PaymentHeaderTrailer header = new EFT.DataContract_2_0.PaymentHeaderTrailer();
+            header.Order = htorder;
+            header.Value = lSKS_EFT_FileDetail.ValueString;
+            Headers.Add(header);
+        }
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = Headers;
+        _paymentFile.FileHeaders = asObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fileTrailer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// File trailer
+    /// </summary>
+    protected void fileTrailer(EFT.DataContract_2_0.PaymentFile _paymentFile)
+    {
+        System.Collections.Generic.List<EFT.DataContract_2_0.PaymentHeaderTrailer> Trailers = new System.Collections.Generic.List<EFT.DataContract_2_0.PaymentHeaderTrailer>();
+        int htorder = 0;
+        while select ValueString from lSKS_EFT_FileDetail
+            where lSKS_EFT_FileDetail.FileRecId == gSKS_EFT_File.RecId &&
+            lSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Trailer
+        {
+            htorder++;
+            EFT.DataContract_2_0.PaymentHeaderTrailer trailer = new EFT.DataContract_2_0.PaymentHeaderTrailer();
+            trailer.Order = htorder;
+            trailer.Value = lSKS_EFT_FileDetail.ValueString;
+            Trailers.Add(trailer);
+        }
+        // Note: Explicit conversion to System.Object is required by the X++ compiler to return a System.Collections.Generic object in an X++ method.
+        System.Object asObject = Trailers;
+        _paymentFile.FileTrailers = asObject;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CNP_InboundFiles</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CNP_InboundFiles extends SKS_EB_Batch
+{
+    #DEFINE.CurrentVersion(1)
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        Batch bat;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+        SKS_EFT_RF locSKS_EFT_ReturnFiles;
+        RefRecId locRefRecID;
+    
+        bat = this.parmCurrentBatch();
+        locRefRecID = bat.RecId;
+    
+        locSKS_EFT_ReturnFiles = new SKS_EFT_RF();
+        while  select crossCompany  locSKS_EB_CommProcess
+            where locSKS_EB_CommProcess.BatchJobId == locRefRecID
+        {
+            locSKS_EFT_ReturnFiles.ProcessAllDirectories(locSKS_EB_CommProcess, true);
+        }
+        SKS_BTB_InboundFiles::CompletionTimeout();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SetInboundTransStatusAction</Name>
+				<Source><![CDATA[
+    private void SetInboundTransStatusAction(SKS_EFT_InboundFile _SKS_EFT_InboundFile)
+    {
+        SKS_EFT_InboundFileLine locSKS_EFT_InboundFileLine;
+        SKS_EFT_InboundTransCompletion locSKS_EFT_InboundTransCompletion;
+        SKS_EFT_InboundStatuses locSKS_EFT_InboundStatuses;
+        SKS_EFTAP_File locSKS_EFTAP_File;
+    
+        ttsBegin;
+        while Select forupdate InboundFileNbr,StatusID,Action,RecId from locSKS_EFT_InboundFileLine
+            where locSKS_EFT_InboundFileLine.InboundFileNbr == _SKS_EFT_InboundFile.InboundFileNbr
+        {
+            select recid, statusid from locSKS_EFT_InboundStatuses
+                where locSKS_EFT_InboundStatuses.StatusId == locSKS_EFT_InboundFileLine.StatusId
+                join InboundStatusRecID, RecId, PaymentJournalStatus from locSKS_EFT_InboundTransCompletion
+                    where locSKS_EFT_InboundTransCompletion.InboundStatusRecID == locSKS_EFT_InboundStatuses.RecId
+                join formatid from locSKS_EFTAP_File
+                    where locSKS_EFTAP_File.RecId == _SKS_EFT_InboundFile.OutboundFileRecId
+                    && locSKS_EFT_InboundStatuses.FormatId == locSKS_EFTAP_File.FormatId;
+            if(!locSKS_EFT_InboundTransCompletion)
+            {
+                locSKS_EFT_InboundFileLine.Action = SKS_EFT_InboundPossibleActions::NoAction;
+            }
+            else
+            {
+                if(locSKS_EFT_InboundTransCompletion.PaymentJournalStatus == SKS_EFT_PaymentJournalStatus::Approved)
+                {
+                    locSKS_EFT_InboundFileLine.Action = SKS_EFT_InboundPossibleActions::Approved;
+                }
+                else
+                {
+                    locSKS_EFT_InboundFileLine.Action = SKS_EFT_InboundPossibleActions::Rejected;
+                }
+            }
+            locSKS_EFT_InboundFileLine.update();
+        }
+        ttsCommit;
+    
+    
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AllTransactionsAccountedFor</Name>
+				<Source><![CDATA[
+    private static server void AllTransactionsAccountedFor(SKS_EFT_InboundFile _SKS_EFT_InboundFile)
+    {
+        SKS_EFT_FileDetail              lSKS_EFT_FileDetail;
+        SKS_EFTAP_File                  lSKS_EFTAP_File;
+        SKS_EFT_InboundFileLine         lSKS_EFT_InboundFileLine;
+        LedgerJournalTrans              lLedgerJournalTrans;
+        SKS_EFT_InboundStatuses         lSKS_EFT_InboundStatuses;
+        SKS_EFT_InboundTransCompletion  lSKS_EFT_InboundTransCompletion;
+    
+        //Are there any outbound lines that are not matched to inbound transactions
+        select firstOnly FileRecId, RecordSection, RecordSummary from lSKS_EFT_FileDetail
+            where lSKS_EFT_FileDetail.FileRecId == _SKS_EFT_InboundFile.outboundFileRecId &&
+                lSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                lSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary
+            notExists join FileDetailRecId from lSKS_EFT_InboundFileLine
+            where
+                lSKS_EFT_InboundFileLine.FileDetailRecId == lSKS_EFT_FileDetail.RecId;
+    
+        if(!lSKS_EFT_FileDetail)
+        {
+            Select FXAProcessing from lSKS_EFTAP_File where lSKS_EFTAP_File.recid == _SKS_EFT_InboundFile.OutboundFileRecID;
+            //If it is FXAutomation, verify there are no Rejected lines.  By Design, FXAutomatin will not complete if there are
+            //rejected lines
+            select firstOnly lSKS_EFT_FileDetail
+                where lSKS_EFT_FileDetail.FileRecId == _SKS_EFT_InboundFile.outboundFileRecId &&
+                    lSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                    lSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+
+            select crosscompany RecId, paymentstatus from lLedgerJournalTrans // SKS_FDD_10590
+                where lLedgerJournalTrans.RecId == lSKS_EFT_FileDetail.PaymentLineRecId && 
+                        lLedgerJournalTrans.PaymentStatus != CustVendPaymStatus::Confirmed &&
+                        lLedgerJournalTrans.PaymentStatus != CustVendPaymStatus::Rejected;
+            if(!lLedgerJournalTrans) // SKS_FDD_10590
+            {
+                SKS_EFT_Processing::AutoCompleteARAP(_SKS_EFT_InboundFile.OutboundFileRecId, SKS_EFT_ActionHistory::AutoCompletionTransAccounted);
+    
+            }
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CompletionTimeout</Name>
+				<Source><![CDATA[
+    public static server void CompletionTimeout()
+    {
+        SKS_EFTAP_File      lSKS_EFTAP_File;
+        SKS_EB_CommProcess  lSKS_EB_CommProcess;
+        utcDateTime todaydatetime = datetimeutil::utcnow();
+        
+   
+        while select RecId, CommId, FileStatus, TransmitDateTime from lSKS_EFTAP_File
+            join CommID, Direction, fileComplete, FileCompletionTime from lSKS_EB_CommProcess
+            where lSKS_EFTAP_File.CommID == lSKS_EB_CommProcess.CommID
+            && lSKS_EFTAP_File.FileStatus == SKS_EFT_FileStatus::Transmitted
+            && lSKS_EB_CommProcess.Module == SKS_EB_Module::BankToBankTransfer
+            && lSKS_EB_CommProcess.Direction == SKS_EB_Direction::Outbound
+            && lSKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::BasedOnInboundSettings
+            && lSKS_EB_CommProcess.FileCompletionTime > 0
+        {
+            if(lSKS_EFTAP_File.TransmitDateTime < DateTimeUtil::addHours(todaydatetime, -lSKS_EB_CommProcess.filecompletiontime))
+            {
+                SKS_EFT_Processing::AutoCompleteARAP(lSKS_EFTAP_File.RecId, SKS_EFT_ActionHistory::AutoCompletionTimeout);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static client server ClassDescription description()
+    {
+        return "@SKS:SKGCNPProcessInboundFiles";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findStatus</Name>
+				<Source><![CDATA[
+    public static server void findStatus(SKS_EFT_InboundFile lSKS_EFT_InboundFile)
+    {
+        SKS_EFTAP_File  lSKS_EFTAP_File;
+        SKS_EFT_InboundFileGroups   lSKS_EFT_InboundFileGroups;
+        SKS_EB_CommProcess  lSKS_EB_CommProcess;
+    
+        select FileStatus, CommID, RecId from lSKS_EFTAP_File where lSKS_EFTAP_File.recid == lSKS_EFT_InboundFile.OutboundFileRecId
+            && lSKS_EFTAP_File.filestatus == SKS_EFT_Filestatus::Transmitted;
+    
+        select fileComplete from lSKS_EB_CommProcess where lSKS_EB_CommProcess.CommID == lSKS_EFTAP_File.CommID;
+    
+        if(lSKS_EB_CommProcess.filecomplete == SKS_EB_FileComplete::BasedOnInboundSettings)
+        {
+            select autoFileCompletion from lSKS_EFT_InboundFileGroups where lSKS_EFT_InboundFile.InboundFileGroupId == lSKS_EFT_InboundFileGroups.InboundFileGroupId;
+        //coomment
+            SKS_CNP_InboundFiles::InboundFileStatusAction(lSKS_EFT_InboundFile, SKS_EB_FileStatusAction::LeaveOutboundUnchanged);
+    
+            if(lSKS_EFT_InboundFileGroups.AutoFileCompletion == SKS_EFT_FileCompletion::InboundFileStatus)
+            {
+                SKS_CNP_InboundFiles::InboundFileStatusAction(lSKS_EFT_InboundFile, SKS_EB_FileStatusAction::MarkOutboundComplete);
+                //call method for based on file statuses
+            }
+            else
+            {
+                SKS_CNP_InboundFiles::AllTransactionsAccountedFor(lSKS_EFT_InboundFile);
+                //call method for transactions
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InboundFileStatusAction</Name>
+				<Source><![CDATA[
+    private static server void InboundFileStatusAction(SKS_EFT_InboundFile lSKS_EFT_InboundFile, SKS_EB_FileStatusAction  _action)
+    {
+        SKS_EFT_InboundFileCompletion   lSKS_EFT_InboundFileCompletion;
+        SKS_EFT_InboundStatuses         lSKS_EFT_InboundStatuses;
+    
+        select lSKS_EFT_InboundFileCompletion join formatid, RecId from lSKS_EFT_InboundStatuses
+            where lSKS_EFT_InboundFileCompletion.InboundStatusRecID == lSKS_EFT_InboundFile.InboundStatusesRecId
+                && lSKS_EFT_InboundFileCompletion.InboundFileGroupId == lSKS_EFT_InboundFile.InboundFileGroupId
+                && lSKS_EFT_InboundStatuses.FormatId == lSKS_EFT_InboundFile.InboundFormatId
+                && lSKS_EFT_InboundStatuses.RecId == lSKS_EFT_InboundFile.InboundStatusesRecId
+                && lsks_eft_inboundfilecompletion.filestatusaction == _action;
+    
+        if(lSKS_EFT_InboundFileCompletion)
+        {
+            if(lSKS_EFT_InboundFileCompletion.filestatusaction == SKS_EB_FileStatusAction::MarkOutboundComplete)
+            {
+                SKS_EFT_Processing::AutoCompleteARAP(lSKS_EFT_InboundFile.OutboundFileRecId, SKS_EFT_ActionHistory::AutoCompletionInboundStatus, lSKS_EFT_InboundFile.InboundFileNbr);
+            }
+    
+            else if (lSKS_EFT_InboundFileCompletion.filestatusaction == SKS_EB_FileStatusAction::LeaveOutboundUnchanged)
+            {
+                SKS_EFT_Processing::ApprovePaymentJournalLines(lSKS_EFT_InboundFile.OutboundFileRecId, CustVendPaymStatus::Recieved);
+            }
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

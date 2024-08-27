@@ -1,0 +1,337 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_FormatChecker</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EFT_FormatChecker
+{        
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the class with the specified arguments.
+    /// </summary>
+    /// <param name = "_args">The specified arguments.</param>
+    public static void main(Args _args)
+    {
+        Dialog locDialog;
+        DialogField locDialogFieldStartDate;
+        DialogField locDialogFieldEndDate;
+        DialogField locDialogModule;
+
+        date locStartDate;
+        date locEndDate;
+        SKS_EFT_Module EFTModule;
+
+        str rootDir = 'SKG-FORMAT-CHECKER';
+        str origDir = 'ORIG';
+        str newDir = 'NEW';
+
+        // Setup dialog
+        locDialog = new Dialog('Format Checker');
+        locDialog.addText('This will re-create format files for the specified transmit dates');
+        locDialog.addText(strFmt('The original file will be copied in subfolder %1 under the original folder', rootDir  + @'\' + origDir));
+        locDialog.addText(strFmt('A new file will be created in subfolder %1 under the original folder', rootDir  + @'\' + newDir));
+        locDialogFieldStartDate = locDialog.addField(extendedTypeStr(SKS_EB_Date), 'Enter start date');
+        locDialogFieldEndDate = locDialog.addField(extendedTypeStr(SKS_EB_Date), 'Enter end date');
+        locDialogModule = locDialog.addField(enumStr(SKS_EFT_Module), 'Module');
+
+        // Default end date to today and start date to 7 days before end date
+        locDialogFieldStartDate.value(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())-7);
+        locDialogFieldEndDate.value(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+
+        // Exit if cancel was pressed
+        if(locDialog.run() == 0)
+            return;
+
+        locStartDate = locDialogFieldStartDate.value();
+        locEndDate = locDialogFieldEndDate.value();
+        EFTModule = locDialogModule.value();
+
+        // Validate dates are not empty
+        if(locStartDate == dateNull())
+            error('Start date is empty');
+        if(locEndDate == dateNull())
+            error('End date is empty');
+
+        if(!locStartDate || !locEndDate)
+            return;
+        
+        utcdatetime _UtcStartPeriod =  DateTimeUtil::newDateTime(locStartDate,0);
+        utcdatetime _UtcEndPeriod = DateTimeUtil::newDateTime(locEndDate,86400);
+
+        // Get all files for date range
+        sks_eftap_file lsks_eftap_file;
+        select lsks_eftap_file where lsks_eftap_file.TransmitDateTime >= _UtcStartPeriod && lsks_eftap_file.TransmitDateTime <= _UtcEndPeriod && lsks_eftap_file.EFTFileType == EFTModule;
+        if(!lsks_eftap_file)
+        {
+            warning('No files found for date range');
+            return;
+        }
+
+        setPrefix('Format Checker results');
+
+        while(lsks_eftap_file)
+        {
+            SKS_EFT_FormatChecker::createFile(lsks_eftap_file, rootDir, origDir, newDir);
+            next lsks_eftap_file;
+        }
+
+        info('Format Checker complete');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFile</Name>
+				<Source><![CDATA[
+    private static void validateFile(sks_eftap_file _sks_eftap_file, str _rootDir, str _origDir, str _newDir, str _formatName, str _formatGroup)
+    {
+        str newFileText;
+        str origFileText;
+        int result;
+        str origFileName = _sks_eftap_file.FilePath + @'\' + _rootDir + @'\' + _origDir + @'\' + _sks_eftap_file.FileName;
+        str newFileName = _sks_eftap_file.FilePath + @'\' + _rootDir + @'\' + _newDir + @'\' + _sks_eftap_file.FileName;
+                
+        origFileText = SKS_EFT_FormatChecker::updateFile(_sks_eftap_file, _formatGroup, origFileName);
+        newFileText = SKS_EFT_FormatChecker::updateFile(_sks_eftap_file, _formatGroup, newFileName);
+        if(origFileText && newFileText)
+        {
+            result = strCmp(origFileText, newFileText);
+            if(result == 0)
+            {
+                info(strFmt('Files match. File number: %1, Format: %2, Orig: %3, New: %4', _sks_eftap_file.FileNbr, _formatName, origFileName, newFileName));
+            }
+            else
+            {
+                error(strFmt('Files do not match. File number: %1, Format: %2, Orig: %3, New: %4', _sks_eftap_file.FileNbr, _formatName, origFileName, newFileName));
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFile</Name>
+				<Source><![CDATA[
+    private static str updateFile(sks_eftap_file _sks_eftap_file, str _formatGroup, str _locFilePathName)
+    {
+        boolean locErrorFileExists;
+
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct();
+        fileHub.parmThrowErrorIfException(false);
+
+        // See if base file exists
+        fileHub.runFileLoad(_locFilePathName);
+
+        locErrorFileExists = fileHub.attrFileExists();
+        if(!locErrorFileExists)
+        {
+            error(strFmt('File number: %1, Could not open file: %2', _sks_eftap_file.FileNbr, _locFilePathName));
+            return '';
+        }
+
+        str fileText = fileHub.fileBody();
+
+        if(_formatGroup == 'US-CITICONNECT-XML' || 
+           _formatGroup == 'US-CITICONNECT-XML-AR' ||
+           _formatGroup == 'EU-DANSKEBANK-XML' ||
+           _formatGroup == 'DK-DANSKEBANK-XML-AR' ||
+           _formatGroup == 'EU-HSBC-CCTI-V22')
+        {
+            int dateFound = strScan(fileText, '<CreDtTm>', 1, strLen(fileText));
+            if(dateFound > 0)
+            {
+                fileText = strPoke(fileText, 'YYYY-MM-DDTHH:MM:SS', dateFound + 9);
+                fileHub.runFileCreate(_locFilePathName, fileText);
+            }
+        }
+        else if(_formatGroup == 'US-WF-PMS-XML-R1201212')
+        {
+            int dateFound = strScan(fileText, 'FileDate', 1, strLen(fileText));
+            if(dateFound > 0)
+            {
+                fileText = strPoke(fileText, 'YYYY-MM-DD', dateFound + 10); 
+            }
+            int timeFound = strScan(fileText, 'FileTime', 1, strLen(fileText));
+            if(timeFound > 0)
+            {
+                fileText = strPoke(fileText, 'HH:MM:SS', timeFound + 10);
+            }
+            if(dateFound > 0 || timeFound > 0)
+            {
+                fileHub.runFileCreate(_locFilePathName, fileText);
+            }
+        }
+        return fileText;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFile</Name>
+				<Source><![CDATA[
+    private static boolean createFile(sks_eftap_file _sks_eftap_file, str _rootDir, str _origDir, str _newDir)
+    {
+        ExecutePermission perm;
+        SysDictClass obj;
+        Object classInstance;
+        int mNbrGoodRecs;
+        str formatName;
+        str mReturnMsg;
+
+        SKS_EFT_FileDetail msks_eft_filedetail;
+        SKS_EFT_FileDetail_Extra msks_eft_filedetail_extra;
+        sks_eft_FileFormat msks_eft_FileFormat;
+        SKS_EFT_FileDetail_BankAccount msks_eft_filedetail_bankaccount;
+
+        select firstonly msks_eft_filedetail_bankaccount join msks_eft_filedetail
+            where msks_eft_filedetail_bankaccount.RefRecId == msks_eft_filedetail.recid
+            && msks_eft_filedetail.FileRecId == _sks_eftap_file.RecId;
+
+        if(!msks_eft_filedetail_bankaccount)
+        {
+            error(strFmt('File number: %1, could not create file. Original file created on version of TAS not compatible with Format Checker', _sks_eftap_file.FileNbr));
+            return false;
+        }
+        
+        // Move original file
+        if(!SKS_EFT_FormatChecker::MoveBaseFile(_sks_eftap_file, _rootDir, _origDir, _newDir))
+        {
+            return false;
+        }
+
+        select msks_eft_FileFormat where msks_eft_FileFormat.FormatId == _sks_eftap_file.FormatId;
+
+        select firstonly msks_eft_filedetail_extra join msks_eft_filedetail
+            where msks_eft_filedetail_extra.RefRecId == msks_eft_filedetail.recid
+            && msks_eft_filedetail.FileRecId == _sks_eftap_file.RecId
+            && msks_eft_filedetail_extra.fieldname == 'nextfileid';
+
+
+        if(_sks_eftap_file.EFTFileType == SKS_EFT_Module::AR)
+        {
+            formatName = strReplace('SKS_EFT_Format_' + msks_eft_FileFormat.FormatGroup + '_AR' + '_RF', '-', '_');
+            mReturnMsg = SKS_EFT_FormatChecker::ValidateClass(formatName, _sks_eftap_file.FormatId); //Check for RF specific class.
+            if(mReturnMsg)
+            {
+                formatName = strReplace('SKS_EFT_Format_' + msks_eft_FileFormat.FormatGroup + '_AR', '-', '_');
+                mReturnMsg = SKS_EFT_FormatChecker::ValidateClass(formatName, _sks_eftap_file.FormatId); //If we don't find RF specific class then continue to check for normal class.
+            }
+        }
+
+        if(_sks_eftap_file.EFTFileType == SKS_EFT_Module::AP || mReturnMsg != '')
+        {
+            formatName = strReplace('SKS_EFT_Format_' + msks_eft_FileFormat.FormatGroup + '_RF', '-', '_');
+            mReturnMsg = SKS_EFT_FormatChecker::ValidateClass(formatName, _sks_eftap_file.FormatId);
+            if(mReturnMsg)
+            {
+                formatName = strReplace('SKS_EFT_Format_' + msks_eft_FileFormat.FormatGroup, '-', '_');
+                mReturnMsg = SKS_EFT_FormatChecker::ValidateClass(formatName, _sks_eftap_file.FormatId);
+            }
+        }
+
+        if(mReturnMsg != '') //errors were found
+        {
+            error(mReturnMsg);
+            return false;
+        }
+
+        perm = new ExecutePermission();
+        perm.assert();
+
+        obj = new SysDictClass(className2Id(formatName));
+        classInstance = obj.makeObject(); // Instantiate class
+        obj.callObject('setFileNbr', classInstance, _sks_eftap_file.FileNbr); // Call method to set variable
+        obj.callObject('setSeqNumber', classInstance, _sks_eftap_file.Ret_NbrGoodRecs);
+        obj.callObject('setFileIdMod', classInstance, msks_eft_filedetail_extra.Value);
+        obj.callObject('setFileTempDir', classInstance, _rootDir + @'\' + _newDir);
+        obj.callObject('setModule', classInstance, _sks_eftap_file.EFTFileType);
+        obj.callObject('run', classInstance); // Run
+
+        mReturnMsg = obj.callObject('getErrorText', classInstance);
+
+        obj = null;
+        classInstance = null;
+        CodeAccessPermission::revertAssert();
+
+        if(mReturnMsg != '') //errors were found
+        {
+            error(mReturnMsg);
+            return false;
+        }
+
+        SKS_EFT_FormatChecker::validateFile(_sks_eftap_file, _rootDir, _origDir, _newDir, formatName, msks_eft_FileFormat.FormatGroup);
+
+        //info(strFmt('File number: %2, new file created at: %3, Format class: %1', formatName, _sks_eftap_file.FileNbr, _sks_eftap_file.FilePath + @'\' + _rootDir + @'\' + _newDir + @'\' + _sks_eftap_file.FileName));
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateClass</Name>
+				<Source><![CDATA[
+    private static str ValidateClass(str className, str formatId)
+    {
+        TreeNode tnode2Enum;
+        ;
+
+        tnode2Enum = TreeNode::findNode('Classes');
+        tnode2Enum = tnode2Enum.AOTfindChild(className);
+
+        if (tnode2Enum == null)
+        {
+            return strFmt("@SKS1022", formatId);
+        }
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MoveBaseFile</Name>
+				<Source><![CDATA[
+    private static boolean MoveBaseFile(SKS_EFTAP_File _SKS_EFTAP_File, str rootDir, str origDir, str newDir)
+    {
+        boolean locErrorFileExists;
+
+        str locFilePathName = _SKS_EFTAP_File.FilePath + @'\' + _SKS_EFTAP_File.FileName;
+
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct();
+        fileHub.parmThrowErrorIfException(false);
+
+        // See if base file exists
+        fileHub.runFileInquire(locFilePathName);
+
+        locErrorFileExists = fileHub.attrFileExists();
+        if(!locErrorFileExists)
+        {
+            error(strFmt('File number: %1, Could not create file. Original file not found: %2', _sks_eftap_file.FileNbr, locFilePathName));
+            return false;
+        }
+        
+        // Create root directory
+        fileHub.runDirectoryCreate(_SKS_EFTAP_File.FilePath + @'\' + rootDir);
+
+        // Create base directory
+        fileHub.runDirectoryCreate(_SKS_EFTAP_File.FilePath + @'\' + rootDir + @'\' + origDir);
+
+        // Create new directory
+        fileHub.runDirectoryCreate(_SKS_EFTAP_File.FilePath + @'\' + rootDir + @'\' + newDir);
+
+        // Copy base file to origDir
+        fileHub.runFileCopyTo(_SKS_EFTAP_File.FilePath + @'\' + rootDir + @'\' + origDir + @'\' + _SKS_EFTAP_File.FileName);
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

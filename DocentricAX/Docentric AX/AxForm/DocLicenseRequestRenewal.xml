@@ -1,0 +1,998 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>DocLicenseRequestRenewal</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+using System.Net.Mail;
+using Docentric.AX.Email;
+using System.Web;
+
+[Form]
+public class DocLicenseRequestRenewal extends FormRun
+{
+    private boolean downloadEmailClicked = false;  // Indicate if the DownloadEmail button was clicked
+    private str currentUser;
+    private DocLicenseParameters bufferDocLicenseParameters;
+    private str contactPersonListVar;
+    private str contactEmailListVar;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        contactPersonListVar,
+        contactEmailListVar
+    #endmacro
+
+
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the form.
+    /// </summary>
+    public void init()
+    {
+        super();
+
+        if (element.args() == null || element.args().dataset() != tableNum(DocLicenseParameters))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Form has to be called from the Docentric AX parameters form');
+        }
+
+        bufferDocLicenseParameters = element.args().record();
+
+        // Set the controls
+        RenewalLicenseSubscriptionStart.dateValue(bufferDocLicenseParameters.LicenseSubscriptionEnd);
+        if (bufferDocLicenseParameters.LicenseType == DocReportParamLicenseType::Trial)
+        {
+            RenewalLicenseSubscriptionEnd.dateValue(RenewalLicenseSubscriptionStart.dateValue() + 30);
+        }
+        else
+        {
+            RenewalLicenseSubscriptionEnd.dateValue(nextYr(RenewalLicenseSubscriptionStart.dateValue()));
+        }
+        LicenseDetails.text(bufferDocLicenseParameters.LicenseDetails);
+
+        UserId curUserId = curUserId();
+        UserName curUserName = xUserInfo::find(false, curUserId).Name;
+        Name curWorkerName = HcmWorker::findByPerson(DirPersonUser::find(curUserId).PersonParty).name();
+
+        // Restore the values of the controls from the SysLastValue store
+        xSysLastValue::getLast(this);
+        ContactPersonList.text(contactPersonListVar ? contactPersonListVar : (curWorkerName != '' ? curWorkerName : curUserName));
+        ContactEmailList.text(contactEmailListVar ? contactEmailListVar : DocEmailMngHelper::getUserEmailAddress(curUserId));
+
+        currentUser = strFmt('%1 (%2)', curUserId, curWorkerName != '' ? curWorkerName : curUserName);
+
+        // Hide the LicenseEntilement tab for specified license types
+        if (bufferDocLicenseParameters.LicenseType == DocReportParamLicenseType::Development
+                || bufferDocLicenseParameters.LicenseType == DocReportParamLicenseType::Partner
+                || bufferDocLicenseParameters.LicenseType == DocReportParamLicenseType::FreeEditionWithPaidSupport)
+        {
+            LicenseEntitlementTabPage.visible(false);
+            LicenseDetails.mandatory(false);
+        }
+
+        // Warn the user if a renewal request has already been sent
+        if (bufferDocLicenseParameters.LicenseRenewalRequestSent)
+        {
+            UserId requesterId = bufferDocLicenseParameters.LicenseRenewalRequestLastSentBy;
+            
+            // Get the worker name or user name of the requester
+            str requesterName = HcmWorker::findByPerson(DirPersonUser::find(requesterId).PersonParty).name();
+            if (!requesterName)
+            {
+                requesterName = xUserInfo::find(false, requesterId).Name;
+            }
+
+            if (Box::yesNo(strFmt("@DocentricAX4:RenewalRequestAlreadySentWarning", requesterId, requesterName,
+                                  DateTimeUtil::applyTimeZoneOffset(bufferDocLicenseParameters.LicenseRenewalRequestLastSentDateTime, DateTimeUtil::getUserPreferredTimeZone())),
+                DialogButton::No) == DialogButton::No)
+            {
+                element.close();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeOk</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Called when button Ok is clicked (in this case this is the SendEmail button).
+    /// </summary>
+    public void closeOk()
+    {
+        if (!element.validate())
+        {
+            return;
+        }
+
+        // Create and send the license renewal request mail
+        if (!element.createRenewalRequestEmail())
+        {
+            return;
+        }
+
+        // Update the LicenseRequestRenewalSent field in the DocLicenseParameters table
+        element.updateLicenseRequestRenewalSent();
+
+        // Save the values of the controls to the SysLastValue store
+        contactPersonListVar = ContactPersonList.text();
+        contactEmailListVar = ContactEmailList.text();
+        xSysLastValue::saveLast(this);
+
+        super();
+
+        DocGlobalHelper::handleInfo("@DocentricAX4:SubscriptionRenewalRequestEmailSentMsg");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeCancel</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Called when the Cancel button is clicked.
+    /// </summary>
+    public void closeCancel()
+    {
+        if (downloadEmailClicked)
+        {
+            // Save the values of the controls to the SysLastValue store
+            contactPersonListVar = ContactPersonList.text();
+            contactEmailListVar = ContactEmailList.text();
+            xSysLastValue::saveLast(this);
+
+            if (Box::yesNo("@DocentricAX4:LicenseRequestRenewalMsgBoxLogRequestRenewalSentText", DialogButton::No) == DialogButton::Yes)
+            {
+                // Update the LicenseRequestRenewalSent field in the DocLicenseParameters table
+                element.updateLicenseRequestRenewalSent();
+            }
+        }
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the value of the controls.
+    /// </summary>
+    /// <returns>True/False</returns>
+    private boolean validate()
+    {
+        boolean res = true;
+
+        // RenewalLicenseSubscriptionEnd
+        // -- Check if the field is mandatory.
+        res = res && RenewalLicenseSubscriptionEnd.validate();
+        // -- Check if the renewal subscription start date is earlier than the current subscription end date.
+        if (res && RenewalLicenseSubscriptionEnd.dateValue() <= RenewalLicenseSubscriptionStart.dateValue())
+        {
+            res = checkFailed("@DocentricAX4:LicenseRequestRenewalSubscriptionExpirationDateLessThanStartDate");
+        }
+
+        // -- Check the subscription renewal interval.
+        if (DocLicenseParameters.LicenseType == DocReportParamLicenseType::Trial)
+        {
+            // Check if the subscription renewal interval is less than 1 week.
+            if (res && RenewalLicenseSubscriptionEnd.dateValue() < RenewalLicenseSubscriptionStart.dateValue() + 7)
+            {
+                res = checkFailed("@DocentricAX4:LicenseRequestRenewalSubscriptionLessThanOneWeek");
+            }
+        }
+        else // For other license types
+        {
+            // Check if the subscription renewal interval is less than 1 year.
+            if (res && RenewalLicenseSubscriptionEnd.dateValue() < nextYr(RenewalLicenseSubscriptionStart.dateValue()))
+            {
+                res = checkFailed("@DocentricAX4:LicenseRequestRenewalSubscriptionLessThanOneYear");
+            }
+        }
+
+        // LicenseDetails
+        // -- Check if the field is mandatory.
+        res = res && LicenseDetails.validate();
+
+        // ContactEmailList
+        // -- Check if the field is mandatory.
+        res = res && ContactEmailList.validate();
+        // -- Validate the entered contact email list.
+        if (res && ContactEmailList.text() && !DocGlobalHelper::validateEmailList(ContactEmailList.text()))
+        {
+            res = checkFailed("@DocentricAX4:ContactEmailsInvalidErrMsg");
+        }
+
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRenewalRequestEmail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and sends a license renewal request email.
+    /// </summary>
+    /// <param name = "_sendEmailManually">Flag indicating whether the email will be send manually</param>
+    /// <returns>True if the email was successfully sent; otherwise false</returns>
+    private boolean createRenewalRequestEmail(boolean _sendEmailManually = false)
+    {
+        boolean renewalRequestSent = false;
+
+        str fromAddress = DocEmailMngHelper::getDefaultEmailProviderEmailAddress();
+        str ccAddresses = ContactEmailList.text();
+        str replyToAddresses = '';
+        if (!_sendEmailManually)
+        {
+            replyToAddresses = DocEmailMngHelper::deleteEmptyAndDuplicatedEmailAddresses(strFmt('%1;%2' , fromAddress, ccAddresses));
+        }
+
+        str subject = strFmt(SysLabel::labelId2String(literalStr("@DocentricAX4:LicenseRequestRenewalEmailSubject"), 'en-us'), DocLicenseParameters.LicenseHolder);
+        str body = element.getEmailBody();
+
+        try
+        {
+            // Create a license renewal request email message
+            using (MailMessage mailMessage = DocEmailMngHelper::createEmailMessage(
+                                                                    fromAddress,
+                                                                    '',  // sender display name will be inferred from fromAddress
+                                                                    DocConstant::LicenseRenewalEmailAddress,  // renewal@docentric.com
+                                                                    ccAddresses,
+                                                                    '',  // Bcc
+                                                                    subject,
+                                                                    body,
+                                                                    true,  // is body HTML
+                                                                    eMailPriority::Normal,
+                                                                    '',  // Attachment filename
+                                                                    conNull(),  // Attachment file content
+                                                                    conNull(),  // Additional attachments
+                                                                    null,  // Embedded images
+                                                                    replyToAddresses,  // Reply-to addresses
+                                                                    '',  // Bounce-to address
+                                                                    true  // Can be the created message sent after downloading
+                                                                ))
+            {
+                if (_sendEmailManually)
+                {
+                    // Send email to user to enable manual sending
+                    DocEmailMngHelper::sendEmailToUser(mailMessage);
+
+                    DocDiagnosticsManager::logLicenseEvent(DocConstantDiagnostics::LicenseRenewalDownloaded);
+                }
+                else
+                {
+                    // Send mail message using email provider set in Email parameters
+                    DocEmailMngHelper::sendEmailMsgUsingEmailProvider(mailMessage);
+
+                    DocDiagnosticsManager::logLicenseEvent(DocConstantDiagnostics::LicenseRenewalSent);
+                }
+
+                renewalRequestSent = true;
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrError(funcName(), "@DocentricAX4:LicenseRequestRenewalEmailSendError");
+        }
+        catch
+        {
+            DocGlobalHelper::handleError("@DocentricAX4:LicenseRequestRenewalEmailSendError", true, funcName());
+        }
+
+        return renewalRequestSent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEmailBody</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates an email body for license renewal request email.
+    /// </summary>
+    /// <returns>An email body</returns>
+    private str getEmailBody()
+    {
+        // Get license renewal request email template from resource file
+        ResourceNode node = SysResource::getResourceNode(resourceStr(DocLicenseRequestRenewalEmailBodyHTM));
+        if (!node)
+        {
+            DocGlobalHelper::handleError(strFmt("@SYS332180", identifierStr(DocLicenseRequestRenewalEmailBodyHTM)), false, funcName(), true);
+        }
+        str emailTemplate = conPeek(SysResource::getResourceNodeData(node), 1);
+        str envDomainName = DocDiagnosticsManager::fullyQualifiedDomainName();
+        str envCustomName = DocDiagnosticsManager::getCurrentEnvironmentCustomName();
+        str lcsEnvironmentId = DocGlobalHelper::getLcsEnvironmentId();
+        DocEnvironmentMode envMode = DocDiagnosticsManager::getCurrentEnvironmentMode();
+        str envDomainNameAndCustomName = envCustomName != '' ? strFmt('%1 (%2)', envDomainName, envCustomName) : envDomainName;
+        str lcsEnvironmentIdAndMode = envMode != DocEnvironmentMode::NotSet ? strFmt('%1 (%2)', lcsEnvironmentId, enum2Str(envMode)) : lcsEnvironmentId;
+
+        return strFmt(emailTemplate,
+            DocLicenseParameters.LicenseSerialNo,
+            DocLicenseParameters.LicenseHolder,
+            DocLicenseParameters.LicenseType,
+            DocLicenseParameters.LicenseCode,
+            DocLicenseParameters.LicenseSubscriptionStart,
+            DocLicenseParameters.LicenseSubscriptionEnd,
+            RenewalLicenseSubscriptionStart.dateValue(),
+            RenewalLicenseSubscriptionEnd.dateValue(),
+            strReplace(HttpUtility::HtmlEncode(LicenseDetails.text()), '\n', '<br>'),
+            strReplace(HttpUtility::HtmlEncode(AdditionalNote.text()), '\n', '<br>'),
+            HttpUtility::HtmlEncode(ContactPersonList.text()),
+            HttpUtility::HtmlEncode(ContactEmailList.text()),
+            HttpUtility::HtmlEncode(DocInstallation::getInstallationId()),
+            HttpUtility::HtmlEncode(strFmt('%1 / %2', DocDiagnosticsManager::deploymentType(), DocDiagnosticsManager::hostingEnvironment())),
+            HttpUtility::HtmlEncode(DocGlobalHelper::getAADTenantId()),
+            HttpUtility::HtmlEncode(envDomainNameAndCustomName),
+            HttpUtility::HtmlEncode(DocDiagnosticsManager::d365Version()),
+            HttpUtility::HtmlEncode(DocDiagnosticsManager::d365UserLicenseCount()),
+            HttpUtility::HtmlEncode(strFmt('%1 (%2)', CompanyInfo::find().name(), curExt())),
+            HttpUtility::HtmlEncode(currentUser),
+            HttpUtility::HtmlEncode(DocGlobalHelper::getServerHostname()),
+            HttpUtility::HtmlEncode(lcsEnvironmentIdAndMode));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLicenseRequestRenewalSent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the LicenseRequestRenewalSent field in the DocLicenseParameters table.
+    /// </summary>
+    private void updateLicenseRequestRenewalSent()
+    {
+        try
+        {
+            ttsbegin;
+
+            bufferDocLicenseParameters.selectForUpdate(true);
+
+            bufferDocLicenseParameters.LicenseRenewalRequestSent = NoYes::Yes;
+            bufferDocLicenseParameters.LicenseRenewalRequestLastSentBy = curUserId();
+            bufferDocLicenseParameters.LicenseRenewalRequestLastSentDateTime = DateTimeUtil::getSystemDateTime();
+
+            bufferDocLicenseParameters.update();
+
+            ttscommit;
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastValueUserId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current user Id.
+    /// </summary>
+    /// <returns>Current user Id</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    private UserId lastValueUserId()
+    {
+        return curUserId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastValueType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the type of the element.
+    /// </summary>
+    /// <returns>Element type</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    private UtilElementType lastValueType()
+    {
+        return UtilElementType::Form;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastValueElementName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the name of the element.
+    /// </summary>
+    /// <returns>Element name</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    private IdentifierName lastValueElementName()
+    {
+        return this.name();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastValueDesignName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the design name.
+    /// </summary>
+    /// <returns>Design name</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    private IdentifierName lastValueDesignName()
+    {
+        // Unique key: (user, company, type, elementName, designName)
+        // We don't have such a need to save different sets of the form data.
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastValueDataAreaId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current data area.
+    /// </summary>
+    /// <returns>Data area Id</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    DataAreaId lastValueDataAreaId()
+    {
+        return curext();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the values of the controls.
+    /// </summary>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    void initParmDefault()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Packs the values of the controls into the container.
+    /// </summary>
+    /// <returns>Packed container</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unpacks the values of the controls in the packed container. 
+    /// </summary>
+    /// <param name = "packedClass">Packed container</param>
+    /// <returns>True/False</returns>
+    /// <remarks>SysLastValue framework need this method.</remarks>
+    public boolean unpack(container packedClass)
+    {
+        int version = conPeek(packedClass, 1);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="" />
+		<DataControls xmlns="">
+			<Control>
+				<Name>RenewalLicenseSubscriptionEnd</Name>
+				<Type>Date</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Event hanlder for the modified event.
+        /// </summary>
+        /// <returns>True/False</returns>
+        public boolean modified()
+        {
+            boolean ret;
+        
+            ret = super();
+            
+            // A workaround to enable the validate() method to work properly.
+            RenewalLicenseSubscriptionEnd.dateValue(this.dateValue());
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>LicenseDetails</Name>
+				<Type>String</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Event hanlder for the modified event.
+        /// </summary>
+        /// <returns>True/False</returns>
+        public boolean modified()
+        {
+            boolean ret;
+    
+            ret = super();
+
+            // A workaround to enable the validate() method to work properly.
+            LicenseDetails.text(this.text());
+    
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>ContactEmailList</Name>
+				<Type>String</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Event hanlder for the modified event.
+        /// </summary>
+        /// <returns>True/False</returns>
+        public boolean modified()
+        {
+            boolean ret;
+        
+            ret = super();
+            
+            // Clean up the email list + a workaround to enable the validate() method to work properly.
+            ContactEmailList.text(DocEmailMngHelper::deleteEmptyAndDuplicatedEmailAddresses(this.text()));
+        
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>DownloadEmailButton</Name>
+				<Type>CommandButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        /// <summary>
+        /// Called when the button is clicked.
+        /// </summary>
+        public void clicked()
+        {
+            if (!element.validate())
+            {
+                return;
+            }
+
+            // Download email in browser to enable the user to preview it or to send it manually
+            if (element.createRenewalRequestEmail(true))
+            {
+                downloadEmailClicked = true;
+            }
+
+            super();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources>
+		<AxFormDataSource xmlns="">
+			<Name>DocLicenseParameters</Name>
+			<Table>DocLicenseParameters</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>Key</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseDetails</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseExpirationDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseHolder</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseNotificationSettings</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseSerialNo</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseStartDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseSubscriptionEnd</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseSubscriptionStart</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>LicenseType</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ModifiedBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ModifiedDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Partition</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<AllowCreate>No</AllowCreate>
+			<AllowDelete>No</AllowDelete>
+			<AllowEdit>No</AllowEdit>
+			<InsertAtEnd>No</InsertAtEnd>
+			<InsertIfEmpty>No</InsertIfEmpty>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+	</DataSources>
+	<Design>
+		<Caption xmlns="">@DocentricAX4:LicenseRequestRenewalCaption</Caption>
+		<DialogSize xmlns="">Medium</DialogSize>
+		<Pattern xmlns="">DialogFastTabs</Pattern>
+		<PatternVersion xmlns="">1.0</PatternVersion>
+		<SetCompany xmlns="">No</SetCompany>
+		<Style xmlns="">Dialog</Style>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormStaticTextControl">
+				<Name>InstructionStaticText</Name>
+				<ExtendedStyle>dialog_secondaryInstruction</ExtendedStyle>
+				<Type>StaticText</Type>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Text>@DocentricAX4:LicenseRequestRenewalInstruction</Text>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormTabControl">
+				<Name>ContentTab</Name>
+				<Type>Tab</Type>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>LicenseInfoTabPage</Name>
+						<Pattern>FieldsFieldGroups</Pattern>
+						<PatternVersion>1.1</PatternVersion>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>LicenseInfoGroup</Name>
+								<Type>Group</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>DocLicenseParameters_LicenseSerialNo</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>LicenseSerialNo</DataField>
+										<DataSource>DocLicenseParameters</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormComboBoxControl">
+										<Name>DocLicenseParameters_LicenseType</Name>
+										<Type>ComboBox</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>LicenseType</DataField>
+										<DataSource>DocLicenseParameters</DataSource>
+										<Items />
+									</AxFormControl>
+								</Controls>
+								<Breakable>No</Breakable>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>LicenseTypeGroup</Name>
+								<Type>Group</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>DocLicenseParameters_LicenseHolder</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>LicenseHolder</DataField>
+										<DataSource>DocLicenseParameters</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormStringControl">
+										<Name>DocLicenseParameters_LicenseCode</Name>
+										<Type>String</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>LicenseCode</DataField>
+										<DataSource>DocLicenseParameters</DataSource>
+									</AxFormControl>
+								</Controls>
+								<Breakable>No</Breakable>
+							</AxFormControl>
+						</Controls>
+						<ColumnsMode>Fill</ColumnsMode>
+						<Caption>@DocentricAX4:LicenseRequestRenewalLicenseInfoTab</Caption>
+						<FastTabExpanded>Yes</FastTabExpanded>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>SubscriptionTabPage</Name>
+						<Pattern>FieldsFieldGroups</Pattern>
+						<PatternVersion>1.1</PatternVersion>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>CurrentSubscriptionGroup</Name>
+								<Type>Group</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>CurrentLicenseSubscriptionStart</Name>
+										<Type>Date</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>LicenseSubscriptionStart</DataField>
+										<DataSource>DocLicenseParameters</DataSource>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>CurrentLicenseSubscriptionEnd</Name>
+										<Type>Date</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<DataField>LicenseSubscriptionEnd</DataField>
+										<DataSource>DocLicenseParameters</DataSource>
+									</AxFormControl>
+								</Controls>
+								<Breakable>No</Breakable>
+								<Caption>@DocentricAX4:LicenseRequestRenewalCurrentSubscriptionGroup</Caption>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormGroupControl">
+								<Name>RenewalSubscriptionGroup</Name>
+								<Type>Group</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<Controls>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>RenewalLicenseSubscriptionStart</Name>
+										<AllowEdit>No</AllowEdit>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>Date</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<ExtendedDataType>DocReportParamLicenseSubscriptionStart</ExtendedDataType>
+									</AxFormControl>
+									<AxFormControl xmlns=""
+										i:type="AxFormDateControl">
+										<Name>RenewalLicenseSubscriptionEnd</Name>
+										<AutoDeclaration>Yes</AutoDeclaration>
+										<Type>Date</Type>
+										<FormControlExtension
+											i:nil="true" />
+										<ExtendedDataType>DocReportParamLicenseSubscriptionEnd</ExtendedDataType>
+										<Mandatory>Yes</Mandatory>
+									</AxFormControl>
+								</Controls>
+								<Breakable>No</Breakable>
+								<Caption>@DocentricAX4:LicenseRequestRenewalRenewalSubscriptionGroup</Caption>
+							</AxFormControl>
+						</Controls>
+						<ColumnsMode>Fill</ColumnsMode>
+						<Caption>@DocentricAX4:LicenseRequestRenewalSubscriptionTab</Caption>
+						<FastTabExpanded>Yes</FastTabExpanded>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>LicenseEntitlementTabPage</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<Pattern>FillText</Pattern>
+						<PatternVersion>UX7 1.0</PatternVersion>
+						<Type>TabPage</Type>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>LicenseDetails</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HeightMode>SizeToAvailable</HeightMode>
+								<Type>String</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>DocReportParamLicenseDescription</ExtendedDataType>
+								<Label>@DocentricAX4:LicenseRequestRenewalLicenseDetailsInstruction</Label>
+								<Mandatory>Yes</Mandatory>
+								<MultiLine>Yes</MultiLine>
+							</AxFormControl>
+						</Controls>
+						<Caption>@DocentricAX4:LicenseRequestRenewalLicenseEntitlementTab</Caption>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>AdditionalNoteTabPage</Name>
+						<Pattern>FillText</Pattern>
+						<PatternVersion>UX7 1.0</PatternVersion>
+						<Type>TabPage</Type>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>AdditionalNote</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HeightMode>SizeToAvailable</HeightMode>
+								<Type>String</Type>
+								<WidthMode>SizeToAvailable</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>Str1260</ExtendedDataType>
+								<MultiLine>Yes</MultiLine>
+								<ShowLabel>No</ShowLabel>
+							</AxFormControl>
+						</Controls>
+						<Caption>@DocentricAX4:LicenseRequestRenewalAdditionalNoteTab</Caption>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormTabPageControl">
+						<Name>CompanyContactsTabPage</Name>
+						<Pattern>FieldsFieldGroups</Pattern>
+						<PatternVersion>1.1</PatternVersion>
+						<Type>TabPage</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>ContactPersonList</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HelpText>@DocentricAX4:LicenseRequestRenewalCompanyContactPersonHelp</HelpText>
+								<Type>String</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>Str1260</ExtendedDataType>
+								<Label>@DocentricAX4:LicenseRequestRenewalCompanyContactPerson</Label>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormStringControl">
+								<Name>ContactEmailList</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<HelpText>@DocentricAX4:LicenseRequestRenewalCompanyContactEmailHelp</HelpText>
+								<Type>String</Type>
+								<FormControlExtension
+									i:nil="true" />
+								<ExtendedDataType>Str1260</ExtendedDataType>
+								<Label>@DocentricAX4:LicenseRequestRenewalCompanyContactEmail</Label>
+								<Mandatory>Yes</Mandatory>
+							</AxFormControl>
+						</Controls>
+						<ColumnsMode>Fill</ColumnsMode>
+						<Caption>@DocentricAX4:LicenseRequestRenewalCompanyContactsTab</Caption>
+						<FastTabExpanded>Yes</FastTabExpanded>
+					</AxFormControl>
+				</Controls>
+				<Style>FastTabs</Style>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormButtonGroupControl">
+				<Name>CommitButtonGroup</Name>
+				<Type>ButtonGroup</Type>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>SendEmailButton</Name>
+						<HelpText>@DocentricAX4:LicenseRequestRenewalSendEmailButtonHelp</HelpText>
+						<Type>CommandButton</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Command>OK</Command>
+						<DefaultButton>Yes</DefaultButton>
+						<Text>@DocentricAX4:LicenseRequestRenewalSendEmailButton</Text>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>DownloadEmailButton</Name>
+						<HelpText>@DocentricAX4:LicenseRequestRenewalDownloadEmailButtonHelp</HelpText>
+						<Type>CommandButton</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Text>@DocentricAX4:LicenseRequestRenewalDownloadEmailButton</Text>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormCommandButtonControl">
+						<Name>CancelButton</Name>
+						<Type>CommandButton</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<Command>Cancel</Command>
+						<SaveRecord>No</SaveRecord>
+						<Text>@SYS15212</Text>
+					</AxFormControl>
+				</Controls>
+				<ArrangeMethod>HorizontalRight</ArrangeMethod>
+				<Style>DialogCommitContainer</Style>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

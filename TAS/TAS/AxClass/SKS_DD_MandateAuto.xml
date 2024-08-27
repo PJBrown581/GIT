@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_DD_MandateAuto</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_DD_MandateAuto extends SKS_DD_MandatesBatch
+{
+    SKS_EFT_Setup       sKS_EFT_Setup = SKS_EFT_Setup::find();
+    boolean             sendMail;
+    SKS_EB_AutoType     autoType;
+    LogisticsElectronicAddress  logisticsElectronicAddress;
+    #timeConstants
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        Batch bat;
+
+        bat = this.parmCurrentBatch();
+
+        if(bat.RecId == sKS_EFT_Setup.AutoSendBatchJobId)
+        {
+            this.runEmailProcess();
+            this.runRegularMailProcess();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runEmailProcess</Name>
+				<Source><![CDATA[
+    public void runEmailProcess()
+    {
+        sendMail = true;
+        autoType = SKS_EB_AutoType::Email;
+        this.sendOriginal();
+        this.sendReminder1();   
+        this.sendReminder2();
+        this.cancelAfterDays();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runRegularMailProcess</Name>
+				<Source><![CDATA[
+    public void runRegularMailProcess()
+    {
+        sendMail = false;
+        autoType = SKS_EB_AutoType::RegularMail;
+        this.sendOriginal();
+        this.sendReminder1();
+        this.sendReminder2();
+        this.cancelAfterDays();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendOriginal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to send email original
+    /// </summary>
+    public void sendOriginal()
+    {
+        CustDirectDebitMandate  custDirectDebitMandate;
+        
+        while select forupdate * from custDirectDebitMandate
+            where custDirectDebitMandate.SKS_EB_MandateAutoStatus == SKS_EB_MandateAutoStatus::Ready
+                && custDirectDebitMandate.SKS_EB_AutoType ==  autoType
+            && (custDirectDebitMandate.Status ==  CustMandateStatus::Incomplete || custDirectDebitMandate.SignatureDate == dateNull() || custDirectDebitMandate.BankAccount == '' || custDirectDebitMandate.CustomerAddress == 0) //Bug 10976
+            && (((custDirectDebitMandate.MandateScheme == CustMandateScheme::B2B || custDirectDebitMandate.MandateScheme == CustMandateScheme::CORE) && custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Standard)|| custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Leverander || custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Betalings)
+        {
+            
+            logisticsElectronicAddress  = this.getContactInfoByPurpose(custDirectDebitMandate);
+            if(logisticsElectronicAddress.Locator)
+            {
+                ttsbegin;
+                SKS_DD_MandateAutomationProcess::beginProcess(custDirectDebitMandate, sendMail, sKS_EFT_Setup.SKS_DD_MandatesTemplate, logisticsElectronicAddress.Locator);
+                custDirectDebitMandate.SKS_EB_MandateAutoStatus = SKS_EB_MandateAutoStatus::Sent;
+                custDirectDebitMandate.SKS_EB_AutoStatusDate = DateTimeUtil::getSystemDateTime();
+                custDirectDebitMandate.update();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendReminder1</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to send email reminder1
+    /// </summary>
+    public void sendReminder1()
+    {
+        CustDirectDebitMandate  custDirectDebitMandate;
+        Days    numberofDays;
+        
+        while select forupdate * from custDirectDebitMandate
+            where custDirectDebitMandate.SKS_EB_MandateAutoStatus == SKS_EB_MandateAutoStatus::Sent
+                && custDirectDebitMandate.SKS_EB_AutoType ==  autoType
+            && (custDirectDebitMandate.Status ==  CustMandateStatus::Incomplete || custDirectDebitMandate.SignatureDate == dateNull() || custDirectDebitMandate.BankAccount == '' || custDirectDebitMandate.CustomerAddress == 0) //Bug 10976
+            && (((custDirectDebitMandate.MandateScheme == CustMandateScheme::B2B || custDirectDebitMandate.MandateScheme == CustMandateScheme::CORE) && custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Standard)|| custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Leverander || custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Betalings)
+        {
+            numberofDays = real2int(DateTimeutil::getDifference(DateTimeUtil::getSystemDateTime(), custDirectDebitMandate.SKS_EB_AutoStatusDate) / #secondsPerDay);
+            
+            if(numberofDays >= sKS_EFT_Setup.Reminder1AfterDays)
+            {
+                logisticsElectronicAddress  = this.getContactInfoByPurpose(custDirectDebitMandate);
+                if(logisticsElectronicAddress.Locator)
+                {
+                    ttsbegin;
+                    SKS_DD_MandateAutomationProcess::beginProcess(custDirectDebitMandate, sendMail, sKS_EFT_Setup.TemplateReminder1, logisticsElectronicAddress.Locator);
+                    custDirectDebitMandate.SKS_EB_MandateAutoStatus = SKS_EB_MandateAutoStatus::SentReminder1;
+                    custDirectDebitMandate.SKS_EB_AutoStatusDate = DateTimeUtil::getSystemDateTime();
+                    custDirectDebitMandate.update();
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendReminder2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to send email reminder2
+    /// </summary>
+    public void sendReminder2()
+    {
+        CustDirectDebitMandate  custDirectDebitMandate;
+        Days    numberofDays;
+        
+        while select forupdate * from custDirectDebitMandate
+            where custDirectDebitMandate.SKS_EB_MandateAutoStatus == SKS_EB_MandateAutoStatus::SentReminder1
+                && custDirectDebitMandate.SKS_EB_AutoType ==  autoType
+            && (custDirectDebitMandate.Status ==  CustMandateStatus::Incomplete || custDirectDebitMandate.SignatureDate == dateNull() || custDirectDebitMandate.BankAccount == '' || custDirectDebitMandate.CustomerAddress == 0) //Bug 10976
+            && (((custDirectDebitMandate.MandateScheme == CustMandateScheme::B2B || custDirectDebitMandate.MandateScheme == CustMandateScheme::CORE) && custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Standard)|| custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Leverander || custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Betalings)
+        {
+            numberofDays = real2int(DateTimeutil::getDifference(DateTimeUtil::getSystemDateTime(), custDirectDebitMandate.SKS_EB_AutoStatusDate) / #secondsPerDay);
+            if(numberofDays >= sKS_EFT_Setup.Reminder2AfterDays)
+            {
+                logisticsElectronicAddress  = this.getContactInfoByPurpose(custDirectDebitMandate);
+                if(logisticsElectronicAddress.Locator)
+                {
+                    ttsbegin;
+                    SKS_DD_MandateAutomationProcess::beginProcess(custDirectDebitMandate, sendMail, sKS_EFT_Setup.TemplateReminder2, logisticsElectronicAddress.Locator);
+                    custDirectDebitMandate.SKS_EB_MandateAutoStatus = SKS_EB_MandateAutoStatus::SentReminder2;
+                    custDirectDebitMandate.SKS_EB_AutoStatusDate = DateTimeUtil::getSystemDateTime();
+                    custDirectDebitMandate.update();
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelAfterDays</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logic to cancel mandates after specified days
+    /// </summary>
+    public void cancelAfterDays()
+    {
+        CustDirectDebitMandate  custDirectDebitMandate;
+        Days    numberofDays;
+        
+        while select forupdate * from custDirectDebitMandate
+            where custDirectDebitMandate.SKS_EB_MandateAutoStatus == SKS_EB_MandateAutoStatus::SentReminder2
+                && custDirectDebitMandate.SKS_EB_AutoType ==  autoType
+        {
+            numberofDays = real2int(DateTimeutil::getDifference(DateTimeUtil::getSystemDateTime(), custDirectDebitMandate.SKS_EB_AutoStatusDate) / #secondsPerDay);
+            ttsbegin;
+            if(numberofDays >= sKS_EFT_Setup.CancelDays)
+            {
+                custDirectDebitMandate.SKS_EB_MandateAutoStatus = SKS_EB_MandateAutoStatus::CanceledNoReceipt;
+                custDirectDebitMandate.SKS_EB_AutoStatusDate = DateTimeUtil::getSystemDateTime();
+                custDirectDebitMandate.CancellationDate =  DateTimeUtil::date(DateTimeUtil::getSystemDateTime());
+                custDirectDebitMandate.update();
+            }
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getContactInfoByPurpose</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// 7536- gets contract info.
+    /// </summary>
+    /// <returns>
+    /// returns logistic electronic address.
+    /// </returns>
+    public logisticsElectronicAddress getContactInfoByPurpose(CustDirectDebitMandate   _mandateRecord)
+    {
+        SKS_EFT_Setup                   sks_EFT_Setupbuff;
+        LogisticsElectronicAddress      logisticsElectronicAddressLoc;
+        DirPartyLocation                dirPartyLocation;
+        LogisticsLocationRole           locationRole;
+        LogisticsElectronicAddressRole  logisticsElectronicAddressRole;
+        CustTable                       mCustTable;
+        DirPartyLocationRoleNames       contactPurpose;
+        sks_EFT_Setupbuff = SKS_EFT_Setup::find();
+
+        mCustTable = CustTable::find(_mandateRecord.CustAccount);
+        if(_mandateRecord.SKS_EB_AutoType == SKS_EB_AutoType::Email)
+        {
+            contactPurpose = sks_EFT_Setupbuff.MandateEmailPurpose;
+        }
+        else
+        {
+            contactPurpose = sks_EFT_Setupbuff.MandateRegularMailPurpose;
+        }
+
+        if(contactPurpose != '')
+        {
+            select Locator, Description from logisticsElectronicAddressLoc
+                where logisticsElectronicAddressLoc.Type == LogisticsElectronicAddressMethodType::Email
+            exists join dirPartyLocation
+                where dirPartyLocation.Location == logisticsElectronicAddressLoc.Location &&
+                        dirPartyLocation.Party == mCustTable.Party
+            exists join logisticsElectronicAddressRole
+                where logisticsElectronicAddressRole.ElectronicAddress == logisticsElectronicAddressLoc.RecId
+            exists join locationRole
+                where locationRole.RecId == logisticsElectronicAddressRole.LocationRole
+                    && locationRole.Name == contactPurpose;
+        }
+        return logisticsElectronicAddressLoc;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

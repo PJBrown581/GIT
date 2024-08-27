@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocSRSPrintArchiveContract</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class DocSRSPrintArchiveContract extends SRSPrintArchiveContract
+{
+    DocuTypeId printArchiveDocuTypeId;
+    DocReportPrintArchiveInfo reportPrintArchiveInfo;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new(DocuTypeId _printArchiveDocuTypeId, SRSReportFileFormat _archiveFormat)
+    {
+        super(_archiveFormat);
+        printArchiveDocuTypeId = _printArchiveDocuTypeId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPrintArchiveDocuTypeId</Name>
+				<Source><![CDATA[
+    public DocuTypeId parmPrintArchiveDocuTypeId(DocuTypeId _printArchiveDocuTypeId = printArchiveDocuTypeId)
+    {
+        printArchiveDocuTypeId = _printArchiveDocuTypeId;
+        return printArchiveDocuTypeId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReportPrintArchiveInfo</Name>
+				<Source><![CDATA[
+    public DocReportPrintArchiveInfo parmReportPrintArchiveInfo(DocReportPrintArchiveInfo _reportPrintArchiveInfo = reportPrintArchiveInfo)
+    {
+        reportPrintArchiveInfo = _reportPrintArchiveInfo;
+        return reportPrintArchiveInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>savePrintArchiveDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Enters details of an SSRS print archive in the <c>DocuRef</c> and saves the document in <c>DocuValue</c> table.
+    /// </summary>
+    /// <param name = "binData">The binary representation of the report</param>
+    /// <returns>The inserted PrintJobHeader RecID</returns>
+    /// <remarks>Copied from SRSPrintArchiveContract.savePrintArchiveDetails() to enable saving using custom document type and the report metadata</remarks>
+    public RecId savePrintArchiveDetails(container binData = [null])
+    {
+        DocuRef                 docuRef;
+        PrintJobHeader          printJobHeader;
+        RecId                   printJobHeaderRecId;
+
+        Filename fName = this.parmFileName();
+        str reportName = System.IO.Path::GetFileNameWithoutExtension(fName);
+
+        try
+        {
+            // Do nothing if there's not anything to archive.
+            if(conPeek(binData, 1) == null)
+            {
+                DocGlobalHelper::handleException(funcName(), 'The archiving document content is empty');
+            }
+
+            Binary binaryData = Binary::constructFromContainer(binData);
+            System.IO.MemoryStream memStream = binaryData.getMemoryStream();
+
+            // Create the header record
+            printJobHeaderRecId = this.createPrintJobHeader_DC();
+
+            str fileContentType = System.Web.MimeMapping::GetMimeMapping(fName);
+            str attachmentName = reportName;
+
+            docuRef = this.attachFile(
+                tableNum(PrintJobHeader),
+                printJobHeaderRecId,
+                curExt(),
+                // <Docentric>
+                this.parmPrintArchiveDocuTypeId(),
+                // </Docentric>
+                memStream,
+                fName,
+                fileContentType,
+                attachmentName);
+
+            // <Docentric>
+            if (docuRef && this.parmReportPrintArchiveInfo() != null)
+            {
+                // Update SharePoint file's metdata
+                docuRef = DocReportingHelper::updateSaveToArchiveSharePointFileMetadata(docuRef, this.parmReportPrintArchiveInfo().parmPrintReportSettings());
+                if (docuRef == null)
+                {
+                    throw Exception::Error;
+                }
+            }
+            // </Docentric>
+        }
+        catch
+        {
+            ttsbegin;
+
+            // Delete doc from storage if necessary
+            if (docuRef && docuRef.RecId)
+            {
+                // Delete the docuRef record and the document content if configured so.
+                docuRef.selectForUpdate();
+                docuRef.delete();
+            }
+
+            // Delete the print job header record
+            if (printJobHeaderRecId)
+            {
+                delete_from printJobHeader where printJobHeader.RecId == printJobHeaderRecId;
+            }
+
+            ttscommit;
+
+            // <Docentric>
+            //throw error(strFmt("@BI:UnableToArchiveReport", reportName));
+            DocGlobalHelper::handleException(funcName(), strFmt("@DocentricAX4:UnableToArchiveReportErrorMsg", reportName, this.parmPrintArchiveDocuTypeId()));
+            // </Docentric>
+        }
+
+        return printJobHeaderRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPrintJobHeader_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts a record in table <c>PrintJobHeader</c> , which represents an SSRS report archive.
+    /// </summary>
+    /// <returns>
+    /// The <c>RecId</c> value of the newly created record.
+    /// </returns>
+    /// <remarks>Copied from SRSPrintArchiveContract.createPrintJobHeader() because we cannot use it since it's a private method</remarks>
+    protected RecId createPrintJobHeader_DC()
+    {
+        PrintJobHeader      printJobHeader;
+
+        ttsbegin;
+        printJobHeader.format = PrintFormat::PDF;
+        printJobHeader.jobDescription = this.parmJobDescription();
+        printJobHeader.jobStatus = PrintJobStatus::Completed;
+        printJobHeader.jobType = #SRSArchiveDocument;
+        printJobHeader.printedBy = curuserid();
+        printJobHeader.printedDate = this.parmExecutionDate();
+        printJobHeader.printedTime = this.parmExecutionTime();
+        printJobHeader.numberOfPages = this.parmExecutionNumberOfPages();
+
+        printJobHeader.doInsert();
+        ttscommit;
+        return printJobHeader.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>attachFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Attaches a file to a record as a new document attachment.
+    /// </summary>
+    /// <param name="_refTableId">The table ID of the record to attach the document to.</param>
+    /// <param name="_refRecId">The RecId of the record to attach the document to.</param>
+    /// <param name="_refDataAreaId">The data area ID of the record to attach the document to.</param>
+    /// <param name="_type">The DocuType to use when attaching the document.</param>
+    /// <param name="_file">A stream containing the file to attach</param>
+    /// <param name="_fileName">The filename of the file to attach.</param>
+    /// <param name="_fileContentType">The MIME type of the file.</param>
+    /// <param name="_attachmentName">The name of the attachment to create.</param>
+    /// <param name="_notes">Optional. Notes that are provided for the new document attachment record.</param>
+    /// <returns>A reference to the created document attachment.</returns>
+    /// <remarks>Copied from DocumentManagement.attachFile() in order to enable setting up archiving file metadata</remarks>
+    protected DocuRef attachFile(TableId _refTableId, RefRecId _refRecId, DataAreaId _refDataAreaId, DocuTypeId _type, System.IO.Stream _file, str _fileName, str _fileContentType, str _attachmentName, str _notes = '')
+    {
+        if (!_refTableId || !_refRecId || !_refDataAreaId || !_type || !_attachmentName || _file == null || !_fileName)
+        {
+            throw error(error::missingParameter(null));
+        }
+        if (!DocReportingHelper::validateDocuTypeForSavingToPrintArchive(_type, true))
+        {
+            throw Exception::Error;
+        }
+
+        DocuRef ref;
+
+        ttsbegin;
+
+        ref.RefTableId = DocuRef::GetRootTableID(_refTableId);
+        ref.RefRecId = _refRecId;
+        ref.RefCompanyId = _refDataAreaId;
+        ref.TypeId = _type;
+        ref.Name = _attachmentName;
+        ref.Notes = _notes;
+        ref.insert();
+
+        DocuAction act = ref.docuAction();
+
+        // <Docentric>
+        DocDocuActionArchiveInterface actWithArchiveMetadata = act as DocDocuActionArchiveInterface;
+        if (actWithArchiveMetadata != null)
+        {
+            actWithArchiveMetadata.setReportPrintArchiveInfo(this.parmReportPrintArchiveInfo());
+        }
+        DocDocuActionReportInfoInterface actWithMetadata = act as DocDocuActionReportInfoInterface;
+        if (actWithMetadata != null && this.parmReportPrintArchiveInfo() != null)
+        {
+            actWithMetadata.setPrintReportSettings(this.parmReportPrintArchiveInfo().parmPrintReportSettings());
+        }
+        // </Docentric>
+
+        boolean result = act.attachFile(ref, _fileName, _fileContentType, _file);
+
+        if (!result)
+        {
+            throw error("@ApplicationFoundation:Docu_ErrorWhileAttaching");
+        }
+
+        ttscommit;
+
+        return ref;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SRSPrintArchiveContract construct(DocReportPrintArchiveInfo _printArchiveInfo = null, SRSReportFileFormat _archiveFormat = SRSReportFileFormat::PDF)
+    {
+        DocuTypeId printArchiveDocuTypeId;
+
+        if (_printArchiveInfo != null)
+        {
+            printArchiveDocuTypeId = _printArchiveInfo.getPrintArchiveDocuTypeId();
+        }
+        else
+        {
+            printArchiveDocuTypeId = DocReportingHelper::getDefaultPrintArchiveDocuTypeId();
+        }
+
+        DocSRSPrintArchiveContract archiveContractClassInstance = new DocSRSPrintArchiveContract(printArchiveDocuTypeId, _archiveFormat);
+        archiveContractClassInstance.parmReportPrintArchiveInfo(_printArchiveInfo);
+
+        return archiveContractClassInstance;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

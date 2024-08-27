@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_PaymJournalPostBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// To autopost the payment journal through batch.
+/// </summary>
+// DevOps - 
+class SKS_EFT_PaymJournalPostBatch extends Runbasebatch
+{
+    SKS_EFT_FileNbr         fileNbr;
+    SKS_EFT_Module          module;
+    int         procStartTime;
+   
+    #Define.CurrentVersion(1)
+    #LOCALMACRO.CurrentList
+        fileNbr,
+        module
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version     version = RunBase::getVersion(packedClass);
+        boolean     retVal = true;
+        
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version,#CurrentList] = packedClass;
+                break;
+            default:
+                retVal = false;
+                break;
+        }
+
+        return retVal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion,#CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runsImpersonated</Name>
+				<Source><![CDATA[
+    public boolean runsImpersonated()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canGoBatch</Name>
+				<Source><![CDATA[
+    public boolean canGoBatch()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMultiThreadBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method create the batch job and execute immediately
+    /// </summary>
+    /// <param name = "_sks_eftap_file">The record of the <c>SKS_EFTAP_File</c> table</param>
+    public static void createMultiThreadBatch(
+        SKS_EFTAP_File _sks_eftap_file)
+    {
+        Batch               Batch;
+        BatchHeader         batHeader;
+        RunBaseBatch        rbbTask;
+        BatchInfo           batInfo;
+
+        ttsBegin;
+        rbbTask = new SKS_EFT_PaymJournalPostBatch();
+        batInfo = rbbTask.batchInfo();
+        
+        batInfo.parmGroupId('');
+    
+        batHeader = BatchHeader::construct();
+        batInfo.parmAutomaticTransaction(false);
+        batInfo.parmCaption(strFmt("@SKS:SKGPaymJourPostingInfo", _sks_eftap_file.FileNbr, curExt()));
+        batHeader.addTask(rbbTask);
+        batHeader.save();
+        Batch = batInfo.parmBatch();
+        if(Batch)
+        {
+            Batch.reread();
+            Batch.selectForUpdate(true);
+            Batch.Parameters = [#CurrentVersion, _sks_eftap_file.FileNbr, _sks_eftap_file.EFTFileType,false];
+            Batch.update();
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method try to send the e-mail.
+    /// </summary>
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer sKS_EFTAP_File is selected forUpdate and is passed to other methods where it is modified.")]
+    public void run()
+    {
+        SKS_EFTAP_File      sKS_EFTAP_File;
+        SKS_EFT_FileDetail sks_eft_filedetail;
+
+        if(module == SKS_EFT_Module::AP)
+        {
+            select firstonly sKS_EFTAP_File where sKS_EFTAP_File.FileNbr == fileNbr &&
+                sKS_EFTAP_File.EFTFileType == module;
+
+            //Auto Post
+            procStartTime = WinAPIServer::getTickCount();
+
+            if(sKS_EFTAP_File.FXAProcessing)
+            {
+                select firstonly sks_eft_filedetail
+                        group by PaymentJournalNum, PaymentCompany
+                           where sks_eft_filedetail.FileRecId == sKS_EFTAP_File.RecId &&
+                                 sks_eft_filedetail.RecordSection == SKS_EFT_RecordSection::FXAllVendor &&
+                                 sks_eft_filedetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+            }
+            else
+            {
+                select firstonly sks_eft_filedetail
+                        group by PaymentJournalNum, PaymentCompany
+                           where sks_eft_filedetail.FileRecId == sKS_EFTAP_File.RecId &&
+                                 sks_eft_filedetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                                 sks_eft_filedetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary;
+            }
+            while(sks_eft_filedetail)
+            {
+                SKS_EFT_Processing::AutoPostPaymentJournal(sks_eft_filedetail.PaymentJournalNum, sKS_EFTAP_File, false, sks_eft_filedetail.PaymentCompany);
+                next sks_eft_filedetail;
+            }
+
+            this.displayLogResults();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public ClassDescription caption()
+    {
+        ClassDescription ret;
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayLogResults</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Display the log results
+    /// </summary>
+    public void displayLogResults()
+    {
+       // info(strFmt("@SKS:SKGInvoiceSettleCustomer", CustCnt));
+
+        int procEndTime = WinAPIServer::getTickCount();
+        int procExecutionTime = (procEndTime-procStartTime) div 1000;
+        if (procExecutionTime)
+        {
+            str execTimeUnit = "@SKS:SKGCCSecondsProcUnit";
+            if (procExecutionTime > 180)
+            {
+                // Greater than 180 seconds then convert to minutes
+                procExecutionTime = any2Int(procExecutionTime / 60);
+                execTimeUnit = "@SKS:SKGCCMinutesProcUnit";
+            }
+            info(strFmt("@SKS:SKGCCProcElapsedTimeWithProcUnit", procExecutionTime, execTimeUnit));
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

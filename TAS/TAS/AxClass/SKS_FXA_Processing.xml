@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_FXA_Processing</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_FXA_Processing extends SKS_EFT_Processing
+{
+    //<Issue21103: BankFabric storage process>
+    str mBFNewFileName; 
+    str mBFNewCtrlFileName; 
+    boolean isBankFabric; 
+    //</Issue21103>
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>callFormat</Name>
+				<Source><![CDATA[
+    private boolean callFormat(str _formatName, str _fileName, SKS_EFT_FileNbr _fileNbr)
+    {
+        ExecutePermission perm;
+        SysDictClass obj;
+        Object classInstance;
+        System.Xml.XmlDocument locXmlDocument;
+        SKS_PP_500PPBas sks_pp_500ppbas = new SKS_PP_500PPBas();
+    
+        perm = new ExecutePermission();
+        perm.assert();
+    
+        // BP deviation documented
+        obj = new SysDictClass(className2Id(_formatName));
+        classInstance = obj.makeObject(); // Instantiate class
+        // BP deviation documented
+        obj.callObject('setFileNbr', classInstance, _fileNbr); // Call method to set variable
+        // BP deviation documented
+        obj.callObject('setModule', classInstance, SKS_EFT_Module::AP);
+        // BP deviation documented
+        obj.callObject('setFileName', classInstance, _fileName);
+        // BP deviation documented
+        locXmlDocument = obj.callObject('run', classInstance); // Run
+
+        //<Issue21103: BankFabric storage process>
+        if(isBankFabric)
+        {
+            //BankFabric get file name
+            mBFNewFileName = obj.callObject('getBFNewFileName', classInstance);
+            mBFNewCtrlFileName = obj.callObject('getBFNewCtrlFileName', classInstance);
+
+            msks_eftap_file.FileName = mBFNewFileName;
+        }
+        //</Issue21103>
+
+        // BP deviation documented
+        mReturnMsg = obj.callObject('getErrorText', classInstance);
+    
+        obj = null;
+        classInstance = null;
+        CodeAccessPermission::revertAssert();
+    
+        if(mReturnMsg != '') //errors were found
+        {
+            sks_pp_500ppbas.Kill(_fileName); // delete file
+            error(mReturnMsg);
+            return false;
+        }
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FXAProcess_PaymentInstructionFile</Name>
+				<Source><![CDATA[
+    public void FXAProcess_PaymentInstructionFile(SKS_EFT_FileNbr _FileNbr)
+    {
+        str fileName;
+        str filePathName;
+        ;
+    
+        ttsBegin;
+    
+        this.initGlobals(_FileNbr);
+    
+        //<Issue21103: BankFabric storage process>
+        isBankFabric = SKS_EFTAP_File::find(_FileNbr, SKS_EFT_Module::AP).BFBankIntegration == SKS_BF_BankIntType::BankFabric;
+
+        if(isBankFabric)
+        {
+            filePathName = msks_eft_bank.FXABankFabricOutboundPmtInstrFileLoc + '\\';
+        }
+        else
+        {
+            fileName = SKS_EFT_Common::buildFileName(msks_eftap_file.FileNbr, msks_eft_bank.FXAOutboundPmtInstrFileName, '-', true, true);
+            filePathName = System.IO.Path::Combine(msks_eft_bank.FXAOutboundPmtInstrFilePath, fileName);
+        }
+        //</Issue21103>
+
+        if(this.callFormat('SKS_EFT_Format_FXAll_PmtInst', filePathName, msks_eftap_file.FileNbr))
+        {
+            msks_eftap_file.FXAPaymentInstructionsSent = DateTimeUtil::getSystemDateTime();
+            msks_eftap_file.FileStatus = SKS_EFT_FileStatus::FXAllPaymentInstructionSent;
+            msks_eftap_file.update();
+            ttsCommit;
+            info(strFmt("@SKS3719", filePathName));
+        }
+        else
+        {
+            ttsAbort; // Report failed
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FXAProcess_TradeFile</Name>
+				<Source><![CDATA[
+    public void FXAProcess_TradeFile(SKS_EFT_FileNbr _FileNbr)
+    {
+        boolean recordCreated = false;
+        str fileName;
+        str filePathName;
+        ;
+    
+        ttsBegin;
+    
+        this.initGlobals(_FileNbr);
+
+        //<Issue21103: BankFabric storage process>
+        isBankFabric = SKS_EFTAP_File::find(_FileNbr, SKS_EFT_Module::AP).BFBankIntegration == SKS_BF_BankIntType::BankFabric;
+
+        if(isBankFabric)
+        {
+            filePathName = msks_eft_bank.FXABankFabricOutboundTradeFileLoc + '\\';
+        }
+        else
+        {
+            fileName = SKS_EFT_Common::buildFileName(msks_eftap_file.FileNbr, msks_eft_bank.FXAOutboundTradeFileName, '-', true, true);
+            filePathName = System.IO.Path::Combine(msks_eft_bank.FXAOutboundTradeFilePath, fileName);
+        }
+        //</Issue21103>
+
+        mReturnMsg = this.CheckUserSelectionAP(msks_eftap_file.RecId);
+        if(mReturnMsg != '') //errors were found
+        {
+            error(mReturnMsg);
+            ttsAbort;
+            return;
+        }
+    
+        recordCreated = this.BuildWorkingTable(SKS_EFT_Module::AP);
+    
+        if(mReturnMsg != '') //errors were found
+        {
+            error(mReturnMsg);
+            ttsAbort;
+            return;
+        }
+        else if(!recordCreated)
+        {
+            error("@SYS4205"); //no records found
+            ttsAbort;
+            return;
+        }
+    
+        mReturnMsg = this.CheckJournals(msks_eftap_file.EFTFileType); // this sets mNbrGoodRecs
+        if(mReturnMsg != '') //errors were found
+        {
+            error(mReturnMsg);
+            ttsAbort;
+            return;
+        }
+        else if(mNbrGoodRecs == 0)
+        {
+            error("@SYS4205");
+            ttsAbort;
+            return;
+        }
+    
+        this.tradeFileUpdate();
+    
+        if(this.callFormat('SKS_EFT_Format_FXAll_Trade', filePathName, msks_eftap_file.FileNbr))
+        {
+            msks_eftap_file.FXATradeSent = DateTimeUtil::getSystemDateTime();
+            msks_eftap_file.FileStatus = SKS_EFT_FileStatus::FXAllTradeSent;
+            msks_eftap_file.update();
+            ttsCommit;
+            info(strFmt("@SKS3720", filePathName));
+        }
+        else
+        {
+            ttsAbort; // Report failed
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initGlobals</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Setting a global buffer.  This variable is used and updated elsewhere.")]
+    private void initGlobals(SKS_EFT_FileNbr _FileNbr)
+    {
+        select forupdate msks_eftap_file where msks_eftap_file.FileNbr == _fileNbr && msks_eftap_file.EFTFileType == SKS_EFT_Module::AP;
+        mSKS_EFT_Setup = SKS_EFT_Setup::find();
+        this.GetAPBank();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tradeFileUpdate</Name>
+				<Source><![CDATA[
+    private void tradeFileUpdate()
+    {
+        SKS_EFT_FileDetail lSKS_EFT_FileDetail;
+        SKS_FXA_Details lSKS_FXA_Details;
+    
+        while select * from lSKS_EFT_FileDetail
+          where lSKS_EFT_FileDetail.FileRecId == msks_eftap_file.RecId &&
+                lSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::FXAllVendor &&
+                lSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary
+        {
+            select forupdate lSKS_FXA_Details
+              where lSKS_FXA_Details.LedgerJournalTransRecid == lSKS_EFT_FileDetail.PaymentLineRecId;
+            if(lSKS_FXA_Details)
+            {
+                lSKS_FXA_Details.SKS_FXA_OrderID = curext() + '_' + msks_eftap_file.FileNbr + '_' + lSKS_FXA_Details.DealtCurrency + '_' + lSKS_FXA_Details.CurrencyPairISO;
+                lSKS_FXA_Details.SKS_FXA_AllocationID = curext() + '_' + lSKS_EFT_FileDetail.PaymentReference;
+                lSKS_FXA_Details.update();
+            }
+            else
+            {
+                error(strFmt("@SKS3611", lSKS_EFT_FileDetail.PaymentLineRecId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>FXALLPaymentUpdate</Name>
+				<Source><![CDATA[
+    static void FXALLPaymentUpdate(SKS_FXA_Details  sks_fxa_details)
+    {
+        LedgerJournalTrans  LedgerJournalTrans;
+        SpecTrans           SpecTrans;
+        SKS_FXA_CurrencyPairsTable  SKS_FXA_CurrencyPairsTable;
+        LedgerJournalTable  LedgerJournalTable;
+    
+        ttsBegin;
+        select forupdate firstonly LedgerJournalTrans where LedgerJournalTrans.recid == sks_fxa_details.LedgerJournalTransRecid;
+    
+        if(LedgerJournalTrans)
+        {
+            select firstOnly Posted, JournalNum from LedgerJournalTable where LedgerJournalTable.JournalNum == LedgerJournalTrans.JournalNum;
+    
+            if(LedgerJournalTable.Posted)
+            {
+                error("@SKS3610");
+                throw Exception::Error;
+            }
+    
+            // For Buy, update amount, currency and exchange rate fields
+            // For Sell, currency and amount don't change.
+            if(sks_fxa_details.SKS_FXA_BuySell == SKS_FXA_BuySell::Buy)
+            {
+                LedgerJournalTrans.AmountCurCredit = 0;
+                LedgerJournalTrans.amountcurdebit = SKS_FXA_Details.sks_fxa_ContraAmount;
+                select firstonly CurrencyPairISO, ToCurrencyCodeISO, FromCurrencyCodeISO from SKS_FXA_CurrencyPairsTable where SKS_FXA_CurrencyPairsTable.CurrencyPairISO == SKS_FXA_Details.CurrencyPairISO;
+                if(sks_fxa_details.DealtCurrency == SKS_FXA_CurrencyPairsTable.ToCurrencyCodeISO)
+                {
+                    LedgerJournalTrans.CurrencyCode = SKS_FXA_CurrencyPairsTable.FromCurrencyCodeISO;
+                }
+                else
+                {
+                    LedgerJournalTrans.CurrencyCode = SKS_FXA_CurrencyPairsTable.ToCurrencyCodeISO;
+                }
+    
+                LedgerJournalTrans.ExchRate = 100;
+            }
+            LedgerJournalTrans.TransDate = sks_fxa_details.ValueDate; // Date is updated for Buy or Sell
+            LedgerJournalTrans.update();
+    
+            // For Buy, update cross rate
+            // For Sell, don't change.
+            if(sks_fxa_details.SKS_FXA_BuySell == SKS_FXA_BuySell::Buy)
+            {
+                while select forupdate SpecTrans
+                    where SpecTrans.SpecCompany == LedgerJournalTrans.dataAreaId
+                        && SpecTrans.SpecRecId == LedgerJournalTrans.RecId
+                        && SpecTrans.SpecTableId == LedgerJournalTrans.TableId
+                {
+                    SpecTrans.CrossRate = (sks_fxa_details.sks_fxa_ContraAmount/SKS_FXA_Details.amount) * 100;
+                    SpecTrans.update();
+                }
+            }
+        }
+        ttsCommit;
+    
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,525 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PCard_ProcessHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_PCard_ProcessHelper
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createJournalHeader</Name>
+				<Source><![CDATA[
+    public static LedgerJournalId createJournalHeader(SKS_PCard_Header _pCardHeader, SKS_EB_CommProcess    _commProcess, SKS_EB_FilePath   _fileLocation)
+    {
+        LedgerJournalTable ledgerJournalTable;
+        LedgerJournalEngine ledgerJournalEngine;
+        SKS_PCard_ParmTable pCardParm;
+        LedgerJournalName   ledgerJournalName;
+        boolean ret = true;
+
+        select firstonly pCardParm
+            where   pCardParm.CommID        == _commProcess.CommID
+            &&      pCardParm.FileLocation  == _fileLocation;
+
+        ledgerJournalName = LedgerJournalName::find(pCardParm.JournalName);
+
+        if (pCardParm.RecId && ledgerJournalName.RecId)
+        {
+            if (ledgerJournalName.BlockUserGroupId)
+            {
+                ret = JournalStatic::hasUserAccessForGroupId(ledgerJournalName.BlockUserGroupId);
+
+                if (!ret)
+                {
+                    SKS_PCard_ErrorLog::createErrorLog(strFmt("@SYS85715", curUserId(), ledgerJournalName.BlockUserGroupId), _pCardHeader.RecId);
+                }
+            }
+
+            if (ret)
+            {
+                try
+                {
+                    ledgerJournalTable = null;
+                    ledgerJournalTable.JournalName = pCardParm.JournalName;
+                    ledgerJournalTable.DefaultDimension = ledgerJournalName.DefaultDimension;
+                    ledgerJournalTable.insert();
+
+                    ledgerJournalEngine = LedgerJournalEngine_Daily::construct();
+                    ledgerJournalEngine.ledgerJournalTable(ledgerJournalTable);
+                    ledgerJournalEngine.newJournalActive(ledgerJournalTable);
+
+                    ret = SKS_PCard_ProcessHelper::createJournalLinesV2(ledgerJournalEngine, ledgerJournalTable, _pCardHeader, pCardParm);
+
+                    if (ret)
+                    {
+                        info (strFmt("@SKS:JourCreated", ledgerJournalTable.JournalNum));
+                        
+                        SKS_PCard_HistoryTable::insertEvent(SKS_PCard_Action::GLAutoCreated,
+                                         _pCardHeader.RecId,
+                                         ledgerJournalTable.JournalNum);
+                    }
+                }
+                catch
+                {
+                    ret = false;
+                    int infoLine = Global::infologLine();
+                    if(infoLine)
+                    {
+                        str errorMessage = infolog.text(Global::infologLine());
+
+                        error (strFmt("@SKS:JourProcessError"));
+
+                        SKS_PCard_ErrorLog::createErrorLog(strFmt("@SKS:PCardHeaderError", errorMessage, _pCardHeader.RecId), _pCardHeader.RecId);
+                    }
+                }
+            }
+        }
+
+        if (!pCardParm.RecId)
+        {
+            ret = false;
+            error (strFmt("@SKS:PCardConfigError", _commProcess.CommID, _fileLocation));
+            SKS_PCard_ErrorLog::createErrorLog(strFmt("@SKS:PCardConfigError", _commProcess.CommID, _fileLocation), _pCardHeader.RecId);
+        }
+
+        if (!ret)
+        {
+            SKS_PCard_Header    pCardHeader;
+
+            select firstonly pCardHeader
+                where pCardHeader.RecId == _pCardHeader.RecId;
+
+            if (pCardHeader)
+            {
+                pCardHeader.selectForUpdate(true);
+                pCardHeader.Status  = SKS_PCard_ImportStatus::JounralCreationError;
+                ttsbegin;
+                pCardHeader.update();
+                ttscommit;
+            }
+
+            SKS_PCard_HistoryTable::insertEvent(SKS_PCard_Action::GLAutoCreatedFailed,
+                                         _pCardHeader.RecId,'');
+
+            if(ledgerJournalTable)
+            {
+                ledgerJournalTable.delete();
+            }
+        }
+
+
+        return ret == true ? ledgerJournalTable.JournalNum : '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalLinesV2</Name>
+				<Source><![CDATA[
+    public static boolean createJournalLinesV2(LedgerJournalEngine _ledgerJournalEngine, LedgerJournalTable   _ledgerJournalTable,
+                                            SKS_PCard_Header    _pCardHeader, SKS_PCard_ParmTable    _pCardParmTable)
+    {
+        LedgerJournalTrans_Project  ledgerJournalTrans_Project;
+        LedgerJournalTrans      ledgerjournalTrans;
+        SKS_PCard_Details       pCardLines;
+        boolean ret = true;
+        int startLine;
+
+        while select pCardLines
+            where pCardLines.HeaderRecId    == _pCardHeader.RecId
+        {
+            try
+            {
+                startLine = Global::infologLine();
+
+                ledgerJournalTrans_Project.clear();
+                ledgerJournalTrans.clear();
+                ledgerJournalTrans.initValue();
+                _ledgerJournalEngine.initValue(ledgerJournalTrans);
+                ledgerJournalTrans.JournalNum = _ledgerJournalTable.JournalNum;
+                ledgerJournalTrans.AccountType = _pCardParmTable.AccountTypeActual;
+
+                _ledgerJournalEngine.initTaxItemGroup(ledgerJournalTrans);
+
+                ledgerJournalTrans.Company = curExt();
+                ledgerJournalTrans.TransDate = pCardLines.TransDate;
+                ledgerJournalTrans.CurrencyCode = pCardLines.Currency;
+                
+                ledgerJournalTrans.Txt = pCardLines.Txt;
+                        
+                if(pCardLines.Amount < 0)
+                {
+                    ledgerJournalTrans.AmountCurDebit = abs(pCardLines.Amount);
+                }
+                else
+                {
+                    ledgerJournalTrans.AmountCurCredit = pCardLines.Amount;
+                }
+            
+                LedgerJournalTrans.TransactionType = LedgerTransType::GeneralJournal;
+                ledgerJournalTrans.AccountType = _pCardParmTable.AccountTypeActual;
+                ledgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, AccountType));
+
+                DimensionDefault    defaultDim = SKS_PCard_ProcessHelper::getDimBasedOnACType(ledgerjournalTrans.AccountType, _pCardParmTable.LedgerDimension);
+                    
+                defaultDim = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(defaultDim, _ledgerJournalTable.DefaultDimension);
+
+                if (ledgerJournalTrans.AccountType == LedgerJournalACType::Ledger)
+                {
+                    ledgerJournalTrans.ledgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimForDefaultDim(defaultDim, _pCardParmTable.LedgerDimension);
+                }
+                else
+                {
+                    ledgerJournalTrans.ledgerDimension = _pCardParmTable.LedgerDimension;
+                    ledgerJournalTrans.DefaultDimension = defaultDim;
+                }
+                
+                ledgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, LedgerDimension));
+                _ledgerJournalEngine.accountModified(ledgerJournalTrans);
+
+                LedgerJournalACType offsetACType;
+                offsetACType = str2Enum(offsetACType, pCardLines.OffsetAccountType);
+
+                ledgerJournalTrans.OffsetCompany    = pCardLines.OffsetCompanyId;
+                ledgerJournalTrans.OffsetAccountType    = offsetACType;
+                ledgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, OffsetAccountType));
+                _ledgerJournalEngine.offsetAccountTypeModified(ledgerJournalTrans, ledgerJournalTrans_Project);
+            
+                ledgerJournalTrans.Invoice      = pCardLines.Invoice;
+                ledgerJournalTrans.Due          = pCardLines.InvoiceDate;
+                ledgerJournalTrans.DocumentDate = pCardLines.InvoiceDate;
+
+                if (!ledgerJournalTrans.OffsetCompany)
+                {
+                    ledgerJournalTrans.OffsetCompany    = curExt();
+                }
+
+                if (offsetACType == LedgerJournalACType::Vend || ledgerJournalTrans.AccountType == LedgerJournalACType::Vend)
+                {
+                    ledgerJournalTrans.Approved     = NoYes::Yes;
+                    ledgerJournalTrans.Approver     = HcmWorker::userId2Worker(curUserId());
+                }
+
+                changecompany(ledgerJournalTrans.OffsetCompany)
+                {
+                    DimensionDynamicAccount offsetAccount;
+
+                    if (offsetACType == LedgerJournalACType::Ledger)
+                    {
+                        offsetAccount   = SKS_PCard_ProcessHelper::createLedgerDim(pCardLines.OffsetAccount);
+                    }
+                    else
+                    {
+                        if (offsetACType == LedgerJournalACType::Project)
+                        {
+                            ProjTable lProjTable = ProjTable::find(pCardLines.OffsetAccount);
+                            if(!lProjTable)
+                            {
+                                ret = false;
+                                error (strFmt("@SKS:PCardProjNotFound", pCardLines.OffsetAccount));
+                                SKS_PCard_ErrorLog::createErrorLog(strFmt("@SKS:PCardProjNotFound", pCardLines.OffsetAccount), _pCardHeader.RecId);
+                                continue;
+                            }
+                            else if (lProjTable.PSAProjStatus != PSAProjStatus::Active)
+                            {
+                                ret = false;
+                                error (strFmt("@SKS:PCardProjInActive", pCardLines.OffsetAccount));
+                                SKS_PCard_ErrorLog::createErrorLog(strFmt("@SKS:PCardProjInActive", pCardLines.OffsetAccount), _pCardHeader.RecId);
+                                continue;
+                            }
+                        }
+
+                        offsetAccount   = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(pCardLines.OffsetAccount, offsetACType);
+                    }
+
+                    if (!offsetAccount)
+                    {
+                        ret = false;
+                        error (strFmt ('@SKS:PCardOffsetAccError', pCardLines.OffsetAccount));
+                        SKS_PCard_ErrorLog::createErrorLog(strFmt ('@SKS:PCardOffsetAccError', pCardLines.OffsetAccount), _pCardHeader.RecId);
+                        continue;
+                    }
+
+                    DimensionDefault        defaultDimOffset    = SKS_PCard_ProcessHelper::getDimBasedOnACType(offsetACType, offsetAccount);
+                    
+                    defaultDimOffset = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(defaultDimOffset, _ledgerJournalTable.DefaultDimension);
+
+                    if (offsetACType == LedgerJournalACType::Ledger)
+                    {
+                        ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimForDefaultDim(defaultDimOffset, offsetAccount);
+                    }
+                    else
+                    {
+                        ledgerJournalTrans.OffsetLedgerDimension = offsetAccount;
+                        ledgerJournalTrans.OffsetDefaultDimension = defaultDimOffset;
+                    }
+
+                    ledgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, OffsetLedgerDimension));
+                    _ledgerJournalEngine.offsetAccountModified(ledgerJournalTrans, ledgerJournalTrans_Project);
+
+                    if (offsetACType == LedgerJournalACType::Vend)
+                    {
+                        _ledgerJournalEngine.iniFromVendtableLocal(ledgerJournalTrans);
+                        ledgerjournalTrans.PostingProfile   = VendParameters::find().PostingProfile;
+                    }
+
+                    if (!ledgerjournalTrans.CurrencyCode)
+                    {
+                        ledgerjournalTrans.CurrencyCode = Ledger::accountingCurrency(CompanyInfo::current());
+                    }
+                }
+
+                if (pCardLines.ProjectCategory)
+                {
+                    ProjCategory    projCategory =  ProjCategory::find(pCardLines.ProjectCategory);
+
+                    if (!projCategory)
+                    {
+                        ret = false;
+                        error (strFmt ('@SKS:PCardProjCatError', pCardLines.ProjectCategory));
+                        SKS_PCard_ErrorLog::createErrorLog(strFmt ('@SKS:PCardProjCatError', pCardLines.ProjectCategory), _pCardHeader.RecId);
+                        continue;
+                    }
+                }
+
+                if (pCardLines.ProjectActivityNumber)
+                {
+                    ProjActivity    projActivity =  ProjActivity::find(pCardLines.ProjectActivityNumber);
+
+                    if (!projActivity)
+                    {
+                        ret = false;
+                        error (strFmt ("@SKS:PCardProjActivityError", pCardLines.ProjectActivityNumber));
+                        SKS_PCard_ErrorLog::createErrorLog(strFmt ("@SKS:PCardProjActivityError", pCardLines.ProjectActivityNumber), _pCardHeader.RecId);
+                        continue;
+                    }
+                }
+
+                ledgerjournalTrans.initForCurrency(_ledgerJournalTable);
+
+                if(ret && ledgerJournalTrans.validateWrite())
+                {
+                    ledgerJournalTrans.insert();
+
+                    if (offsetACType == LedgerJournalACType::Project &&
+                        pCardLines.ProjectCategory)
+                    {
+                        ledgerJournalTrans_Project.RefRecId = ledgerJournalTrans.RecId;
+                        ledgerJournalTrans_Project.initValue();
+
+                        SKS_PCard_ProcessHelper::initFromProjTable(ledgerJournalTrans, ledgerJournalTrans_Project);
+                    
+                        ledgerJournalTrans_Project.ActivityNumber = pCardLines.ProjectActivityNumber;
+                        ledgerJournalTrans_Project.CategoryId = pCardLines.ProjectCategory;
+                        ledgerJournalTrans_Project.TaxItemGroupSales = ProjCategory::find(ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+                        ledgerJournalTrans_Project.LinePropertyId = ProjLinePropertySetup::findLinePropertyId(
+                                                            ledgerJournalTrans.findProjTable().ProjId,
+                                                            ledgerJournalTrans_Project.CategoryId);
+                    
+                        LedgerJournalEngine::setProjCostSalesPrice(ledgerjournalTrans, ledgerJournalTrans_Project, ledgerJournalTrans_Project.SalesPrice, false, true);
+
+                        if (ledgerJournalTrans_Project.validateWrite())
+                        {
+                            ledgerJournalTrans_Project.insert();
+                        }
+                    }
+                }
+            }
+            catch
+            {
+
+                int currentLine;
+                // ...
+                for (currentLine = startLine + 1; currentLine <= Global::infologLine(); currentLine++)
+                {
+                    if(!strScan(infolog.text(currentLine), "@SYS98197", 1, strLen(infolog.text(currentLine))))
+                    {
+                        SKS_PCard_ErrorLog::createErrorLog(infolog.text(currentLine), _pCardHeader.RecId);
+                    }
+                }
+
+                ret = false;
+
+                continue;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromProjTable</Name>
+				<Source><![CDATA[
+    static void initFromProjTable(
+        LedgerJournalTrans          _ledgerJournalTrans,
+        LedgerJournalTrans_Project  _ledgerJournalTrans_Project)
+    {
+        ProjTable   projTable;
+
+        if (!_ledgerJournalTrans.CurrencyCode)
+        {
+            _ledgerJournalTrans.CurrencyCode = CompanyInfoHelper::standardCurrency();
+        }
+
+        projTable = _ledgerJournalTrans.findProjTable();
+        ProjInvoiceTable ProjInvoiceTableLocal = ProjInvoiceTable::find(projTable.ProjInvoiceProjId);
+ 
+        if (ProjInvoiceTableLocal)
+        {
+            _ledgerJournalTrans_Project.SalesCurrencyId = ProjInvoiceTableLocal.CurrencyId;
+            _ledgerJournalTrans_Project.ProjPriceGroupID = ProjInvoiceTableLocal.ProjPriceGroup;
+        }
+
+        if (!_ledgerJournalTrans_Project.SalesCurrencyId)
+        {
+            if (projTable.CustAccount)
+            {
+                _ledgerJournalTrans_Project.SalesCurrencyId = CustTable::find(projTable.CustAccount).Currency;
+            }
+            else
+            {
+                _ledgerJournalTrans_Project.SalesCurrencyId = CompanyInfoHelper::standardCurrency();
+            }
+        }
+
+        if (!ProjValProjCategorySetUp::checkProjCategory(_ledgerJournalTrans.parmAccount(), _ledgerJournalTrans_Project.CategoryId))
+        {
+            _ledgerJournalTrans_Project.CategoryId = '';
+        }
+        else
+        {
+            _ledgerJournalTrans_Project.CategoryId = (_ledgerJournalTrans_Project.CategoryId ? _ledgerJournalTrans_Project.CategoryId : ProjParameters::find().CostCategory);
+            _ledgerJournalTrans_Project.TaxItemGroupSales    = ProjCategory::find(_ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+        }
+
+        _ledgerJournalTrans_Project.LinePropertyId = ProjLinePropertySetup::findLinePropertyId(projTable.ProjId, _ledgerJournalTrans_Project.CategoryId);
+
+        
+        _ledgerJournalTrans_Project.TaxItemGroupSales = ProjCategory::find(_ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+        _ledgerJournalTrans_Project.LinePropertyId = ProjLinePropertySetup::findLinePropertyId(
+                                                            _ledgerJournalTrans.findProjTable().ProjId,
+                                                            _ledgerJournalTrans_Project.CategoryId);
+
+        if (_ledgerJournalTrans.AccountType == LedgerJournalACType::Project)
+        {
+            _ledgerJournalTrans_Project.ProjId = _ledgerJournalTrans.parmAccount();
+            _ledgerJournalTrans_Project.TaxGroupSales = ProjParameters::taxGroupInvoice(_ledgerJournalTrans.parmAccount());
+        }
+        else if (_ledgerJournalTrans.OffsetAccountType == LedgerJournalACType::Project)
+        {
+            _ledgerJournalTrans_Project.ProjId = _ledgerJournalTrans.parmOffsetAccount();
+            _ledgerJournalTrans_Project.TaxGroupSales = ProjParameters::taxGroupInvoice(_ledgerJournalTrans.parmOffsetAccount());
+        }
+
+        _ledgerJournalTrans_Project.TaxItemGroupSales = ProjCategory::find(_ledgerJournalTrans_Project.CategoryId).TaxItemGroupId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerDim</Name>
+				<Source><![CDATA[
+    public static DimensionCombinationBase createLedgerDim(str  _ledgerDim)
+    {
+        DimensionHierarchyLevel     dimHierarchyLevel;
+        DimensionHierarchyId        dimHierarchyId;
+        DimensionAttribute          dimAttribute;
+        DimensionCombinationBase    ledgerDimension;
+        container                   ledgerCon;
+        DefaultDimensionIntegrationValues   defaultDimIntegrationValues;
+        DimensionDynamicAccountResolver     dimDynamicAccountResolver;
+        int                         accStructureLen = 0;
+        Array                               acctDimAttrArray = new Array(Types::String);
+        Array                               acctDimArray     = new Array(Types::String);
+
+        ledgerCon = str2con(_ledgerDim, '@SYS77038', false);
+
+        if (conLen(ledgerCon) >= 1)
+        {
+            if (!MainAccount::findByMainAccountId(conPeek(ledgerCon, 1)).RecId)
+            {
+                return 0;
+            }
+
+            dimHierarchyId = DimensionHierarchy::getAccountStructure(MainAccount::findByMainAccountId(conPeek(ledgerCon, 1)).RecId);
+
+            while select DimensionAttribute from dimHierarchyLevel order by dimHierarchyLevel.Level asc
+                join Name from dimAttribute
+                where   dimAttribute.RecId == dimHierarchyLevel.DimensionAttribute
+                &&      dimHierarchyLevel.DimensionHierarchy == dimHierarchyId
+            {
+                accStructureLen ++;
+                acctDimAttrArray.value(accStructureLen, dimAttribute.Name);
+            }
+        }
+
+        if (accStructureLen)
+        {
+            int a;
+
+            for (a = 1; a <= accStructureLen ; a++)
+            {
+                if (a > conLen (ledgerCon))
+                {
+                    acctDimArray.value(a, '');
+                }
+                else
+                {
+                    acctDimArray.value(a, conPeek(ledgerCon, a));
+                }
+            }
+
+            defaultDimIntegrationValues = DimensionResolver::getEntityDisplayValue(acctDimAttrArray, acctDimArray, extendedTypeStr(DimensionDynamicAccount));
+            dimDynamicAccountResolver   = DimensionDynamicAccountResolver::newResolver(defaultDimIntegrationValues);
+ 
+            ledgerDimension = dimDynamicAccountResolver.resolve();
+        }
+
+        return ledgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDimBasedOnACType</Name>
+				<Source><![CDATA[
+    public static DimensionDefault getDimBasedOnACType(LedgerJournalACType  _accountType, DimensionDynamicAccount   _ledgerDim)
+    {
+        DimensionDefault    defaultDim;
+
+        switch (_accountType)
+        {
+            case LedgerJournalACType::Ledger:
+                defaultDim = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(_ledgerDim);
+                break;
+            
+            case LedgerJournalACType::Bank:
+                defaultDim = BankAccountTable::findByLedgerDimension(_ledgerDim).DefaultDimension;
+                break;
+                
+            case LedgerJournalACType::Vend:
+                defaultDim = VendTable::findByLedgerDimension(_ledgerDim).DefaultDimension;
+                break;
+                
+            case LedgerJournalACType::Cust:
+                defaultDim = CustTable::findByLedgerDimension(_ledgerDim).DefaultDimension;
+                break;
+                
+            case LedgerJournalACType::Project:
+                defaultDim = ProjTable::findByLedgerDimension(_ledgerDim).DefaultDimension;
+                break;
+        }
+
+        return defaultDim;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

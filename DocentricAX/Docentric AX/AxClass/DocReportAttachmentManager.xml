@@ -1,0 +1,1075 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocReportAttachmentManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The DocReportAttachmentManager class is a manager for report attachments.
+/// </summary>
+public class DocReportAttachmentManager
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>constructReportAttachmentFromDocuRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the actual attachment object based on the attachment definition and relevant DocuRef. 
+    /// </summary>
+    /// <param name = "_docuRefRecId">DocuRef.RecId as unique identification of the DocuRef record to be used for the attachment</param>
+    /// <param name = "_docuValueFileName">Filename of the attachment document</param>
+    /// <param name = "_docuValueFileType">File extension of the attachment document</param>
+    /// <param name = "_attachmentRule">Object holding the attachment rule, based on which the attachments should be resolved</param>
+    /// <returns>An instance of the DocReportAttachmentResolved class</returns>
+    public static DocReportAttachmentResolved constructReportAttachmentFromDocuRef(
+        DocuRefRecId            _docuRefRecId, 
+        Filename                _docuValueFileName,
+        FilenameType            _docuValueFileType,
+        DocReportAttachmentRule _attachmentRule)
+    {
+        if (!_docuRefRecId || !_attachmentRule)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Parameter _docuRefRecId and/or _attachmentDefinition is not provided');
+        } 
+
+        DocuRef docuRef = DocuRef::findRecId(_docuRefRecId);
+        if (!docuRef.RecId)
+        {
+            DocGlobalHelper::handleException(funcName(), strFmt('DocuRef with RecId %1 does not exist', _docuRefRecId));
+        }
+
+        DocReportAttachmentResolved reportAttachment = new DocReportAttachmentResolved();
+
+        // Pointer to the source data: attachment definition and DocuRef
+        reportAttachment.parmAttachmentRule(_attachmentRule);
+        reportAttachment.parmDocuRefRecId(_docuRefRecId);
+
+        // Display name 
+        DocEmailAttachmentName displayName = _attachmentRule.parmDisplayName();
+        if (displayName == DocConstantFile::FilenameWildcard)
+        {
+            // If the name was provided as a wildcard (*), then we take the Display name from Docuref.
+            reportAttachment.parmDisplayName(docuRef.Name);
+        }
+        else
+        {
+            // Name different from wildcard specified on attachment definition.
+            // Check and replace placeholders for original filename of description.
+            str trimmedPlaceholder = DocConstant::ReportAttachmentOrigFilenameTrimmed;
+            if (DocPlaceholderManager::findPlaceholder(displayName, trimmedPlaceholder))
+            {
+                displayName = DocPlaceholderManager::replacePlaceholder(displayName, trimmedPlaceholder, _docuValueFileName);
+            }
+            
+            trimmedPlaceholder = DocConstant::ReportAttachmentOrigDescTrimmed;
+            if (DocPlaceholderManager::findPlaceholder(displayName, trimmedPlaceholder))
+            {
+                displayName = DocPlaceholderManager::replacePlaceholder(displayName, trimmedPlaceholder, docuRef.Name);
+            }
+
+            reportAttachment.parmDisplayName(displayName);
+        }
+
+        // File extension, full name   
+        reportAttachment.parmFileExtension(_docuValueFileType);
+        str fullFilename = DocFileMngHelper::replaceInvalidCharsForFileName(
+                            strFmt('%1.%2', reportAttachment.parmDisplayName(), reportAttachment.parmFileExtension()));
+        reportAttachment.parmFullFilename(fullFilename);
+
+        // Content
+        try
+        {
+            using (System.IO.Stream docuRefStream = DocumentManagement::getAttachmentStream(docuRef))
+            {
+                using (System.IO.MemoryStream attachmentContent = new System.IO.MemoryStream())
+                {
+                    docuRefStream.CopyTo(attachmentContent);
+                    reportAttachment.parmContent(DocGlobalHelper::convertMemoryStreamToContainer(attachmentContent));
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            DocGlobalHelper::handleClrException(funcName(), 'Error while fetching the attachment content');
+        }
+        catch
+        {
+            DocGlobalHelper::handleException(funcName(), 'Error while fetching the attachment content');
+        }
+
+        return reportAttachment;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getResolvedAttachmentList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get a list of all attachment documents resolved based on a given
+    /// attachment rule.
+    /// </summary>
+    /// <param name = "_reportRunContext">DocReportRunContext object, not used
+    /// in this implementation, but provided for the purposes of extending
+    /// this method by other implementations.</param>
+    /// <param name = "_attachmentRule">Object containing the attachment rule</param>
+    /// <param name = "_attachedDocuRefRecIdSet">Set of all DocuRef.RecId used so far for
+    /// this report, so that we don't attach duplicates which might come from
+    /// different rules.</param>
+    /// <param name = "_attachmentRecord">Underlying record on which to search for
+    /// the attachment documents. Is used if attachments are not to be loaded
+    /// from the global attachments.</param>
+    /// <returns>List(DocReportAttachmentResolved) - list of documents resolved
+    /// based on the given rule.</returns>
+    public static List getResolvedAttachmentList(
+        DocReportRunContext     _reportRunContext, 
+        DocReportAttachmentRule _attachmentRule,
+        Set                     _attachedDocuRefRecIdSet /* Set(int64 _DocuRefRecId) */,
+        Common                  _attachmentRecord)
+    {
+        CompanyId reportContextCompanyId = _reportRunContext.parmTemplateCompanyId();
+        LanguageId languageId = _reportRunContext.parmTemplateLanguageId();
+        DocAttachmentCategoryId categoryId = _attachmentRule.parmCategoryId();
+        DocAttachmentDescription name = _attachmentRule.parmName();
+        DocReportAttachmentName fileExtension = _attachmentRule.parmFileExtension();
+        DocReportAttachmentDocuTypeId docuTypeId = _attachmentRule.parmDocuTypeId();
+        DocReportAttachmentRestriction restriction = _attachmentRule.parmRestriction();
+        DocReportAttachmentLanguageFilter languageFilter = _attachmentRule.parmLanguageFilter();
+        DataAreaId selectedAttachmentCompanyId = _attachmentRule.parmSelectedAttachmentCompanyId();
+        DocAttachmentTags tags = _attachmentRule.parmTags();
+
+        RefTableId refTableId;
+        RefRecId refRecId;
+        Map recordFilter = new Map(Types::Int64, Types::Int64);
+        switch (_attachmentRule.parmLoadFrom())
+        {
+            case DocReportAttachmentLoadFrom::GlobalAttachments:                
+                refTableId = DocuRef::GetRootTableID(tableNum(CompanyInfo));
+                refRecId = 0;
+
+                break;
+
+            case DocReportAttachmentLoadFrom::AccountTable:
+            case DocReportAttachmentLoadFrom::ContextRecord:
+            case DocReportAttachmentLoadFrom::CustomRecord:
+            case DocReportAttachmentLoadFrom::Journal:
+            case DocReportAttachmentLoadFrom::SourceTable:              
+                refTableId = DocuRef::GetRootTableID(_attachmentRecord.TableId);
+                refRecId = _attachmentRecord.RecId;
+
+                break;
+                
+            case DocReportAttachmentLoadFrom::Items:
+            case DocReportAttachmentLoadFrom::ItemVariants:
+            case DocReportAttachmentLoadFrom::JournalLines:
+            case DocReportAttachmentLoadFrom::SourceLines:
+            case DocReportAttachmentLoadFrom::CustomRecords:
+                refRecId = 0;
+                refTableId = 0;
+
+                if ((_attachmentRule.parmLoadFrom() == DocReportAttachmentLoadFrom::JournalLines)
+                    && (_attachmentRecord.TableId == tableName2Id(tableStr(ProjInvoiceTransUnion))))
+                {
+                    // Project invoice journal: 5 different types of transactions are possible,
+                    // but we need to return only one type of buffer. 
+                    // For that, we will use the ProjInvoiceTransUnion union view, which allows us
+                    // to reference all linked transactions at once.
+                    ProjInvoiceTransUnion projInvoiceTransUnion = _attachmentRecord as ProjInvoiceTransUnion;
+                    ttsbegin;
+                    while (projInvoiceTransUnion)
+                    {
+                        switch (projInvoiceTransUnion.SourceTableId)
+                        {
+                            case tableName2Id(tableStr(ProjInvoiceCost)):  
+                                recordFilter.insert(ProjInvoiceCost::findTransId(projInvoiceTransUnion.ProjTransId).RecId,
+                                                    DocuRef::GetRootTableID(tableName2Id(tableStr(ProjInvoiceCost))));
+                                break;
+                            
+                            case tableName2Id(tableStr(ProjInvoiceEmpl)):
+                                recordFilter.insert(ProjInvoiceEmpl::findTransId(projInvoiceTransUnion.ProjTransId).RecId,
+                                                    DocuRef::GetRootTableID(tableName2Id(tableStr(ProjInvoiceEmpl))));
+                                break;
+                            
+                            case tableName2Id(tableStr(ProjInvoiceItem)):
+                                recordFilter.insert(ProjInvoiceItem::findTransId(projInvoiceTransUnion.ProjTransId).RecId,
+                                                    DocuRef::GetRootTableID(tableName2Id(tableStr(ProjInvoiceItem))));
+                                break;
+                            
+                            case tableName2Id(tableStr(ProjInvoiceOnAcc)):
+                                recordFilter.insert(ProjInvoiceOnAcc::findTransId(projInvoiceTransUnion.ProjTransId).RecId,
+                                                    DocuRef::GetRootTableID(tableName2Id(tableStr(ProjInvoiceOnAcc))));
+                                break;
+                            
+                            case tableName2Id(tableStr(ProjInvoiceRevenue)):
+                                recordFilter.insert(ProjInvoiceRevenue::findTransId(projInvoiceTransUnion.ProjTransId).RecId,
+                                                    DocuRef::GetRootTableID(tableName2Id(tableStr(ProjInvoiceRevenue))));
+                                break;
+                        }
+
+                        next projInvoiceTransUnion;
+                    }                                                      
+                    ttscommit;                   
+                }
+                else if ((_attachmentRule.parmLoadFrom() == DocReportAttachmentLoadFrom::SourceLines)
+                    && (_attachmentRecord.TableId == tableName2Id(tableStr(DocProjProposalAllLinesView))))
+                {
+                    // Project invoice proposal: 5 different types of lines are possible,
+                    // but we need to return only one type of buffer.
+                    // For that, we created one union view to handle them all at once.
+                    DocProjProposalAllLinesView projProposalLines = _attachmentRecord as DocProjProposalAllLinesView;
+                    ttsbegin;
+                    while (projProposalLines)
+                    {
+                        recordFilter.insert(projProposalLines.ProposalLineRecId, str2Int64(projProposalLines.ProposalLineTableId));
+                        next projProposalLines;
+                    }
+                    ttscommit;
+                }
+                else
+                {
+                    // Any other type of lines or line items
+                    refTableId = DocuRef::GetRootTableID(_attachmentRecord.TableId);
+                    ttsbegin;
+                    while (_attachmentRecord)
+                    {
+                        recordFilter.insert(_attachmentRecord.RecId, refTableId);
+                        next _attachmentRecord;
+                    }
+                    ttscommit;
+                }
+
+                break;
+
+            default:
+                // Should not happen, do nothing
+        }
+
+        QueryRun queryRun = new QueryRun(DocReportAttachmentManager::buildQuery(
+                                            reportContextCompanyId,
+                                            _attachmentRule.parmLoadFrom(),
+                                            languageId, categoryId, name, fileExtension, docuTypeId,
+                                            restriction, languageFilter, selectedAttachmentCompanyId,
+                                            refTableId, refRecId, recordFilter));
+        
+        List resolvedAttachmentList = new List(Types::Class); // List<DocReportAttachmentResolved>
+
+        DocReportAttachmentResolved resolvedAttachment;
+        DocuRef docuRef;
+        CompanyInfo companyInfo;
+        DocuValue docuValue;
+        
+        CompanyId companyIdCurrent, companyIdOld = '';
+        LanguageId languageIdCurrent, languageIdOld = '';
+        int cnt = 0;
+        DocValidationResult validationResult;
+        
+        while (queryRun.next())
+        {
+            docuRef = queryRun.get(tableNum(DocuRef));
+            docuValue = queryRun.get(tableNum(DocuValue));
+
+            if (!DocGlobalHelper::containsTags(docuRef.Tags_DC, tags, true))
+            {
+                // Skip attachment which does not contain all specified tags
+                continue;
+            }
+            
+            if (_attachedDocuRefRecIdSet.in(docuRef.RecId))
+            {
+                // This document has already been attached based on other attachment definition, skip it
+                continue;
+            }
+            _attachedDocuRefRecIdSet.add(docuRef.RecId);
+
+            if (_attachmentRule.parmLoadFrom() == DocReportAttachmentLoadFrom::GlobalAttachments)
+            {
+                companyInfo = queryRun.get(tableNum(CompanyInfo));
+                companyIdCurrent = companyInfo.DataArea;
+            }
+            else
+            {
+                companyIdCurrent = docuRef.ActualCompanyId;
+            }
+            languageIdCurrent = docuRef.LanguageId_DC;
+
+            if (cnt > 0 && // something was found already
+                    // company has changed
+                    ((companyIdCurrent != companyIdOld)     
+                     || 
+                    // language has changed and it matters (language filter set to SameLanguageThenNoLanguage)
+                    (_attachmentRule.parmLanguageFilter() == DocReportAttachmentLanguageFilter::SameLanguageThenNoLanguage
+                        && (languageIdCurrent != languageIdOld))))
+            {
+                // New (worse-fit) combination of CompanyId and LanguageId,
+                // and we already found some attachments with the better fit.
+                // Don't continue.
+                break;
+            }
+
+            // Construct the attachment object
+            try
+            {
+                resolvedAttachment = DocReportAttachmentManager::constructReportAttachmentFromDocuRef(
+                                        docuRef.RecId, docuValue.FileName, docuValue.FileType, _attachmentRule);
+            }
+            catch
+            {
+                DocGlobalHelper::handleException(
+                        funcName(),
+                        strFmt("@DocentricAX2:ErrorRetrievingAttachment",
+                                docuValue.FileName, docuValue.FileType, _attachmentRule.toString()));
+            }
+
+            // Validate this attachment
+            validationResult = resolvedAttachment.validate();
+            if (!validationResult.parmIsValid())
+            {
+                DocGlobalHelper::handleException(
+                        funcName(),
+                        strFmt("@DocentricAX2:ErrorValidatingResolvedAttachment",
+                                resolvedAttachment.toString(), validationResult.parmMessage()));
+            }
+
+            // Attachment is valid, add it to the list of resolved attachments
+            resolvedAttachmentList.addEnd(resolvedAttachment);
+
+            cnt++;
+            companyIdOld = companyIdCurrent;
+            languageIdOld = languageIdCurrent;
+        }
+        
+        return resolvedAttachmentList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromGlobalAttachment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get a list of all global attachment documents resolved based on a given
+    /// attachment rule.  
+    /// </summary>
+    /// <param name = "_reportRunContext">DocReportRunContext object</param>
+    /// <param name = "_attachmentRule">Object containing the attachment rule</param>
+    /// <param name = "_attachedDocuRefRecIdSet">Set of all DocuRef.RecId used so far for
+    /// this report, so that we don't attach duplicates which might come from
+    /// different rules.</param>
+    /// <returns>List(DocReportAttachmentResolved) - list of documents resolved
+    /// based on the given rule.</returns>
+    public static List getFromGlobalAttachment(DocReportRunContext _reportRunContext, DocReportAttachmentRule _attachmentRule,
+                                               Set _attachedDocuRefRecIdSet /* Set(int64 _DocuRefRecId) */)
+    {  
+        return DocReportAttachmentManager::getResolvedAttachmentList(_reportRunContext, _attachmentRule, _attachedDocuRefRecIdSet, null);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDynamicAttachment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get a list of all dynamic attachment documents resolved based on a given
+    /// attachment rule.
+    /// </summary>
+    /// <param name = "_reportRunContext">DocReportRunContext object</param>
+    /// <param name = "_attachmentRule">Object containing the attachment rule</param>
+    /// <param name = "_attachedDocuRefRecIdSet">Set of all DocuRef.RecId used so far for
+    /// this report, so that we don't attach duplicates which might come from
+    /// different rules.</param>
+    /// <param name = "_attachmentRecord">Underlying record for which the attachment
+    /// documents should be resolved</param>
+    /// <returns>List(DocReportAttachmentResolved) - list of documents resolved
+    /// based on the given rule.</returns>
+    public static List getFromDynamicAttachment(DocReportRunContext _reportRunContext, DocReportAttachmentRule _attachmentRule,
+                                                Set _attachedDocuRefRecIdSet, /* Set(int64 _DocuRefRecId) */ 
+                                                Common _attachmentRecord)
+    {
+        return DocReportAttachmentManager::getResolvedAttachmentList(_reportRunContext, _attachmentRule, _attachedDocuRefRecIdSet, _attachmentRecord);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasUserAccessToRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the current user has at least read access to the current record.
+    /// </summary>
+    /// <param name = "_record">Any record resolved as underlying record for the 
+    /// dynamic attachments.</param>
+    /// <returns>true if user has access to the record</returns>
+    public static boolean hasUserAccessToRecord(Common _record)
+    {              
+        DictTable dictTable = new DictTable(_record.TableId);
+        str menuItemStr = (dictTable ? dictTable.formRef() : '');   
+        
+        // If menu item is not found, menuItemAccessRight() below would return 'Full control' for Admin,
+        // but 'No access' for everyone else, so we have to check here if the menu item returned
+        // by formRef() above exists.
+        boolean menuItemExists = SysDictMenu::MenuItemElementExists(MenuItemType::Display, menuItemStr);        
+
+        // If formRef is not known, or menu item returned by system doesn't exist,
+        // we do not control the security
+        if (!menuItemStr || !menuItemExists)
+        {
+            return true;
+        }
+ 
+        // Menu item is known and it exists in the system, check its security.
+        SecurityRights  securityRights = SecurityRights::construct();
+        DataAreaId      companyId = (dictTable.dataPrCompany() ? _record.DataAreaId : curExt());        
+        AccessRight     right = securityRights.menuItemAccessRight(SecurableType::MenuItemDisplay, menuItemStr, companyId);      
+
+        return right != AccessRight::NoAccess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasUserAccessToGlobalAttachments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the current user has at least read access to Legal entities
+    /// or to our menu item Global attachments.
+    /// </summary>
+    /// <returns>true if user has access to at least one of the required menu items.</returns>
+    public static boolean hasUserAccessToGlobalAttachments()
+    {
+        SecurityRights securityRights = SecurityRights::construct();
+
+        // Check access to Legal entities
+        AccessRight right = securityRights.menuItemAccessRight(SecurableType::MenuItemDisplay, menuItemDisplayStr(OMLegalEntities));
+
+        if (right != AccessRight::NoAccess)
+        {
+            return true;
+        }
+
+        // Check access to our menu item Global attachments
+        right = securityRights.menuItemAccessRight(SecurableType::MenuItemDisplay, menuItemDisplayStr(DocReportGlobalAttachment));
+
+        return right != AccessRight::NoAccess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resolveReportAttachmentRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the underlying record which represents the "dynamic" attachment source. "Dynamic" source 
+    /// is a record which is in runtime resolved based on the LoadFrom parameter on the attachment
+    /// rule and the actual report being executed. For example, for the SalesInvoice report, 
+    /// Journal will be resolved as SalesInvoiceJournal record, Account as Customer record, 
+    /// Source table as SalesTable, Context record as SalesInvoiceJournal. 
+    /// </summary>
+    /// <param name = "_reportRunContext">DocReportRunContext object</param>
+    /// <param name = "_attachmentRule">Object containing the attachment rule</param>
+    /// <returns>Buffer of type Common with the resolved underlying dynamic record. The documents
+    /// attached to this record are the candidates for the report attachment based on the given rule.</returns>
+    public static Common resolveReportAttachmentRecord(DocReportRunContext _reportRunContext, DocReportAttachmentRule _attachmentRule)
+    {
+        if (_reportRunContext == null || _attachmentRule == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Method is called with invalid parameters');
+        }
+
+        Common common = null;
+        
+        DocReportAttachmentLoadFrom loadFrom = _attachmentRule.parmLoadFrom();
+        DocArchiveContract archiveContract = _reportRunContext.archiveContract();
+
+        switch (loadFrom)
+        {
+            case DocReportAttachmentLoadFrom::ContextRecord:
+                common = _reportRunContext.getReportExecutionContextRecord();
+                break;
+
+            case DocReportAttachmentLoadFrom::Journal:
+                common = archiveContract.getJournalTableRecord();
+                break;
+
+            case DocReportAttachmentLoadFrom::JournalLines:
+                common = archiveContract.getJournalLineRecords();
+                break;
+
+            case DocReportAttachmentLoadFrom::AccountTable:
+                common = archiveContract.getAccountTableRecord();
+                break;
+
+            case DocReportAttachmentLoadFrom::SourceTable:
+                common = archiveContract.getSourceTableRecord();
+                break;
+
+            case DocReportAttachmentLoadFrom::SourceLines:
+                common = archiveContract.getSourceLineRecords();
+                break;
+
+            case DocReportAttachmentLoadFrom::Items:
+                common = archiveContract.getLineItemRecords();
+                break;
+
+            case DocReportAttachmentLoadFrom::ItemVariants:
+                common = archiveContract.getLineItemVariantRecords();
+                break;
+
+            case DocReportAttachmentLoadFrom::CustomRecord:
+            case DocReportAttachmentLoadFrom::CustomRecords:
+                // to be handled in the custom DSP class.
+                break;
+
+            default:
+                DocGlobalHelper::handleException(
+                    funcName(),
+                    strFmt("@DocentricAX2:InvalidParameterValue",
+                        fieldId2PName(tableNum(DocReportAttachmentRuleTmp), fieldNum(DocReportAttachmentRuleTmp, LoadFrom)),
+                        loadFrom));
+        }
+
+        return common;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUnresolvedUnderlyingRecordErrorMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct the error message to be displayed if the underlying dynamic record couldn't be
+    /// resolved, or is resolved but doesn't have a content.
+    /// </summary>
+    /// <param name = "_reportRunContext">DocReportRunContext object</param>
+    /// <param name = "_attachmentRule">Object containing the attachment rule</param>
+    /// <returns>String with the constructed error message.</returns>
+    public static str getUnresolvedUnderlyingRecordErrorMessage(DocReportRunContext _reportRunContext, DocReportAttachmentRule _attachmentRule)
+    {
+        if (_reportRunContext == null || _attachmentRule == null)
+        {
+            DocGlobalHelper::handleException(funcName(), 'Method is called with invalid parameters');
+        }
+
+        str errorMessage = '';
+        str tableName = '';
+        
+        DocReportAttachmentLoadFrom loadFrom = _attachmentRule.parmLoadFrom();
+        DocArchiveContract archiveContract = _reportRunContext.archiveContract();
+        
+        switch (loadFrom)
+        {
+            case DocReportAttachmentLoadFrom::ContextRecord:
+                Common contextRecord = _reportRunContext.getReportExecutionContextRecord();
+                if (contextRecord != null)
+                {
+                    tableName = tableId2PName(contextRecord.TableId);
+                }
+                break;
+
+            case DocReportAttachmentLoadFrom::Journal:
+                tableName = archiveContract.getJournalTableName();
+                break;
+
+            case DocReportAttachmentLoadFrom::JournalLines:
+                tableName = archiveContract.getJournalLineTableName();
+                break;
+
+            case DocReportAttachmentLoadFrom::AccountTable:
+                tableName = archiveContract.getAccountTableName();
+                break;
+
+            case DocReportAttachmentLoadFrom::SourceTable:
+                tableName = archiveContract.getSourceTableName();
+                break;
+
+            case DocReportAttachmentLoadFrom::SourceLines:
+                tableName = archiveContract.getSourceLineTableName();
+                break;
+
+            case DocReportAttachmentLoadFrom::Items:
+                tableName = archiveContract.getJournalLineTableName();
+                break;
+
+            case DocReportAttachmentLoadFrom::ItemVariants:
+                tableName = archiveContract.getJournalLineTableName();
+
+            case DocReportAttachmentLoadFrom::CustomRecord:
+                // We will show the generic message.
+                break;
+
+            default:
+                DocGlobalHelper::handleException(
+                    funcName(),
+                    strFmt("@DocentricAX2:InvalidParameterValue",
+                        fieldId2PName(tableNum(DocReportAttachmentRuleTmp), fieldNum(DocReportAttachmentRuleTmp, LoadFrom)),
+                        loadFrom));
+        }
+
+        if (tableName == '')
+        {
+            errorMessage = strFmt("@DocentricAX2:UnresolvedUnderlyingNoTable", loadFrom);
+        }
+        else
+        {
+            errorMessage = strFmt("@DocentricAX2:UnresolvedUnderlyingWithTable", loadFrom, tableName);
+        }
+
+        return errorMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleNotFoundCondition</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handles the case where the attachment is not found for the specified rules.
+    /// </summary>
+    /// <param name = "_reportRunContext">An instance of the DocReportRunContext class</param>
+    /// <param name = "_attachmentRule">An instance of the DocReportAttachmentRule class</param>
+    /// <param name = "_attachmentResolved">An instance of the DocReportAttachmentResolved class</param>
+    public static void handleNotFoundCondition(
+        DocReportRunContext         _reportRunContext, 
+        DocReportAttachmentRule     _attachmentRule,
+        DocReportAttachmentResolved _attachmentResolved)
+    {
+        DocReportAttachmentIfNotFoundAction ifNotFoundAction;
+        
+        if (_attachmentResolved != null)
+        {
+            // Actual attachment -> read the parameters from the attachment rule
+            ifNotFoundAction = _attachmentResolved.parmAttachmentRule().parmIfNotFoundAction();
+        }
+        else if (_attachmentRule != null)
+        {
+            // Attachment rule --> it has the parameter we need
+            ifNotFoundAction = _attachmentRule.parmIfNotFoundAction();
+        }
+        else
+        {
+            // Show error and throw exception, so that the report is not printed
+            DocGlobalHelper::handleException(funcName(), '_attachmentRule or _attachmentResolved must be provided');
+        }
+
+        if (ifNotFoundAction == DocReportAttachmentIfNotFoundAction::NoWarning)
+        {
+            // Do nothing
+            return;
+        }
+        
+        // Construct the warning/error message
+        boolean isAttachmentRule = (_attachmentResolved == null);
+        date currentDate = DocGlobalHelper::getCurrentUsersCurrentDate();
+        str errorMessage;
+        if (isAttachmentRule)
+        {
+            errorMessage = strFmt("@DocentricAX2:NoAttachmentFoundForDefinition", currentDate, _attachmentRule.toString());
+        }
+        else
+        {
+            errorMessage = strFmt("@DocentricAX2:InvalidAttachmentContent", _attachmentResolved.toString(), _attachmentResolved.parmAttachmentRule().toString());
+        }
+
+        // And use the constructed message for warning or exception
+        if (ifNotFoundAction == DocReportAttachmentIfNotFoundAction::ShowWarning)
+        {
+            // Show warning
+            DocGlobalHelper::handleWarning(errorMessage);
+        }
+        else
+        {
+            // Show error and throw exception, so that the report is not printed
+            DocGlobalHelper::handleException(funcName(), errorMessage);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAndCheckRange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds and checks the specified range for the specified query data source.
+    /// </summary>
+    /// <param name = "_qbds">Query data source</param>
+    /// <param name = "_filterString">Filtering string for range</param>
+    /// <param name = "_rangeFieldId">Range field Id</param>
+    /// <param name = "_fieldName">Range field name</param>
+    /// <param name = "_fieldValue">Range field value</param>
+    private static void addAndCheckRange(
+        QueryBuildDataSource    _qbds, 
+        str                     _filterString, 
+        FieldId                 _rangeFieldId, 
+        str                     _fieldName, 
+        str                     _fieldValue)
+    {        
+        int lastInfoLogLine = infologLine();        
+        QueryBuildRange qbr = _qbds.addRange(_rangeFieldId);
+        qbr.value(_filterString);
+
+        if (!qbr.valid())
+        {
+            infolog.clear(lastInfoLogLine);
+            DocGlobalHelper::handleException(funcName(), 
+                strFmt("@DocentricAX2:InvalidFilterExpression", _fieldName, _fieldValue, _filterString));
+        }       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build the query to be used for retrieving the DocuRef records for one attachment definition.
+    /// Start from the already existing query DocReportAttachmentQuery and conditionally add
+    /// different ranges and ordering.
+    /// </summary>
+    /// <param name = "_companyId">Company ID from the report runContext</param>
+    /// <param name = "_loadFrom">Enum specifying if attachments are loaded from the global
+    /// attachments or dynamically from the underlying record</param>
+    /// <param name = "_languageId">Report runtime language. We first seach for the attachments
+    /// that match that language and if they are not found, then we search for the attachments
+    /// with no language specified.</param>
+    /// <param name = "_categoryId">Category on the attachment. If provided, only the attachments
+    /// with this category will be filtered.</param>
+    /// <param name = "_name">Attachment name. If provided, it will be used as a filter criteria.</param>
+    /// <param name = "_fileExtension">Attachment file type. If provided, it will be used
+    /// as a filter criteria</param>
+    /// <param name = "_docuTypeId">Attachment document type. If provided, it will be used
+    /// as a filter criteria</param>
+    /// <param name = "_restriction">Restriction specified on the attachment document. If different 
+    /// from All, it will be used as a filter criteria.</param>
+    /// <param name = "_languageFilter">Filter by document Language ID to be applied.</param>
+    /// <param name = "_selectedAttachmentCompanyId">Company ID on the selected global attachment.
+    /// It is used when user selects the global attachment from the list of available attachments
+    /// when specifying the attachments. We offer the attachments from the current company and
+    /// from the DAT company in the attachment definition form, and the same attachment description
+    /// can appear in both of them.</param>
+    /// <param name = "_refTableId">Table ID of the underlying record for which the dynamic attachments
+    /// should be searched. For all derived tables (ex. CompanyInfo) that attachment is linked to the base table!</param>
+    /// <param name = "_refRecId">Record ID of the underlying record for which the dynamic attachments
+    /// should be searched.</param>
+    /// <param name = "_recIdFilter">A map with RecId filters</param>
+    /// <returns>A created query</returns>
+    public static Query buildQuery(
+        CompanyId                           _companyId,
+        DocReportAttachmentLoadFrom         _loadFrom,
+        LanguageId                          _languageId,
+        DocAttachmentCategoryId             _categoryId,
+        DocAttachmentDescription            _name,
+        DocReportAttachmentName             _fileExtension,
+        DocReportAttachmentDocuTypeId       _docuTypeId,
+        DocReportAttachmentRestriction      _restriction,
+        DocReportAttachmentLanguageFilter   _languageFilter,
+        DataAreaId                          _selectedAttachmentCompanyId,
+        RefTableId                          _refTableId = DocuRef::GetRootTableID(tableNum(CompanyInfo)),
+        RefRecId                            _refRecId = 0,
+        Map                                 _recIdFilter = null)
+    {
+        str filterString;
+
+        Query query = new Query(queryStr(DocReportAttachmentQuery));
+        QueryBuildDataSource qbds, qbdsValue, qbdsCompanyInfo;
+
+        qbds = query.dataSourceTable(tableNum(DocuRef));
+        qbdsValue = query.dataSourceTable(tableNum(DocuValue));
+        qbdsCompanyInfo = query.dataSourceTable(tableNum(CompanyInfo));
+        
+        // If loading global attachments, change outer join to inner join with the CompanyInfo datasource.
+        if (_loadFrom == DocReportAttachmentLoadFrom::GlobalAttachments)
+        {
+            // Change join type to inner join
+            qbdsCompanyInfo.joinMode(JoinMode::InnerJoin);  // if we used Exists join instead, we would get an error, which is documented on MS.
+        }
+        
+        // Order by company:
+        //      - ASC if current company is in alphabet before 'DAT'
+        //      - DESC if current company is in alphabet after 'DAT'
+        if (_loadFrom == DocReportAttachmentLoadFrom::GlobalAttachments)
+        {
+            // For global attachments, company information is in companyInfo.DataArea
+            if (strUpr(_companyId) > 'DAT')
+            {
+                qbdsCompanyInfo.addOrderByField(fieldNum(CompanyInfo, DataArea), SortOrder::Descending);
+            }
+            else
+            {
+                qbdsCompanyInfo.addOrderByField(fieldNum(CompanyInfo, DataArea), SortOrder::Ascending);
+            }
+        }
+        else
+        {
+            // For dynamic attachments, company information is in docuRef.ActualCompanyId
+            if (strUpr(_companyId) > 'DAT')
+            {
+                qbds.addOrderByField(fieldNum(DocuRef, ActualCompanyId), SortOrder::Descending);
+            }
+            else
+            {
+                qbds.addOrderByField(fieldNum(DocuRef, ActualCompanyId), SortOrder::Ascending);
+            }
+        }
+
+        // This and the above ordering by company enable running just one query, where we will
+        // get the results in the following order:
+        //      1. current company, runtime languge
+        //      2. current company, no language
+        //      3. DAT company, runtime language
+        //      4. DAT company, no language
+        // In the caller method we execute this query and then:
+        // If we find some attachments in group 1, we collect them all and then don't continue.
+        // If we don't get anything in the group 1, we move on to the next group and either collect
+        // all the results from there and stop or don't get anything and continue to the next group
+        // and so on.
+        qbds.addOrderByField(fieldNum(DocuRef, LanguageId_DC), SortOrder::Descending);
+
+        // Filter by company (allow current company and 'DAT' company)
+        if (_loadFrom == DocReportAttachmentLoadFrom::GlobalAttachments)
+        {
+            // Global attachments
+            if (_selectedAttachmentCompanyId == '')
+            {
+                // If Global attachment is specified via Category, then no specific company on attachment
+                // is required, include both current company and DAT
+                filterString = strFmt('((%1.DataArea == "%2") || (%1.DataArea == "DAT"))', qbdsCompanyInfo.name(), _companyId);  
+            }
+            else
+            {
+                // Attachment definition was selected via lookup, the company is known and
+                // we want to filter only that company
+                filterString = strFmt('(%1.DataArea == "%2")', qbdsCompanyInfo.name(), _selectedAttachmentCompanyId);
+            }            
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbdsCompanyInfo, filterString, fieldNum(CompanyInfo, DataArea),
+                    fieldId2PName(tableNum(CompanyInfo), fieldNum(CompanyInfo, DataArea)),
+                    (_selectedAttachmentCompanyId == '' ? _companyId : _selectedAttachmentCompanyId));
+        }
+        else
+        {
+            // Dynamic attachments
+            filterString = strFmt('((%1.ActualCompanyId == "%2") || (%1.ActualCompanyId == "DAT"))', qbds.name(), _companyId);                       
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbds, filterString, fieldNum(DocuRef, ActualCompanyId),
+                    fieldId2PName(tableNum(DocuRef), fieldNum(DocuRef, ActualCompanyId)),
+                    _companyId);
+        }
+        
+        // Filter by language if it is required (language filter different from 'AnyLanguage').
+        if (_languageFilter != DocReportAttachmentLanguageFilter::AnyLanguage)
+        {
+            if (_languageFilter == DocReportAttachmentLanguageFilter::SameLanguage)
+            {
+                filterString = strFmt('(%1.LanguageId_DC == "%2")', qbds.name(), _languageId);
+            }
+            else
+            {
+                // SameLanguageThenNoLanguage or SameOrNoLanguage
+                filterString = strFmt('((%1.LanguageId_DC == "%2") || (%1.LanguageId_DC == ""))', qbds.name(), _languageId);
+            }
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbds, filterString, fieldNum(DocuRef, LanguageId_DC),
+                    "@SYS66040",
+                    _languageId);
+        }
+
+        // Filter by restriction
+        if (_restriction == DocReportAttachmentRestriction::Internal)
+        {
+            qbds.addRange(fieldNum(DocuRef, Restriction)).value(queryValue(DocuRestriction::Internal));
+        }
+        else if (_restriction == DocReportAttachmentRestriction::External)
+        {
+            qbds.addRange(fieldNum(DocuRef, Restriction)).value(queryValue(DocuRestriction::External));
+        }
+        else
+        {
+            // Do nothing - don't filter by restriction
+        }
+
+        if (_loadFrom == DocReportAttachmentLoadFrom::GlobalAttachments)
+        {
+            // Filter only global aggachments (docuRef.IsGlobalAttachment_DC = true)
+            qbds.addRange(fieldNum(DocuRef, IsGlobalAttachment_DC)).value(queryValue(NoYes::Yes));
+            
+            // docuRef.RefTableId == _refTableId
+            qbds.addRange(fieldNum(DocuRef, RefTableId)).value(queryValue(_refTableId));
+        }
+        else
+        {
+            // add filter by docuRef.RefRecId
+            if (_refRecId == 0 && _recIdFilter == null)
+            {
+                // Should not happen, if dynamic attachment then RecId or lines filter must be provided
+                DocGlobalHelper::handleException(funcName(), 'Invalid parameters, _refRecId of _recIdFilter must be provided for dynamic attachments');
+            }
+
+            if (_refRecId != 0)
+            {
+                // Single record
+                qbds.addRange(fieldNum(DocuRef, RefRecId)).value(queryValue(_refRecId));
+                qbds.addRange(fieldNum(DocuRef, RefTableId)).value(queryValue(_refTableId));
+            }
+            else
+            {
+                // Multiple records, as specified in _recIdFilter.
+                // Dynamically create range as 1 to N pairs of RefRecid and RefTableId filters,
+                // based on _recidFilter pairs.
+                filterString = '(';
+                int lineCnt = 0;
+                MapEnumerator me = _recIdFilter.getEnumerator();
+                while (me.moveNext())
+                {
+                    if (lineCnt > 0)
+                    {
+                        filterString += ' || ';
+                    }
+
+                    filterString += strFmt('((%1.%2 == %3) && (%1.%4 == %5))',
+                        qbds.name(),
+                        fieldStr(DocuRef, RefRecId),
+                        me.currentKey(),
+                        fieldStr(DocuRef, RefTableId),
+                        me.currentValue());
+
+                    lineCnt++;
+                }
+                filterString += ')';
+                
+                DocReportAttachmentManager::addAndCheckRange(
+                    qbds, filterString, fieldNum(DocuRef, RefRecId),
+                    fieldId2PName(tableNum(DocuRef), fieldNum(DocuRef, RefRecId)),
+                    '');
+            }
+        }            
+
+        // Filter by category
+        str categoryIdTrimmed = strLTrim(strRTrim(_categoryId));
+        if (categoryIdTrimmed != '')
+        {
+            // Category provided, filter by it
+            filterString = queryValue(categoryIdTrimmed);
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbds, filterString, fieldNum(DocuRef, CategoryId_DC),
+                    fieldId2PName(tableNum(DocReportAttachmentRuleTmp), fieldNum(DocReportAttachmentRuleTmp, CategoryId)),
+                    categoryIdTrimmed);
+        }
+
+        // Filter by name  
+        str nameTrimmed = strLTrim(strRTrim(_name));
+        if (nameTrimmed == DocConstantFile::FilenameWildcard || nameTrimmed == '')
+        {
+            // Name is only * wildcard or it is empty. Both of them mean: apply no filter by name.
+            // This is OK unless LoadFrom is Global and _categoryId is also empty --> we don't allow
+            // this because it might result in too many attachments.
+            if (_loadFrom == DocReportAttachmentLoadFrom::GlobalAttachments && categoryIdTrimmed == '')
+            {
+                DocGlobalHelper::handleException(funcName(), 'Invalid parameters, filter by _name or _categoryId must be provided for global attachments');
+            }
+            else
+            {
+                // do nothing - don't add filter by name
+            } 
+        } 
+        else
+        {
+            // Name contains filename or filename pattern with optional wildcards (* and/or ?).
+            // Comma (,), quote (", ') will be treated as normal characters and do not change the syntax
+            filterString = strFmt('(%1.Name LIKE "%2")', qbds.name(), strReplace(nameTrimmed, '"', '\\"'));
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbds, filterString, fieldNum(DocuRef, Name),
+                    fieldId2PName(tableNum(DocReportAttachmentRuleTmp), fieldNum(DocReportAttachmentRuleTmp, Description)),
+                    nameTrimmed);
+        }
+
+        // Filter by FileExtension
+        str fileExtensionTrimmed = strLTrim(strRTrim(_fileExtension));
+        if (fileExtensionTrimmed != '')
+        {
+            // FileExtension provided, filter by it
+            filterString = queryValue(fileExtensionTrimmed);
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbdsValue, filterString, fieldNum(DocuValue, FileType),
+                    fieldId2PName(tableNum(DocReportAttachmentRuleTmp), fieldNum(DocReportAttachmentRuleTmp, FileExtension)),
+                    fileExtensionTrimmed);
+        }
+
+        // Filter by Document type
+        str docuTypeIdTrimmed = strLTrim(strRTrim(_docuTypeId));
+        if (docuTypeIdTrimmed != '')
+        {
+            // Document type provided, filter by it
+            filterString = queryValue(docuTypeIdTrimmed);
+
+            DocReportAttachmentManager::addAndCheckRange(
+                    qbds, filterString, fieldNum(DocuRef, TypeId),
+                    fieldId2PName(tableNum(DocReportAttachmentRuleTmp), fieldNum(DocReportAttachmentRuleTmp, DocuTypeId)),
+                    docuTypeIdTrimmed);
+        }
+
+        // Filter only active attachments
+        date currentDate = DocGlobalHelper::getCurrentUsersCurrentDate();
+        filterString = strFmt('((%1.%2 <= %3) && ((%1.%4 == %5) || (%1.%4 >= %3)))',
+                        qbds.name(),
+                        fieldStr(DocuRef, ActiveFrom_DC),
+                        Date2StrXpp(currentDate),
+                        fieldStr(DocuRef, ActiveTo_DC),
+                        Date2StrXpp(dateNull()));
+        DocReportAttachmentManager::addAndCheckRange(
+                qbds, filterString, fieldNum(DocuRef, ActiveFrom_DC),
+                fieldId2PName(tableNum(DocuRef), fieldNum(DocuRef, ActiveFrom_DC)),
+                Date2StrXpp(currentDate));
+
+
+        //info(strFmt('%1', query.toString()));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRecordRequired</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag indicating whether the record is required for the specified attachment source.
+    /// </summary>
+    /// <param name = "_loadFrom">Specifies the attachment source</param>
+    /// <returns>True if the record is required; otherwise faLse</returns>
+    public static boolean isRecordRequired(DocReportAttachmentLoadFrom _loadFrom)
+    {
+        boolean retVal;
+
+        switch (_loadFrom)
+        {
+            case DocReportAttachmentLoadFrom::AccountTable:
+            case DocReportAttachmentLoadFrom::ContextRecord:
+            case DocReportAttachmentLoadFrom::CustomRecord:
+            case DocReportAttachmentLoadFrom::GlobalAttachments:
+            case DocReportAttachmentLoadFrom::Journal:
+            case DocReportAttachmentLoadFrom::SourceTable:
+                retVal = true;
+                break;
+
+            case DocReportAttachmentLoadFrom::Items:
+            case DocReportAttachmentLoadFrom::ItemVariants:
+            case DocReportAttachmentLoadFrom::JournalLines:
+            case DocReportAttachmentLoadFrom::SourceLines:
+                retVal = false;
+                break;
+        }
+
+        return retVal;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

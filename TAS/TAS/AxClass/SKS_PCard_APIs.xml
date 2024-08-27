@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_PCard_APIs</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_PCard_APIs //extends SKS_EFT_APIBatchInbound
+{
+    #DEFINE.CurrentVersion(1)
+    #define.Empty('<Empty>')
+    
+    SKS_PCard_ParmTable pCardParm;
+    SKS_EFTAP_File gSKS_EFTAP_File;
+    SKS_EFT_FileDetail gSKS_EFT_FileDetail;
+    SKS_EFT_Bank gSKS_EFT_Bank;
+    SKS_EB_CommProcess gSKS_EB_CommProcess;
+    SKS_EFT_InboundFileFormat gInboundFileFormat;
+    SKS_EFT_InboundFileGroups   gInboundFileGroup;
+    SKS_EB_FilePath             bankFabricLoc;
+    SKG_BF.Models.PCardResponse pCardResponse = new SKG_BF.Models.PCardResponse();
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmBankFabricLocation</Name>
+				<Source><![CDATA[
+    public SKS_EB_FilePath parmBankFabricLocation(SKS_EB_FilePath _bankFabricLoc = bankFabricLoc)
+    {
+        bankFabricLoc = _bankFabricLoc;
+        return bankFabricLoc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCommId</Name>
+				<Source><![CDATA[
+    public SKS_EB_CommProcess parmCommId(SKS_EB_CommProcess _gSKS_EB_CommProcess = gSKS_EB_CommProcess)
+    {
+        gSKS_EB_CommProcess = _gSKS_EB_CommProcess;
+        return gSKS_EB_CommProcess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        SKG_BF.Models.PCardSource   pCardSrc;
+        SKS_PCard_Header            pCardHeader;
+
+        int       numrecords;
+        int       counter;
+
+        select firstonly pCardParm
+            where   pCardParm.CommID        == gSKS_EB_CommProcess.CommID
+            &&      pCardParm.FileLocation  == this.parmBankFabricLocation();
+
+        this.getPCardStatus();
+
+        numrecords = pCardResponse.PCardSources.get_count();
+
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            pCardSrc = pCardResponse.PCardSources.get_item(Counter);
+
+            if(pCardSrc != null)
+            {
+                if (pCardSrc.Success)
+                {
+                    pCardHeader = this.importPCard(pCardSrc);
+
+                    if (pCardHeader)
+                    {
+                        pCardHeader.selectForUpdate(true);
+                        pCardHeader.Status = SKS_PCard_ImportStatus::Completed;
+                        ttsbegin;
+                        pCardHeader.update();
+                        ttscommit;
+                      
+                        LedgerJournalId journalId = SKS_PCard_ProcessHelper::createJournalHeader(pCardHeader, gSKS_EB_CommProcess, this.parmBankFabricLocation());
+                        
+                        if (journalId && pCardParm.AutoPost)
+                        {
+                            try
+                            {
+                                LedgerJournalTable  ledgerJourTable = LedgerJournalTable::find(journalId);
+
+                                LedgerJournalCheckPost ledgerJournalValidate = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJourTable, NoYes::No);
+                                ledgerJournalValidate.runOperation();
+
+                                if(ledgerJournalValidate.tableErrorLog())
+                                {
+                                    SKS_PCard_HistoryTable::insertEvent(SKS_PCard_Action::GLAutoPostingFailed,
+                                            pCardHeader.RecId,
+                                            ledgerJourTable.JournalNum);
+
+                                    SKS_PCard_ErrorLog::createErrorLog(strFmt ("@SKS:JourPostError", journalId, ledgerJournalValidate.tableErrorLog()), pCardHeader.RecId);
+                                }
+                                else
+                                {
+                                    LedgerJournalCheckPost ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJourTable, NoYes::Yes);
+                                    ledgerJournalCheckPost.runOperation();
+
+                                    SKS_PCard_HistoryTable::insertEvent(SKS_PCard_Action::GLAutoPosted,
+                                            pCardHeader.RecId,
+                                            ledgerJourTable.JournalNum);
+                                }
+                            }
+                            catch
+                            {
+                                SKS_PCard_HistoryTable::insertEvent(SKS_PCard_Action::GLAutoPostingFailed,
+                                            pCardHeader.RecId,
+                                            journalId);
+                                
+                                SKS_PCard_ErrorLog::createErrorLog(strFmt ("@SKS:JourPostError1", journalId), pCardHeader.RecId);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    SKS_PCard_Header    pCardFile;
+
+                    ttsbegin;
+                    pCardFile.clear();
+                    pCardFile.ImportIdentifier  = pCardSrc.BFIdentifier;
+                    pCardFile.CreationDateTime  = pCardSrc.CreationDateTime;
+                    pCardFile.ImportDate        = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                    pCardFile.Status            = SKS_PCard_ImportStatus::ImportError;
+                    pCardFile.insert();
+                    ttscommit;
+
+                    SKS_PCard_ErrorLog::createErrorLog(strFmt ("@SKS:PCardImportError", pCardSrc.Reason), pCardFile.RecId);
+
+                    error (strFmt ("@SKS:PCardImportError", pCardSrc.Reason));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPCardStatus</Name>
+				<Source><![CDATA[
+    private void getPCardStatus()
+    {
+        SKG_BF.Models.PCardRequest  pCardReqContract = new SKG_BF.Models.PCardRequest();
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType::BankFabric);
+
+        pCardReqContract.BankFabricCommunicationName = gSKS_EB_CommProcess.BankFabricCommunicationName;
+        pCardReqContract.BankFabricLocation = this.parmBankFabricLocation();
+        pCardReqContract.DNS = SKS_EB_FileHub::getDNS(SKS_BF_BankIntType::BankFabric);
+        pCardReqContract.PCardFormatName = pCardParm.FileFormat;
+        pCardReqContract.TASVersion = '';
+        pCardReqContract.SecretName = '';
+        pCardReqContract.RuntimeUrl = '';
+
+        // TODO
+        pCardResponse = filehub.callAPIPCardStatus(pCardReqContract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importPCard</Name>
+				<Source><![CDATA[
+    private SKS_PCard_Header importPCard(SKG_BF.Models.PCardSource  _pCardSource)
+    {
+        int       numrecords;
+        int       counter;
+        SKG_BF.Models.PCardRecordDetail  pCardRecordDetails;
+        SKS_PCard_Header              pCardFile;
+        SKS_PCard_Details           pCardLines;
+
+        numrecords = _pCardSource.PCardRecordDetails.get_count();
+
+        if (numrecords > 0)
+        {
+            ttsbegin;
+            pCardFile.clear();
+            pCardFile.ImportIdentifier  = _pCardSource.BFIdentifier;
+            pCardFile.CreationDateTime  = _pCardSource.CreationDateTime;
+            pCardFile.ImportDate        = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            pCardFile.FileLocation      = this.parmBankFabricLocation();
+            pCardFile.CommID            = gSKS_EB_CommProcess.CommID;
+            pCardFile.insert();
+            ttscommit;
+        }
+
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            pCardRecordDetails = _pCardSource.PCardRecordDetails.get_item(Counter);
+            if(pCardRecordDetails != null)
+            {
+                ttsbegin;
+
+                pCardLines.clear();
+                pCardLines.Txt          = pCardRecordDetails.Description;
+                pCardLines.Currency     = pCardRecordDetails.Currency;
+                pCardLines.Invoice      = pCardRecordDetails.InvoiceNumber;
+                pCardLines.TransDate    = pCardRecordDetails.TransDate;
+                pCardLines.InvoiceDate  = pCardRecordDetails.InvoiceDate;
+                pCardLines.Amount               = pCardRecordDetails.Amount;
+                pCardLines.OffsetCompanyId      = pCardRecordDetails.OffsetCompanyId;
+                pCardLines.ProjectCategory      = pCardRecordDetails.ProjectCategory;
+                pCardLines.ProjectActivityNumber = pCardRecordDetails.ProjectActivityNumber;
+                pCardLines.OffsetAccount        = pCardRecordDetails.OffsetAccount;
+                pCardLines.OffsetAccountType    = pCardRecordDetails.OffsetAccountType;
+                pCardLines.HeaderRecId          = pCardFile.RecId;
+
+                pCardLines.insert();
+
+                ttscommit;
+            }
+        }
+
+        return pCardFile;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

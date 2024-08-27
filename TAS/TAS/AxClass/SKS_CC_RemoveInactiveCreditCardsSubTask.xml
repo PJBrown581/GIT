@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_RemoveInactiveCreditCardsSubTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_RemoveInactiveCreditCardsSubTask extends RunBaseBatch
+{
+    #OCCRetryCount
+    container               recordList;
+    str                     threadCaption;
+    boolean                 isBatchMode;
+    boolean                 displayRemoveCardResults;
+    Counter                 creditCardsRemovedRecCnt;
+    int                     procStartTime;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        recordList,
+        threadCaption,
+        displayRemoveCardResults,
+        isBatchMode
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>newSubTask</Name>
+				<Source><![CDATA[
+    public static SKS_CC_RemoveInactiveCreditCardsSubTask newSubTask(
+        container _recordList,
+        str _threadCaption,
+        boolean _displayRemoveCardResults,
+        boolean _isBatchMode = false)
+    {
+        SKS_CC_RemoveInactiveCreditCardsSubTask custCreditCardSyncSubTask = SKS_CC_RemoveInactiveCreditCardsSubTask::construct();
+
+        custCreditCardSyncSubTask.parmRecordList(_recordList);
+        custCreditCardSyncSubTask.parmThreadCaption(_threadCaption);
+        custCreditCardSyncSubTask.parmDisplayRemoveCardResults(_displayRemoveCardResults);
+        custCreditCardSyncSubTask.parmIsBatchMode(_isBatchMode);
+
+        return custCreditCardSyncSubTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsBatchMode</Name>
+				<Source><![CDATA[
+    public boolean parmIsBatchMode(boolean _isBatchMode = isBatchMode)
+    {
+        isBatchMode = _isBatchMode;
+
+        return isBatchMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDisplayRemoveCardResults</Name>
+				<Source><![CDATA[
+    public boolean parmDisplayRemoveCardResults(boolean _displayRemoveCardResults = displayRemoveCardResults)
+    {
+        displayRemoveCardResults = _displayRemoveCardResults;
+
+        return displayRemoveCardResults;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecordList</Name>
+				<Source><![CDATA[
+    public container parmRecordList(container _recordList = recordList)
+    {
+        recordList = _recordList;
+
+        return recordList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmThreadCaption</Name>
+				<Source><![CDATA[
+    public str parmThreadCaption(str _threadCaption = threadCaption)
+    {
+        threadCaption = _threadCaption;
+
+        return threadCaption;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayLogResults</Name>
+				<Source><![CDATA[
+    public void displayLogResults()
+    {
+        info(strFmt("@SKS:SKGCCCreditCardsRemoved", creditCardsRemovedRecCnt));
+
+        int procEndTime = WinAPIServer::getTickCount();
+        int procExecutionTime = (procEndTime-procStartTime) div 1000;
+        if (procExecutionTime)
+        {
+            str execTimeUnit = "@SKS:SKGCCSecondsProcUnit";
+            if (procExecutionTime > 180)
+            {
+                // Greater than 180 seconds then convert to minutes
+                procExecutionTime = any2Int(procExecutionTime / 60);
+                execTimeUnit = "@SKS:SKGCCMinutesProcUnit";
+            }
+            info(strFmt("@SKS:SKGCCProcElapsedTimeWithProcUnit", procExecutionTime, execTimeUnit));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        if (SKS_PP_Setup::find().ModCC == NoYes::No)
+        {
+            throw error("@SKS6608");
+        }
+        
+        if (!SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor())
+        {
+            throw error("@SKS:SKGCCPayFabricNotActivePaymProc");
+        }
+
+        procStartTime = WinAPIServer::getTickCount();
+
+        for (int counterIdx = 1; counterIdx <= conLen(recordList); counterIdx++)
+        {
+            RecId creditCardRecId = conPeek(recordList, counterIdx);
+            if (!creditCardRecId)
+            {
+                continue;
+            }
+
+            CreditCardCust creditCardCustDel = CreditCardCust::find(creditCardRecId);
+            if (!creditCardCustDel)
+            {
+                error(strFmt("@SKS:SKGCCCouldNotFindCardToRemove", creditCardRecId));
+                continue;
+            }
+
+            str curCardMsg = strFmt('%1: %2, %3: %4', "@SYS7149", creditCardCustDel.CustAccount, "@SYS112023", creditCardCustDel.CardNumber);
+            setPrefix(curCardMsg);
+            
+            if (!creditCardCustDel.UniqueCardId)
+            {
+                error(strFmt("@SKS:SKGCCCouldNotFindCardToRemove", creditCardRecId));
+                continue;
+            }
+            
+            if (!SKS_CC_PayFabricWalletHandler::validateDeleteForOpenAuth(creditCardCustDel.RecId))
+            {
+                continue;
+            }
+            
+            try
+            {
+                SKS_CC_PayFabricWalletHandler pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+                pfWalletHandler.parmCustAccount(creditCardCustDel.CustAccount);
+                if (creditCardCustDel.SKS_CC_OneTimeCustRefTableId && creditCardCustDel.SKS_CC_OneTimeCustRefRecId)
+                {
+                    pfWalletHandler.parmOneTimeCustRefTableId(creditCardCustDel.SKS_CC_OneTimeCustRefTableId);
+                    pfWalletHandler.parmOneTimeCustRefRecId(creditCardCustDel.SKS_CC_OneTimeCustRefRecId);
+                }
+                pfWalletHandler.setPayFabricCustomerNbr();
+
+                boolean pfDeleteCardResult = pfWalletHandler.removePayFabricWallet(creditCardCustDel.UniqueCardId, creditCardCustDel.CardNumber);
+
+                if (pfDeleteCardResult)
+                {
+                    ttsBegin;
+                    creditCardCustDel.selectForUpdate(true);
+                    creditCardCustDel.delete();
+                    ttsCommit;
+
+                    creditCardsRemovedRecCnt++;
+
+                    if (displayRemoveCardResults)
+                    {
+                        info(strFmt('%1: %2', "@SKS:SKGCCCreditCardRecordDeleted", curCardMsg));
+                    }
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::DuplicateKeyException)
+            {
+                error(strFmt("@SKS:SKGCCErrorOccurredDuringCardRemoval", creditCardCustDel.RecId));
+            }
+            catch (Exception::CLRError)
+            {
+                error(strFmt("@SKS:SKGCCErrorOccurredDuringCardRemoval", creditCardCustDel.RecId));
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@SKS:SKGCCErrorOccurredDuringCardRemoval", creditCardCustDel.RecId));
+            }
+        }
+
+        this.displayLogResults();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = runbase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_RemoveInactiveCreditCardsSubTask construct()
+    {
+        return new SKS_CC_RemoveInactiveCreditCardsSubTask();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public server static ClassDescription description()
+    {
+        return "@SKS:SKGCCRemoveExpiredOrInactiveCreditCards";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public ClassDescription caption()
+    {
+        ClassDescription ret;
+    
+        ret = super();
+
+        if (threadCaption)
+        {
+            ret = threadCaption;
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

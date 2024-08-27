@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>EventActionAlert_DC_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using UL = Docentric.AX.Framework.Utilities;
+
+/// <summary>
+/// The class EventActionAlert_DC_Extension is an extension of the class EventActionAlert.
+/// </summary>
+[ExtensionOf(classStr(EventActionAlert))]
+final class EventActionAlert_DC_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes an alert event action.
+    /// </summary>
+    /// <param name = "_eventRule">Alert event rule</param>
+    /// <param name = "_eventType">Alert event type</param>
+    /// <param name = "_buffer">Alert table buffer </param>
+    /// <param name = "_inbox">Alert event inbox</param>
+    /// <param name = "_alertCreatedDateTime">Alert created date and time</param>
+    public void execute(
+        EventRule _eventRule,
+        EventType _eventType,
+        Common _buffer,
+        EventInbox _inbox,
+        EventAlertCreatedDateTime _alertCreatedDateTime)
+    {
+        // Tracing
+        DocTraceContextAlerts trace(DocMessageSeverity _traceMsgSeverity, str _traceEvent, DocTraceContextAlerts _traceContext = null, boolean _isEmailingError = false)
+        {
+            DocTraceContextAlerts tc;
+            if (DocTrace::isTraceCategoryEnabled(DocConstantDiagnostics::TraceAlerts))
+            {
+                tc = _traceContext != null ? _traceContext : DocTraceContextAlerts::constructForNotification(_eventRule, _eventType, _buffer, _inbox);
+                switch (_traceMsgSeverity)
+                {
+                    case DocMessageSeverity::Info:
+                        DocTrace::info(DocConstantDiagnostics::TraceAlerts, _traceEvent, tc.getTraceMessage(), tc);
+                        break;
+                    case DocMessageSeverity::Warning:
+                        DocTrace::warning(DocConstantDiagnostics::TraceAlerts, _traceEvent, tc.getTraceMessage(), tc);
+                        break;
+                    case DocMessageSeverity::Error:
+                        DocTrace::error(DocConstantDiagnostics::TraceAlerts, _traceEvent, tc.getTraceMessage(), tc.setIsEmailingError(_isEmailingError));
+                        break;
+                }
+            }
+            return tc;
+        }
+               
+        // Get the error message
+        str errorMessage()
+        {
+            return strFmt("@DocentricAX4:SendingAlertMailGlobalError",
+                          EventInbox::buildSubject(_inbox), _alertCreatedDateTime, 
+                          _eventRule.CompanyId == '' ? "@DocentricAX4:System" : "@DocentricAX4:Organization",
+                          _eventRule.EmailId_DC);
+        }
+
+        // Relaod the EventRule table buffer to get all fields from the EventRule table.
+        // This is necessary because since version 10.0.37 MS only passes a selected list of fields with the EventRule table buffer.
+        _eventRule = EventRule::find(_eventRule.RuleId, true);
+        _eventType.setRule(_eventRule);
+
+        boolean sendAlertEmailStoredValue;
+
+        // Check if the flag SendEmailUsingDocentric is set
+        if (_eventRule.SendAlertEmail && _eventRule.SendEmailUsingDocentric_DC)
+        {
+            // Store the _eventRule.SendAlertEmail value.
+            sendAlertEmailStoredValue = _eventRule.SendAlertEmail;
+
+            // Block sending the built-in alert email.
+            _eventRule.SendAlertEmail = false;
+        }
+
+        next execute(_eventRule, _eventType, _buffer, _inbox, _alertCreatedDateTime);
+
+        /****** TRACING ******/
+        DocTraceContextAlerts traceContext = trace(DocMessageSeverity::Info, DocConstantDiagnostics::TraceAlertsNotificationCreated);
+
+        // Add the alert notification to the alert summary email table if the IncludeInSummaryEmail flag is set
+        try
+        {
+            if (_inbox && _eventRule.IncludeInSummaryEmail_DC)
+            {
+                /*********************************   DOCENTRIC AX FREE EDITION LICENSE NOTICE   *********************************/
+                /*
+                In case that you are using Docentric AX Free Edition, changing these parts of the source code related to the licensing
+                is STRICTLY FORBIDDEN and DOES NOT COMPLY with Docentric AX Free Edition License, which you accepted by installing
+                the Docentric AX Free Edition product.
+                You must keep intact all parts of the source code related to the licensing of the full product version.
+                Read more: https://ax.docentric.com/free-edition-license/
+                */
+                /*********************************   DOCENTRIC AX FREE EDITION LICENSE NOTICE   *********************************/
+
+                // If the Alert summary emails are used, check the license. This feature cannot be used with Free Edition!
+                // This call will throw an exception if the license is not found or if the license is invalid, expired or insufficient.
+                DocLicenseMng::checkLicense(DocConstant::FeatureAlertSummaryEmails, strFmt("@DocentricAX4:SendingAlertSummaryEmailIncludeAlertFailed", _eventRule.RuleId));
+
+                DocAlertSummaryEmailStatusTable docAlertSummaryEmailStatusTable;
+                DocAlertSummaryEmailStatusLine docAlertSummaryEmailStatusLine;
+            
+                ttsbegin;
+
+                docAlertSummaryEmailStatusTable.clear();
+                docAlertSummaryEmailStatusTable.EventInboxRecId = _inbox.RecId;
+                docAlertSummaryEmailStatusTable.Status = DocAlertSummaryEmailStatus::Created;
+                docAlertSummaryEmailStatusTable.insert();
+
+                Set emailRecipientSet = this.getEmailRecipientSet(_eventRule.SummaryEmailRecipients_DC, _eventRule);
+                SetEnumerator emailRecipientSetEnum = emailRecipientSet.getEnumerator();
+
+                RecordInsertList recordInsertList = new RecordInsertList(tableNum(DocAlertSummaryEmailStatusLine));
+                while (emailRecipientSetEnum.moveNext())
+                {
+                    docAlertSummaryEmailStatusLine.clear();
+                    docAlertSummaryEmailStatusLine.AlertSummaryEmailStatusTableRecId = docAlertSummaryEmailStatusTable.RecId;
+                    docAlertSummaryEmailStatusLine.EmailRecipient = emailRecipientSetEnum.current();
+                    docAlertSummaryEmailStatusLine.Status = DocAlertSummaryEmailStatus::Created;
+                    recordInsertList.add(docAlertSummaryEmailStatusLine);
+                }
+                recordInsertList.insertDatabase();
+
+                ttscommit;
+            }
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+
+        // Send the alert email with Docentric - if an error was raised in the execute method in the base class, the _inbox table buffer is empty
+        if (_inbox && sendAlertEmailStoredValue && _eventRule.SendEmailUsingDocentric_DC)
+        {
+            // Restore the _eventRule.SendAlertEmail value.
+            _eventRule.SendAlertEmail = sendAlertEmailStoredValue;
+
+            try
+            {
+                ttsbegin;
+
+                // Update the SendEmail status and the EmailRecipient, since the SendAlertEmail status has been reset
+                SysUserInfo userInfo = SysUserInfo::find(_eventRule.UserId);
+
+                _inbox.selectForUpdate(true);
+                if (userInfo)
+                {
+                    _inbox.SendEmail = _eventRule.SendAlertEmail;
+                    if (_inbox.SendEmail)
+                    {
+                        _inbox.EmailRecipient = _eventRule.emailRecipient();
+                    }
+                }
+                _inbox.EmailTemplateId = _eventRule.EmailId_DC;
+                _inbox.update();
+
+                ttscommit;
+
+                // Get the already generated link to the alert entity.
+                System.Uri linkToBusinessData = UL.ReflectionHelper::GetField(this, identifierStr(linkUrl), false);
+
+                // Send the alert email.
+                DocEmailTemplateManager::sendAlertEmailNotifications(_eventRule, _eventType, _buffer, _inbox, linkToBusinessData);
+            }
+            catch (Exception::CLRError)
+            {
+                /****** TRACING ******/
+                trace(DocMessageSeverity::Error, DocConstantDiagnostics::TraceAlertsDocentricEmailing, traceContext, true);
+                DocGlobalHelper::handleClrException(funcName(), errorMessage());
+            }
+            catch
+            {
+                /****** TRACING ******/
+                trace(DocMessageSeverity::Error, DocConstantDiagnostics::TraceAlertsDocentricEmailing, traceContext, true);
+                DocGlobalHelper::handleException(funcName(), errorMessage());
+            }
+        }
+
+        // Notify also users from selected user group (just EventInbox and SystemNotification, not emails and bussiness events)
+        if (_eventRule.UserGroupId_DC)
+        {
+            UserGroupList userGroupList;
+            EventRule origEventRule = _eventRule.data();
+            EventInbox origInbox = _inbox.data();
+
+            while select userGroupList
+                where userGroupList.groupId == _eventRule.UserGroupId_DC
+                   && userGroupList.userId != origEventRule.UserId
+            {
+                // Change event rule, but the changes will not be saved
+                _eventRule.UserId = userGroupList.userId;
+                _eventRule.SendAlertEmail = false;
+                _eventRule.SendEmail = false;
+                _eventRule.SendEmailUsingDocentric_DC = false;
+                _eventRule.EmailRecipients = '';
+                _eventRule.EnabledForExternal = false;
+                _eventRule.UserGroupId_DC = '';
+                _eventRule.IncludeInSummaryEmail_DC = false;
+                _eventRule.Message = strFmt('%1\r\n\r\n%2', origEventRule.Message, strFmt("@DocentricAX4:EventRuleUserGroupMemberAlertMessage", origEventRule.UserGroupId_DC, origEventRule.UserId));
+
+                this.execute(_eventRule, _eventType, _buffer, _inbox, _alertCreatedDateTime);
+            }
+
+            // Restore the event rule and event inbox to original
+            _eventRule.data(origEventRule);
+            _inbox.data(origInbox);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEmailRecipientSet</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves placeholders in the specified email recipients string, splits the string to the list of email recipients, 
+    /// validates each email recipient and adds each valid email recipient to the set.
+    /// </summary>
+    /// <param name = "_emailRecipients">Email recipients string</param>
+    /// <param name = "_eventRule">Alert event rule</param>
+    /// <returns>Set of valid email recipients</returns>
+    private Set getEmailRecipientSet(SysEmailRecipients _emailRecipients, EventRule _eventRule)
+    {
+        Set emailRecipientSet = new Set(Types::String);
+
+        // Resolve placeholders in email recipients string 
+        str emailRecipients = DocEmailTemplateHelper::replacePlaceholdersUserGroup(DocEmailTemplateHelper::replacePlaceholdersUser(_emailRecipients));
+
+        // Split the email address string and validate each email address
+        List emailRecipientList = DocGlobalHelper::getEmailList(emailRecipients);
+
+        ListEnumerator emailRecipientListEnum = emailRecipientList.getEnumerator();
+        while (emailRecipientListEnum.moveNext())
+        {
+            str emailAddress = strLRTrim(emailRecipientListEnum.current());
+
+            // If a single email address is invalid, then skip it
+            if (!emailAddress || !DocGlobalHelper::validateEmail(emailAddress))
+            {
+                DocGlobalHelper::handleWarning(strFmt("@DocentricAX4:SendingAlertSummaryEmailRecipientNotValid", emailAddress, _eventRule.RuleId));
+                continue;
+            }
+
+            emailRecipientSet.add(emailAddress);
+        }
+        return emailRecipientSet;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

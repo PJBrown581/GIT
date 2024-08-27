@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIRailCarHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Helper class to handle reversal of Railcar records
+/// </summary>
+public class GGIRailCarHelper
+{
+    TTBRailCarTable     carTable;
+    TTBInventGaugeTable gaugeTable;
+    TTBRailCarLine      carLine;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// new instance
+    /// </summary>
+    /// <returns><c>GGIRailCarHelper</c></returns>
+    static GGIRailCarHelper construct()
+    {
+        return new GGIRailCarHelper();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRailCarLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// parm method to get/set<c>GGIRailCarHelper</c>
+    /// </summary>
+    /// <param name = "_carLine"><c>TTBRailCarLine</c></param>
+    /// <returns><c>TTBRailCarLine</c></returns>
+    public TTBRailCarLine parmRailCarLine(TTBRailCarLine _carLine = carLine)
+    {
+        carLine = _carLine;
+        return carLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>itemUnRegistration</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// un-registration of inventory
+    /// </summary>
+    void itemUnRegistration()
+    {
+        PurchLine               purchLine, purchLineLocal;
+        InventTrans             inventTrans;
+        InventTransOrigin       inventTransOrigin;
+        InventDim               inventDim;
+        InventTransWMS_Register inventTransWMS_Register;
+        TmpInventTransWMS       tmpInventTransWMS;
+        InventQualityOrderTable inventQualityOrderTable;
+
+        carTable = TTBRailCarTable::find(carLine.RailCarTable);
+
+        select firstonly InventTransId from purchLine
+                    where purchLine.PurchId == carLine.ReferenceId
+                    && purchLine.ItemId == carLine.ItemId;
+        if (purchLine.InventTransId)
+        {
+            this.cancelPackingSlip(purchLine.InventTransId);
+
+            inventTransOrigin = InventTransOrigin::findByInventTransId(purchLine.InventTransId);
+            inventTrans       = InventTrans::findByInventTransOrigin(inventTransOrigin.RecId);
+            inventDim         = inventTrans.inventDim();
+        }
+        delete_from inventQualityOrderTable
+                    where inventQualityOrderTable.QualityOrderId == carTable.InventQualityOrderId
+                        && inventQualityOrderTable.OrderStatus == InventTestOrderStatus::Open;
+
+        this.createInvTransfer(
+                    carLine.ItemId,
+                    carLine.InventDimId,
+                    inventDim.inventDimId,
+                    carLine.Qty);
+
+        tmpInventTransWMS.clear();
+        inventTransWMS_Register         = InventTransWMS_Register::newStandard(tmpInventTransWMS);
+        tmpInventTransWMS.initFromInventTrans(inventTrans);
+        tmpInventTransWMS.initFromInventTransOrigin(inventTransOrigin);
+        tmpInventTransWMS.InventQty     = carLine.Qty * -1;
+        purchLineLocal                  = purchline::findInventTransId(inventTransOrigin.InventTransId);
+
+        if (purchLineLocal)
+        {
+            tmpInventTransWMS.InventDimId   = inventDim.inventDimId;
+            inventTransWMS_Register.writeTmpInventTransWMS(tmpInventTransWMS,inventTrans,inventDim);
+            inventTransWMS_Register.parmTmpInventTransWMS(tmpInventTransWMS);
+            inventTransWMS_Register.updateInvent(purchLine);
+            this.createRailCarLine();
+
+            //updating gauge status
+            select firstonly forupdate gaugeTable
+                        where gaugeTable.WorkTransType == WHSWorkTransType::Purch
+                                && gaugeTable.RCRId == carTable.RailCarRecordNumber;
+
+            gaugeTable.Status = TTBInventGaugeTableStatus::Void;
+            gaugeTable.skipDatabaseLog(true);
+            gaugeTable.doUpdate();
+            gaugeTable.skipDatabaseLog(false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPackingSlip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancelling packing slip
+    /// </summary>
+    /// <param name = "_inventTransId">Lot id</param>
+    void cancelPackingSlip(InventTransId _inventTransId)
+    {
+        
+        VendPackingSlipTrans vendPackingSlipTrans;
+        PurchFormLetter purchFormLetter;
+        PurchTable purchTable;
+        VendPackingSlipJour vendPackingSlipJour;
+
+        while select vendPackingSlipTrans
+            where vendPackingSlipTrans.InventTransId == _inventTransId
+        {
+            purchTable = PurchTable::find(vendPackingSlipTrans.purchLine().PurchId);
+            vendPackingSlipJour = vendPackingSlipTrans.vendPackingslipJour();
+        
+            purchFormLetter = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+            PurchFormLetter.parmVersioningUpdateType(VersioningUpdateType::Cancel);
+            PurchFormLetter.parmCallerTable(vendPackingSlipJour);
+            PurchFormLetter.allowEmptyTable(true);
+            PurchFormLetter.initAllowEmptyTable(true);
+            PurchFormLetter.multiForm(true);
+            purchFormLetter.update( purchTable,
+            vendPackingSlipJour.PackingSlipId,
+            VendPackingSlipJour.DeliveryDate,
+            PurchUpdate::ReceiveNow,
+            AccountOrder::None,
+            NoYes::No,
+            NoYes::No,
+            NoYes::Yes);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAdjJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inventory adjustment journal
+    /// </summary>
+    void createAdjJournal()
+    {
+        InventJournalTable              inventJournalTable;
+        InventJournalTrans              inventJournalTrans, inventJournalTransFind;
+        InventJournalNameId             inventJournalName;
+        JournalCheckPost                journalCheckPost;
+
+        //<Creation of journal header>
+        inventJournalTable.clear();
+        inventJournalName =  InventJournalName::standardJournalName(InventJournalType::LossProfit);
+        inventJournalTable.initFromInventJournalName(InventJournalName::find(inventJournalName));
+        inventJournalTable.insert();
+        //<end Creation of journal header>
+
+        //<Creation of journal Line>
+        select firstonly inventJournalTransFind
+                    where inventJournalTransFind.JournalId == carLine.ReferenceId;
+
+        inventJournalTrans.initFromInventJournalTable(inventJournalTable);
+        inventJournalTrans.TransDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        inventJournalTrans.ItemId = inventJournalTransFind.ItemId;
+        inventJournalTrans.initFromInventTable(InventTable::find(inventJournalTransFind.ItemId));
+        if (inventJournalTransFind.Qty > 0)
+        {
+            inventJournalTrans.Qty = inventJournalTransFind.Qty * -1;
+        }
+        else if (inventJournalTransFind.Qty < 0)
+        {
+            inventJournalTrans.Qty = abs(inventJournalTransFind.Qty);
+        }
+        inventJournalTrans.modifiedField(fieldNum(InventJournalTrans, Qty));
+        inventJournalTrans.InventDimId = inventJournalTransFind.inventDimId;
+        inventJournalTrans.DefaultDimension = inventJournalTransFind.DefaultDimension;
+
+        inventJournalTrans.insert();
+        //</End Creation of journal Line>
+
+        //<Post Journal>
+        journalCheckPost = InventJournalCheckPost::newPostJournal(inventJournalTable);
+        journalCheckPost.runOperation();
+        //<End post Journal>
+        this.createRailCarLine(inventJournalTrans.JournalId);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>itemMoveAdj</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adjustment of Inventory and gauge
+    /// </summary>
+    void itemMoveAdj()
+    {
+        InventDim inventDimLocal;
+
+        select firstonly forupdate WorkId, DBRId from gaugeTable
+                    where gaugeTable.InventGaugeId == carLine.InventGaugeId
+                                && gaugeTable.InventBatchId == InventDim::find(carLine.InventDimId).inventBatchId;
+                
+        if (gaugeTable.WorkId)
+        {
+            WHSWorkLine workLine;
+
+            select firstonly WMSLocationId from workLine
+                        where workLine.WorkId == gaugeTable.WorkId
+                            && workLine.WorkType == WHSWorkType::Pick;
+
+            inventDimLocal = InventDim::find(carLine.InventDimId);
+            InventDimLocal.wMSLocationId = workLine.WMSLocationId;
+
+            this.createInvTransfer(carLine.ItemId, carLine.InventDimId, InventDim::findOrCreate(inventDimLocal).InventDimId, carLine.Qty);
+            this.createRailCarLine();
+            //update Gauge status
+            gaugeTable.Status = TTBInventGaugeTableStatus::Void;
+            gaugeTable.skipDatabaseLog(true);
+            gaugeTable.doUpdate();
+            gaugeTable.skipDatabaseLog(false);
+
+            //Reversal of bottling record
+            GGIDumpAndBottlingLine bottlingLine, bottlineLineNew;
+            const str reverseVal = ' - Reverse';
+
+            select firstonly bottlingLine
+                        where bottlingLine.DBRId == gaugeTable.DBRId
+                            && bottlingLine.ReferenceId == gaugeTable.WorkId
+                            && bottlingLine.Qty > 0;
+
+            if (bottlingLine.dumpAndBottlinigRecord().Status == GGIDumpAndBottlingRecordStatus::Open)
+            {
+                buf2Buf(bottlingLine, bottlineLineNew);
+                bottlineLineNew.Qty = - bottlineLineNew.Qty;
+                bottlineLineNew.WineGallon = - bottlineLineNew.WineGallon;
+                bottlineLineNew.ProofGallon = - bottlineLineNew.ProofGallon;
+                bottlineLineNew.TransTypeTxt = bottlineLineNew.TransTypeTxt + reverseVal;
+
+                bottlineLineNew.insert();
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRailCarLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// creating record in TTBRailCar
+    /// </summary>
+    /// <param name = "_journalId">Journal id</param>
+    public void createRailCarLine(JournalId _journalId = '')
+    {
+        TTBRailCarLine carLineNew;
+
+        buf2Buf(carLine, carLineNew);
+        carLineNew.LineNumber = TTBRailCarLine::lastLineNum(carLine.RailCarTable) + 1;
+        carLineNew.ReferenceId = _journalId;
+        carLineNew.Qty = carLine.Qty;
+        if (carLineNew.Qty > 0)
+        {
+            carLineNew.Qty = carLineNew.Qty * -1;
+            carLineNew.ProofGallon = carLineNew.ProofGallon * -1;
+            carLineNew.WineGallon = carLineNew.WineGallon * -1;
+        }
+        else if (carLineNew.Qty < 0)
+        {
+            carLineNew.Qty = abs(carLineNew.Qty);
+            carLineNew.ProofGallon = abs(carLineNew.ProofGallon);
+            carLineNew.WineGallon = abs(carLineNew.WineGallon);
+        }
+        
+        carLineNew.insert();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInvTransfer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// creating inventory transfer
+    /// </summary>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_fromDim">from dimension</param>
+    /// <param name = "_toDim">to dimension</param>
+    /// <param name = "_qty">Qty</param>
+    public void createInvTransfer(
+        ItemId _itemId,
+        InventDimId _fromDim,
+        InventDimId _toDim,
+        Qty _qty)
+    {
+        InventJournalTable              inventJournalTable;
+        InventJournalTrans              inventJournalTrans;
+        InventJournalName               inventJournalName;
+        JournalCheckPost                journalCheckPost;
+
+        //<Creation of journal header>
+        inventJournalTable.clear();
+        select firstonly inventJournalName
+            where inventJournalName.JournalNameId   == InventParameters::find().GGIRCRCorrectionJournalNameId;
+
+        if (!inventJournalName)
+        {
+            throw error("@GGI:CorrectionJournalMsg");
+            return;
+        }
+
+        inventJournalTable.initFromInventJournalName(inventJournalName);
+        inventJournalTable.Reservation  = ItemReservation::Automatic;
+        inventJournalTable.NumOfLines   = 1;
+        inventJournalTable.insert();
+        //<end Creation of journal header>
+
+        inventJournalTrans.initValue();
+        inventJournalTrans.initFromInventJournalTable(inventJournalTable);
+        inventJournalTrans.initFromInventTable(InventTable::find(_itemId), false, false, true);
+        inventJournalTrans.setInventDimId(_fromDim);
+        inventJournalTrans.ToInventDimId    = _toDim;
+
+        inventJournalTrans.Qty = _qty;
+        
+        inventJournalTrans.CostAmount = inventJournalTrans.calcCostAmount();
+        InventJournalTrans.insert();
+        //posting journal
+        journalCheckPost = InventJournalCheckPost::newPostJournal(inventJournalTable);
+        journalCheckPost.runOperation();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

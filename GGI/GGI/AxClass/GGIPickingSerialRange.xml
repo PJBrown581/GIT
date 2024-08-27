@@ -1,0 +1,1341 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIPickingSerialRange</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// DEV003B mobile pick by serail range
+/// </summary>
+[WHSWorkExecuteMode(WHSWorkExecuteMode::GGIPickingSerialization)]
+
+public class GGIPickingSerialRange extends WhsWorkExecuteDisplay
+{
+    private WHSRFPassthrough    fieldValues = new WHSRFPassthrough(Types::String, Types::String);
+    private const int           postion = 2;
+    int                         i = 1;
+    InventSerialId              serialId;
+    Private const string255     FirstSerialId = 'First serial number';
+    Private const string255     LastSerialId = 'Last serial number';
+    ListIterator                serialIterator;
+    str                         serial, firstSerial, lastSerial;
+    InventDim                   inventDim;
+    List                        serialList = new List(Types::String);
+    int                         qty, serialQty;
+    Private const string255     RFConfirm = 'Confirm';
+    Private const string255     LP = 'License plate';
+    Private const string255     RFLicensePlateScan  = 'Scan license plate';
+    Private const string255     RFNonSerializedScan = 'Scan non-serialized item';
+    Private const string255     RFCancelWork = 'Cancel Work Line';
+    container                   serialCon;
+    private const int           workPosition = 1;
+    private const int           inventQty = 1;
+    private const int           weight = 0;
+    WhsWorkExecute              workExecute = WhsWorkExecute::construct();
+    Map                         serialMap = new Map(Types::String, Types::String);
+    MapEnumerator               serialMapEnumerator;
+    WHSLicensePlateId           licensePlate;
+    private WMSLocationId       newLocationId;
+    private const String30      newLocationScan = 'NewWMSLocationId';
+    Private const string255     RFShortPick = 'shortpickworkLine';
+    private const String255     RFShortpickLine = 'shortpick';
+    private const String20      pickingValues = 'PickingValues';
+    
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>displayForm</Name>
+				<Source><![CDATA[
+    public container displayForm(container _con, str _buttonClicked = '')
+    {
+        container               ret = conNull();
+        container               con = _con;
+        int                     hasError = 0;
+        boolean                 error = false;
+        WHSWorkLine             workLineLoc;
+        container               tmpPass; 
+        WHSRFPassthrough        globalPass;
+        int                     NumberOfSerialPicked;
+       
+
+        globalPass = pass;
+
+        pass = WHSRFPassthrough::create(conPeek(_con,postion));
+
+        pass = this.combineMaps(globalPass, pass);
+
+        hasError = this.hasError(_con);
+
+        if (pass.exists(#UserId))
+        {
+            userId = pass.lookup(#UserId);
+
+            if (!pass.exists(#InventLocationId))
+            {
+                pass.insert(#InventLocationId, WHSWorkUserSession::find(userId).InventLocationId);
+            }
+        }
+
+        
+        this.setWork();
+        [ret,con,error,step ] = this.processButtonClicked(_buttonClicked, ret, con, error,hasError,step);
+    
+
+        if (_buttonClicked == RFConfirm || _buttonClicked == #RFFinished)
+        {
+            [con, error] = this.processData(con);
+
+            workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+            workTable.reread();
+
+            select sum(QtyRemain) from workLineLoc
+                        where workLineLoc.WorkId    == workTable.WorkId
+                        && workLineLoc.LineNum      == pass.lookup(#LineNum)
+                        && workLineLoc.WorkStatus   != WHSWorkStatus::Closed
+                        && workLineLoc.WorkType     == WHSWorkType::Pick;
+
+            if(!workLineLoc.QtyRemain)
+            {
+                ret = this.addErrorLabel(ret, "@GGI:WorkValidation", WHSRFColorText::Error);
+                error = true;
+            }
+
+            if(  str2Int(pass.lookup(#Qty)) > workLineLoc.QtyRemain)
+            {
+                ret = this.addErrorLabel(ret, "@GGI:SerialQtyValidation", WHSRFColorText::Error);
+                error = true;
+            }
+           
+
+            if(!error)
+            {
+                serial = pass.exists(#SelectedValue) ? pass.lookup(#SelectedValue): '';
+
+                if(_buttonClicked == RFConfirm && serial!= '')
+                {
+                    [con, error] = this.validateSerialNumber(con, workTable);
+                }
+
+                if(!error && _buttonClicked == RFConfirm)
+                {
+                    while select workLineLoc
+                            where workLineLoc.WorkId    == workTable.WorkId
+                            && workLineLoc.LineNum      == pass.lookup(#LineNum)
+                            && workLineLoc.WorkStatus   != WHSWorkStatus::Closed
+                            && workLineLoc.WorkType     == WHSWorkType::Pick
+                    {
+                        i = 1;
+
+                        serial = pass.exists(#SelectedValue) ? pass.lookup(#SelectedValue): '';
+                        if(serial)
+                        {
+                            serialCon = str2con(serial);
+                            NumberOfSerialPicked = conLen(serialCon);
+
+                            while ( i <= conLen(serialCon))
+                            {
+                                if(workLineLoc.WMSLocationId == serialMap.lookup(conPeek(serialCon, i)))
+                                {
+                                    pass.insert(#SerialId , conPeek(serialCon, i));
+                                    if(pass.exists(LP))
+                                    {
+                                        pass.insert(#LicensePlateId , pass.lookup(LP));
+                                    }
+                                    this.processPickLine(workLineLoc);
+                                }
+                                pass.remove(#SerialId);
+                                i++;
+                            }
+                        }
+                        else
+                        {
+                            if(pass.exists(LP))
+                            {
+                                pass.insert(#LicensePlateId , pass.lookup(LP));
+                                pass.insert(#WmsLocationId  , workLineLoc.WMSLocationId);
+                                for(i = str2Int(pass.lookup(#Qty)); (i <= workLineLoc.QtyRemain && i>0); i--)
+                                {
+                                    this.processPickLine(workLineLoc);
+                                }
+                            }
+                        }
+                    }
+                    pass.remove(#WmsLocationId);
+                    pass.remove(#LineNum);
+                    pass.remove(LP);
+                    pass.remove(#LicensePlateId);
+  
+                    if(WHSWorkLine::firstOpenOrInProcessPickLine(pass.lookup(#WorkId)))
+                    {
+                        step = 2;
+                    }
+                    else
+                    {
+                        step = 6;
+                    }
+                }
+                else if(!error && _buttonClicked == #RFFinished) // scan non serial items
+                {
+                    while select workLineLoc
+                            where workLineLoc.WorkId    == workTable.WorkId
+                            && workLineLoc.LineNum      == pass.lookup(#LineNum)
+                            && workLineLoc.WorkStatus   != WHSWorkStatus::Closed
+                            && workLineLoc.WorkType     == WHSWorkType::Pick
+                    {
+                        for(i = str2Int(pass.lookup(#Qty)); (i <= workLineLoc.QtyRemain && i>0); i--)
+                        {
+                            this.processPickLine(workLineLoc);
+                        }
+                    }
+                    pass.remove(#LineNum);
+                    pass.remove(LP);
+                    pass.remove(#WmsLocationId);
+                    pass.remove(#LicensePlateId);
+                    pass.remove(#Qty);
+
+                    if(WHSWorkLine::firstOpenOrInProcessPickLine(pass.lookup(#WorkId)))
+                    {
+                        step = 2;
+                    }
+                    else
+                    {
+                        step = 6;
+                    }    
+                }
+                else
+                {
+                    ret = this.addErrorLabel(ret, "@GGI:SerialSequenceValidation", WHSRFColorText::Error);
+                
+                    step = 0;
+                    serialCon = conNull();
+                    pass.remove(#Qty);
+                    pass.remove(#SelectedValue);
+                    pass.remove(#ProdId);
+                    pass.remove(FirstSerialId);
+                    pass.remove(#ParentLp);
+                    pass.remove(LastSerialId);
+                }
+            }
+            else
+            {
+                step = 0;
+                serialCon = conNull();
+                pass.remove(#Qty);
+                pass.remove(#SelectedValue);
+                pass.remove(#ProdId);
+                pass.remove(FirstSerialId);
+                pass.remove(#ParentLp);
+                pass.remove(LastSerialId);
+            }  
+        }
+        if(_buttonClicked == #RFDone)
+        {
+            workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+            workTable.reread();
+
+            while select workLineLoc
+                        where workLineLoc.WorkId    == workTable.WorkId
+                        && workLineLoc.WorkStatus   == WHSWorkStatus::Open
+                        && workLineLoc.WorkType     == WHSWorkType::Put
+            {
+                This.processPutLine(workLineLoc);
+            }
+            pass.insert(#WorkComplete, workPosition);
+            ret = this.handleWorkCompletedMessage(ret);
+
+            pass.remove(#ProdId);
+            pass.remove(FirstSerialId);
+            pass.remove(#ParentLp);
+            pass.remove(LastSerialId);
+            pass.remove(#Qty);
+            pass.remove(#SelectedValue);
+
+            step = 0; 
+        }
+      
+        switch (step)
+        {
+            case 0: 
+                ret = this.buildGetWorkId(ret);
+                step = 1;
+                break;
+
+            case 1: //target LP
+                error = false;
+                if (!pass.exists(#WorkId))
+                {
+                    pass.insert(#Id, conPeek(conPeek(con,5 ),5));
+                    workTable = WHSWorkTable::find(pass.lookup(#Id));
+                    pass.insert(#WorkId, workTable.WorkId);
+                }
+                else
+                {
+                    workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+                }
+                
+                workLine = workExecute.getFirstOpenLine(workTable.WorkId, userId);
+                
+                [con, error,tmpPass] = this.processData(con);
+
+                pass = new WHSRFPassthrough(Types::String, Types::String);
+                pass = WHSRFPassthrough::create(tmpPass);
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(#WorkId) && pass.lookup(#WorkId)  == '')
+                {
+                    ret = this.buildGetWorkId(ret);
+                }
+                else
+                {
+                    ret = this.buildGetParentLicensePlate(ret);
+                    step = 2;
+                }
+                break;
+
+            case 2: //linenumber
+                error = false;
+                [con, error,tmpPass] = this.processData(con);
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(#ParentLP) && pass.lookup(#ParentLP)  == '')
+                {
+                    ret = this.buildGetParentLicensePlate(ret);
+                }
+                else 
+                {
+                    ret = this.buildLineNum(ret);
+                    step = 3;
+                }           
+                break;
+            case 3: // first serial number
+                error = false;
+                [con, error,tmpPass] = this.processData(con); 
+              
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(#LineNum) && pass.lookup(#LineNum)  == '')
+                {
+                    ret = this.buildLineNum(ret);
+                }
+                else
+                {
+                    workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+                    workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+                    ret = this.buildFirstSerialNumber(ret);
+                    step = 4;
+                }
+                break;
+            case 4: // last serial number
+                error = false;
+                [con, error,tmpPass] = this.processData(con);
+                
+                workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+                workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+
+                serialId = pass.exists(#SerialId) ? pass.lookup(#SerialId) : '';
+                pass.insert(FirstSerialId, serialId);
+                pass.remove(#SerialId);
+
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(FirstSerialId) && pass.lookup(FirstSerialId)  == '')
+                {
+                    ret = this.buildFirstSerialNumber(ret);
+                }
+                else
+                {
+                    ret = this.buildLastSerialNumber(ret);
+                    step = 5;
+                }
+                break;
+            case 5:
+                error = false;
+                InventSum   inventSumLocal;
+                [con, error,tmpPass] = this.processData(con);
+
+                serialId = pass.exists(#SerialId) ? pass.lookup(#SerialId) : '';
+                pass.insert(LastSerialId, serialId);
+                pass.remove(#SerialId);
+
+                if(error)
+                {
+                    ret = con;
+                }
+                else if(pass.exists(LastSerialId) && pass.lookup(LastSerialId)  == '')
+                {
+                    ret = this.buildLastSerialNumber(ret);
+                }
+                else
+                {
+                    firstSerial = pass.lookup(FirstSerialId);
+                    lastSerial  = pass.lookup(LastSerialId);
+                    qty = 0;
+                    
+                    while select  inventSumLocal
+                        where inventSumLocal.ItemId == workLine.ItemId 
+                    join inventDim  group by inventSerialId
+                        where inventDim.inventDimId             == inventSumLocal.InventDimId
+                            && inventDim.inventSerialId         >=  firstSerial
+                        && inventDim.inventSerialId             <=  lastSerial
+                            && inventDim.wMSLocationId          ==  workLine.WMSLocationId 
+                            && inventSumLocal.PhysicalInvent    != 0
+                    {
+                        if(inventDim)
+                        {
+                            if(qty < workLine.QtyRemain)
+                            {
+                                qty ++;
+                                serialCon = conIns(serialCon,conLen(serialCon)+1,inventDim.inventSerialId);
+                            }
+                            else
+                            {
+                                break;
+                            } 
+                        }
+                    }
+
+                    if(!qty && !error)
+                    {
+                        while select  inventSumLocal
+                            where inventSumLocal.ItemId == WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum)).ItemId
+                        join inventDim  group by inventSerialId
+                            where inventDim.inventDimId     == inventSumLocal.InventDimId
+                            && inventDim.inventSerialId >=  lastSerial
+                            && inventDim.inventSerialId <=  firstSerial
+                            && inventDim.wMSLocationId  == WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum)).wMSLocationId
+                            && inventSumLocal.PhysicalInvent != 0
+                        {
+                            if(inventDim)
+                            {
+                                if(qty < WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum)).QtyRemain)
+                                {
+                                    qty ++;
+                                    serialCon = conIns(serialCon,conLen(serialCon)+1,inventDim.inventSerialId);
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        if(!qty)
+                        {
+                            ret = this.addErrorLabel(ret, "@GGI:SerialSequenceValidation", WHSRFColorText::Error);
+                            workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+                            workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+                            ret = this.buildFirstSerialNumber(ret);
+                            step = 4;
+                        }
+                    }
+   
+                    if(!error && qty)
+                    {
+                        workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+                        workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+                        ret  = this.buildConfirmQtySerialNumber(ret);
+                        
+                        if(pass.exists(#WorkId) && WHSWorkLine::firstOpenOrInProcessPickLine(pass.lookup(#WorkId)))
+                        {
+                            step = 2;
+                        }
+                        else
+                        {
+                            step = 6;
+                        }
+                        pass.insert(#SelectedValue, con2Str(serialCon));
+                        pass.insert(#Qty, qty);
+                    }
+                }
+                break;
+            case 6:
+                ret  = this.buildPutLocation(ret);
+                break;
+            case 7:
+                ret  = this.buildLicensePlate(ret);
+                step = 8;
+                break;
+            case 8:
+                error = false;
+                [con, error,tmpPass] = this.processData(con);
+
+                if(error)
+                {
+                    ret = con;
+                }
+                else
+                {
+                    serialCon    = conNull();
+                    licensePlate = pass.exists(LP) ? pass.lookup(LP) : '';
+
+                    if(licensePlate)
+                    {
+                        workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+                        workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+                        qty = workLine.QtyRemain;
+
+                        if(!error && qty)
+                        {
+                            pass.remove(FirstSerialId);
+                            pass.remove(LastSerialId);
+                            pass.remove(#SerialId);
+                            ret  = this.buildConfirmQtySerialNumber(ret);
+                            pass.remove(#SelectedValue);
+                            pass.insert(#Qty, qty);
+                        }
+                        if(!qty)
+                        {
+                            ret  = this.buildLicensePlate(ret);
+                            step = 8;
+                        }
+                    }
+                    else
+                    {  
+                        ret  = this.buildLicensePlate(ret);
+                        step = 8;
+                    }
+                }
+                break;
+            case 9:
+                select sum(QtyRemain) from workLineLoc
+                        where workLineLoc.WorkId    == pass.lookup(#WorkId)
+                        && workLineLoc.LineNum      == pass.lookup(#LineNum)
+                        && workLineLoc.WorkStatus   != WHSWorkStatus::Closed
+                        && workLineLoc.WorkType     == WHSWorkType::Pick;
+
+                if(workLineLoc.QtyRemain > 0)
+                {
+                    pass.insert(#Qty, workLineLoc.QtyRemain);
+                }
+
+                ret  = this.buildNonSerilalizedItem(ret);
+                step = 0;
+                break;
+            case 98: // build shortpick
+                ret = this.buildShortPickQty(ret);
+                break;
+            case 100: // Override step   
+                con = conPoke(con, 2, pass.pack());
+                ret = this.buildGetLocation(ret);
+                [con, error,tmpPass] = this.processData(con);
+                pass = new WHSRFPassthrough(Types::String, Types::String);
+                pass = WHSRFPassthrough::create(tmpPass);              
+                break;
+         }
+              
+        ret = this.updateModeStepPass(ret, WHSWorkExecuteMode::GGIPickingSerialization , step, pass);
+        
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setWork</Name>
+				<Source><![CDATA[
+    protected void setWork()
+    {
+        if( pass.exists(#WorkId) && pass.exists(#LineNum)  )
+        {
+            workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+            workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPutLine</Name>
+				<Source><![CDATA[
+    Private void processPutLine(WHSworkLine _workLineLoc)
+    {
+        WHSWorkPutFlow workFlowPut = (WHSWorkLine::getPrevOppositeWorkLine(_workLineLoc.WorkId, _workLineLoc.LineNum, _workLineLoc.WorkType).InventQtyWork > _workLineLoc.InventQtyWork ?
+                                    WHSWorkPutFlow::SplitQuantity :
+                                    WHSWorkPutFlow::MoveAll);
+
+        workLine = workExecute.putAwayToLocation(_workLineLoc.WorkId,
+                                                _workLineLoc.LineNum,
+                                                _workLineLoc.WMSLocationId,
+                                                workFlowPut,
+                                                UserId,
+                                                '',
+                                                pass.lookup(#ParentLP),
+                                                false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processButtonClicked</Name>
+				<Source><![CDATA[
+    private container processButtonClicked(str _buttonClicked, container _ret, container _con, boolean _error,boolean _hasError, int _step)
+    {
+        int localStep = _step;
+
+        switch(_buttonClicked)
+        {
+            case RFShortPick:
+                localStep =3;
+                [_con, _error] = this.processData(_con);
+                this.shortpickWorkLine(str2int(pass.lookup(#qty)),_con);
+                workTable.reread();
+               // short pick to zero.
+                if(this.canPutWork())
+                {
+                    localStep = 6;
+                }
+                else
+                {
+                    localStep = 2;
+                }
+                // if all lines were closed or cancelled
+                if(workTable.WorkStatus == WHSWorkStatus::Closed || workTable.WorkStatus == WHSWorkStatus::Cancelled)
+                {
+                    localStep = 0;
+                }
+                break;
+            case RFShortpickLine:
+                localStep = 98;
+                break;
+            case RFLicensePlateScan:
+                localStep = 7;
+                break;
+            case RFNonSerializedScan:
+                localStep = 9;
+                break;
+            case #RFOverride:
+                localStep =100;
+                break;
+            case #RFCancel:
+                if(step ==100)
+                {
+                    localStep =0;
+                }
+
+
+                break;
+            case RFCancelWork:
+                [localStep, _ret] = this.cancelWorkLine(_ret);
+               
+                break;
+            case #RFOk:
+
+                if(localStep ==100)
+                {
+                    if(conPeek(conPeek(_con,4+ _hasError ),5))
+                    {
+                        workExecute.updateWorkLineLocation(pass.lookup(#WorkId), pass.parmLineNum(), conPeek(conPeek(_con,4 + _hasError ),5) ,pass.lookup(#UserId));
+                        workLine.reread();
+                    }
+                    localStep =3;
+                }
+                break;
+            default :
+        }
+        return [_ret,_con,_error,localStep ];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelWorkLine</Name>
+				<Source><![CDATA[
+    private container cancelWorkLine(container _ret)
+    {
+        int retStep = 2;
+        container retCon;
+
+        workTable = WHSWorkTable::find(pass.lookup(#WorkId));
+        workLine = WHSWorkLine::find(pass.lookup(#WorkId), pass.lookup(#LineNum));
+
+        if(workLine)
+        {
+            WHSWorkLine cancelWorkLine = WHSWorkLine::find(workLine.WorkId, workLine.LineNum, true);
+
+            if(!cancelWorkLine.canCancelLine(false))
+            {
+                retCon = this.addErrorLabel(_ret, "@GGI:WorkLinecancelMessage", WHSRFColorText::Error);
+            }
+            else
+            {
+                WHSWorkLine::cancelLine(workLine.WorkId, workLine.LineNum, workLine.QtyRemain , workLine.ItemId, false);
+                if(WHSWorkLine::firstOpenOrInProcessPickLine(pass.lookup(#WorkId)))
+                {
+                    retStep = 6;
+                }
+            }
+        }
+        return[retStep, retCon];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shortpickWorkLine</Name>
+				<Source><![CDATA[
+    private container shortpickWorkLine(inventQty _qty , container _container)
+    {
+        container localCon = _container;
+        try
+        {
+            if(pass.exists(LP))
+            {
+                workExecute.executeShortPick(
+                    workLine.WorkId,
+                    workLine.LineNum,
+                    'mobile short pick',
+                    _qty,
+                    workLine.UnitId,
+                    userId,
+                    pass.lookup(#ParentLP),
+                    false);
+            }
+            else
+            {
+                workExecute.executeShortPick(
+                    workLine.WorkId,
+                    workLine.LineNum,
+                    'mobile short pick',
+                    _qty,
+                    workLine.UnitId,
+                    userId,
+                    '',
+                    false);
+            }
+        }
+        catch
+        {
+            localCon = this.addErrorLabel(localCon, 'Short pick error', WHSRFColorText::Error);
+        }
+        return localCon;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPickLPnonSerial</Name>
+				<Source><![CDATA[
+    private void processPickLPnonSerial(WHSworkLine _workLineLoc)
+    {
+        if(pass.exists(LP) && !pass.exists(#SerialId))
+        {
+            workLine = workExecute.pickWorkFromLicensePlate(pass.lookup(LP),
+                                                            _workLineLoc,
+                                                            userId,
+                                                            this.createInventDimFromPass(),
+                                                            pass.lookup(#ParentLP),
+                                                            0,
+                                                            false,
+                                                            false,
+                                                            false,
+                                                            false);
+
+        }
+        else
+        {
+            workLine = workExecute.pickNonLicensePlateCheckDigitQuantities(_workLineLoc.WorkId,
+                                                                                            _workLineLoc.LineNum,
+                                                                                            _workLineLoc.ItemId,
+                                                                                            str2Int(pass.lookup(#Qty)),
+                                                                                            weight,
+                                                                                            _workLineLoc.UnitId,
+                                                                                            userId,
+                                                                                            this.createInventDimFromPass(),
+                                                                                            pass.lookup(#ParentLP),
+                                                                                            false);
+        }
+       
+        if (pass.exists(#ParentLP))
+        {
+            WHSWorkTable::addTargetLicensePlate(_workLineLoc.WorkId, pass.lookup(#ParentLP));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPickLine</Name>
+				<Source><![CDATA[
+    Private void processPickLine(WHSworkLine _workLineLoc)
+    {
+        if(pass.exists(LP) && !pass.exists(#SerialId))
+        {
+            workLine = workExecute.pickWorkFromLicensePlate(pass.lookup(LP),
+                                                            _workLineLoc,
+                                                            userId,
+                                                            this.createInventDimFromPass(),
+                                                            pass.lookup(#ParentLP),
+                                                            0,
+                                                            false,
+                                                            false,
+                                                            false,
+                                                            false);
+        }
+        else
+        {
+            workLine = workExecute.pickNonLicensePlateCheckDigitQuantities(_workLineLoc.WorkId,
+                                                                                            _workLineLoc.LineNum,
+                                                                                            _workLineLoc.ItemId,
+                                                                                            inventQty,
+                                                                                            weight,
+                                                                                            _workLineLoc.UnitId,
+                                                                                            userId,
+                                                                                            this.createInventDimFromPass(),
+                                                                                            pass.lookup(#ParentLP),
+                                                                                            false);
+        }
+       
+
+        if (pass.exists(#ParentLP))
+        {
+            WHSWorkTable::addTargetLicensePlate(_workLineLoc.WorkId, pass.lookup(#ParentLP));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleWorkCompletedMessage</Name>
+				<Source><![CDATA[
+    private container handleWorkCompletedMessage(container _con)
+    {
+        container ret = conNull();
+        if (pass.exists(#WorkComplete))
+        {
+            ret = this.addErrorLabel(ret, "@WAX866", WHSRFColorText::Success);
+            pass.remove(#WorkComplete);
+        }
+        ret += _con;
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processData</Name>
+				<Source><![CDATA[
+    private container processData(container _con)
+    {
+        container con = _con;
+
+        if (this.hasError(con))
+        {
+            con = this.deleteControlDataFromContainer(con, #RFError);
+        }
+        container  tmpFieldValues;
+        [con, tmpFieldValues] = WHSRFControlData::processData(con, pass);
+        fieldValues = WHSRFPassthrough::create(tmpFieldValues);
+      
+        pass = this.combineMaps(pass, fieldValues);
+        
+        return [con, this.hasError(con),pass.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGetLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds controls to form state for scanning location.
+    /// </summary>
+    /// <param name="_con">
+    /// Container containing the form state before controls are added.
+    /// </param>
+    /// <param name="_extraText">
+    /// Label text.
+    /// </param>
+    /// <param name="_location">
+    /// Location to be stored as data in the control.
+    /// </param>
+    /// <returns>
+    /// Container containing the form state after controls are added.
+    /// </returns>
+    container buildGetLocation(container        _con,
+                               str              _extraText = '',
+                               WMSLocationId    _location = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@WAX723";     // Scan a Location
+
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFText, newLocationScan, "@SYS80395", 1, _location, extendedTypeNum(WMSLocationId), '', 0)];
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWorkLineInfo</Name>
+				<Source><![CDATA[
+    private void getWorkLineInfo()
+    {
+        WMSLocation                     location;
+        location = WMSLocation::find(workLine.wmsLocationId, workTable.InventLocationId);
+        pass.insert(#WorkId, workLine.WorkId);
+        pass.parmLineNum(workLine.LineNum);
+        pass.insert(#WMSLocationId, location.wmsLocationId);
+        pass.insert(#InventDimId, workLine.InventDimId);
+        pass.insert(#ItemId, workLine.ItemId);
+        pass.insert(#UOM, workLine.UnitId);
+        pass.insert(#QtyLeft, workLine.InventQtyRemain);
+        pass.insert(#QtyWork, workLine.QtyWork);
+        pass.insert(#InventQtyWork, workLine.InventQtyWork);
+        pass.insert(#IsMultiSKU, WHSWorkTable::find(workLine.WorkId).WorkIsMultiSKU);
+        pass.insert(#WHSWorkTypeCustomCode, workLine.WorkTypeCustomCode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSerialNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// validate serial number
+    /// </summary>
+    /// <param name = "_con">container of serial numbers</param>
+    /// <param name = "_workTable">current work table record</param>
+    /// <returns>container of current values</returns>
+    public container validateSerialNumber(container _con,  WHSworkTable _workTable)
+    {
+        container               con = _con;
+        InventSum               inventSum;
+        WHSWorkLine             workLineLoc;
+        InventDim               inventDimLocal;
+        
+        while select workLineLoc
+                        where workLineLoc.WorkId    == workTable.WorkId
+                        && workLineLoc.LineNum      == pass.lookup(#LineNum)
+                        && workLineLoc.WorkStatus   != WHSWorkStatus::Closed
+                        && workLineLoc.WorkType     == WHSWorkType::Pick
+        {
+            i = 1;
+            serial = pass.exists(#SelectedValue) ? pass.lookup(#SelectedValue): '';
+            serialCon = str2con(serial);
+            if(serialCon != conNull())
+            {
+                while ( i <= conLen(serialCon))
+                {
+                    select  firstonly inventSum
+                        where inventSum.ItemId == workLineLoc.ItemId
+                    join inventDimLocal
+                        where inventDimLocal.inventDimId     == inventSum.InventDimId
+                            && inventDimLocal.inventSerialId == conpeek(serialCon, i)
+                            && inventDimLocal.wMSLocationId  == workLineLoc.wMSLocationId
+                            && inventSum.PhysicalInvent      != 0;
+
+                    if(inventSum)
+                    {
+                        if(!serialMap.exists(conPeek(serialCon, i)))
+                        {
+                            serialMap.add(conPeek(serialCon, i), workLineLoc.wMSLocationId);
+                        }
+                    }
+                    i++;
+                }
+            }
+        }
+
+        serialMapEnumerator = SerialMap.getEnumerator();
+        while (serialMapEnumerator.moveNext())
+        {
+            serialQty ++;
+        }
+        if( str2Int(pass.lookup(#Qty)) != serialQty)
+        {
+            con = this.addErrorLabel(con, "@GGI:SerialSequenceValidation", WHSRFColorText::Error);
+        }
+       
+        return [con, this.hasError(con)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLastSerialNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// didplay form to capture last serial number
+    /// </summary>
+    /// <param name = "_con">curent form conatainer vlaues</param>
+    /// <param name = "_extraText">additional display text</param>
+    /// <returns> conatiner of new form controls</returns>
+    container buildLastSerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:SerialNumberInput";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, enum2Str(WHSWorkCreationProcess::ReportAsFinishedBySerial), finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #SerialId, "@GGI:LastSerialNumber", 1, '', extendedTypeNum(InventSerialId), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+           
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGetWorkId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// display form to capture wotrk Id
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">additional display text</param>
+    /// <returns>container with added controls</returns>
+    container buildGetWorkId(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:ScanWorkId";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #WorkId, "@WAX273", 1, '', extendedTypeNum(WHSWorkID), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLineNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// display form to capture line number
+    /// </summary>
+    /// <param name = "_con">curent display values </param>
+    /// <param name = "_extraText">dispaly additional text</param>
+    /// <returns>container of new form controls</returns>
+    container buildLineNum(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:ScanLineNum";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #LineNum, "@SYS27207", 1, '', extendedTypeNum(LineNumber), '', 0)];
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGetParentLicensePlate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// display form to capture license plate value
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">additional text to dislay</param>
+    /// <returns>container of new cantrols</returns>
+    container buildGetParentLicensePlate(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@WAX1198";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFText, #ParentLP, "@WAX1214", 1, '', extendedTypeNum(WHSLicensePlateId), '', 0)];  
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+        
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWorkLineInfo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// display info from the workline
+    /// </summary>
+    /// <param name = "_con">curent values</param>
+    /// <param name = "_extraText">additional display text</param>
+    /// <returns>contianer with  new controls</returns>
+    container buildWorkLineInfo(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        WMSLocation                     location;
+        inventDim   locInventDim = inventDim::find(workLine.InventDimId);
+
+        location = WMSLocation::find(workLine.wmsLocationId, workTable.InventLocationId);
+        ret = [this.buildControl(#RFText,'Loc','Loc',1,location.wmsLocationId,extendedTypeNum(WMSLocationId),'',0,false)];
+        ret += [this.buildControl(#RFText,'ItemId','ItemID',1,workLine.ItemId,extendedTypeNum(ItemId),'',0,false)];
+        ret += [this.buildControl(#RFLabel,'Qty',strFmt('Qty:%1 %2 : %3 %4', any2Str(workLine.InventQtyWork),workLine.UnitId,
+            any2Str(workLine.QtyRemain),workLine.UnitId ) ,1,'',#WHSRFUndefinedDataType,'',0)];
+        ret += [this.buildControl(#RFLabel,'itemName',workLine.displayItemName() ,1,'',#WHSRFUndefinedDataType,'',0)];
+        ret += [this.buildControl(#RFLabel,'inventStyle',strFmt('Style: %1', locInventDim.InventStyleId) ,1,'',#WHSRFUndefinedDataType,'',0)];
+        ret += [this.buildControl(#RFLabel,'InventoryStatus',strFmt('Inventory Status: %1', locInventDim.InventStatusId) ,1,'',#WHSRFUndefinedDataType,'',0)];
+        ret += [this.buildControl(#RFLabel,'BatchNumber',strFmt('Batch Number: %1', locInventDim.inventBatchId ) ,1,'',#WHSRFUndefinedDataType,'',0)];
+        
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildNonSerilalizedItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// display form to capture non serial items
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">display additional text</param>
+    /// <returns>container of new controls</returns>
+    container buildNonSerilalizedItem(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@WAX1198";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        if(pass.exists(#Qty) && pass.lookup(#Qty)  != '')
+        {
+            ret += [this.buildControl(#RFText, #Qty, "@SYS105177", 1, pass.lookup(#Qty) , extendedTypeNum(InventSerialId), '', 0)];
+        }
+        else
+        {
+            ret += [this.buildControl(#RFText, #Qty, "@SYS105177", 1, '0' , extendedTypeNum(InventSerialId), '', 0)];
+        }
+        ret += this.buildWorkLineInfo(ret);
+        ret += [this.buildControl(#RFButton, #RFFinished, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+      
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildShortPickQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// build controls for short pick
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">display additional text</param>
+    /// <returns>container of new controls</returns>
+    container buildShortPickQty(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+       
+
+        ret += [this.buildControl(#RFText, #Qty, "@SYS105177", 1, '0' , extendedTypeNum(Qty), '', 0)];
+        ret += [this.buildControl(#RFButton, RFShortPick, "@WAX1322", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLicensePlate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// display form to capture LP
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">display additional text</param>
+    /// <returns>container of new controls</returns>
+    container buildLicensePlate(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@WAX1198";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, LP, "@WAX359", 1, '', extendedTypeNum(WHSLicensePlateId), '', 0)];
+        ret += this.buildWorkLineInfo(ret);
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildFirstSerialNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  display form to capture first serial number in range
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">display additional text</param>
+    /// <returns>container of new controls</returns>
+    container buildFirstSerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:SerialNumberInput";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, enum2Str(WHSWorkCreationProcess::ReportAsFinishedBySerial), finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #SerialId, "@GGI:FirstSerialNumber", 1, '', extendedTypeNum(InventSerialId), '', 0)];
+        
+        ret += this.buildWorkLineInfo(ret);
+
+        ret += [this.buildControl(#RFButton, #RFOK, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, RFLicensePlateScan, "@GGI:ScanLicensePlate", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, RFNonSerializedScan, "@GGI:ScanNonSerialItem", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, RFCancelWork, "@GGI:WorkLinecancelfromMobile", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFButton, #RFOverride, "@WAX:OverrideLoc", 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFButton, RFShortpickLine, "@WAX1322", 0, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConfirmQtySerialNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// build form to confim serial number for pick
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">display additional text</param>
+    /// <returns>container of new controls</returns>
+    container buildConfirmQtySerialNumber(container _con, str _extraText = '')
+    {
+        container   ret = _con;
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        if(pass.exists(FirstSerialId))
+        {
+            ret += [this.buildControl(#RFLabel, #Scan, strFmt("@GGI:FirstSerial",pass.lookup(FirstSerialId)), 1, '', #WHSRFUndefinedDataType, '', 0)];
+        }
+        if(pass.exists(LastSerialId))
+        {
+            ret += [this.buildControl(#RFLabel, #Scan, strFmt("@GGI:LastSerial",pass.lookup(LastSerialId)), 1, '', #WHSRFUndefinedDataType, '', 0)];
+        }
+        ret += [this.buildControl(#RFText, #Qty, "@SYS105177", 1, int2Str(qty) , extendedTypeNum(InventSerialId), '', 0, false)];
+
+        ret += this.buildWorkLineInfo(ret);
+
+        ret += [this.buildControl(#RFButton, RFConfirm, "@SYS5473", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+        
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPutLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// build fomr to capture Put location
+    /// </summary>
+    /// <param name = "_con">current values</param>
+    /// <param name = "_extraText">display additional text</param>
+    /// <returns>container of new controls</returns>
+    container buildPutLocation(container _con, str _extraText = '')
+    {
+        WHSWorkLine     line;
+
+        select firstonly line
+            order by LineNum asc
+            where line.WorkId			== workTable.WorkId
+                && line.WorkType		== WHSWorkType::Put
+                && line.WorkStatus		== WHSWorkStatus::Open;
+
+        container   ret = _con;
+        str         finalLabel = _extraText ? _extraText : "@GGI:PutLoc";
+
+        ret += [this.buildControl(#RFLabel, #RFTitle, WHSRFMenuItemTable::find(pass.lookup(#MenuItem)).rfTitle, 1, '', #WHSRFUndefinedDataType, '', 0)];
+        ret += [this.buildControl(#RFLabel, #Scan, finalLabel, 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        ret += [this.buildControl(#RFText, #WMSLocationId, "@GGI:Loc", 1, line.WMSLocationId, extendedTypeNum(WMSLocationId), '', 0, false)];
+   
+        ret += [this.buildControl(#RFButton, #RFDone , "@SYS4784", 1, '', #WHSRFUndefinedDataType, '', 1)];
+        ret += [this.buildControl(#RFButton, #RFCancel, "@SYS50163", 1, '', #WHSRFUndefinedDataType, '', 0)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOpenPickLines</Name>
+				<Source><![CDATA[
+    private boolean hasOpenPickLines(WHSWorkId _workId, LineNumber _curentLineNum)
+    {  
+        return (select firstonly WHSWorkLine
+                where WHSWorkLine.WorkId    == _workId
+                && WHSWorkLine.LineNum      != _curentLineNum
+                && WHSWorkLine.WorkStatus   != WHSWorkStatus::Closed
+                && WHSWorkLine.WorkType     == WHSWorkType::Pick).recid != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InitPickingQtyLine</Name>
+				<Source><![CDATA[
+    private GGIPickingSerialRangePIckQty InitPickingQtyLine(inventQty _pickQty,WHSWorkLine _workLine )
+    {          
+        GGIPickingSerialRangePIckQty    pickLineQty = new GGIPickingSerialRangePIckQty();
+        
+        pickLineQty.workId = _workLine.WorkId ;
+        pickLineQty.workline = _workLine.LineNum ;
+        pickLineQty.workQty = _workLine.QtyWork;
+        pickLineQty.qtyRemaning = workLine.QtyRemain;
+        pickLineQty.qtyInPicking = _pickQty ;
+        pickLineQty.lineStatus = WHSWorkStatus::Open;
+        
+        return pickLineQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canPutWork</Name>
+				<Source><![CDATA[
+    private boolean canPutWork()
+    {
+        boolean ret = true;
+        if(WHSWorkLine::firstOpenOrInProcessPickLine(pass.lookup(#WorkId)))
+        {
+            ret = false;
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

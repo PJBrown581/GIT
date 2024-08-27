@@ -1,0 +1,463 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EPY_PaymentCreation</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_EPY_PaymentCreation
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreatePaymentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// EPAY: following method's has a header to keep it compiling until we integrate ePay into AX7
+    /// </summary>
+    /// <param name = "payment">payment</param>
+    /// <param name = "sks_epy_setup">sks_epy_setup</param>
+    /// <param name = "SKS_EPY_Queue">SKS_EPY_Queue</param>
+    /// <returns>epay queue record</returns>
+    public static SKS_EPY_Queue CreatePaymentJournal(SKS.ePayData.Payment payment, SKS_EPY_setup sks_epy_setup, SKS_EPY_Queue SKS_EPY_Queue)
+    {
+        
+        PaymMode    ePayPaymMode;
+        str         BatchIDDate;
+        SKS_EPY_BatchID         BatchID;
+        SKS_EPY_JournalDate     JournalDate;
+        LedgerJournalTable lLedgerJournalTable;
+        CustTable   lCustTable;
+        CustAccount cust;
+        CustPaymModeTable   CustPaymModeTable;
+        ;
+        cust = payment.get_CustomerID();
+        select firstonly lCustTable where lCustTable.AccountNum == cust;
+    
+        ePayPaymMode = payment.get_CardName();
+    
+        if (!CustPaymModeTable::exist(ePayPaymMode))
+        {
+            if (ePayPaymMode != '')
+            {
+                SKS_EPY_Queue.ErrorWarning = strFmt("@SKS3371", ePayPaymMode);
+                SKS_EPY_Queue.Status = SKS_EPY_Status::CompletedWithWarnings;
+            }
+    
+            ePayPaymMode = sks_epy_setup.PaymMode;
+        }
+    
+        select firstonly AccountType, paymentledgerDimension from CustPaymModeTable where CustPaymModeTable.PaymMode == ePayPaymMode;
+    
+        if(!lCustTable)
+        {
+            SKS_EPY_Queue.Action = SKS_EPY_Action::RetrievalFromEPayFailed;
+            SKS_EPY_Queue.ErrorWarning = "@SKS3372";
+            SKS_EPY_Queue.Status =SKS_EPY_Status::Failed;
+            return SKS_EPY_Queue;
+        }
+        else
+        {
+            if(lCustTable.SKS_EPY_CustFilter != SKS_EPY_CustFilter::Yes && lCustTable.SKS_EPY_CustFilter != SKS_EPY_CustFilter::YesByFilter)
+            {
+                SKS_EPY_Queue.ErrorWarning = "@SKS3373";
+                SKS_EPY_Queue.Status = SKS_EPY_Status::CompletedWithWarnings;
+            }
+        }
+    
+        BatchIDDate = payment.get_BatchID();
+        BatchID = subStr(BatchIDDate, strLen(BatchIDDate) - 8, -(strLen(BatchIDDate) - 8));
+        JournalDate = str2Date(subStr(BatchIDDate, strLen(BatchIDDate), -8), 321);
+    
+        try
+        {
+            ttsBegin;
+            if(sks_epy_setup.PaymentCreation == SKS_EPY_PaymCreation::PerPaym)
+            {
+                lLedgerJournalTable.JournalName = SKS_EPY_Setup.JournalName;
+                lLedgerJournalTable.SKS_EPY_EPayCreated = NoYes::Yes;
+                lLedgerJournalTable.insert();
+                lLedgerJournalTable.OffsetAccountType = CustPaymModeTable.AccountType;
+                lLedgerJournalTable.OffsetLedgerDimension = CustPaymModeTable.PaymentLedgerDimension;
+                lLedgerJournalTable.update();
+            }
+            else
+            {
+                select firstOnly lLedgerJournalTable where
+                lLedgerJournalTable.SKS_EPY_BatchID == BatchID
+                && lLedgerJournalTable.SKS_EPY_JournalDate == JournalDate
+                && lLedgerJournalTable.SKS_EPY_EPayCreated == NoYes::Yes
+                && lLedgerJournalTable.Posted == noyes::No;
+    
+                if(!lLedgerJournalTable)
+                {
+                    lLedgerJournalTable.JournalName = SKS_EPY_Setup.JournalName;//TODO: Make this a new method that can be called both sides of this statement
+                    lLedgerJournalTable.SKS_EPY_EPayCreated = NoYes::Yes;
+                    lLedgerJournalTable.insert();
+                    lLedgerJournalTable.OffsetAccountType = CustPaymModeTable.AccountType;
+                    lLedgerJournalTable.OffsetLedgerDimension = CustPaymModeTable.PaymentLedgerDimension;
+                    lLedgerJournalTable.sks_epy_batchID = BatchID;
+                    lLedgerJournalTable.SKS_EPY_JournalDate = JournalDate;
+                    lLedgerJournalTable.update();
+                }
+            }
+    
+            SKS_EPY_Queue.JournalNum = lLedgerJournalTable.JournalNum;
+            SKS_EPY_Queue = SKS_EPY_PaymentCreationEPay::CreateJournalLine(payment, lLedgerJournalTable, sks_epy_setup, SKS_EPY_Queue, ePayPaymMode);
+            ttsCommit;
+
+            //Auto-posting functionality
+            if(sks_epy_setup.EPYAutoPost && sks_epy_setup.PaymentCreation == SKS_EPY_PaymCreation::PerPaym)
+            {
+                try
+                {
+                    LedgerJournalPost::postJournal(lLedgerJournalTable, NoYes::No, NoYes::No, NoYes::Yes);
+                }
+                catch(Exception::Error)
+                {
+                    ttsbegin;
+                    SKS_EPY_Queue.ErrorWarning = "@SKS3370";
+                    SKS_EPY_Queue.Status = SKS_EPY_Status::CompletedWithWarnings;
+                    SKS_EPY_Queue.update();
+                    ttscommit;
+                }
+            }
+        }
+        catch(Exception::Error)
+        {
+            ttsbegin;
+            SKS_EPY_Queue.ErrorWarning = "@SKS3374";
+            SKS_EPY_Queue.Status = SKS_EPY_Status::Failed;
+            SKS_EPY_Queue.update();
+            ttscommit;
+        }
+    
+        return SKS_EPY_Queue;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateSettlements</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates ePay settlements
+    /// </summary>
+    /// <param name = "InvPaym">InvPaym</param>
+    /// <param name = "ePayPaym">ePayPaym</param>
+    /// <param name = "lLedgerJournalTrans">lLedgerJournalTrans</param>
+    /// <returns>string</returns>
+    public static str CreateSettlements(SKS.ePayData.InvoicePayment InvPaym, SKS.ePayData.Payment ePayPaym, LedgerJournalTrans lLedgerJournalTrans)
+    {
+        amount                  settleAmount;
+        amount                  discountAmount;
+        System.String           identityrec;
+        str                     invoiceid;
+        str                     errortext;
+        str                     txt;
+        CustTrans               local_CustTrans;
+        CustTransOpen           local_CustTransOpen;
+        CustPaymSettlementManager   SettlementManager;
+        SKS_EPY_Setup           lSKS_EPY_Setup = SKS_EPY_Setup::find();
+        SpecTransManager        SpecTransManager = SpecTransManager::newFromSpec(lLedgerJournalTrans);
+        discountAmount = str2Num(InvPaym.get_Discount());
+        settleAmount = InvPaym.get_Amount();
+        invoiceid = InvPaym.get_InvoiceID();
+        identityRec = InvPaym.get_Identity();
+
+        select crosscompany local_CustTransOpen where local_CustTransOpen.RecId == str2Int64(InvPaym.get_Identity());
+        if(local_CustTransOpen)
+        {
+            select crosscompany local_CustTrans where local_custtrans.recid == local_CustTransOpen.RefRecId;
+            if(local_CustTrans)
+            {
+                if(SpecTransManager.existForOtherSpec(local_CustTransOpen.company(), local_CustTransOpen.TableId, local_CustTransOpen.RecId))
+                {
+                    errorText = strFmt("@SKS419", local_CustTrans.Invoice);
+                    return errortext;
+                }
+               
+                if(lSKS_EPY_Setup.UseInvDim)
+                {
+                    lLedgerJournalTrans = SKS_EPY_PaymentCreation::SplitPaymentByDimensions(lLedgerJournalTrans, local_CustTrans, lSKS_EPY_Setup);
+                }
+
+                specTransManager = SpecTransManager::newFromSpec(lLedgerJournalTrans);
+
+                if(local_CustTransOpen.possibleCashDisc != discountAmount)
+                {
+                    settlementManager = CustPaymSettlementManager::construct(lLedgerJournalTrans);
+                    settlementManager.updateCashDiscAmount(local_CustTransOpen, discountAmount);
+                }
+    
+                specTransManager.insert(local_CustTransOpen.company(), local_CustTransOpen.TableId, local_CustTransOpen.RecId, settleAmount, local_CustTrans.CurrencyCode);
+
+                if(lLedgerJournalTrans.MarkedInvoice == '')
+                {
+                    lLedgerJournalTrans.MarkedInvoice = local_CustTrans.Invoice;
+                    lLedgerJournalTrans.MarkedInvoiceCompany = local_CustTransOpen.company();
+                    lLedgerJournalTrans.MarkedInvoiceRecId = local_CustTransOpen.RecId;
+                    if(local_CustTrans.Invoice != '')
+                    {
+                        lLedgerJournalTrans.SettleVoucher = SettlementType::SelectedTransact;
+                    }
+                }
+                else if(lLedgerJournalTrans.MarkedInvoice != local_CustTrans.Invoice)
+                {
+                    lLedgerJournalTrans.MarkedInvoice = '*';
+                    lLedgerJournalTrans.MarkedInvoiceCompany = '';
+                    lLedgerJournalTrans.MarkedInvoiceRecId = 0;
+                }
+            }
+        }
+        //When sending both a prepayment and settlement of an invoice AX overwrites the description with "Payment" so we need to re-set the field
+        txt = ePayPaym.get_Description();
+        if(txt != '')
+        {
+            lLedgerJournalTrans.txt = txt;
+        }
+        lLedgerJournalTrans.update();
+
+        return errortext;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpdateEPayStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// update the status of the ePay queue record
+    /// </summary>
+    /// <param name = "sks_epy_setup">sks_epy_setup</param>
+    /// <param name = "submitted">submitted</param>
+    /// <param name = "errortxt">errortxt</param>
+    /// <param name = "paymId">paymId</param>
+    public static void UpdateEPayStatus(SKS_EPY_Setup sks_epy_setup, boolean submitted, str errortxt, str paymId)
+    {
+        str             url;
+        SKS.ePayData.Document Doc = new SKS.ePayData.Document();
+        SKS.ePayData.SKS_EPY_Return_In  sks_epy_return_in = new SKS.ePayData.SKS_EPY_Return_In();
+        ;
+    
+        url = SKS_PP_StringFormats::strAssembleURL(sks_epy_setup.WebServLoc, '/document');
+        Doc.set_Id(paymId);
+        Doc.set_ErrorMessage(errortxt);
+        Doc.set_IsSubmited(submitted);
+        sks_epy_return_in = SKS_EPY_Sync::SyncDocStatus(Doc, url, sks_epy_setup);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>WriteToQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// write a record to the ePay queue
+    /// </summary>
+    /// <param name = "JSONData">JSONData</param>
+    /// <param name = "CustAccountNum">CustAccountNum</param>
+    /// <param name = "status">status</param>
+    /// <param name = "errorText">errorText</param>
+    /// <param name = "paymNum">paymNum</param>
+    /// <param name = "_Amount">_Amount</param>
+    /// <param name = "_CurrencyCode">_CurrencyCode</param>
+    /// <returns>ePay queu record</returns>
+    public static SKS_EPY_Queue WriteToQueue(str JSONData, CustVendAC CustAccountNum, SKS_EPY_Status status, str errorText, str paymNum, real _Amount, CurrencyCode _CurrencyCode)
+    {
+        
+        SKS_EPY_Queue   sks_epy_queue;
+        CustTable       custTable;
+        DirPartyTable   dirPartyTable;
+        ;
+
+        ttsBegin;
+    
+        select forUpdate firstOnly SKS_epy_queue order by sks_epy_queue.recid desc where sks_epy_queue.Entity == SKS_EPY_Entity::Payment;
+    
+    
+        if(errorText != '' && sks_epy_queue.Action == SKS_EPY_Action::RetrievalFromEPayFailed)
+        {
+            sks_epy_queue.ErrorWarning = errorText;
+            sks_epy_queue.Status = SKS_EPY_Status::Failed;
+            sks_epy_queue.SendReceiveDateTime = DateTimeUtil::utcNow();
+            sks_epy_queue.update();
+        }
+        else
+        {
+            sks_epy_queue = null;
+            select firstonly * from CustTable join dirPartyTable where custTable.Party == dirPartyTable.recid
+                && custTable.accountNum == CustAccountNum;
+    
+            sks_epy_queue.AccountNum = CustAccountNum;
+            sks_epy_queue.AccountName = dirPartyTable.Name;
+            if(errorText != '')
+            {
+                sks_epy_queue.action = SKS_EPY_Action::RetrievalFromEPayFailed;
+            }
+            else
+            {
+                sks_epy_queue.Action = SKS_EPY_Action::PmtFromEPay;
+            }
+            sks_epy_queue.ChangeType = SKS_EPY_ChangeType::Created;
+            sks_epy_queue.Entity = SKS_EPY_Entity::Payment;
+            sks_epy_queue.DataStr = JSONData;
+            sks_epy_queue.Status = status;
+            sks_epy_queue.ErrorWarning = errorText;
+            sks_epy_queue.PaymNum = paymNum;
+            sks_epy_queue.Amount = _Amount;
+            sks_epy_queue.CurrencyCode = _CurrencyCode;
+            sks_epy_queue.insert();
+    
+        }
+        ttsCommit;
+    
+        return SKS_EPY_Queue;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateNewTransLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new transaction line
+    /// </summary>
+    /// <param name = "_LedgerJournalTrans">_LedgerJournalTrans</param>
+    /// <returns>Ledger Journal transaction record</returns>
+    public static LedgerJournalTrans CreateNewTransLine(LedgerJournalTrans _LedgerJournalTrans)
+    {
+        LedgerJournalTrans  UpdLedgerJournalTrans;
+
+        buf2Buf(_LedgerJournalTrans, UpdLedgerJournalTrans);
+        
+        NumberSeq numberSeq = NumberSeq::newGetNumFromId(LedgerJournalTable::find(_LedgerJournalTrans.journalnum).NumberSequenceTable);
+        UpdLedgerJournalTrans.Voucher = numberSeq.num();
+        ttsbegin;
+        UpdLedgerJournalTrans.insert();
+        ttscommit;
+        _LedgerJournalTrans = UpdLedgerJournalTrans;
+        _LedgerJournalTrans.MarkedInvoice = '';
+
+        return _LedgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SplitPaymentByDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Splits the payments by dimension
+    /// </summary>
+    /// <param name = "_LedgerJournalTrans">_LedgerJournalTrans</param>
+    /// <param name = "_CustTrans">_CustTrans</param>
+    /// <param name = "_SKS_EPY_Setup">_SKS_EPY_Setup</param>
+    /// <returns>Ledger Journal Transaction record</returns>
+    public static LedgerJournalTrans SplitPaymentByDimensions(LedgerJournalTrans _LedgerJournalTrans, CustTrans _CustTrans, SKS_EPY_Setup _SKS_EPY_Setup)
+    {
+        LedgerJournalTrans TmpLedgerJournalTrans;
+        
+        if(_LedgerJournalTrans.DefaultDimension == 0)
+        {
+            if(_SKS_EPY_Setup.DefaultDimIfNoInv && _CustTrans.DefaultDimension == 0)//if default dimension if no invoice dimension is turned on and the invoice has no dimension
+            {
+                //Default from setup
+                _LedgerJournalTrans.DefaultDimension = _SKS_EPY_Setup.epyDefaultDIM;
+            }
+            else if(_CustTrans.DefaultDimension != 0)
+            {
+                select firstonly forupdate TmpLedgerJournalTrans where TmpLedgerJournalTrans.JournalNum == _LedgerJournalTrans.JournalNum
+                    && TmpLedgerJournalTrans.SKS_EPY_PmtNbr == _LedgerJournalTrans.SKS_EPY_PmtNbr
+                    && TmpLedgerJournalTrans.LedgerDimension == _LedgerJournalTrans.LedgerDimension
+                    && TmpLedgerJournalTrans.DefaultDimension == _CustTrans.DefaultDimension
+                    && TmpLedgerJournalTrans.AmountCurDebit == 0;
+
+                SpecTrans lSpecTrans = SpecTrans::findBySpec(_LedgerJournalTrans.DataAreaId, _LedgerJournalTrans.TableId, _LedgerJournalTrans.RecId);
+
+                if(!TmpLedgerJournalTrans && lSpecTrans)
+                {
+                    _LedgerJournalTrans = SKS_EPY_PaymentCreation::CreateNewTransLine(_LedgerJournalTrans);
+                }
+                else if(_LedgerJournalTrans.MarkedInvoice != '')
+                {
+                    _LedgerJournalTrans = TmpLedgerJournalTrans;
+                }
+                _LedgerJournalTrans.DefaultDimension = _CustTrans.DefaultDimension;
+            }
+            else
+            {
+                _LedgerJournalTrans.DefaultDimension = custtable::findByLedgerDimension(_ledgerjournaltrans.LedgerDimension).DefaultDimension;
+            }
+        }
+        else
+        {
+            if(_CustTrans.DefaultDimension != _LedgerJournalTrans.DefaultDimension && _CustTrans.DefaultDimension != 0)
+            {
+                select firstonly forupdate TmpLedgerJournalTrans where TmpLedgerJournalTrans.DefaultDimension == _CustTrans.DefaultDimension
+                    && TmpLedgerJournalTrans.SKS_EPY_PmtNbr == _LedgerJournalTrans.SKS_EPY_PmtNbr
+                    && TmpLedgerJournalTrans.LedgerDimension == _LedgerJournalTrans.LedgerDimension
+                    && TmpLedgerJournalTrans.JournalNum == _LedgerJournalTrans.JournalNum
+                    && TmpLedgerJournalTrans.AmountCurDebit == 0;
+
+                if(!TmpLedgerJournalTrans)
+                {
+                    _LedgerJournalTrans = SKS_EPY_PaymentCreation::CreateNewTransLine(_LedgerJournalTrans);
+                    _LedgerJournalTrans.DefaultDimension = _CustTrans.DefaultDimension;
+                }
+                else
+                {
+                    _LedgerJournalTrans = TmpLedgerJournalTrans;
+                }
+            }
+            else
+            {
+                if(_CustTrans.DefaultDimension == 0)
+                {
+                    if(_SKS_EPY_Setup.DefaultDimIfNoInv)
+                    {
+                        select firstonly forupdate TmpLedgerJournalTrans where TmpLedgerJournalTrans.DefaultDimension == _SKS_EPY_Setup.epyDefaultDIM
+                            && TmpLedgerJournalTrans.SKS_EPY_PmtNbr == _LedgerJournalTrans.SKS_EPY_PmtNbr
+                            && TmpLedgerJournalTrans.LedgerDimension == _LedgerJournalTrans.LedgerDimension
+                            && TmpLedgerJournalTrans.JournalNum == _LedgerJournalTrans.JournalNum
+                            && TmpLedgerJournalTrans.AmountCurDebit == 0;
+                        if(TmpLedgerJournalTrans)
+                        {
+                            _LedgerJournalTrans = TmpLedgerJournalTrans;
+                        }
+                        else
+                        {
+                            _LedgerJournalTrans = SKS_EPY_PaymentCreation::CreateNewTransLine(_LedgerJournalTrans);
+                            _LedgerJournalTrans.DefaultDimension = _SKS_EPY_Setup.epyDefaultDIM;
+                        }
+                    }
+                    else
+                    {
+                        select firstonly forupdate TmpLedgerJournalTrans where TmpLedgerJournalTrans.DefaultDimension == 0
+                            && TmpLedgerJournalTrans.SKS_EPY_PmtNbr == _LedgerJournalTrans.SKS_EPY_PmtNbr
+                            && TmpLedgerJournalTrans.LedgerDimension == _LedgerJournalTrans.LedgerDimension
+                            && TmpLedgerJournalTrans.JournalNum == _LedgerJournalTrans.JournalNum
+                            && TmpLedgerJournalTrans.AmountCurDebit == 0;
+                        if(TmpLedgerJournalTrans)
+                        {
+                            _LedgerJournalTrans = TmpLedgerJournalTrans;
+                        }
+                        else
+                        {
+                            _LedgerJournalTrans = SKS_EPY_PaymentCreation::CreateNewTransLine(_LedgerJournalTrans);
+                            _LedgerJournalTrans.DefaultDimension = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        return _LedgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

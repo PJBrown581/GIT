@@ -1,0 +1,1213 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_Format_US_BNY_MELLON_FX</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+// BNY Mellon format
+/// <summary>
+/// SKS_EFT_Format_US_BNY_MELLON_FX extends SKS_EFT_Format
+/// </summary>
+class SKS_EFT_Format_US_BNY_MELLON_FX extends SKS_EFT_Format
+{
+    #define.FormatVersion('20221018')
+    int mRecordCount;
+    AmountMST mPaymentAmount;
+    str mTimeStamp;
+    CurrencyCode mOrigCurrency;
+    Boolean mFxWire;
+    #define.SWT('SWT')
+    #define.FWT('FWT')
+    #define.DoubleQuote('"')
+    #define.Caret('^')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getFormatVersion</Name>
+				<Source><![CDATA[
+    protected str getFormatVersion()
+    {
+        return #FormatVersion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatStructure</Name>
+				<Source><![CDATA[
+    //Record Type                       Usage
+    //File Header Record                Required
+    //Email Record                      Required
+    //Payment Record                    Required
+    //Payment Note Record               Optional
+    //Payment Note Record               Optional
+    //Payment Detail Reference Record   Required
+    //Payment Detail Reference Record   Required
+    //Payment Detail Reference Record   Required
+    //Payment Address Record            Required
+    //Payment Address Record            Required
+    //Payment Address Record            Optional
+    //File Trailer Record               Required
+    
+    protected void formatStructure()
+    {
+        BankAccountTable lBankAccountTable;
+        ;
+        mTimeStamp = SKS_PP_StringFormats::strDateYYYYMMDD(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())) + SKS_PP_StringFormats::strTimeHHMMSS();
+    
+        //File Header Record
+        this.rec_Header();
+        this.getCompanyEmail();
+        while(mSKS_EFT_FileDetail)
+        {
+            // Get SKS_EFT_Bank
+            this.getSKS_EFT_Bank();
+    
+            // Get SKS_EFT_VendorPaym
+            this.getSKS_EFT_VendorPaym();
+    
+            // Get SKS_EFT_FileFormatPaymSpec
+            this.getSKS_EFT_FileFormatPaymSpec();
+    
+            select CurrencyCode, AccountID from lBankAccountTable where lBankAccountTable.AccountID == mSKS_EFT_Bank.BankAccountId;
+    
+            mOrigCurrency = lBankAccountTable.CurrencyCode;
+    
+            if(lBankAccountTable.CurrencyCode != mSKS_EFT_FileDetail.PaymentCurrencyCode)
+            {
+                mFxWire = true;
+            }
+            else
+            {
+                mFxWire = false;
+            }
+    
+            // Record lines
+            this.rec_Payment();
+    
+            this.rec_Note();
+    
+            if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #SWT && mFxWire)
+            {
+                this.rec_Detail(true);
+                this.rec_Detail();
+                this.rec_Detail_PHC();
+            }
+    
+            this.rec_Detail_Address_PR(); // Payer
+            this.rec_Detail_Address_BE(); // Beneficiary
+            this.rec_Detail_Address_BK(); // Beneficiary bank
+            this.rec_Detail_Address_IK(); // Intermediary bank
+    
+            next mSKS_EFT_FileDetail;
+        }
+    
+        //File Trailer Record               Required
+        this.rec_Trailer();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCompanyEmail</Name>
+				<Source><![CDATA[
+    private void getCompanyEmail()
+    {
+        LogisticsElectronicAddress lLogisticsElectronicAddress;
+        LogisticsLocation          lLogisticsLocation;
+        DirPartyLocation           lDirPartyLocation;
+    
+        while select Location, Party from lDirPartyLocation join lLogisticsElectronicAddress
+                                    where lDirPartyLocation.Party == CompanyInfo::find().RecId
+                                       && lLogisticsElectronicAddress.Location == lDirPartyLocation.Location
+                                       && lLogisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Email
+                                     join Description from lLogisticsLocation
+                                    where lLogisticsLocation.RecId == lLogisticsElectronicAddress.Location
+                                       && lLogisticsLocation.Description like 'FASTTRACK*'
+        {
+            this.rec_Email(lLogisticsElectronicAddress.Locator);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalPaymentNotes</Name>
+				<Source><![CDATA[
+    private str getJournalPaymentNotes()
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+    
+        select crossCompany PaymentNotes from ledgerJournalTrans where
+            ledgerJournalTrans.RecId == mSKS_EFT_FileDetail.PaymentLineRecId;
+    
+        return this.CharacterReplacement(ledgerJournalTrans.PaymentNotes);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournaltxt</Name>
+				<Source><![CDATA[
+    private str getJournaltxt()
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+    
+        select crossCompany Txt from ledgerJournalTrans where
+            ledgerJournalTrans.RecId == mSKS_EFT_FileDetail.PaymentLineRecId;
+    
+        return this.CharacterReplacement(ledgerJournalTrans.Txt);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Detail</Name>
+				<Source><![CDATA[
+    //Detail Reference Record 5T/LU
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Ref Qualifier 1                           3            9 - 11
+    // 3        Ref ID                                   50           12 - 61
+    // 4        Ref Description 1                        80           62 -141
+    // 5        Filler                                  934          142 -995
+    
+    boolean rec_Detail(boolean rec5T = false)
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                               8            1 -  8
+        sb.Append(this.wrapField('PDT02005'));
+    
+        // 2        Ref Qualifier 1                           3            9 - 11
+        if(rec5T)
+        {
+            sb.Append(this.wrapField('5T'));
+        }
+        else
+        {
+            sb.Append(this.wrapField('LU'));
+        }
+    
+        // 3        Ref ID                                   50           12 - 61
+        if(rec5T)
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBenBankName))); //Receipt Location
+        }
+        else
+        {
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankAcct));
+        }
+    
+        // 4        Ref Description 1                        80           62 -141
+        if(rec5T)
+        {
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.PaymentCurrencyCode)); //ISO Currency Code
+        }
+        else
+        {
+            sb.Append(this.wrapField(this.getJournalPaymentNotes())); //Client Comments
+        }
+    
+        // 5        Filler                                  934          142 -995
+        sb.Append(this.wrapField('',false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Detail_Address_BE</Name>
+				<Source><![CDATA[
+    //Detail Address Record BE
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Name Qualifier                            3            9 - 11
+    // 3        ID Code Qualifier                         2           12 - 13
+    // 4        ID Code                                  80           14 - 93
+    // 5        Name                                     60           95 -153
+    // 6        Filler                                  120          154 -273
+    // 7        Address line 1                           55          274 -328
+    // 8        Address line 2                           55          329 -383
+    // 9        Address line 3                           55          384 -438
+    //10        Address line 4                           55          439 -493
+    //11        Address line 5                           55          494 -548
+    //12        Address line 6                           55          549 -603
+    //13        Filler                                  220          604 -823
+    //14        City                                     30          824 -853
+    //15        State/Providence                          2          854 -85
+    //16        Postal Code                              15          636 -650
+    //17        Country Code                              3          651 -653
+    //18        Country Name                             30          654 -683
+    //19        Filler                                  309          684 -995
+    
+    boolean rec_Detail_Address_BE()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                               8            1 -  8
+        sb.Append(this.wrapField('PDT02010'));
+    
+        // 2        Name Qualifier                            3            9 - 11
+        sb.Append(this.wrapField('BE'));
+    
+        // 3        ID Code Qualifier                         2           12 - 13
+        sb.Append(this.wrapField(''));
+    
+        // 4        ID Code                                  80           14 - 93
+        sb.Append(this.wrapField(''));
+    
+        // 5        Name                                     60           95 -153
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBeneName)));
+    
+        // 6        Additional Name 1                        60          154 -213
+        sb.Append(this.wrapField(''));
+    
+        // 7        Additional Name 2                        60          214 -273
+        sb.Append(this.wrapField(''));
+    
+        // 8        Address line 1                           55          274 -328
+        sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBeneAddr), 1, 35)));
+    
+        // 9        Address line 2                           55          329 -383
+        sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBeneAddr2), 1, 35)));
+    
+        //10        Address line 3                           55          384 -438
+        sb.Append(this.wrapField(''));
+    
+        //11        Address line 4                           55          439 -493
+        sb.Append(this.wrapField(''));
+    
+        //12        Address line 5                           55          494 -548
+        sb.Append(this.wrapField(''));
+    
+        //13        Address line 6                           55          549 -603
+        sb.Append(this.wrapField(''));
+    
+        //14        City                                     30          824 -853
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBeneCity)));
+    
+        //15        State/Providence                          2          854 -85
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBeneState)));
+    
+        //16        Postal Code                              15          636 -650
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBeneZipPostal)));
+    
+        //17        Country Code                              3          651 -653
+        sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_VendorPaym.WBeneCountryRegionId)));
+    
+        //18        Country Name                             30          654 -683
+        sb.Append(this.wrapField(this.CharacterReplacement(this.getLogisticsAddressCountryRegionName(mSKS_EFT_VendorPaym.WBeneCountryRegionId))));
+    
+        //19        Country Subdivision                       3          684 -686
+        sb.Append(this.wrapField(''));
+    
+        //20        Filler                                  309          687 -995
+        sb.Append(this.wrapField('', false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Detail_Address_BK</Name>
+				<Source><![CDATA[
+    //Detail Address Record BK
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Name Qualifier                            3            9 - 11
+    // 3        ID Code Qualifier                         2           12 - 13
+    // 4        ID Code                                  80           14 - 93
+    // 5        Name                                     60           95 -153
+    // 6        Additional Name 1                        60          154 -213
+    // 7        Additional Name 2                        60          214 -273
+    // 8        Address line 1                           55          274 -328
+    // 9        Address line 2                           55          329 -383
+    //10        Address line 3                           55          384 -438
+    //11        Address line 4                           55          439 -493
+    //12        Address line 5                           55          494 -548
+    //13        Address line 6                           55          549 -603
+    //14        City                                     30          604 -633
+    //15        State/Providence                          2          634 -635
+    //16        Postal Code                              15          636 -650
+    //17        Country Code                              3          651 -653
+    //18        Country Name                             30          654 -683
+    //19        Country Subdivision                       3          684 -686
+    //20        Filler                                  309          687 -995
+    
+    boolean rec_Detail_Address_BK()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        if(mSKS_EFT_VendorPaym.WBenBankName != '' ||
+           mSKS_EFT_VendorPaym.WBenBankAddr != '' ||
+           mSKS_EFT_VendorPaym.WBenBankCity != '' ||
+           mSKS_EFT_VendorPaym.WBenBankCountryRegionId != '')
+        {
+            mRecordCount++;
+    
+            // 1        Record Type                               8            1 -  8
+            sb.Append(this.wrapField('PDT02010'));
+    
+            // 2        Name Qualifier                            3            9 - 11
+            sb.Append(this.wrapField('BK'));
+    
+            // 3        ID Code Qualifier                         2           12 - 13
+            // 4        ID Code                                  80           14 - 93
+            if(mSKS_EFT_FileDetail.PaymentCurrencyCode == 'CAD')
+            {
+                sb.Append(this.wrapField('ZZ'));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBenBankBranch)));
+            }
+            else
+            {
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+            }
+    
+            // 5        Name                                     60           95 -153
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBenBankName)));
+    
+            // 6        Additional Name 1                        60          154 -213
+            sb.Append(this.wrapField(''));
+    
+            // 7        Additional Name 2                        60          214 -273
+            sb.Append(this.wrapField(''));
+    
+            // 8        Address line 1                           55          274 -328
+            sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBenBankAddr), 1, 35)));
+    
+            // 9        Address line 2                           55          329 -383
+            sb.Append(this.wrapField(''));
+    
+            //10        Address line 3                           55          384 -438
+            sb.Append(this.wrapField(''));
+    
+            //11        Address line 4                           55          439 -493
+            sb.Append(this.wrapField(''));
+    
+            //12        Address line 5                           55          494 -548
+            sb.Append(this.wrapField(''));
+    
+            //13        Address line 6                           55          549 -603
+            sb.Append(this.wrapField(''));
+    
+            //14        City                                     30          824 -853
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WBenBankCity)));
+    
+            //15        State/Providence                          2          854 -85
+            sb.Append(this.wrapField(''));
+    
+            //16        Postal Code                              15          636 -650
+            sb.Append(this.wrapField(''));
+    
+            //17        Country Code                              3          651 -653
+            sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_VendorPaym.WBenBankCountryRegionId)));
+    
+            //18        Country Name                             30          654 -683
+            sb.Append(this.wrapField(this.CharacterReplacement(this.getLogisticsAddressCountryRegionName(mSKS_EFT_VendorPaym.WBenBankCountryRegionId))));
+    
+            //19        Country Subdivision                       3          684 -686
+            sb.Append(this.wrapField(''));
+    
+            //20        Filler                                  309          687 -995
+            sb.Append(this.wrapField('', false));
+    
+            this.fileWrite(sb.ToString());
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Detail_Address_IK</Name>
+				<Source><![CDATA[
+    //Detail Address Record IK
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Name Qualifier                            3            9 - 11
+    // 3        ID Code Qualifier                         2           12 - 13
+    // 4        ID Code                                  80           14 - 93
+    // 5        Name                                     60           95 -153
+    // 6        Additional Name 1                        60          154 -213
+    // 7        Additional Name 2                        60          214 -273
+    // 8        Address line 1                           55          274 -328
+    // 9        Address line 2                           55          329 -383
+    //10        Address line 3                           55          384 -438
+    //11        Address line 4                           55          439 -493
+    //12        Address line 5                           55          494 -548
+    //13        Address line 6                           55          549 -603
+    //14        City                                     30          604 -633
+    //15        State/Providence                          2          634 -635
+    //16        Postal Code                              15          636 -650
+    //17        Country Code                              3          651 -653
+    //18        Country Name                             30          654 -683
+    //19        Country Subdivision                       3          684 -686
+    //20        Filler                                  312          687 -995
+    
+    boolean rec_Detail_Address_IK()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        if(mSKS_EFT_VendorPaym.WIntBankSwift != '' ||
+           mSKS_EFT_VendorPaym.WIntBankName != '' ||
+           mSKS_EFT_VendorPaym.WIntBankAddr != '' ||
+           mSKS_EFT_VendorPaym.WIntBankCity != '' ||
+           mSKS_EFT_VendorPaym.WIntBankCountryRegionId != '')
+        {
+            mRecordCount++;
+    
+            // 1        Record Type                               8            1 -  8
+            sb.Append(this.wrapField('PDT02010'));
+    
+            // 2        Name Qualifier                            3            9 - 11
+            sb.Append(this.wrapField('IK'));
+    
+            // 3        ID Code Qualifier                         2           12 - 13
+            sb.Append(this.wrapField('SW'));
+    
+            // 4        ID Code                                  80           14 - 93
+            sb.Append(this.wrapField(mSKS_EFT_VendorPaym.WIntBankSwift));
+    
+            // 5        Name                                     60           95 -153
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WIntBankName)));
+    
+            // 6        Additional Name 1                        60          154 -213
+            sb.Append(this.wrapField(''));
+    
+            // 7        Additional Name 2                        60          214 -273
+            sb.Append(this.wrapField(''));
+    
+            // 8        Address line 1                           55          274 -328
+            sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_VendorPaym.WIntBankAddr), 1, 35)));
+    
+            // 9        Address line 2                           55          329 -383
+            sb.Append(this.wrapField(''));
+    
+            //10        Address line 3                           55          384 -438
+            sb.Append(this.wrapField(''));
+    
+            //11        Address line 4                           55          439 -493
+            sb.Append(this.wrapField(''));
+    
+            //12        Address line 5                           55          494 -548
+            sb.Append(this.wrapField(''));
+    
+            //13        Address line 6                           55          549 -603
+            sb.Append(this.wrapField(''));
+    
+            //14        City                                     30          824 -853
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_VendorPaym.WIntBankCity)));
+    
+            //15        State/Providence                          2          854 -85
+            sb.Append(this.wrapField(''));
+    
+            //16        Postal Code                              15          636 -650
+            sb.Append(this.wrapField(''));
+    
+            //17        Country Code                              3          651 -653
+            sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_VendorPaym.WIntBankCountryRegionId)));
+    
+            //18        Country Name                             30          654 -683
+            sb.Append(this.wrapField(this.CharacterReplacement(this.getLogisticsAddressCountryRegionName(mSKS_EFT_VendorPaym.WIntBankCountryRegionId))));
+    
+            //19        Country Subdivision                       3          684 -686
+            sb.Append(this.wrapField(''));
+    
+            //20        Filler                                  309          687 -995
+            sb.Append(this.wrapField('', false));
+    
+            this.fileWrite(sb.ToString());
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Detail_Address_PR</Name>
+				<Source><![CDATA[
+    //Detail Address Record PR
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Name Qualifier                            3            9 - 11
+    // 3        ID Code Qualifier                         2           12 - 13
+    // 4        ID Code                                  80           14 - 93
+    // 5        Name                                     60           95 -153
+    // 6        Additional Name 1                        60          154 -213
+    // 7        Additional Name 2                        60          214 -273
+    // 8        Address line 1                           55          274 -328
+    // 9        Address line 2                           55          329 -383
+    //10        Address line 3                           55          384 -438
+    //11        Address line 4                           55          439 -493
+    //12        Address line 5                           55          494 -548
+    //13        Address line 6                           55          549 -603
+    //14        City                                     30          604 -633
+    //15        State/Providence                          2          634 -635
+    //16        Postal Code                              15          636 -650
+    //17        Country Code                              3          651 -653
+    //18        Country Name                             30          654 -683
+    //19        Country Subdivision                       3          684 -686
+    //20        Filler                                  309          687 -995
+    
+    boolean rec_Detail_Address_PR()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                               8            1 -  8
+        sb.Append(this.wrapField('PDT02010'));
+    
+        // 2        Name Qualifier                            3            9 - 11
+        sb.Append(this.wrapField('PR'));
+    
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #SWT && mFxWire)
+        {
+            // 3        ID Code Qualifier                         2           12 - 13
+            sb.Append(this.wrapField('PI'));
+    
+            // 4        ID Code                                  80           14 - 93
+            sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CounterpartyId', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank))));
+    
+            // 5        Name                                     60           95 -153
+            sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CounterpartyName', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank))));
+        }
+        else
+        {
+            // 3        ID Code Qualifier                         2           12 - 13
+            if(mSKS_EFT_Bank.WOrdPartyId != '')
+            {
+                sb.Append(this.wrapField('PI'));
+            }
+            else
+            {
+                sb.Append(this.wrapField(''));
+            }
+    
+            // 4        ID Code                                  80           14 - 93
+            sb.Append(this.wrapField(mSKS_EFT_Bank.WOrdPartyId));
+    
+            // 5        Name                                     60           95 -153
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_Bank.WOrdPartyName)));
+        }
+    
+        // 6        Additional Name 1                        60          154 -213
+        sb.Append(this.wrapField(''));
+    
+        // 7        Additional Name 2                        60          214 -273
+        sb.Append(this.wrapField(''));
+    
+        // 8        Address line 1                           55          274 -328
+        sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_Bank.WOrdPartyAddr), 1, 55)));
+    
+        // 9        Address line 2                           55          329 -383
+        sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_Bank.WOrdPartyAddr2), 1, 55)));
+    
+        //10        Address line 3                           55          384 -438
+        sb.Append(this.wrapField(''));
+    
+        //11        Address line 4                           55          439 -493
+        sb.Append(this.wrapField(''));
+    
+        //12        Address Line 5                           55          494 -548
+        sb.Append(this.wrapField(''));
+    
+        //13        Address Line 6                           55          549 -603
+        sb.Append(this.wrapField(''));
+    
+        //14        City                                     30          604 -633
+        sb.Append(this.wrapField(subStr(this.CharacterReplacement(mSKS_EFT_Bank.WOrdPartyCity), 1, 30)));
+    
+        //15        State/Providence                          2          634 -635
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_Bank.WOrdPartyState)));
+    
+        //16        Zip Code                                 15          636 -650
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_Bank.WOrdPartyZipCode)));
+    
+        //17        Country Code                              3          651 -653
+        sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_Bank.WOrdPartyCountryRegionId)));
+    
+        //18        Country Name                             30          654 -683
+        sb.Append(this.wrapField(this.CharacterReplacement(this.getLogisticsAddressCountryRegionName(mSKS_EFT_Bank.WOrdPartyCountryRegionId))));
+    
+        //19        Country Subdivision                       3          684 -686
+        sb.Append(this.wrapField(''));
+    
+        //20        Filler                                  309          687 -995
+        sb.Append(this.wrapField('', false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Detail_PHC</Name>
+				<Source><![CDATA[
+    //Detail Reference Record PHC
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Ref Qualifier 1                           3            9 - 11
+    // 3        Ref ID                                   50           12 - 61
+    // 4        Filler                                  934           62 -995
+    
+    boolean rec_Detail_PHC()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                               8            1 -  8
+        sb.Append(this.wrapField('PDT02005'));
+    
+        // 2        Ref Qualifier 1                           3            9 - 11
+        sb.Append(this.wrapField('PHC'));
+    
+        // 3        Ref ID                                   50           12 - 61
+        sb.Append(this.wrapField('WRE'));
+    
+        // 4        Filler                                  934           62 -995
+        sb.Append(this.wrapField('',false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Email</Name>
+				<Source><![CDATA[
+    //Email Record
+    //Field     Name                        Length      Position
+    // 1        Record Type                   8           1 -  8
+    // 2        Email Address                50           9 - 58
+    // 3        Filler                      937          59 -995
+    boolean rec_Email(str _email)
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                   8           1 -  8
+        sb.Append(this.wrapField('FIL00020'));
+    
+        // 2        Email Address                50           9 - 58
+        sb.Append(this.wrapField(subStr(_email,1,50)));
+    
+        // 3        Filler                      937          59 -995
+        sb.Append(this.wrapField('',false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Header</Name>
+				<Source><![CDATA[
+    //File Header Record
+    //Field     Name                        Length      Position
+    // 1        Record Type                   8           1 -  8
+    // 2        Variable or Fixed Flag        1                9
+    // 3        Application ID                8          10 - 17
+    // 4        Customer ID                  35          18 - 52
+    // 5        Test Indicator                1               53
+    // 6        Document ID                   3          54 - 56
+    // 7        Bank ID                      15          57 - 71
+    // 8        Customer Division ID         35          72 -106
+    // 9        File Date/Time               14         107 -120
+    //10        Reserved Field                3         121 -123
+    //11        Filler                      872         124 -995
+    boolean rec_Header()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                   8           1 -  8
+        sb.Append(this.wrapField('FIL00010'));
+    
+        // 2        Variable or Fixed Flag        1                9
+        sb.Append(this.wrapField('V'));
+    
+        // 3        Application ID                8          10 - 17
+        sb.Append(this.wrapField('FFCARET'));
+    
+        // 4        Customer ID                  35          18 - 52
+        sb.Append(this.wrapField(subStr(mSKS_EFT_FileDetail.FileACHCompanyId, 1, 35)));
+    
+        // 5        Test Indicator                1               53
+        if(strUpr(SKS_EFT_Format::getCodelookupvalue('TestFile', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank)) == 'Y')
+        {
+            sb.Append(this.wrapField('T'));
+        }
+        else
+        {
+            sb.Append(this.wrapField('P'));
+        }
+    
+        // 6        Document ID                   3          54 - 56
+        sb.Append(this.wrapField('820'));
+    
+        // 7        Bank ID                      15          57 - 71
+        sb.Append(this.wrapField('BNYMELLONPAY'));
+    
+        // 8        Customer Division ID         35          72 -106
+        sb.Append(this.wrapField(''));
+    
+        // 9        File Date/Time               14         107 -120
+        sb.Append(this.wrapField(mTimeStamp));
+    
+        //10        Reserved Field                3         121 -123
+        sb.Append(this.wrapField(''));
+    
+        //11        Filler                      872         124 -995
+        sb.Append(this.wrapField('', false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Note</Name>
+				<Source><![CDATA[
+    //Note Record
+    //Field     Name                                    Length
+    // 1        Record Type                               8
+    // 2        Note Qualifier 1                          5
+    // 3        Note 1                                   80
+    // 4        Note Qualifier 2                          5
+    // 5        Note 2                                   80
+    // 6        Note Qualifier 3                          5
+    // 7        Note 3                                   80
+    // 8        Note Qualifier 4                          5
+    // 9        Note 4                                   80
+    // 10       Filler                                  647
+    
+    boolean rec_Note()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        str journalTxt;
+        str noteQualifier;
+        ;
+    
+        if(mFxWire)
+        {
+            noteQualifier = 'TLR';
+        }
+        else
+        {
+            noteQualifier = 'OTH';
+        }
+    
+        journalTxt = subStr(this.getJournaltxt(),1,80);
+    
+        if(mSKS_EFT_VendorPaym.WCrePartyAcct != '' || mSKS_EFT_VendorPaym.WCrePartyName != '' || journalTxt != '')
+        {
+            mRecordCount++;
+    
+            // 1        Record Type                               8
+            sb.Append(this.wrapField('PDT02000'));
+    
+            if(mSKS_EFT_VendorPaym.WCrePartyAcct != '' || mSKS_EFT_VendorPaym.WCrePartyName != '')
+            {
+                // 2        Note Qualifier 1                          3
+                sb.Append(this.wrapField(noteQualifier));
+    
+                // 3        Note 1                                   80
+                sb.Append(this.wrapField(subStr('FFC ' + this.CharacterReplacement(mSKS_EFT_VendorPaym.WCrePartyName),1,80))); //Credit party name
+    
+                // 4        Note Qualifier 2                          5
+                sb.Append(this.wrapField(noteQualifier));
+    
+                // 5        Note 2                                   80
+                sb.Append(this.wrapField(subStr('ACCOUNT ' + mSKS_EFT_VendorPaym.WCrePartyAcct,1,80))); //Credit party account
+    
+                // 6        Note Qualifier 3                          5
+                // 7        Note 3                                   80
+                if(journalTxt == '')
+                {
+                    sb.Append(this.wrapField(''));
+                    sb.Append(this.wrapField(''));
+                }
+                else
+                {
+                    sb.Append(this.wrapField(noteQualifier));
+                    sb.Append(this.wrapField(journalTxt)); //Client Comments
+                }
+            }
+            else
+            {
+                // 2        Note Qualifier 1                          5
+                // 3        Note 1                                   80
+                if(journalTxt == '')
+                {
+                    sb.Append(this.wrapField(''));
+                    sb.Append(this.wrapField(''));
+                }
+                else
+                {
+                    sb.Append(this.wrapField(noteQualifier));
+                    sb.Append(this.wrapField(journalTxt)); //Client Comments
+                }
+    
+                // 4        Note Qualifier 2                          5
+                sb.Append(this.wrapField(''));
+    
+                // 5        Note 2                                   80
+                sb.Append(this.wrapField(''));
+    
+                // 6        Note Qualifier 3                          5
+                sb.Append(this.wrapField(''));
+    
+                // 7        Note 3                                   80
+                sb.Append(this.wrapField(''));
+            }
+            // 8        Note Qualifier 4                          5
+            sb.Append(this.wrapField(''));
+    
+            // 9        Note 4                                   80
+            sb.Append(this.wrapField(''));
+    
+            // 10        Filler                                  647
+            sb.Append(this.wrapField('', false));
+    
+            this.fileWrite(sb.ToString());
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Payment</Name>
+				<Source><![CDATA[
+    //Payment Record
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Transaction Handling Code                 2            9 - 10
+    // 3        Payment Amount                           18           11 - 28
+    // 4        Credit or Debit Flag                      1                29
+    // 5        Payment Method                            3           30 - 32
+    // 6        Payment Format                           10           33 - 42
+    // 7        Originators Bank ID Qualifier             2           43 - 44
+    // 8        Originators Bank ID                      12           45 - 56
+    // 9        Originating Account Number Qualifier      3           57 - 59
+    //10        Originating Account Number               35           60 - 94
+    //11        Originating Company Identifier           10           95 -104
+    //12        Receiving Bank ID Qualifier               2          105 -106
+    //13        Receiving Bank ID                        12          107 -118
+    //14        Receiving Account Number Qualifier        3          119 -121
+    //15        Receiving Account Number                 35          122 -156
+    //16        Effective Date                            8          157 -164
+    //17        Business Function Code                    3          165 -167
+    //18        Trace Number                             50          168 -217
+    //19        Division Code                            50          218 -267
+    //20        Currency Code                             3          268 -270
+    //21        Orig Co Supplemental Code                 9          271 -279
+    //22        Currency Code Identifier                  3          280 -282
+    //23        Exchange Rate                            10          283 -292
+    //24        Currency Code Identifier                  3          293 -295
+    //25        Currency Code                             3          296 -298
+    //26        Market Exchange Code                      3          299 -301
+    //27        Date Qualifier                            3          302 -304
+    //28        Trade Date                                8          305 -312
+    //29        Filler                                  683          313 -995
+    
+    boolean rec_Payment()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                               8            1 -  8
+        sb.Append(this.wrapField('PAY01000'));
+    
+        // 2        Transaction Handling Code                 2            9 - 10
+        sb.Append(this.wrapField('1'));
+    
+        // 3        Payment Amount                           18           11 - 28
+        mPaymentAmount += mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur;
+        sb.Append(this.wrapField(num2str(-1 * mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur,0,2,1,0)));
+    
+        // 4        Credit or Debit Flag                      1                29
+        sb.Append(this.wrapField('C'));
+    
+        // 5        Payment Method                            3           30 - 32
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #SWT:
+                if(mFxWire)
+                {
+                    sb.Append(this.wrapField('BOP'));
+                }
+                else
+                {
+                    sb.Append(this.wrapField('SWT'));
+                }
+                break;
+            case #FWT:
+                sb.Append(this.wrapField('FWT'));
+                break;
+        }
+    
+        // 6        Payment Format                           10           33 - 42
+        sb.Append(this.wrapField(''));
+    
+        // 7        Originators Bank ID Qualifier             2           43 - 44
+        sb.Append(this.wrapField('01'));
+    
+        // 8        Originators Bank ID                      12           45 - 56
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankTransit));
+    
+        // 9        Originating Account Number Qualifier      3           57 - 59
+        sb.Append(this.wrapField(''));
+    
+        //10        Originating Account Number               35           60 - 94
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankAcct));
+    
+        //11        Originating Company Identifier           10           95 -104
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #SWT && mFxWire)
+        {
+            sb.Append(this.wrapField('FXNONREP  '));
+        }
+        else
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_Bank.ACHImmOrigName)));
+        }
+    
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            Case #FWT:
+                //12        Receiving Bank ID Qualifier               2          105 -106
+                sb.Append(this.wrapField('01')); //FWT
+    
+                //13        Receiving Bank ID                        12          107 -118
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit));
+                break;
+            default: //SWT
+                //12        Receiving Bank ID Qualifier               2          105 -106
+                sb.Append(this.wrapField('02')); //SWT
+    
+                //13        Receiving Bank ID                        12          107 -118
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepSwiftNo));
+                break;
+        }
+    
+        //14        Receiving Account Number Qualifier        3          119 -121
+        sb.Append(this.wrapField(''));
+    
+        //15        Receiving Account Number                 35          122 -156
+        if(mSKS_EFT_FileDetail.DepBankIBAN != '')
+        {
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankIBAN));
+        }
+        else
+        {
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankAcct));
+        }
+    
+        //16        Effective Date                            8          157 -164
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(mSKS_EFT_File.EffectiveDate)));
+    
+        //17        Business Function Code                    3          165 -167
+        sb.Append(this.wrapField(''));
+    
+        //18        Trace Number                             50          168 -217
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.PaymentReference)));
+    
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #SWT && mFxWire)
+        {
+            //19        Division Code                            50          218 -267
+            sb.Append(this.wrapField(''));
+    
+            //20        Currency Code                             3          268 -270
+            sb.Append(this.wrapField(mOrigCurrency));
+    
+            //21        Orig Co Supplemental Code                 9          271 -279
+            sb.Append(this.wrapField(''));
+    
+            //22        Currency Code Identifier                  3          280 -282
+            sb.Append(this.wrapField('SE'));
+    
+            //23        Exchange Rate                            10          283 -292
+            sb.Append(this.wrapField(''));
+    
+            //24        Currency Code Identifier                  3          293 -295
+            sb.Append(this.wrapField('BY'));
+    
+            //25        Currency Code                             3          296 -298
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.PaymentCurrencyCode));
+    
+            //26        Market Exchange Code                      3          299 -301
+            sb.Append(this.wrapField(''));
+    
+            //27        Date Qualifier                            3          302 -304
+            sb.Append(this.wrapField('816'));
+    
+            //28        Trade Date                                8          305 -312
+            sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(mSKS_EFT_File.EffectiveDate)));
+    
+            //29        Filler                                  683          313 -995
+            sb.Append(this.wrapField('', false));
+        }
+        else if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #SWT && mSKS_EFT_FileDetail.PaymentCurrencyCode != 'USD')
+        {
+            //19        Division Code                            50          218 -267
+            sb.Append(this.wrapField(''));
+    
+            //20        Currency Code                             3          268 -270
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.PaymentCurrencyCode));
+    
+            //21        Orig Co Supplemental Code                 9          271 -279
+            sb.Append(this.wrapField(''));
+    
+            //22        Currency Code Identifier                  3          280 -282
+            sb.Append(this.wrapField(''));
+    
+            //23        Exchange Rate                            10          283 -292
+            sb.Append(this.wrapField(''));
+    
+            //24        Currency Code Identifier                  3          293 -295
+            sb.Append(this.wrapField(''));
+    
+            //25        Currency Code                             3          296 -298
+            sb.Append(this.wrapField(''));
+    
+            //26        Market Exchange Code                      3          299 -301
+            sb.Append(this.wrapField(''));
+    
+            //27        Date Qualifier                            3          302 -304
+            sb.Append(this.wrapField(''));
+    
+            //28        Trade Date                                8          305 -312
+            sb.Append(this.wrapField(''));
+    
+            //29        Filler                                  683          313 -995
+            sb.Append(this.wrapField('', false));
+        }
+        else
+        {
+            //19        Filler                                  778          218 -995
+            sb.Append(this.wrapField('', false));
+        }
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Trailer</Name>
+				<Source><![CDATA[
+    //File Trailer Record
+    //Field     Name                                    Length       Position
+    // 1        Record Type                               8            1 -  8
+    // 2        Record Count                             15            9 - 23
+    // 3        Total Amount                             25           24 - 48
+    // 4        Filler                                  347           49 -995
+    
+    boolean rec_Trailer()
+    {
+        //BP Deviation Documented
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        ;
+    
+        mRecordCount++;
+    
+        // 1        Record Type                               8            1 -  8
+        sb.Append(this.wrapField('TRL09000'));
+    
+        // 2        Record Count                             15            9 - 23
+        sb.Append(this.wrapField(int2str(mRecordCount)));
+    
+        // 3        Total Amount                             25           24 - 48
+        sb.Append(this.wrapField(num2str(-1 * mPaymentAmount,0,2,1,0)));
+    
+        // 4        Filler                                  347           49 -995
+        sb.Append(this.wrapField('', false));
+    
+        this.fileWrite(sb.ToString());
+    
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wrapField</Name>
+				<Source><![CDATA[
+    private str wrapField(str _field = '', boolean _Delimit = true)
+    {
+        if(_Delimit)
+        {
+            if(strFind(_field,#Caret,1,strLen(_field) != 0 ))
+            {
+                return #DoubleQuote + _field + #DoubleQuote + #Caret;
+            }
+            else
+            {
+                return _field + #Caret;
+            }
+        }
+        else
+        {
+            if(strFind(_field,#Caret,1,strLen(_field) != 0 ))
+            {
+                return #DoubleQuote + _field + #DoubleQuote;
+            }
+            else
+            {
+                return _field;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

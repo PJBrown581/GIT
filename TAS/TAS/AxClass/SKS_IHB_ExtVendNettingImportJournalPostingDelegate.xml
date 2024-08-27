@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_IHB_ExtVendNettingImportJournalPostingDelegate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_IHB_ExtVendNettingImportJournalPostingDelegate
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>LedgerJournalCheckPost_runInternalPostPostJournalDelegate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create and post the IHB customer intercompany journal
+    /// </summary>
+    /// <param name="_ledgerJournalCheckPost"> The instance of the <c>LedgerJournalCheckPost</c> class.</param>
+    /// <param name="_postingSuccess"> A boolean value indicating if the journal was posted successfully.</param>
+    /// <param name="_intercompanyPostingSuccess"> A boolean value indicating if the intercompany part of the journal was posted successfully.</param>
+    [SubscribesTo(classStr(LedgerJournalCheckPost), delegateStr(LedgerJournalCheckPost, runInternalPostPostJournalDelegate))]
+    public static void LedgerJournalCheckPost_runInternalPostPostJournalDelegate(LedgerJournalCheckPost _ledgerJournalCheckPost, boolean _postingSuccess, boolean _intercompanyPostingSuccess)
+    {
+        LedgerJournalTable  ledgerJournalTable = _ledgerJournalCheckPost.parmLedgerJournalTable();
+
+        // after correcting the error, once posting completes then update the vendor netting header and line status to complete
+        if (ledgerJournalTable.IsExtVendNettingJournal && ledgerJournalTable.IsExtVendNettingJournalOutCustAutoFailed)
+        {
+            LedgerJournalTrans ledgerJournalTrans;
+            SKS_IHB_VendNettingFileDetails vendNettingDetails, vendNettingDetailsLoc, vendNettingLineDetails;
+            SKS_IHB_VendNettingFilesHeader vendNettingFileHeader;
+
+            select firstonly vendNettingFileHeader
+                join vendNettingLineDetails
+                where vendNettingLineDetails.VendNettingHeaderRecid == vendNettingFileHeader.RecId
+                && vendNettingLineDetails.JournalNum == ledgerJournalTable.JournalNum;
+
+            update_recordset vendNettingDetails
+                        setting TransactionStatus = SKS_IHB_TransactionStatus::Complete,
+                                JournalNum = ledgerJournalTable.JournalNum,
+                                ErrorNotes = ''
+                        join ledgerJournalTrans
+                        where ledgerJournalTrans.SKS_IHB_VendNettingLineRecid == vendNettingDetails.RecId
+                        && ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum;
+
+            // Check whether any lines with 'Requires review' status, if not set Transfer status to complete otherwise; requires review
+            select firstonly vendNettingDetailsLoc
+                        where vendNettingDetailsLoc.VendNettingHeaderRecid == vendNettingFileHeader.RecId
+                        && vendNettingDetailsLoc.TransactionStatus == SKS_IHB_TransactionStatus::RequiresReview;
+
+            SKS_IHB_VendNettingImportJournalHelper helper = SKS_IHB_VendNettingImportJournalHelper::construct(vendNettingFileHeader);
+                    
+            if (vendNettingDetailsLoc)
+            {
+                // Update error note for file header if vendFileDetails transaction has 'Required review' line and error note is empty.
+
+                if (vendNettingFileHeader.ErrorNotes == '')
+                {
+                    vendNettingFileHeader.ErrorNotes = "@SKS:SKGIHBVendNettingTransStatus";
+                }
+                helper.updateVendNettingFilesheaderStatus(vendNettingFileHeader, true);
+            }
+            else
+            {
+                helper.updateVendNettingFilesheaderStatus(vendNettingFileHeader, false);
+            }
+        }
+
+        if (ledgerJournalTable.IsExtVendNettingJournal && ledgerJournalTable.IsExtVendNettingJournalAutoFailed)
+        {
+            SKS_IHB_VendNettingFilesHeader vendNettingFileHeader;
+            SKS_IHB_VendNettingFileDetails vendNettingFileDetails;
+
+            select firstonly vendNettingFileHeader
+                join vendNettingFileDetails
+                where vendNettingFileDetails.VendNettingHeaderRecid == vendNettingFileHeader.RecId
+                && vendNettingFileDetails.JournalNum == ledgerJournalTable.JournalNum;
+
+            SKS_IHB_VendNettingImportJournalHelper helper = SKS_IHB_VendNettingImportJournalHelper::construct(vendNettingFileHeader);
+            
+            boolean isJourPosted;
+            System.Exception ex;
+
+            try
+            {
+                ttsbegin;
+
+                helper.parmGLJournalId(ledgerJournalTable.JournalNum);
+
+                Map jourNumMap = helper.createCustPaymJournal();
+                helper.validateAndPostCustPaymJour(jourNumMap);
+
+                ttscommit;
+            }
+            catch (ex)
+            {
+                helper.insertErrorLog(vendNettingFileHeader.FileId, ex.Message);
+                helper.insertJournalHistory(helper.parmErrorJournalId(), vendNettingFileHeader.FileId, helper.parmError());
+                helper.updateVendNettingFilesheaderStatus(vendNettingFileHeader, true);
+                helper.updateHeaderErrorNotes(vendNettingFileHeader, helper.parmError());
+
+                helper.updateNettingLinesForInsideCustomer();
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProjInvoiceJournalPostTAS_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(ClassStr(ProjInvoiceJournalPost))]
+final class ProjInvoiceJournalPostTAS_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts a journal.
+    /// </summary>
+    public void run()
+    {
+        SKS_CC_CreditCardPaymentJournal sKS_CC_CreditCardPaymentJournal;
+        CreditCardAuthTrans             creditCardAuthTrans;
+        boolean                         isRefund;
+
+        void updateProjProposalJourAuthorizationError(ProjProposalId _projProposalId, NoYes _hasError)
+        {
+            ProjProposalJour projProposalJourLocal = ProjProposalJour::find(_projProposalId, true);
+
+            if(projProposalJourLocal &&
+                projProposalJourLocal.Payment &&
+                SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(projProposalJourLocal.Payment))
+            {
+                projProposalJourLocal.SKS_CC_CreditCardAuthorizationError = _hasError;
+                projProposalJourLocal.update();
+            }
+        }
+
+        boolean isCCInvoiceProposalEnabled = SKS_PP_Setup::isCreditCardInvoiceProposalEnabled();
+        if (isCCInvoiceProposalEnabled)
+        {
+            if (!this.isProforma())
+            {
+                ttsbegin;
+
+                updateProjProposalJourAuthorizationError(projInvoiceJour.ProposalId, NoYes::No);
+            }
+        }
+
+        next run();
+
+        if (isCCInvoiceProposalEnabled)
+        {
+            if (!this.isProforma())
+            {
+                isRefund = projInvoiceJour.InvoiceAmount < 0;
+                if (this.sKS_CC_CreditCardDoCaptureOrPostAuth(projInvoiceJour.ProjInvoiceId, isRefund, projInvoiceJour))
+                {
+                    ttscommit;
+
+                    if (projInvoiceJour.remainAmountToBePaid() && projInvoiceJour.Payment && SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(projInvoiceJour.Payment))
+                    {
+                        // Create the payment journal and settle this project invoice with credit card payment.
+                        sKS_CC_CreditCardPaymentJournal = SKS_CC_CreditCardPaymentJournal::construct(projInvoiceJour);
+                        sKS_CC_CreditCardPaymentJournal.run();
+                    }
+                }
+                else
+                {
+                    // Credit card capture failed.  Abort to not post the invoice.
+                    ttsabort;
+
+                    if (isRefund)
+                    {
+                        creditCardAuthTrans = CreditCardAuthTrans::sKS_CC_findLastDeclinedRefundByProjInv(projInvoiceJour.ProjInvoiceId);
+                    }
+                    else
+                    {
+                        creditCardAuthTrans = CreditCardAuthTrans::sKS_CC_findLastDeclinedChargeByProjInv(projInvoiceJour.ProjInvoiceId);
+                    }
+
+                    ttsbegin;
+                    if (creditCardAuthTrans)
+                    {
+                        creditCardAuthTrans.selectForUpdate(true);
+                        // no posting so invoice id does not apply
+                        creditCardAuthTrans.SKS_CC_ProjInvoiceId = '';
+                        creditCardAuthTrans.SalesInvoiceId = '';
+                        creditCardAuthTrans.update();
+                    }
+
+                    // Put the Project Invoice Proposal into the "Credit card issues list"
+                    updateProjProposalJourAuthorizationError(projInvoiceJour.ProposalId, NoYes::Yes);
+                    ttscommit;
+
+                    throw error(strFmt("@SKS6718", projInvoiceJour.ProposalId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postFailed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Called when the posting of a journal fails.
+    /// </summary>
+    /// <param name="_logText">
+    /// A String with an error message.
+    /// </param>
+    public void postFailed(LogText _logText)
+    {
+        //SKS-Begin
+        CreditCardAuthTrans         creditCardAuthTransToVoid;
+        boolean                     voidOK;
+        str                         transTypeForVoid;
+
+        if (SKS_PP_Setup::isCreditCardInvoiceProposalEnabled())
+        {
+            if (projInvoiceJour.ProjInvoiceId)
+            {
+                if (projInvoiceJour.InvoiceAmount < 0)
+                {
+                    creditCardAuthTransToVoid = CreditCardAuthTrans::sKS_CC_findRefundByProjInvoice(projInvoiceJour.ProjInvoiceId);
+                }
+                else
+                {
+                    creditCardAuthTransToVoid = CreditCardAuthTrans::sKS_CC_findChargeByProjInvoice(projInvoiceJour.ProjInvoiceId);
+                }
+
+                if (creditCardAuthTransToVoid)
+                {
+                    const str constRefund = 'Refund';
+                    const str constCapture = 'Capture';
+
+                    transTypeForVoid = creditCardAuthTransToVoid.ApprovalType == CreditCardOperation::Refund ? constRefund : constCapture;
+
+                    voidOK = SKS_CC_CreditCardProcess::sKS_CC_DoVoidCapture(creditCardAuthTransToVoid, false, strFmt("@SKS6494", transTypeForVoid, creditCardAuthTransToVoid.Authorization));
+                    if (voidOK)
+                    {
+                        info(strFmt("@SKS6495", transTypeForVoid, creditCardAuthTransToVoid.Authorization));
+                    }
+                    else
+                    {
+                        error(strFmt("@SKS6496", strLwr(transTypeForVoid), creditCardAuthTransToVoid.Authorization));
+                    }
+                }
+            }
+        }
+
+        next postFailed(_logText);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_CreditCardDoCaptureOrPostAuth</Name>
+				<Source><![CDATA[
+    public boolean sKS_CC_CreditCardDoCaptureOrPostAuth(ProjInvoiceId _projInvoiceId, boolean _isRefund, ProjInvoiceJour _projInvoiceJour)
+    {
+        boolean success = true;
+        SKS_CC_CustPaymTable sKS_CC_CustPaymTable;
+        CreditCardAuthTrans creditCardAuthTrans;
+        AmountCur creditCardAmountSKS;
+
+        creditCardAmountSKS = _projInvoiceJour.remainAmountToBePaid();
+
+        // Only if payment terms is credit card
+        if (creditCardAmountSKS && _projInvoiceJour.Payment && SKS_CC_CustPaymTable::IsCreditCardPaymentTerms(_projInvoiceJour.Payment))
+        {
+            sKS_CC_CustPaymTable = ProjInvoiceJournalPost::sKS_CC_FindCCPaymRecordForProjInv(_projInvoiceJour);
+            if (!sKS_CC_CustPaymTable)
+            {
+                throw error(strFmt("@SKS6721", _projInvoiceJour.ProposalId));
+            }
+
+            if (_isRefund)
+            {
+                success = SKS_CC_CreditCardProcess::sKS_CC_DoRefundFromProjInvoice(
+                    sKS_CC_CustPaymTable,
+                    _projInvoiceJour.ProjInvoiceId,
+                    _projInvoiceJour,
+                    creditCardAmountSKS);
+            }
+            else
+            {
+                if (sKS_CC_CustPaymTable.RefTableId == tableNum(SMAServiceOrderTable))
+                {
+                    creditCardAuthTrans = CreditCardAuthTrans::sKS_CC_FindValidPreApproval(sKS_CC_CustPaymTable.RecId);
+                    if (creditCardAuthTrans)
+                    {
+                        success = SKS_CC_CreditCardProcess::sKS_CC_DoCaptureFromProjInvoice(
+                            creditCardAuthTrans,
+                            _projInvoiceJour.ProjInvoiceId,
+                            _projInvoiceJour,
+                            creditCardAmountSKS);
+                    }
+                    else
+                    {
+                        success = SKS_CC_CreditCardProcess::sKS_CC_DoCaptureFromProjInvoice(
+                            sKS_CC_CustPaymTable,
+                            _projInvoiceJour.ProjInvoiceId,
+                            _projInvoiceJour,
+                            creditCardAmountSKS);
+                    }
+                }
+                else
+                {
+                    success = SKS_CC_CreditCardProcess::sKS_CC_DoCaptureFromProjInvoice(
+                        sKS_CC_CustPaymTable,
+                        _projInvoiceJour.ProjInvoiceId,
+                        _projInvoiceJour,
+                        creditCardAmountSKS);
+                }
+            }
+        }
+
+        return success;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_FindCCPaymRecordForProjInv</Name>
+				<Source><![CDATA[
+    public static SKS_CC_CustPaymTable sKS_CC_FindCCPaymRecordForProjInv(ProjInvoiceJour _projInvoiceJour)
+    {
+        SKS_CC_CustPaymTable sKS_CC_CustPaymTable;
+        ProjProposalJour projProposalJour;
+        SMAServiceOrderTable serviceOrderTable;
+
+        if (!_projInvoiceJour && !_projInvoiceJour.ProposalId)
+        {
+            return null;
+        }
+
+        projProposalJour = ProjProposalJour::find(_projInvoiceJour.ProposalId);
+        if (!projProposalJour)
+        {
+            return null;
+        }
+
+        sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findPendingPayment(projProposalJour.TableId, projProposalJour.RecId);
+        if (!sKS_CC_CustPaymTable)
+        {
+            if (_projInvoiceJour.InvoiceAmount > 0)
+            {
+                if (projProposalJour.SKS_CC_ServiceOrderId)
+                {
+                    serviceOrderTable = SMAServiceOrderTable::find(projProposalJour.SKS_CC_ServiceOrderId);
+                }
+
+                if (!serviceOrderTable)
+                {
+                    serviceOrderTable = SKS_CC_CustPaymTable::getServiceOrderFromProposal(projProposalJour);
+                }
+
+                if (serviceOrderTable)
+                {
+                    sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findCCPaymWithApprovedAuthorization(serviceOrderTable.TableId, serviceOrderTable.RecId);
+                    if (!sKS_CC_CustPaymTable)
+                    {
+                        sKS_CC_CustPaymTable = SKS_CC_CustPaymTable::findPendingAuthorization(serviceOrderTable.TableId, serviceOrderTable.RecId);
+                    }
+                }
+            }
+        }
+
+        return sKS_CC_CustPaymTable;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EPY_PaymentCreationEPay</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class is separated from SKS_EPY_PaymentCreation
+/// Anything in this class had a dependency on SKS.ePay.dll
+/// SKS.ePay.dll has a dependency on the AX SKS_EPY_PaymentCreation class
+/// </summary>
+class SKS_EPY_PaymentCreationEPay
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreateJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create journal line
+    /// </summary>
+    /// <param name = "Paym">Paym</param>
+    /// <param name = "lLedgerJournalTable">lLedgerJournalTable</param>
+    /// <param name = "sks_epy_setup">sks_epy_setup</param>
+    /// <param name = "SKS_EPY_Queue">SKS_EPY_Queue</param>
+    /// <param name = "ePayPaymMode">ePayPaymMode</param>
+    /// <returns>ePay queue record</returns>
+    public static SKS_EPY_Queue CreateJournalLine(SKS.ePayData.Payment Paym, LedgerJournalTable lLedgerJournalTable, sks_epy_setup sks_epy_setup, SKS_EPY_Queue SKS_EPY_Queue, PaymMode ePayPaymMode)
+    {
+        int64               ledgerDimension;
+        sks_epy_setup       lSKS_EPY_Setup;
+        AmountCur           paymAmount;
+        AmountCur           FeeAmount;
+        CustTable           lCusttable;
+        CustAccount         cust;
+        LedgerJournalTrans  lLedgerJournalTrans;
+        LedgerJournalEngine_CustPayment     ledgerJournalEngine;
+        ledgerJournalEngine = LedgerJournalEngine::construct(LedgerJournalType::CustPayment);
+        ledgerJournalEngine.ledgerJournalTable(lLedgerJournalTable);
+        ledgerJournalEngine.newJournalActive(lLedgerJournalTable);
+
+        try
+        {
+            ttsBegin;
+
+            lSKS_EPY_Setup = SKS_epy_setup::find();
+            lledgerJournalTrans.clear();
+            lLedgerJournalTrans.initValue();
+            ledgerJournalEngine.initValue(lLedgerJournalTrans);
+            paymAmount = Paym.get_Amount();
+            FeeAmount = Paym.get_AdditionalFeeAmount();
+            lLedgerJournalTrans.AmountCurCredit = paymAmount - FeeAmount;
+            lLedgerJournalTrans.JournalNum = lLedgerJournalTable.JournalNum;
+            lLedgerJournalTrans.Company = lLedgerJournalTable.company();
+            lLedgerJournalTrans.SettleVoucher = SettlementType::None;
+            lLedgerJournalTrans.LoadingDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            lLedgerJournalTrans.PaymMode = ePayPaymMode;
+            lLedgerJournalTrans.BankTransType = CustPaymModeTable::find(lLedgerJournalTrans.PaymMode).BankTransType;
+            lLedgerJournalTrans.DocumentDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+
+            changeCompany(lLedgerJournalTable.company())
+            {
+                cust = Paym.get_CustomerID();
+                select firstonly lCustTable where lCustTable.AccountNum == cust;
+                if(lCusttable.InvoiceAccount != '')
+                {
+                    ledgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(lCusttable.InvoiceAccount, LedgerJournalACType::Cust);
+                }
+                else
+                {
+                    ledgerDimension = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(lCusttable.AccountNum, LedgerJournalACType::Cust);
+                }
+            }
+
+            lLedgerJournalTrans.LedgerDimension = ledgerDimension;
+            
+            str invoiceId = '';
+            InvoiceDate invoiceDate = dateNull();
+
+            [invoiceId, invoiceDate] = SKS_EPY_PaymentCreationEPay::checkSettledInvoice(Paym);
+            boolean settledInvoiceFlag = (invoiceId == '') ? false : true;
+          
+            if(lSKS_EPY_Setup.UseInvDim && lSKS_EPY_Setup.DefaultDimIfNoInv && !settledInvoiceFlag)
+            {
+                lLedgerJournalTrans.DefaultDimension = lSKS_EPY_Setup.EPYDefaultDim;
+            }
+
+            if(( lSKS_EPY_Setup.UseInvDim  && !lSKS_EPY_Setup.DefaultDimIfNoInv && !settledInvoiceFlag) 
+                 || (!lSKS_EPY_Setup.UseInvDim  && !lSKS_EPY_Setup.DefaultDimIfNoInv && !settledInvoiceFlag) 
+                 || (!lSKS_EPY_Setup.UseInvDim  && !lSKS_EPY_Setup.DefaultDimIfNoInv &&  settledInvoiceFlag) )
+            {
+                lLedgerJournalTrans.DefaultDimension = CustTable::find(Paym.get_CustomerID()).DefaultDimension;
+            }
+
+            if(lSKS_EPY_Setup.UseInvDim  && lSKS_EPY_Setup.DefaultDimIfNoInv && settledInvoiceFlag)
+            {
+                // invoice dimensions
+                lLedgerJournalTrans.DefaultDimension = CustInvoiceTable::findPostedInvoice(Paym.get_CustomerID(), invoiceId, invoiceDate).DefaultDimension;
+            }
+            
+            
+            lLedgerJournalTrans.OffsetDefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(CustTable::find(Paym.get_CustomerID()).DefaultDimension, BankAccountTable::find(LedgerDimensionFacade::getDisplayValueForLedgerDimension(lLedgerJournalTable.OffsetLedgerDimension)).DefaultDimension);            
+           
+            lLedgerJournalTrans.ImportDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            lLedgerJournalTrans.CurrencyCode = Paym.get_CurrencyID();
+            ledgerJournalEngine.currencyModified(lLedgerJournalTrans);
+            lLedgerJournalTrans.Txt = Paym.get_Description();
+            lLedgerJournalTrans.SKS_EPY_PmtNbr = Paym.get_PaymentID();
+                        
+            if (lSKS_EPY_Setup.EPYAuthCodeValue == SKS_CC_AuthCodeValue::OriginationId)
+            {
+                lLedgerJournalTrans.PaymReference = Paym.getOriginationIdString();            
+            }
+            else 
+            {
+                lLedgerJournalTrans.PaymReference = Paym.getPayfabricTransactionIdString();
+            }
+
+            lLedgerJournalTrans.insert();
+            if(lsks_epy_setup.ePayFees == NoYes::Yes)
+            {
+                SKS_LB_Payment::LBFee(lLedgerJournalTrans, lsks_epy_setup.ePayFeeId , FeeAmount * -1, Paym.get_CustomerID());
+            }
+
+            SKS_EPY_Queue.PaymLineRecID = lLedgerJournalTrans.RecId;
+
+            SKS_EPY_Queue = SKS_EPY_PaymentCreationEpay::SettlementCreation(Paym, lLedgerJournalTable,  lLedgerJournalTrans, SKS_EPY_Queue , sks_epy_setup);
+            ttsCommit;
+        }
+        catch(Exception::Error)
+        {
+            SKS_EPY_Queue.ErrorWarning = "@SKS3369";
+            throw Exception::Error;
+        }
+
+        return SKS_EPY_Queue;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSettledInvoice</Name>
+				<Source><![CDATA[
+    private static container checkSettledInvoice(SKS.ePayData.Payment Paym)
+    {
+        System.Collections.IList    InvList;
+        SKS.ePayData.InvoicePayment    TmpInvPaym;
+        InvList = Paym.Invoices;
+        str invoiceId = '';
+        CustTransOpen local_CustTransOpen;
+        InvoiceDate invoiceDate = dateNull();
+            
+        System.Collections.IEnumerator enumerator;
+        int length = 0;
+        enumerator = InvList.getEnumerator();
+        while(enumerator.moveNext())
+        {
+            length++;
+        }
+            
+        if(length > 0)
+        {
+            TmpInvPaym = InvList.get_item(0);
+            invoiceId = TmpInvPaym.get_InvoiceID();
+
+            select crosscompany local_CustTransOpen where local_CustTransOpen.RecId == str2Int64(TmpInvPaym.get_Identity());
+            invoiceDate = local_CustTransOpen.TransDate;
+        }
+
+        return [invoiceId, InvoiceDate];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SettlementCreation</Name>
+				<Source><![CDATA[
+    public static SKS_EPY_Queue SettlementCreation(SKS.ePayData.Payment pmt, LedgerJournalTable lLedgerJournalTable, LedgerJournalTrans lLedgerJouranlTrans,  SKS_EPY_Queue SKS_EPY_Queue, SKS_EPY_Setup ePaySetup)
+    {
+        Boolean InvoiceFound = false;
+        int numrecords;
+        int counter;
+        str ErrorTxt;
+        System.Collections.IList    InvList;
+        SKS.ePayData.InvoicePayment    TmpInvPaym;
+
+        InvList = pmt.Invoices;
+        numrecords = InvList.get_count();
+
+        for(counter = 0; counter < numrecords; Counter++)
+        {
+            TmpInvPaym = InvList.get_item(Counter);
+            InvoiceFound = true;
+            errorTxt = SKS_EPY_PaymentCreation::CreateSettlements(TMpInvPaym, pmt, lLedgerJouranlTrans);
+            if(errorTxt != '')
+            {
+                SKS_EPY_Queue.ErrorWarning = errorTxt;
+                SKS_EPY_Queue.Status = SKS_EPY_Status::CompletedWithWarnings;
+                SKS_EPY_Queue.PaymLineRecID = lLedgerJouranlTrans.RecId;
+                SKS_EPY_Queue.JournalNum = lLedgerJournalTable.JournalNum;
+            }
+        }
+
+        if (InvoiceFound == false)
+        {
+            SKS_EPY_Setup    lSetup = SKS_EPY_Setup::find();
+            if(lSetup.UseInvDim && lSetup.DefaultDimIfNoInv)
+            {
+                //Default from setup
+                lLedgerJouranlTrans.DefaultDimension = lSetup.epyDefaultDIM;
+                lLedgerJouranlTrans.update();
+            }
+            SKS_EPY_Queue.ErrorWarning = "@SKS6227";
+            SKS_EPY_Queue.Status = SKS_EPY_Status::CompletedWithWarnings;
+            SKS_EPY_Queue.PaymLineRecID = lLedgerJouranlTrans.RecId;
+            SKS_EPY_Queue.JournalNum = lLedgerJournalTable.JournalNum;
+        }
+        else if(SKS_EPY_Setup::find().UseInvDim)
+        {
+            SKS_EPY_PaymentCreationEPay::RecalcJournalAmounts(lLedgerJouranlTrans);
+        }
+
+        SKS_EPY_PaymentCreation::UpdateEPayStatus(ePaySetup, true, SKS_EPY_Queue.ErrorWarning, pmt.Id);
+        return SKS_EPY_Queue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RecalcJournalAmounts</Name>
+				<Source><![CDATA[
+    Public static void RecalcJournalAmounts(LedgerJournalTrans _LedgerJournalTrans)
+    {
+        LedgerJournalTrans  UpdLedgerJournalTrans;
+        SpecTrans           lSpecTrans;
+        AmountCur           TotalSettleAmtPerPmt;
+        AmountCur           RemainingPMTAmt = _LedgerJournalTrans.amountCurCredit;
+
+        select forupdate UpdLedgerJournalTrans where UpdLedgerJournalTrans.JournalNum == _LedgerJournalTrans.journalnum;
+
+        while(UpdLedgerJournalTrans)
+        {
+            TotalSettleAmtPerPmt = 0;
+
+            while select balance01 from  lSpecTrans where lSpecTrans.SpecCompany == UpdLedgerJournalTrans.dataareaid
+                && lSpecTrans.SpecRecId == UpdLedgerJournalTrans.RecId
+                && lSpecTrans.SpecTableId == UpdLedgerJournalTrans.TableId
+            {
+                TotalSettleAmtPerPmt += lSpecTrans.balance01;
+            }
+
+            if (TotalSettleAmtPerPmt == 0)
+            {
+                //This is for when a payment is made but the invoice is marked in another settlement.
+                TotalSettleAmtPerPmt = UpdLedgerJournalTrans.AmountCurCredit;
+            }
+
+            UpdLedgerJournalTrans.amountCurCredit = TotalSettleAmtPerPmt;
+            RemainingPMTAmt -= TotalSettleAmtPerPmt;
+            UpdLedgerJournalTrans.update();
+
+            next UpdLedgerJournalTrans;
+        }
+
+        if(RemainingPMTAmt > 0)
+        {
+            select forupdate UpdLedgerJournalTrans where UpdLedgerJournalTrans.JournalNum == _LedgerJournalTrans.journalnum;
+            UpdledgerJournalTrans.amountCurCredit += RemainingPMTAmt;
+            UpdledgerJournalTrans.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

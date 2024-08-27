@@ -1,0 +1,606 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_APR_RemitAttachDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Report DP class for AP Advice reports.
+/// </summary>
+[SRSReportParameterAttribute(classStr(SKS_APR_RemitAttachContract))]
+class SKS_APR_RemitAttachDP extends SrsReportDataProviderPreProcessTempDB
+{
+    SKS_APR_RemitAttachReportTmp    remitAttachReportTmp;
+    SKS_APR_RemitAttachContract     remitAttachContract;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getRemitAttachReportTmp</Name>
+				<Source><![CDATA[
+    [
+    SRSReportDataSetAttribute(tableStr(SKS_APR_RemitAttachReportTmp))
+    ]
+        public SKS_APR_RemitAttachReportTmp getRemitAttachReportTmp()
+    {
+        select remitAttachReportTmp;
+        return remitAttachReportTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    public void processReport()
+    {
+        this.insertTmpTable();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTmpTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// inserts data into tmp table
+    /// </summary>
+    [SuppressBPWarningAttribute('BPCheckInsertMethodInLoop', 'The remitAttachReportTmp buffer must be inserted in the loop in the method insertTmpTable(). Use of the CAR compliant RecordInsertList instead of the .insert() results in a SQL blocking condition when the Update_Recordset is executed on the remitAttachReportTmp table at the end of processing.')]
+    public void insertTmpTable()
+    {
+        RecId                       sks_EFTAP_FileRecID;
+        sks_eft_FileDetail          sks_eft_FileDetail;
+        sks_eft_FileDetail          sks_eft_FileDetailSummary;
+        VendTrans                   vendTransInvoice;
+        VendTable                   vendTableAP;
+        VendTable                   vendTableOrderAccount;
+        SKS_EFT_Bank                sks_eft_Bank;
+        CompanyInfo                 companyInfo = CompanyInfo::find();
+        BankAccountTable            bankAccountTable;
+        LogisticsPostalAddress      vendorAPPostalAddress;
+        LogisticsPostalAddress      companyAPPostalAddress;
+        container                   locCompanies;
+        CurrencyExchangeHelper      currencyHelper;
+        str                         paymentRef;
+        RefRecId                    oldPaymentReference;
+        SKS_EB_Vendor               sks_EB_Vendor;
+        //SKS IHB 9615
+        BankAccountID               inHouseBank;
+        SKS_PP_Bank                 sks_PP_Bank;
+        //SKS IHB 9615
+        //SKS 16746
+        boolean                     locHideDueDate = false;
+        //SKS 16746
+
+        RecordInsertList            invoicesToBeInserted = new RecordInsertList(tableNum(SKS_APR_RemitAttachReportTmp),
+                                                                                true, // skip insert
+                                                                                true, // skip database log
+                                                                                true, // skip events
+                                                                                true, // skip aos validation
+                                                                                false, // skip RLS validation
+                                                                                remitAttachReportTmp);
+
+        remitAttachContract = this.parmDataContract() as SKS_APR_RemitAttachContract;
+        sks_EFTAP_FileRecID = remitAttachContract.parmSKS_EFTAP_File_RecordId();
+
+        //SKS IHB 9615
+        inHouseBank = remitAttachContract.parmIHB();
+        sks_PP_Bank = SKS_PP_Bank::find(inHouseBank);//FDD-10590 //SKS_Bug_12537
+        //16746
+        locHideDueDate = remitAttachContract.parmHideDueDate();
+
+        //SKS 14816, RemitAttachControllerV2 -->
+        boolean isRemitAttachControllerV2 = remitAttachContract.parmIsRemitAttachControllerV2();
+        SKF_EFT_APSRSRemitAttachDetailBodyText remitAttachDetailBodyTextV2;
+        if (isRemitAttachControllerV2)
+        {
+            SKS_EFT_Setup eftSetup = SKS_EFT_Setup::find();
+            remitAttachDetailBodyTextV2 = eftSetup.APSRSRemitAttachDetailBodyText;
+        }
+        //SKS 14816, RemitAttachControllerV2 <--
+
+        if(sks_PP_Bank.IHB_Remit == NoYes::Yes)
+        {
+            paymentRef = '';
+
+            while select sks_eft_FileDetail
+                where sks_eft_FileDetail.FileRecId == sks_EFTAP_FileRecID
+                        && sks_eft_FileDetail.InvoiceSettleAmountCur != 0
+                        && sks_eft_FileDetail.AccountNum == remitAttachContract.parmVendAccount()
+                        && sks_eft_FileDetail.EFTAP_IHBBankAccount == inHouseBank
+                        && sks_eft_FileDetail.BankAccountId == remitAttachContract.parmBankAccountID()
+                        && sks_eft_FileDetail.AccountCompany == remitAttachContract.parmAccountCompany()
+                        && (sks_eft_FileDetail.PaymentCompany == remitAttachContract.parmPaymentCompany()
+                            || (sks_eft_FileDetail.PaymentCompany == '' && remitAttachContract.parmPaymentCompany() == curExt()))//FDD-10590
+            {
+                locCompanies = [sks_eft_FileDetail.AccountCompany];
+
+                currencyHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(sks_eft_FileDetail.AccountCompany).RecId), sks_eft_FileDetail.PaymentTransDate);
+
+                select firstonly crosscompany vendTransInvoice
+                    where vendTransInvoice.RecId == sks_eft_FileDetail.VendTransRecId;
+
+                if(!sks_eft_FileDetail.PaymentCompany)  //FDD-10590
+                {
+                    select firstonly sks_eft_Bank
+                        where sks_eft_Bank.BankAccountId == sks_eft_FileDetail.BankAccountId
+                            && sks_eft_Bank.PaymMode     == sks_eft_FileDetail.PaymMode;
+
+                    select firstonly  bankAccountTable
+                        where bankAccountTable.AccountID == sks_eft_FileDetail.BankAccountId;
+                }
+                else  //FDD-10590 --->
+                {
+                    sks_eft_Bank = sks_eft_Bank::findByCompany(sks_eft_FileDetail.PaymentCompany, sks_eft_FileDetail.BankAccountId, sks_eft_FileDetail.PaymMode);
+                    bankAccountTable = bankAccountTable::findByCompany(sks_eft_FileDetail.PaymentCompany, sks_eft_FileDetail.BankAccountId);
+                }  //<--- FDD-10590
+
+                select firstonly PaymentReference,RecId from sks_eft_FileDetailSummary
+                    where sks_eft_FileDetailSummary.FileRecId == sks_EFTAP_FileRecID
+                        && sks_eft_FileDetailSummary.RecordSummary  == SKS_EFT_RecordSummary::Payment
+                        && sks_eft_FileDetailSummary.AccountNum == remitAttachContract.parmVendAccount()
+                        && sks_eft_FileDetailSummary.RecordSummary != 0
+                        && sks_eft_FileDetailSummary.RecId != oldPaymentReference;
+
+                select firstonly crosscompany:locCompanies vendTableAP
+                    where vendTableAP.AccountNum == sks_eft_FileDetail.AccountNum;
+
+                select firstonly crosscompany:locCompanies vendTableOrderAccount
+                    where vendTableOrderAccount.AccountNum == vendTransInvoice.AccountNum;
+
+                if(!sks_eft_FileDetail.PaymentCompany)  //FDD-10590
+                {
+                    select firstonly sks_EB_Vendor
+                        where sks_EB_Vendor.VendAccount == sks_eft_FileDetail.AccountNum
+                            && sks_EB_Vendor.VendCompany == sks_eft_FileDetail.AccountCompany;
+                }
+                else //FDD-10590 --->
+                {
+                    sks_EB_Vendor = sks_EB_Vendor::findByCompany(sks_eft_FileDetail.PaymentCompany, sks_eft_FileDetail.AccountNum, sks_eft_FileDetail.AccountCompany);
+                }
+                sks_PP_Bank = SKS_PP_Bank::find(inHouseBank); //<--- FDD-10590
+
+                remitAttachReportTmp.clear();
+
+                remitAttachReportTmp.TemplateLanguage   =   sks_EB_Vendor.EMTemplateLanguage;
+
+                remitAttachReportTmp.TransDate          = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+
+                remitAttachReportTmp.AccountNumber      = sks_eft_FileDetail.AccountNum;
+                remitAttachReportTmp.ContactName        = sks_PP_Bank.APContactName;
+                remitAttachReportTmp.ContactPhone       = sks_PP_Bank.APContactPhone;
+                remitAttachReportTmp.ContactEmail       = sks_PP_Bank.APContactEmail;
+
+                remitAttachReportTmp.InvoiceNumber      = sks_eft_FileDetail.InvoiceNumber;
+                remitAttachReportTmp.InvoiceDate        = sks_eft_FileDetail.InvoiceDate;
+                remitAttachReportTmp.DueDate            = vendTransInvoice.DueDate;
+                
+                remitAttachReportTmp.InvoicedAmount     = vendTransInvoice.AmountCur * -1;
+
+                remitAttachReportTmp.CashDiscAmount     = sks_eft_FileDetail.InvoiceDiscAmountPmtCur * -1;
+                remitAttachReportTmp.Currency           = sks_eft_FileDetail.PaymentCurrencyCode;
+                remitAttachReportTmp.PaymentDate        = sks_eft_FileDetail.EffectiveDate;
+                remitAttachReportTmp.PaymentAmount      = sks_eft_FileDetail.InvoiceSettleAmountPmtCur * -1;
+
+                // <18063>
+                SKS_EFT_VendorPaym sks_eft_vendorpaym = SKS_EFT_VendorPaym::findByCompany(sks_eft_FileDetail.PaymentCompany ? sks_eft_FileDetail.PaymentCompany : sks_eft_FileDetail.DataAreaId,sks_eft_FileDetail.AccountCompany, sks_eft_FileDetail.AccountNum,
+                                                               sks_eft_FileDetail.PaymMode, sks_eft_FileDetail.PaymSpec, sks_eft_FileDetail.DepBankAccountId);
+
+                SKS_EFT_FileFormatPaymSpec sks_eft_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(sks_eft_FileDetail.PaymentCompany ? sks_eft_FileDetail.PaymentCompany : sks_eft_FileDetail.DataAreaId,
+                                                                               sks_eft_FileDetail.FormatId, sks_eft_FileDetail.PaymSpec);
+
+                LedgerJournalTrans      lLedgerJournalTrans;
+                LogisticsLocation       lLogisticsLocation;
+
+                if((sks_eft_FileFormatPaymSpec.UseCheckNumber == NoYes::Yes && sks_eft_FileDetail.PaymentLineRecId) || sks_eft_vendorpaym.WBeneRemittanceLocation)
+                {
+                    if(sks_eft_FileFormatPaymSpec.UseCheckNumber == NoYes::Yes && sks_eft_FileDetail.PaymentLineRecId)
+                    {
+                        select firstonly crosscompany RemittanceLocation
+                            from lLedgerJournalTrans
+                                where lLedgerJournalTrans.Recid == sks_eft_FileDetail.PaymentLineRecId
+                            join vendorAPPostalAddress
+                                where vendorAPPostalAddress.Location == lLedgerJournalTrans.RemittanceLocation;
+
+                        lLogisticsLocation = LogisticsLocation::find(lLedgerJournalTrans.RemittanceLocation);
+                    }
+                    else // Populate from D365 address specified on vendor ebanking details - payment spec, not specific fields
+                    {
+                        select firstonly *
+                            from vendorAPPostalAddress
+                                where vendorAPPostalAddress.Location == sks_eft_vendorpaym.WBeneRemittanceLocation;
+
+                        lLogisticsLocation = LogisticsLocation::find(sks_eft_vendorpaym.WBeneRemittanceLocation);
+                    }
+                        
+                    remitAttachReportTmp.VendAddressAPEFT = vendorAPPostalAddress.RecId ? vendorAPPostalAddress.Address : vendTableAP.postalAddress().Address;
+                }
+                else
+                {
+                    var addressStringBuilderParameters = new LogisticsPostalAddressStringBuilderParameters();
+
+                    addressStringBuilderParameters.parmStreet(sks_eft_vendorpaym.WBeneAddr +' '+sks_eft_vendorpaym.WBeneAddr2);
+                    addressStringBuilderParameters.parmCityName(sks_eft_vendorpaym.WBeneCity);
+                    addressStringBuilderParameters.parmStateId(sks_eft_vendorpaym.WBeneState);
+                    addressStringBuilderParameters.parmZipCodeId(sks_eft_vendorpaym.WBeneZipPostal);
+                    addressStringBuilderParameters.parmCountryRegionId(sks_eft_vendorpaym.WBeneCountryRegionId);
+                        
+                    remitAttachReportTmp.VendAddressAPEFT =  LogisticsPostalAddressStringBuilder::buildAddressStringFromParameters(addressStringBuilderParameters);
+                }
+                // </18063>
+
+                remitAttachReportTmp.VendAddressAPEFT = strReplace(remitAttachReportTmp.VendAddressAPEFT, '\n', '\n\n');
+
+                // <18063>
+                if(vendorAPPostalAddress)
+                {
+                    remitAttachReportTmp.VendAddressAPEFTName = lLogisticsLocation.Description;
+                }
+                else
+                {
+                    remitAttachReportTmp.VendAddressAPEFTName = vendTableAP.name();
+                }
+                // </18063>
+
+                remitAttachReportTmp.VendAddressAPEFTName = vendTableAP.name();
+                changecompany(sks_PP_Bank.SKS_IHBLinkedinhousebankcompany)
+                {
+                    companyInfo = CompanyInfo::find();
+
+                    companyAPPostalAddress = DirParty::findPostalAddressByRole(companyInfo.RecId, LogisticsLocationRoleType::None);
+
+                    remitAttachReportTmp.CompanyAddress   = companyAPPostalAddress.RecId ? companyAPPostalAddress.Address
+                                                                                    : companyInfo.primaryAddress();
+
+                    remitAttachReportTmp.CompanyAddress   = strReplace(remitAttachReportTmp.CompanyAddress, '\n', '\n\n');
+
+                    remitAttachReportTmp.CompanyName      = companyInfo.name;
+                    remitAttachReportTmp.CompanyLogo      = CompanyImage::findByRecord(companyInfo).Image;
+
+                    remitAttachReportTmp.PhoneFooter      = con2Str(this.getPhoneAndFax(companyInfo.RecId,LogisticsElectronicAddressMethodType::Phone,"@SYS71417")); //9496
+                    remitAttachReportTmp.FaxFooter        = con2Str(this.getPhoneAndFax(companyInfo.RecId,LogisticsElectronicAddressMethodType::Fax,"@SYS71417")); //9496
+                    remitAttachReportTmp.VatNumber        = companyInfo.CoRegNum;
+                }
+
+                remitAttachReportTmp.DetailCurrency   = sks_eft_FileDetail.PaymentCurrencyCode;
+
+                //delegate caller. SKS 9584.
+                EventHandlerResult  result = new EventHandlerResult();
+                this.getCoustomFieldValuesDelegate(remitAttachReportTmp, sks_eft_FileDetail, result);
+                //End.
+
+                //SKS 14816, RemitAttachControllerV2 -->
+                if (isRemitAttachControllerV2)
+                {
+                    remitAttachReportTmp.RecordSummaryRecIdV2 = sks_eft_FileDetail.RecordSummaryRecId;
+                }
+                //SKS 14816, RemitAttachControllerV2 <--
+               
+                invoicesToBeInserted.add(remitAttachReportTmp);
+            }
+        }
+        else
+        {
+            while select sks_eft_FileDetail
+                where sks_eft_FileDetail.FileRecId == sks_EFTAP_FileRecID
+                     && sks_eft_FileDetail.InvoiceSettleAmountCur != 0
+                     && sks_eft_FileDetail.AccountNum == remitAttachContract.parmVendAccount()
+                     && sks_eft_FileDetail.BankAccountId == remitAttachContract.parmBankAccountID()
+                     && sks_eft_FileDetail.AccountCompany == remitAttachContract.parmAccountCompany()
+                     && (sks_eft_FileDetail.PaymentCompany == remitAttachContract.parmPaymentCompany()
+                            || (sks_eft_FileDetail.PaymentCompany == '' && remitAttachContract.parmPaymentCompany() == curExt()))//FDD-10590
+            {
+                if(SKS_PP_Bank::find(sks_eft_FileDetail.EFTAP_IHBBankAccount).IHB_Remit == NoYes::No) //SKS IHB 9615
+                {
+                    paymentRef = '';
+                    locCompanies = [sks_eft_FileDetail.AccountCompany];
+
+                    currencyHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(sks_eft_FileDetail.AccountCompany).RecId), sks_eft_FileDetail.PaymentTransDate);
+
+                    select firstonly crosscompany vendTransInvoice
+                        where vendTransInvoice.RecId == sks_eft_FileDetail.VendTransRecId;
+
+                    if(!sks_eft_FileDetail.PaymentCompany)
+                    {
+                        select firstonly sks_eft_Bank
+                            where sks_eft_Bank.BankAccountId == sks_eft_FileDetail.BankAccountId
+                                && sks_eft_Bank.PaymMode     == sks_eft_FileDetail.PaymMode;
+
+                        select firstonly bankAccountTable
+                            where bankAccountTable.AccountID == sks_eft_FileDetail.BankAccountId;
+                    }
+                    else //FDD-10590 --->
+                    {
+                        sks_eft_Bank = sks_eft_Bank::findByCompany(sks_eft_FileDetail.PaymentCompany, sks_eft_FileDetail.BankAccountId, sks_eft_FileDetail.PaymMode);
+                        bankAccountTable = bankAccountTable::findByCompany(sks_eft_FileDetail.PaymentCompany, sks_eft_FileDetail.BankAccountId);
+                    } //<--- FDD-10590
+
+                    select firstonly PaymentReference,RecId from sks_eft_FileDetailSummary
+                        where sks_eft_FileDetailSummary.FileRecId == sks_EFTAP_FileRecID
+                            && sks_eft_FileDetailSummary.RecordSummary  == SKS_EFT_RecordSummary::Payment
+                            && sks_eft_FileDetailSummary.AccountNum == remitAttachContract.parmVendAccount()
+                            && sks_eft_FileDetailSummary.RecordSummary != 0
+                            && sks_eft_FileDetailSummary.RecId != oldPaymentReference;
+
+                    select firstonly crosscompany:locCompanies vendTableAP
+                        where vendTableAP.AccountNum == sks_eft_FileDetail.AccountNum;
+
+                    select firstonly crosscompany:locCompanies vendTableOrderAccount
+                        where vendTableOrderAccount.AccountNum == vendTransInvoice.AccountNum;
+
+                    if(!sks_eft_FileDetail.PaymentCompany) //FDD-10590
+                    {
+                        select firstonly sks_EB_Vendor
+                            where sks_EB_Vendor.VendAccount == sks_eft_FileDetail.AccountNum
+                                && sks_EB_Vendor.VendCompany == sks_eft_FileDetail.AccountCompany;
+                    }
+                    else //FDD-10590--->
+                    {
+                        sks_EB_Vendor = sks_EB_Vendor::findByCompany(sks_eft_FileDetail.PaymentCompany, sks_eft_FileDetail.AccountNum, sks_eft_FileDetail.AccountCompany);
+                    } //<--- FDD-10590
+
+                    remitAttachReportTmp.clear();
+
+                    remitAttachReportTmp.TemplateLanguage   =   sks_EB_Vendor.EMTemplateLanguage;
+
+                    remitAttachReportTmp.TransDate          = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+
+                    remitAttachReportTmp.AccountNumber      = sks_eft_FileDetail.AccountNum;
+                    remitAttachReportTmp.ContactName        = sks_eft_Bank.APContactName;
+                    remitAttachReportTmp.ContactPhone       = sks_eft_Bank.APContactPhone;
+                    remitAttachReportTmp.ContactEmail       = sks_eft_Bank.APContactEmail;
+
+                    remitAttachReportTmp.InvoiceNumber      = sks_eft_FileDetail.InvoiceNumber;
+                    remitAttachReportTmp.InvoiceDate        = sks_eft_FileDetail.InvoiceDate;
+                    remitAttachReportTmp.DueDate            = vendTransInvoice.DueDate;
+                    remitAttachReportTmp.InvCurr            = vendTransInvoice.CurrencyCode;
+                    remitAttachReportTmp.InvoicedAmount     = vendTransInvoice.AmountCur * -1;
+
+                    remitAttachReportTmp.CashDiscAmount     = sks_eft_FileDetail.InvoiceDiscAmountPmtCur * -1;
+                    remitAttachReportTmp.Currency           = sks_eft_FileDetail.PaymentCurrencyCode;
+                    remitAttachReportTmp.PaymentDate        = sks_eft_FileDetail.EffectiveDate;
+                    remitAttachReportTmp.PaymentAmount      = sks_eft_FileDetail.InvoiceSettleAmountPmtCur * -1;
+
+                    // <18063>                     
+                    SKS_EFT_VendorPaym sks_eft_vendorpaym = SKS_EFT_VendorPaym::findByCompany(sks_eft_FileDetail.PaymentCompany ? sks_eft_FileDetail.PaymentCompany : sks_eft_FileDetail.DataAreaId,sks_eft_FileDetail.AccountCompany, sks_eft_FileDetail.AccountNum,
+                                                               sks_eft_FileDetail.PaymMode, sks_eft_FileDetail.PaymSpec, sks_eft_FileDetail.DepBankAccountId);
+
+                    SKS_EFT_FileFormatPaymSpec sks_eft_FileFormatPaymSpec = SKS_EFT_FileFormatPaymSpec::findByCompany(sks_eft_FileDetail.PaymentCompany ? sks_eft_FileDetail.PaymentCompany : sks_eft_FileDetail.DataAreaId,
+                                                                               sks_eft_FileDetail.FormatId, sks_eft_FileDetail.PaymSpec);
+
+                    LedgerJournalTrans      lLedgerJournalTrans;
+                    LogisticsLocation       lLogisticsLocation;                       
+
+                    if((sks_eft_FileFormatPaymSpec.UseCheckNumber == NoYes::Yes && sks_eft_FileDetail.PaymentLineRecId) || sks_eft_vendorpaym.WBeneRemittanceLocation)
+                    {
+                        if(sks_eft_FileFormatPaymSpec.UseCheckNumber == NoYes::Yes && sks_eft_FileDetail.PaymentLineRecId)
+                        {
+                            select firstonly crosscompany RemittanceLocation
+                            from lLedgerJournalTrans
+                                where lLedgerJournalTrans.Recid == sks_eft_FileDetail.PaymentLineRecId
+                            join vendorAPPostalAddress
+                                where vendorAPPostalAddress.Location == lLedgerJournalTrans.RemittanceLocation;
+
+                            lLogisticsLocation = LogisticsLocation::find(lLedgerJournalTrans.RemittanceLocation);
+                        }
+                        else // Populate from D365 address specified on vendor ebanking details - payment spec, not specific fields
+                        {
+                            select firstonly *
+                                from vendorAPPostalAddress
+                                where vendorAPPostalAddress.Location == sks_eft_vendorpaym.WBeneRemittanceLocation;
+
+                            lLogisticsLocation = LogisticsLocation::find(sks_eft_vendorpaym.WBeneRemittanceLocation);
+                        }
+                        
+                        remitAttachReportTmp.VendAddressAPEFT = vendorAPPostalAddress.RecId ? vendorAPPostalAddress.Address : vendTableAP.postalAddress().Address;
+                    }
+                    else
+                    {
+                        var addressStringBuilderParameters = new LogisticsPostalAddressStringBuilderParameters();
+
+                        addressStringBuilderParameters.parmStreet(sks_eft_vendorpaym.WBeneAddr +' '+sks_eft_vendorpaym.WBeneAddr2);
+                        addressStringBuilderParameters.parmCityName(sks_eft_vendorpaym.WBeneCity);
+                        addressStringBuilderParameters.parmStateId(sks_eft_vendorpaym.WBeneState);
+                        addressStringBuilderParameters.parmZipCodeId(sks_eft_vendorpaym.WBeneZipPostal);
+                        addressStringBuilderParameters.parmCountryRegionId(sks_eft_vendorpaym.WBeneCountryRegionId);
+                        
+                        remitAttachReportTmp.VendAddressAPEFT =  LogisticsPostalAddressStringBuilder::buildAddressStringFromParameters(addressStringBuilderParameters);
+                    }
+                    // </18063>
+                    
+                    remitAttachReportTmp.VendAddressAPEFT = strReplace(remitAttachReportTmp.VendAddressAPEFT, '\n', '\n\n');                                  
+                    
+                    // <18063>
+                    if(vendorAPPostalAddress)
+                    {
+                        remitAttachReportTmp.VendAddressAPEFTName = lLogisticsLocation.Description;
+                    }
+                    else
+                    {
+                        remitAttachReportTmp.VendAddressAPEFTName = vendTableAP.name();
+                    }                    
+                    // </18063>
+
+                    SelectableDataArea compAcct = sks_eft_FileDetail.PaymentCompany;
+                    if (!compAcct)
+                    {
+                        compAcct = sks_eft_FileDetail.AccountCompany;
+                    }
+
+                    if (!compAcct)
+                    {
+                        compAcct = curExt();
+                    }
+
+                    changecompany(compAcct)
+                    {
+                        companyInfo = CompanyInfo::find();
+                    
+                        companyAPPostalAddress = DirParty::findPostalAddressByRole(companyInfo.RecId, LogisticsLocationRoleType::None);
+
+                        remitAttachReportTmp.CompanyAddress   = companyAPPostalAddress.RecId ? companyAPPostalAddress.Address
+                                                                                    : companyInfo.primaryAddress();
+
+                        remitAttachReportTmp.CompanyAddress   = strReplace(remitAttachReportTmp.CompanyAddress, '\n', '\n\n');
+
+                        remitAttachReportTmp.CompanyName      = companyInfo.name;
+                        remitAttachReportTmp.CompanyLogo      = CompanyImage::findByRecord(companyInfo).Image;
+
+                        remitAttachReportTmp.PhoneFooter      = con2Str(this.getPhoneAndFax(companyInfo.RecId,LogisticsElectronicAddressMethodType::Phone,"@SYS71417")); //9496
+                        remitAttachReportTmp.FaxFooter        = con2Str(this.getPhoneAndFax(companyInfo.RecId,LogisticsElectronicAddressMethodType::Fax,"@SYS71417")); //9496
+                        remitAttachReportTmp.VatNumber        = companyInfo.CoRegNum;
+                    }
+                    //remitAttachReportTmp.GiroNum          = companyInfo.Giro;
+
+                    remitAttachReportTmp.DetailCurrency   = sks_eft_FileDetail.PaymentCurrencyCode;
+
+                    ///remitAttachReportTmp.BankAcct         = bankAccountTable.Name + '\n';
+                    //remitAttachReportTmp.DunsNumber       = companyInfo.editDunsNumber(true, DirDunsNumber::find(companyInfo.DunsNumberRecId).DunsNumber);
+                    //remitAttachReportTmp.FooterIBAN       = bankAccountTable.IBAN;
+                    // remitAttachReportTmp.FooterBIC        = bankAccountTable.SWIFTNo;
+
+                    //delegate caller. SKS 9584.
+                    EventHandlerResult  result = new EventHandlerResult();
+                    this.getCoustomFieldValuesDelegate(remitAttachReportTmp, sks_eft_FileDetail, result);
+                    //End.
+                    remitAttachReportTmp.InvCurr            = VendTransInvoice.CurrencyCode;
+
+                    //SKS 14816, RemitAttachControllerV2 -->
+                    if (isRemitAttachControllerV2)
+                    {
+                        remitAttachReportTmp.RecordSummaryRecIdV2 = sks_eft_FileDetail.RecordSummaryRecId;
+                    }
+                    //SKS 14816, RemitAttachControllerV2 <--
+
+                    invoicesToBeInserted.add(remitAttachReportTmp);
+                }
+            }
+        }
+
+        invoicesToBeInserted.insertDatabase();
+
+        //SKS 14816, RemitAttachControllerV2 -->
+        // If it is version 2 of controller then setting of payment reference
+        // is based on RecordSummaryRecId for current EFTFileDetail record.
+        if (isRemitAttachControllerV2)
+        {
+            while select PaymentReference, RecId from sks_eft_FileDetailSummary
+                where sks_eft_FileDetailSummary.FileRecId == sks_EFTAP_FileRecID
+                && sks_eft_FileDetailSummary.RecordSummary  == SKS_EFT_RecordSummary::Payment
+                && sks_eft_FileDetailSummary.AccountNum == remitAttachContract.parmVendAccount()
+            {
+                update_recordset remitAttachReportTmp
+                    setting PaymentReference = sks_eft_FileDetailSummary.PaymentReference,
+                            APSRSRemitAttachDetailBodyTextV2 = remitAttachDetailBodyTextV2
+                    where remitAttachReportTmp.RecordSummaryRecIdV2 == sks_eft_FileDetailSummary.RecId;
+            }            
+        }
+        else
+        {
+            //SKS 14816, RemitAttachControllerV2 <--
+
+            while select PaymentReference from sks_eft_FileDetailSummary
+                    where sks_eft_FileDetailSummary.FileRecId == sks_EFTAP_FileRecID
+                    && sks_eft_FileDetailSummary.RecordSummary  == SKS_EFT_RecordSummary::Payment
+                    && sks_eft_FileDetailSummary.AccountNum == remitAttachContract.parmVendAccount()
+                    && sks_eft_FileDetailSummary.RecordSummary != 0
+            {
+                paymentRef  += sks_eft_FileDetailSummary.PaymentReference + ',';
+            }
+
+            update_recordset remitAttachReportTmp
+                setting PaymentReference = strdel(paymentRef,strLen(paymentRef),strLen(paymentRef)), HideDueDate = locHideDueDate;
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPhoneAndFax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets phone and fax for directdebit role type.
+    /// </summary>
+    /// <param name = "_partyRecId">party rec id</param>
+    /// <param name = "_type">type</param>
+    /// <param name = "_role">role</param>
+    /// <returns>container</returns>    
+    public  container getPhoneAndFax(
+            DirPartyRecId _partyRecId,
+            LogisticsElectronicAddressMethodType _type = LogisticsElectronicAddressMethodType::Phone,
+            LogisticsLocationRoleName _role = '')
+    {
+        DirPartyLocation partyLocation;
+        LogisticsLocationRole locationRole;
+        LogisticsElectronicAddressRole addressRole;
+        LogisticsElectronicAddress address;
+        container electronicAddresses;
+
+        if(!_role)
+        {
+            return electronicAddresses;
+        }
+
+        select firstonly Locator
+            from address
+            where
+                address.Type == _type &&
+                address.Locator != ''
+            exists join locationRole
+                where
+                     locationRole.Name == _role
+            exists join addressRole
+                where
+                    addressRole.ElectronicAddress == address.RecId &&
+                    addressRole.LocationRole == locationRole.RecId
+            exists join partyLocation
+                where
+                    partyLocation.Location == address.Location &&
+            partyLocation.Party == _partyRecId;
+
+        electronicAddresses += address.Locator;
+
+        return electronicAddresses;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCoustomFieldValuesDelegate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// delegated for the Turkish report - SKS 9584
+    /// </summary>
+    /// <param name = "remitAttachReportTmp1">remitAttachReportTmp1</param>
+    /// <param name = "sks_eft_FileDetail">sks_eft_FileDetail</param>
+    /// <param name = "_result">_result</param>
+    delegate void getCoustomFieldValuesDelegate(SKS_APR_RemitAttachReportTmp remitAttachReportTmp1,sks_eft_FileDetail sks_eft_FileDetail, EventHandlerResult _result)
+    {
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getIHBRemitValues</Name>
+				<Source><![CDATA[
+    //End
+
+    /// <summary>
+    /// delegated for the IHB Remit Report - SKS 9615
+    /// </summary>
+    /// <param name = "remitAttachReportTmploc">remitAttachReportTmploc</param>
+    /// <param name = "sks_eft_FileDetail">sks_eft_FileDetail</param>
+    /// <param name = "_result">_result</param>
+    delegate void getIHBRemitValues(SKS_APR_RemitAttachReportTmp remitAttachReportTmploc,sks_eft_FileDetail sks_eft_FileDetail, EventHandlerResult _result)
+    {
+
+    }
+    //End
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

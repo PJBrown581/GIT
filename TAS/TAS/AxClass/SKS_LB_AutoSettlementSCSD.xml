@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_AutoSettlementSCSD</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Do auto-settlement using "Single credit to single debit"
+/// </summary>
+class SKS_LB_AutoSettlementSCSD
+{
+    CustTable                   custTable;
+    SKS_LB_AutoSettlementSetup  autoSettlementSetup;
+    SKS_LB_AutoSettlementRules  autoSettlementRules;
+    CustVendOpenTransManager    settleManager;
+    SpecTransManager            specTransManager_AutoSettlement;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_LB_AutoSettlementSCSD construct(CustTable _custTable, SKS_LB_AutoSettlementSetup _autoSettlement, SKS_LB_AutoSettlementRules _autosettlementRules)
+    {
+        SKS_LB_AutoSettlementSCSD autoSettlementSCSD;
+
+        autoSettlementSCSD = new SKS_LB_AutoSettlementSCSD(_custTable, _autoSettlement, _autosettlementRules);
+
+        return autoSettlementSCSD;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(CustTable _custTable, SKS_LB_AutoSettlementSetup _autoSettlement, SKS_LB_AutoSettlementRules _autosettlementRules)
+    {
+        custTable           = _custTable;
+        autoSettlementSetup = _autoSettlement;
+        autoSettlementRules = _autosettlementRules;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processAutoSettlementSCSD</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Auto-settlment process for the single credit to single debit
+    /// </summary>
+    public void processAutoSettlementSCSD()
+    {
+        CustTransOpen custTransOpenDebit, custTransOpenCredit;
+        Amount      diffAmount;
+        boolean             checkOK;
+
+        AmountCur creditAmount;
+        AmountCur debitAmount;
+
+        SKS_LB_AutoSettlementHelper autoSettlementHelper = SKS_LB_AutoSettlementHelper::construct(custTable);
+
+        //Credit open transactions
+        while select custTransOpenCredit
+            order by custTransOpenCredit.DueDate
+            where custTransOpenCredit.AccountNum == custTable.AccountNum
+            && custTransOpenCredit.AmountCur < 0
+        {
+            if (!autoSettlementHelper.validateParameterConstraint(custTransOpenCredit, autoSettlementRules.SettlementTypeId))
+            {
+                continue;
+            }
+
+            //Credit amount 
+            creditAmount = autoSettlementHelper.getSettlementCashDiscountAmount(autoSettlementRules.Discount, custTransOpenCredit.TransDate, custTransOpenCredit);
+
+            checkOK =  false; // reset CheckOK flag on every fresh credit transaction.
+            
+            debitAmount = 0;
+            //Fetch debit open transaction
+            while select custTransOpenDebit
+                order by custTransOpenDebit.DueDate
+                where custTransOpenDebit.AccountNum == custTable.AccountNum
+                && custTransOpenDebit.AmountCur > 0.0
+            {
+                if (!autoSettlementHelper.validateParameterConstraint(custTransOpenDebit, autoSettlementRules.SettlementTypeId))
+                {
+                    continue;
+                }
+
+                debitAmount = autoSettlementHelper.getSettlementCashDiscountAmount(autoSettlementRules.Discount, custTransOpenCredit.TransDate, custTransOpenDebit);
+
+                // Check for tolerance                
+                if (autoSettlementRules.Tolerance && debitAmount != abs(creditAmount))
+                {
+                    diffAmount = abs(debitAmount - abs(creditAmount));
+
+                    if (diffAmount > CustParameters::find().MaxMSTOverUnder)
+                    {
+                        continue;
+                    }
+                    else
+                    {
+                        checkOK = true;
+                    }
+                }
+                else if(debitAmount == abs(creditAmount))
+                {
+                    checkOK = true;
+                }
+
+                //Mark and settle the open transactions
+                if (checkOK)
+                {
+                    settleManager = autoSettlementHelper.parmCustVendOpenTransManager();
+
+                    //Debit
+                    settleManager.updateTransMarked(custTransOpenDebit, true);
+                    autoSettlementHelper.updateSettleAmount(custTransOpenDebit, custTransOpenDebit.AmountCur,
+                                                                            autoSettlementRules.Discount, custTransOpenCredit.TransDate); // settling with amount value
+
+                    //Credit
+                    settleManager.updateTransMarked(custTransOpenCredit, true);
+                    autoSettlementHelper.updateSettleAmount(custTransOpenCredit, creditAmount, autoSettlementRules.Discount, custTransOpenCredit.TransDate);
+
+                    if (autoSettlementRules.Discount)
+                    {
+                        settleManager.settleMarkedTrans();
+                    }
+                    else
+                    {
+                        using (SKS_LB_AutoSettlementContext autoContext = new SKS_LB_AutoSettlementContext())
+                        {
+                            autoContext.isAutoSettlementCustom =  true;
+
+                            settleManager.settleMarkedTrans();
+                        }
+                    }
+                }
+            }// end of debit
+        }// end of credit
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

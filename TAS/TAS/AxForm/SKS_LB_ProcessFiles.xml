@@ -1,0 +1,1319 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
+	<Name>SKS_LB_ProcessFiles</Name>
+	<SourceCode>
+		<Methods xmlns="">
+			<Method>
+				<Name>classDeclaration</Name>
+				<Source><![CDATA[
+[Form]
+public class SKS_LB_ProcessFiles extends FormRun
+{
+    #MACROLIB.resAppl
+    ImageListAppl     imageListAppl;
+    QueryBuildRange   ProcessStatus;
+    QueryBuildRange   ProcessStatus2;
+    QueryBuildRange   JournalFromLedger;
+    QueryBuildRange   BatchFromLedger;
+
+    Query           origQuery;
+    str menuItemName;
+    boolean menuFlag = false;
+    boolean menuFlag_eS = false;
+}
+]]></Source>
+			</Method>
+			<Method>
+				<Name>HasOrphans</Name>
+				<Source><![CDATA[
+    boolean HasOrphans(JournalId WBJournalID)
+    {
+        SKS_LB_JournalAR SKS_LB_JournalAR;
+        LedgerJournalTrans LedgerJournalTrans;
+
+        select firstonly RecId from SKS_LB_JournalAR
+            where SKS_LB_JournalAR.JournalId == WBJournalID &&
+                SKS_LB_JournalAR.LedgerJournalTransRecId != 0
+            notexists join firstonly RecId from LedgerJournalTrans
+                where LedgerJournalTrans.RecId == SKS_LB_JournalAR.LedgerJournalTransRecId;
+
+        // Due to using a "notexists join" above, if there are records, they are orphans
+        return (SKS_LB_JournalAR.RecId != 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    public void init()
+    {
+        SKS_PP_500PPBas dd500PP = new SKS_PP_500PPBas();
+        SKS_PP_Sys      tmpSKS_PP_Sys;
+        SKS_LB_FileFormat   sks_lb_fileformat;
+        SKS_LB_Bank     sks_lb_bank;
+        int result;
+        ;
+
+        menuItemName = element.args().menuItemName();
+               
+        if(menuItemName == 'SKS_LB_AssignedToMeMI')
+        {
+            menuFlag = true;                 
+        }
+
+        if(menuItemName == 'SKS_LB_eSReviewMI')
+        {
+            menuFlag_eS = true;
+        }
+
+        super();
+
+        tmpSKS_PP_Sys = new SKS_PP_Sys();
+
+        select firstOnly FormatID, filetype from sks_lb_fileformat
+            join lbformatid from sks_lb_bank
+            where sks_lb_fileformat.formatID == sks_lb_bank.lbformatid
+                && SKS_LB_FileFormat.filetype == SKS_LB_FileType::BAI2;
+
+        if(!sks_lb_fileformat)
+        {
+            SKS_LB_Journal_bankpmtcnt.visible(false);
+            SKS_LB_Journal_bankpmttot.visible(false);
+        }
+
+        
+        if(menuItemName == 'SKS_LB_ProcessLockboxFilesAll')
+        {
+            AllCompleted.selection(SKS_LB_AllCompleted::All);
+            RestrictedWorkbench.visible(true);
+            Workbench.visible(false);
+        }
+        else
+        {
+            Workbench.visible(true);
+            RestrictedWorkbench.visible(false);
+        }
+
+
+        if ( !tmpSKS_PP_Sys.ValidateSetup(this.name()))
+        {
+            this.close();
+        }
+        else
+        {
+
+            result = dd500PP.IsRegistered('LB');
+            if (result != 1)
+            {
+                box::warning("@SKS326");
+                this.close();
+            }
+        }
+
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>MoveFileFromCompletedFolder</Name>
+				<Source><![CDATA[
+    void MoveFileFromCompletedFolder(SKS_LB_JournalAR lb_JournalAR)
+    {
+        str fileName;
+        str lockboxPath;
+        str completedFilePathName;
+        str inProcessFilePathName;
+        SKS_LB_Bank LB_Bank;
+        SKS_LB_Import LB_Import;
+        SKS_LB_Journal LB_Journal;
+        SKS_PP_Sys PP_Sys;
+        SKS_PP_Setup PP_Setup;
+
+        LB_Import = new SKS_LB_Import();
+        PP_Sys = new SKS_PP_Sys();
+
+        // If the completed file exists, move it
+        SKS_EB_BankIntegOptWithNoLicense bankIntOption = SKS_EB_FileStorage::find().StorageOption_LB;
+        SKS_BF_BankIntType SKS_BF_BankIntType = SKS_BF_BankIntType::FileHubLocal;
+        if(bankIntOption == SKS_EB_BankIntegOptWithNoLicense::BankFabricEnumValue)
+        {
+            SKS_BF_BankIntType = SKS_BF_BankIntType::BankFabric;
+        }
+
+        select FirstOnly LBPath, LBBankFabricLocation from PP_Setup;
+
+        // Get the path for completed files
+
+        // need the SKS_PP_Bank record
+        select firstonly LBPath, LBBankFabricLocation from LB_Bank
+            where LB_Bank.BankAccountId == lb_JournalAR.BankAcct && LB_Bank.LBFormatId == lb_JournalAR.FormatID;
+        //PP_Bank.SetAcctSub(LB_JournalAR.AccountNum);
+
+        // Select to lockbox path, setup changes push out to the bank table so bank table will always hold the correct lockbox information
+        // (but not necessarily the correct information for this file. The bank could be updated after a workbench is made)
+        if(SKS_BF_BankIntType == SKS_BF_BankIntType::FileHubLocal)
+        {
+            lockboxPath = LB_Bank.LBPath;
+        }
+        else
+        {
+            lockboxPath = LB_Bank.LBBankFabricLocation;
+        }
+        // Gets the file name if it hasn't been archived or deleted
+        fileName = System.IO.Path::GetFileName(lb_JournalAR.Filename);
+        completedFilePathName = LB_Import.CheckLBFolders(SKS_LB_In_Process::Complete_FolderName, lockboxPath) + '\\' + fileName;
+        inProcessFilePathName = LB_Import.CheckLBFolders(SKS_LB_In_Process::InProcess_FolderName, lockboxPath) + '\\' + fileName;
+        
+
+        SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct(SKS_BF_BankIntType);
+        fileHub.runFileInquire(completedFilePathName);
+        if(fileHub.attrFileExists())
+        {
+            fileHub.runFileMoveTo(inProcessFilePathName);
+
+            ttsbegin;
+
+            update_recordset lb_JournalAR
+            setting FileName = inProcessFilePathName
+            where lb_JournalAR.FileName == completedFilePathName;
+
+            update_recordset LB_Journal
+            setting FileName = inProcessFilePathName
+            where LB_Journal.FileName == completedFilePathName;
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RefreshGrid</Name>
+				<Source><![CDATA[
+    void RefreshGrid()
+    {
+        ;
+
+        SKS_LB_Journal_ds.executeQuery();
+        SKS_LB_Journal_ds.reread();
+        SKS_LB_Journal_ds.refresh();
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ResetPaymentJournalLinks</Name>
+				<Source><![CDATA[
+    void ResetPaymentJournalLinks(JournalId journalID)
+    {
+        SKS_LB_Journal LB_Journal;
+        SKS_LB_JournalAR LB_JournalAR;
+        LedgerJournalTrans LedgerJournalTrans;
+        boolean linksReset = false;
+
+        ttsBegin;
+
+        // Go through all of the good journal lines with a ledger tran rec that does not exist
+        while select forUpdate LB_JournalAR
+            where LB_JournalAR.JournalId == journalID &&
+            LB_JournalAR.LedgerJournalTransRecId != 0
+            notexists join firstonly LedgerJournalTrans
+                where LedgerJournalTrans.RecId == LB_JournalAR.LedgerJournalTransRecId
+        {
+            // Zero the ledger tran rec
+            LB_JournalAR.LedgerJournalTransRecId = 0;
+            LB_JournalAR.update();
+
+            if (LB_Journal.KeepDelete == SKS_LB_Status::Completed)
+            {
+                element.MoveFileFromCompletedFolder(LB_JournalAR);
+            }
+            linksReset = true;
+        }
+
+        if (linksReset)
+        {
+            // Update the journal processing status
+            select forupdate firstonly LB_Journal where LB_Journal.JournalID == journalID;
+
+            // See if there are no processed lines
+            select firstonly RecId from LB_JournalAR
+                where LB_JournalAR.JournalId == journalID
+                    && LB_JournalAR.LedgerJournalTransRecId != 0
+                join firstonly RecId from LedgerJournalTrans
+                    where LedgerJournalTrans.RecId == LB_JournalAR.LedgerJournalTransRecId;
+            if (LB_JournalAR.RecId == 0)
+            {
+                LB_Journal.KeepDelete = SKS_LB_Status::NotProcessed;
+                LB_Journal.update();
+            }
+            // there are some processed lines left
+            else
+            {
+                if (LB_Journal.KeepDelete != SKS_LB_Status::PartiallyProcessed)
+                {
+                    LB_Journal.KeepDelete = SKS_LB_Status::PartiallyProcessed;
+                    LB_Journal.update();
+                }
+            }
+        }
+
+        ttsCommit;
+
+        FormDataUtil::getFormDataSource(SKS_LB_Journal).research(true);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+		<DataSources xmlns="">
+			<DataSource>
+				<Name>SKS_LB_Journal</Name>
+				<Methods>
+					<Method>
+						<Name>inUseBlock</Name>
+						<Source><![CDATA[
+        edit JournalMarkInUseBlock inUseBlock(boolean _set, SKS_LB_Journal _journal, JournalMarkInUseBlock _value)
+        {
+            ;
+            if (_set)
+            {
+                if (!_value )
+                {
+                    _journal.SessionId = 0;
+                    return true;
+                }
+            }
+
+            return _journal.SessionId ? true : false;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>init</Name>
+						<Source><![CDATA[
+        public void init()
+        {
+            super();
+            
+            ProcessStatus = this.query().dataSourceNo(1).addRange(fieldnum(SKS_LB_Journal, KeepDelete));
+            ProcessStatus.status(RangeStatus::Hidden);
+            ProcessStatus2 = this.query().dataSourceNo(1).addRange(fieldnum(SKS_LB_Journal, KeepDelete));
+            ProcessStatus2.status(RangeStatus::Hidden);
+            JournalFromLedger = this.query().dataSourceNo(1).addRange(fieldnum(SKS_LB_Journal, JournalId));
+            BatchFromLedger = this.query().dataSourceNo(1).addRange(fieldnum(SKS_LB_Journal, BatchNum));
+            SKS_LB_Journal_ds.cacheAddMethod('LockImage');
+            
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>lockImage</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute]
+        display Integer lockImage(SKS_LB_Journal _sks_lb_journal)
+        {
+            if(_sks_lb_journal.SessionId)
+            {
+                return imageListAppl.image(#image_journalBlockInUse);
+            }
+            else
+            {
+                return -1;
+            }
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>InUseUserId</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute]
+        display JournalBlockInUseUserId InUseUserId(SKS_LB_Journal _sks_lb_journal)
+        {
+            return _sks_lb_journal.SessionId ? new xSession(_sks_lb_journal.SessionId).userId() : '';
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>active</Name>
+						<Source><![CDATA[
+        public int active()
+        {
+            int ret;
+
+            if (SKS_LB_JournalInUse::canBeAutoUnlocked(SKS_LB_Journal))
+            {
+                SKS_LB_JournalInUse::updateBlockServer(SKS_LB_Journal,
+                                                        JournalBlockLevel::None,
+                                                        JournalBlockLevel::None,
+                                                        strFmt("@SKS911",SKS_LB_Journal.JournalId, SKS_LB_Journal.BatchNum)
+                                                        );
+                FormDataUtil::getFormDataSource(SKS_LB_Journal).reread();
+                FormDataUtil::getFormDataSource(SKS_LB_Journal).refresh();
+            }
+
+            if(sks_lb_journal.SessionId)
+            {
+                Workbench.enabled(false);
+                SKS_LB_Journal_ds.allowDelete(false);
+            }
+            else
+            {
+                Workbench.enabled(true);
+                SKS_LB_Journal_ds.allowDelete(true);
+            }
+
+            if(SKS_LB_Journal.KeepDelete == SKS_LB_Status::CompleteWithWarn)
+            {
+                markcomplete.enabled(true);
+            }
+            else
+            {
+                markcomplete.enabled(false);
+            }
+
+            InUseChk.enabled(SKS_LB_Journal.sessionID == 0 ? false : true);
+
+            if(menuFlag)
+            {
+                this.filterRows();
+
+                RestrictedWorkbench.visible(true);
+                Workbench.visible(false);
+            }
+
+            if(menuFlag_eS)
+            {
+                this.filterRows_eS();
+            }
+            
+            ret = super(); 
+                
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>executeQuery</Name>
+						<Source><![CDATA[
+        public void executeQuery()
+        {
+            if(origQuery && (!menuFlag && !menuFlag_eS))
+            {
+                this.query(origQuery);
+            }
+
+            SKS_LB_Journal_ds.query().dataSourceNo(1).addSortField(fieldNum(SKS_LB_Journal, JournalID), SortOrder::Descending);
+
+            FormRun callerForm = element.args().caller();
+
+            if((callerForm) && (callerForm.Name() == formStr(LedgerJournalTransCustPaym)))
+            {
+                AllCompleted.selection(SKS_LB_AllCompleted::All);
+
+                SKS_LB_Journal record = element.args().record();
+                JournalFromLedger.value(queryValue(record.JournalID));
+                JournalFromLedger.status(RangeStatus::Hidden);
+                BatchFromLedger.value(queryValue(record.BatchNum));
+                BatchFromLedger.status(RangeStatus::Hidden);
+            }            
+          
+            switch (AllCompleted.selection())
+            {
+                case SKS_LB_AllCompleted::All:
+                    ProcessStatus.value('');
+                    ProcessStatus2.value('');
+                    break;
+
+                case SKS_LB_AllCompleted::Completed :
+                    ProcessStatus.value(queryValue(SKS_LB_Status::Completed));
+                    ProcessStatus2.value('');
+                    break;
+
+                case SKS_LB_AllCompleted::CompletedWarn :
+                    ProcessStatus.value(queryValue(SKS_LB_Status::CompleteWithWarn));
+                    break;
+
+                case SKS_LB_AllCompleted::NonCompleted :
+                    ProcessStatus.value(queryValue(SKS_LB_Status::NotProcessed));
+                    ProcessStatus2.value(queryValue(SKS_LB_Status::PartiallyProcessed));
+                    break;
+
+                case SKS_LB_AllCompleted::Error :
+                    ProcessStatus.value(queryValue(SKS_LB_Status::FileError));
+                    ProcessStatus2.value('');
+                    break;
+            }
+            
+            
+            if(menuFlag)
+            {        
+                if(!origQuery)
+                {
+                    origQuery = this.query();
+                }
+                this.filterRows();
+
+                RestrictedWorkbench.visible(true);
+                Workbench.visible(false);
+            }
+
+            if(menuFlag_eS)
+            {
+                if(!origQuery)
+                {
+                    origQuery = this.query();
+                }
+                this.filterRows_eS();
+            }
+
+            super();
+
+            if ( SKS_LB_Journal.RecId)
+            {
+                Workbench.enabled(true);
+                SKS_LB_JournalSum.enabled(true);
+            }
+            else
+            {
+                Workbench.enabled(false);
+                SKS_LB_JournalSum.enabled(false);
+            }
+
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>filterRows</Name>
+						<Source><![CDATA[
+        private void filterRows()
+        {             
+            this.query().clearQueryFilters();
+
+            Query                   query;
+            QueryBuildDataSource    qbdsJournal, qbdsJournal1, qbdsJournalAR, qbdsJournalARErrors;
+                         
+            query               = new query();
+            query.queryType(QueryType::Union);
+
+            qbdsJournal         = query.addDataSource(tableNum(SKS_LB_Journal));
+            qbdsJournal.addRange(fieldnum(SKS_LB_Journal, KeepDelete)).value(queryValue(SKS_LB_Status::NotProcessed));
+
+            qbdsJournalARErrors = qbdsJournal.addDataSource(tableNum(SKS_LB_JournalARErrors));
+            qbdsJournalARErrors.relations(true);
+            qbdsJournalARErrors.joinMode(JoinMode::ExistsJoin);
+            qbdsJournalARErrors.addRange(fieldnum(SKS_LB_JournalARErrors, AssignedTo)).value(curUserId());
+            qbdsJournalARErrors.addRange(fieldNum(SKS_LB_JournalARErrors, ReviewStatus)).value(SysQuery::value(SKS_LB_ReviewStatus::NeedsReview));
+                                                        
+            qbdsJournal1         = query.addDataSource(tableNum(SKS_LB_Journal), identifierstr(SKS_LB_JournalAR), UnionType::Union);
+            qbdsJournal1.addRange(fieldnum(SKS_LB_Journal, KeepDelete)).value(queryValue(SKS_LB_Status::NotProcessed));
+
+            qbdsJournalAR = qbdsJournal1.addDataSource(tableNum(SKS_LB_JournalAR));
+            qbdsJournalAR.relations(true);
+            qbdsJournalAR.joinMode(JoinMode::ExistsJoin);
+            qbdsJournalAR.addRange(fieldnum(SKS_LB_JournalAR, AssignedTo)).value(curUserId());
+            qbdsJournalAR.addRange(fieldNum(SKS_LB_JournalAR, ReviewStatus)).value(SysQuery::value(SKS_LB_ReviewStatus::NeedsReview));
+          
+            this.query(query);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>filterRows_eS</Name>
+						<Source><![CDATA[
+        private void filterRows_eS()
+        {
+            this.query().clearQueryFilters();
+
+            Query                   query;
+            QueryBuildDataSource    qbdsJournal, qbdsJournal1, qbdsJournalAR, qbdsJournalARErrors;
+                         
+            query               = new query();
+            query.queryType(QueryType::Union);
+
+            qbdsJournal         = query.addDataSource(tableNum(SKS_LB_Journal));
+            qbdsJournal.addRange(fieldnum(SKS_LB_Journal, KeepDelete)).value(queryValue(SKS_LB_Status::NotProcessed));
+
+            qbdsJournalARErrors = qbdsJournal.addDataSource(tableNum(SKS_LB_JournalARErrors));
+            qbdsJournalARErrors.relations(true);
+            qbdsJournalARErrors.joinMode(JoinMode::ExistsJoin);
+            qbdsJournalARErrors.addRange(fieldnum(SKS_LB_JournalARErrors, AssignedTo)).value(curUserId());
+            qbdsJournalARErrors.addRange(fieldNum(SKS_LB_JournalARErrors, ReviewStatus)).value(SysQuery::value(SKS_LB_ReviewStatus::ReviewCompleted));
+                                                        
+            qbdsJournal1         = query.addDataSource(tableNum(SKS_LB_Journal), identifierstr(SKS_LB_JournalAR), UnionType::Union);
+            qbdsJournal1.addRange(fieldnum(SKS_LB_Journal, KeepDelete)).value(queryValue(SKS_LB_Status::NotProcessed));
+
+            qbdsJournalAR = qbdsJournal1.addDataSource(tableNum(SKS_LB_JournalAR));
+            qbdsJournalAR.relations(true);
+            qbdsJournalAR.joinMode(JoinMode::ExistsJoin);
+            qbdsJournalAR.addRange(fieldnum(SKS_LB_JournalAR, AssignedTo)).value(curUserId());
+            qbdsJournalAR.addRange(fieldNum(SKS_LB_JournalAR, ReviewStatus)).value(SysQuery::value(SKS_LB_ReviewStatus::ReviewCompleted));
+          
+            this.query(query);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>delete</Name>
+						<Source><![CDATA[
+        public void delete()
+        {
+            SKS_LB_Import           cls_SKS_LB_Import  = new SKS_LB_Import();
+
+            ;
+            FormDataUtil::getFormDataSource(SKS_LB_Journal).reread();
+            ttsbegin;
+            cls_SKS_LB_Import.JournalARLB_Delete( SKS_LB_Journal.JournalID, SKS_LB_Journal.BatchNum);
+            super();
+            ttscommit;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+				<Fields>
+					<Field>
+						<DataField>Owner</DataField>
+						<Methods>
+							<Method>
+								<Name>lookup</Name>
+								<Source><![CDATA[
+            public void lookup(FormControl _formControl, str _filterStr)
+            {
+                SysTableLookup  SysTableLookup = SysTableLookup::newParameters(tablenum(UserInfo), _formControl);
+
+                Query query = new Query();
+                QueryBuildDataSource QBDS;
+                ;
+
+                SysTableLookup.addLookupfield(fieldNum(UserInfo, Name), true);
+                SysTableLookup.addLookupfield(fieldNum(UserInfo, ID), true);
+                QBDS = query.addDataSource(tableNum(UserInfo));
+
+                //QBDS.addRange(fieldNum(UserInfo, Id)).value(_filterStr);
+
+                SysTableLookup.parmquery(query);
+                SysTableLookup.performFormLookup();
+
+
+            }
+
+]]></Source>
+							</Method>
+						</Methods>
+					</Field>
+				</Fields>
+			</DataSource>
+		</DataSources>
+		<DataControls xmlns="">
+			<Control>
+				<Name>RestrictedWorkbench</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            // if we have a lockbox journal with orphans, see if the user wants to reset the payment journal links
+            if ((SKS_LB_Journal.KeepDelete == SKS_LB_Status::Completed ||
+                    SKS_LB_Journal.KeepDelete == SKS_LB_Status::PartiallyProcessed)&&
+                element.HasOrphans(SKS_LB_Journal.JournalID))
+            {
+                if (DialogButton::Yes == box::yesNo(strfmt("@SKS559", SKS_LB_Journal.JournalID), DialogButton::Yes, "@SKS400"))
+                {
+                    element.ResetPaymentJournalLinks(SKS_LB_Journal.JournalID);
+                }
+            }
+
+            super();
+
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>Workbench</Name>
+				<Type>MenuFunctionButton</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+
+            // if we have a lockbox journal with orphans, see if the user wants to reset the payment journal links
+            if (element.HasOrphans(SKS_LB_Journal.JournalID))
+            {
+                //<ISSUE-19488 if "AllCompleted" is not All and journal status change, don't open the right journal>
+                if(AllCompleted.selection() != SKS_LB_AllCompleted::All)
+                {
+                    AllCompleted.selection(SKS_LB_AllCompleted::All);
+                    AllCompleted.modified();
+                }
+                //</ISSUE-19488>
+
+                if (DialogButton::Yes == box::yesNo(strfmt("@SKS559", SKS_LB_Journal.JournalID), DialogButton::Yes, "@SKS400"))
+                {
+                    element.ResetPaymentJournalLinks(SKS_LB_Journal.JournalID);
+                }
+            }
+
+            super();
+
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>ImportButton</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            SKS_PP_Sys              cls_SKS_PP_Sys = new SKS_PP_Sys();
+
+            super();
+
+            cls_SKS_PP_Sys.CallModalForm( element, formstr( SKS_LB_ImportFiles));
+
+
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>MarkComplete</Name>
+				<Type>Button</Type>
+				<Methods>
+					<Method>
+						<Name>clicked</Name>
+						<Source><![CDATA[
+        void clicked()
+        {
+            super();
+
+            SKS_LB_Journal.KeepDelete = SKS_LB_Status::Completed;
+
+            SKS_LB_Journal_ds.refresh();
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>AllCompleted</Name>
+				<Type>ComboBox</Type>
+				<Methods>
+					<Method>
+						<Name>modified</Name>
+						<Source><![CDATA[
+        public boolean modified()
+        {
+            boolean ret;
+
+            menuFlag = false;
+            menuFlag_eS = false;
+
+            ret = super();
+            
+            sks_lb_journal_ds.executequery();
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+			<Control>
+				<Name>InUseChk</Name>
+				<Type>CheckBox</Type>
+				<Methods>
+					<Method>
+						<Name>validate</Name>
+						<Source><![CDATA[
+        public boolean validate()
+        {
+            DialogButton    DiagBut;
+            boolean ret = false;
+
+            if(!InUseChk.checked())
+            {
+                diagBut = Box::yesNo(
+                    "@SKS6013",
+                    DialogButton::Yes,
+                    "@SKS313");
+
+                if (diagBut == DialogButton::Yes)
+                {
+                    ret = super();
+                }
+                else
+                {
+                    ret = false;
+                }
+            }
+
+            return ret;
+        }
+
+]]></Source>
+					</Method>
+				</Methods>
+			</Control>
+		</DataControls>
+		<Members xmlns="" />
+	</SourceCode>
+	<DataSources>
+		<AxFormDataSource xmlns="">
+			<Name>SKS_LB_Journal</Name>
+			<Table>SKS_LB_Journal</Table>
+			<Fields>
+				<AxFormDataSourceField>
+					<DataField>BankAcct</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankPmtCnt</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BankPmtTotal</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BatchBadPmtTotal</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BatchNum</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>BatchPmtCnt</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>createdBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>createdDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>CurrencyCode</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>dataAreaId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ErrCount</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>ExchRate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>FileName</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>FormatID</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>HeadPaymDate</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>InReview</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>JournalID</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>KeepDelete</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>modifiedBy</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>modifiedDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>Owner</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>PmtTotal</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>RecId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SessionId</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SessionLoginDateTime</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>SplitPaymentsExist</DataField>
+				</AxFormDataSourceField>
+				<AxFormDataSourceField>
+					<DataField>TableId</DataField>
+				</AxFormDataSourceField>
+			</Fields>
+			<ReferencedDataSources />
+			<AllowCreate>No</AllowCreate>
+			<DataSourceLinks />
+			<DerivedDataSources />
+		</AxFormDataSource>
+	</DataSources>
+	<Design>
+		<Caption xmlns="">@SKS400</Caption>
+		<DataSource xmlns="">SKS_LB_Journal</DataSource>
+		<Pattern xmlns="">SimpleList</Pattern>
+		<PatternVersion xmlns="">1.1</PatternVersion>
+		<Style xmlns="">SimpleList</Style>
+		<Controls xmlns="">
+			<AxFormControl xmlns=""
+				i:type="AxFormActionPaneControl">
+				<Name>ActionPane</Name>
+				<ElementPosition>715827882</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<Type>ActionPane</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormButtonGroupControl">
+						<Name>ButtonGroup</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1503238552</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>ButtonGroup</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<Controls>
+							<AxFormControl xmlns=""
+								i:type="AxFormMenuFunctionButtonControl">
+								<Name>RestrictedWorkbench</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<ElementPosition>536870910</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>Auto</HeightMode>
+								<Type>MenuFunctionButton</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<MenuItemName>SKS_LB_RestrictedPaymentAppWorkbench</MenuItemName>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormMenuFunctionButtonControl">
+								<Name>Workbench</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<ElementPosition>805306366</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>Auto</HeightMode>
+								<HelpText>@SKS725</HelpText>
+								<Type>MenuFunctionButton</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<AutoRefreshData>Yes</AutoRefreshData>
+								<DataSource>SKS_LB_Journal</DataSource>
+								<MenuItemName>SKS_LB_PaymentAppWorkbench</MenuItemName>
+								<Text>@SKS434</Text>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormMenuFunctionButtonControl">
+								<Name>SKS_LB_JournalSum</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<ElementPosition>1207959549</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>Auto</HeightMode>
+								<Type>MenuFunctionButton</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<DataSource>SKS_LB_Journal</DataSource>
+								<MenuItemName>SKS_LB_JournalSum</MenuItemName>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonControl">
+								<Name>ImportButton</Name>
+								<ElementPosition>1610612733</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>Auto</HeightMode>
+								<HelpText>@SKS727</HelpText>
+								<LeftMode>RightEdge</LeftMode>
+								<Type>Button</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Text>@SKS453</Text>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormMenuFunctionButtonControl">
+								<Name>SKS_LB_FileHistory</Name>
+								<ElementPosition>1879048189</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>Auto</HeightMode>
+								<Type>MenuFunctionButton</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<MenuItemName>SKS_LB_FileHistory</MenuItemName>
+							</AxFormControl>
+							<AxFormControl xmlns=""
+								i:type="AxFormButtonControl">
+								<Name>MarkComplete</Name>
+								<AutoDeclaration>Yes</AutoDeclaration>
+								<ElementPosition>2013265917</ElementPosition>
+								<FilterExpression>%1</FilterExpression>
+								<HeightMode>Auto</HeightMode>
+								<HelpText>@SKS3189</HelpText>
+								<Type>Button</Type>
+								<VerticalSpacing>-1</VerticalSpacing>
+								<WidthMode>Auto</WidthMode>
+								<FormControlExtension
+									i:nil="true" />
+								<Text>@SYS125598</Text>
+							</AxFormControl>
+						</Controls>
+						<ArrangeMethod>Vertical</ArrangeMethod>
+						<HideIfEmpty>No</HideIfEmpty>
+					</AxFormControl>
+				</Controls>
+				<AlignChild>No</AlignChild>
+				<AlignChildren>No</AlignChildren>
+				<ArrangeMethod>Vertical</ArrangeMethod>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGroupControl">
+				<Name>CustomFilterGroup</Name>
+				<ElementPosition>1288490187</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<Pattern>CustomAndQuickFilters</Pattern>
+				<PatternVersion>1.1</PatternVersion>
+				<Type>Group</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<WidthMode>SizeToAvailable</WidthMode>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl>
+						<Name>QuickFilterControl</Name>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension>
+							<Name>QuickFilterControl</Name>
+							<ExtensionComponents />
+							<ExtensionProperties>
+								<AxFormControlExtensionProperty>
+									<Name>targetControlName</Name>
+									<Type>String</Type>
+									<TypeName>str</TypeName>
+									<Value>Grid</Value>
+								</AxFormControlExtensionProperty>
+								<AxFormControlExtensionProperty>
+									<Name>defaultColumnName</Name>
+									<Type>String</Type>
+									<TypeName>str</TypeName>
+								</AxFormControlExtensionProperty>
+								<AxFormControlExtensionProperty>
+									<Name>placeholderText</Name>
+									<Type>String</Type>
+								</AxFormControlExtensionProperty>
+							</ExtensionProperties>
+						</FormControlExtension>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormComboBoxControl">
+						<Name>AllCompleted</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1431655764</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<Type>ComboBox</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<FormControlExtension
+							i:nil="true" />
+						<EnumType>SKS_LB_AllCompleted</EnumType>
+						<Label>@SYS8335</Label>
+						<Items />
+					</AxFormControl>
+				</Controls>
+				<AlignChild>No</AlignChild>
+				<ArrangeMethod>HorizontalLeft</ArrangeMethod>
+				<FrameType>None</FrameType>
+				<Style>CustomFilter</Style>
+				<ViewEditMode>Edit</ViewEditMode>
+			</AxFormControl>
+			<AxFormControl xmlns=""
+				i:type="AxFormGridControl">
+				<Name>Grid</Name>
+				<AutoDeclaration>Yes</AutoDeclaration>
+				<ElementPosition>1431655764</ElementPosition>
+				<FilterExpression>%1</FilterExpression>
+				<Type>Grid</Type>
+				<VerticalSpacing>-1</VerticalSpacing>
+				<FormControlExtension
+					i:nil="true" />
+				<Controls>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>SKS_LB_Journal_JournalID</Name>
+						<ElementPosition>858993458</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>String</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>JournalID</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>SKS_LB_Journal_BatchNum</Name>
+						<ElementPosition>1073741822</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>String</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>BatchNum</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormComboBoxControl">
+						<Name>SKS_LB_Journal_KeepDelete</Name>
+						<ElementPosition>1395864369</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>ComboBox</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>KeepDelete</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+						<Items />
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>SKS_LB_Journal_BankAcct</Name>
+						<ElementPosition>1717986916</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>String</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>BankAcct</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>SKS_LB_Journal_CurrencyCode</Name>
+						<Enabled>No</Enabled>
+						<Type>String</Type>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>CurrencyCode</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormIntegerControl">
+						<Name>SKS_LB_Journal_BankPmtCnt</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1730871817</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>Integer</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>BankPmtCnt</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormIntegerControl">
+						<Name>SKS_LB_Journal_BatchPmtCnt</Name>
+						<ElementPosition>1743756718</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>Integer</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>BatchPmtCnt</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormIntegerControl">
+						<Name>SKS_LB_Journal_ErrCount</Name>
+						<ElementPosition>1756641619</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>Integer</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>ErrCount</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormRealControl">
+						<Name>SKS_LB_Journal_BankPmtTot</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1769526522</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>Real</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>BankPmtTotal</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+						<NoOfDecimals>-1</NoOfDecimals>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormRealControl">
+						<Name>SKS_LB_Journal_PmtTotal</Name>
+						<ElementPosition>1782411425</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<HelpText>@SKS2390</HelpText>
+						<Type>Real</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataMethod>batchtotal</DataMethod>
+						<DataSource>SKS_LB_Journal</DataSource>
+						<Label>@SKS885</Label>
+						<NoOfDecimals>-1</NoOfDecimals>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormCheckBoxControl">
+						<Name>InUseChk</Name>
+						<AutoDeclaration>Yes</AutoDeclaration>
+						<ElementPosition>1911260443</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>CheckBox</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<BackgroundColor>WindowBackground</BackgroundColor>
+						<DataMethod>inUseBlock</DataMethod>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>InUseUserId</Name>
+						<AllowEdit>No</AllowEdit>
+						<ElementPosition>2040109462</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>String</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataMethod>InUseUserId</DataMethod>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>SKS_LB_Journal_FileName</Name>
+						<ElementPosition>2093796554</ElementPosition>
+						<Enabled>No</Enabled>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>String</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>SizeToAvailable</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>FileName</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormCheckBoxControl">
+						<Name>SKS_LB_Journal_InReview</Name>
+						<AllowEdit>No</AllowEdit>
+						<ElementPosition>2107218327</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>CheckBox</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<BackgroundColor>WindowBackground</BackgroundColor>
+						<DataField>InReview</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+					</AxFormControl>
+					<AxFormControl xmlns=""
+						i:type="AxFormStringControl">
+						<Name>SKS_LB_Journal_Owner</Name>
+						<ElementPosition>2127350986</ElementPosition>
+						<FilterExpression>%1</FilterExpression>
+						<HeightMode>Auto</HeightMode>
+						<Type>String</Type>
+						<VerticalSpacing>-1</VerticalSpacing>
+						<WidthMode>Auto</WidthMode>
+						<FormControlExtension
+							i:nil="true" />
+						<DataField>Owner</DataField>
+						<DataSource>SKS_LB_Journal</DataSource>
+						<Label>@SYS77709</Label>
+					</AxFormControl>
+				</Controls>
+				<AlternateRowShading>No</AlternateRowShading>
+				<DataSource>SKS_LB_Journal</DataSource>
+				<Style>Tabular</Style>
+			</AxFormControl>
+		</Controls>
+	</Design>
+	<Parts />
+</AxForm>

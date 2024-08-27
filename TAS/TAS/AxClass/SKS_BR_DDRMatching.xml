@@ -1,0 +1,692 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_DDRMatching</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Matching for DDR rules
+/// </summary>
+class SKS_BR_DDRMatching
+{
+    #SKS_Global
+
+    SKS_PP_Setup globalSKS_PP_Setup;
+
+    
+    str mTranTypeFilterString;
+    LedgerJournalId mPaymentJournalNum;
+    LedgerJournalTable      ledgerJournalTable;
+    LedgerJournalEngine     ledgerJournalEngine;
+    str                     errorText;
+
+    boolean isPosted;   
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>matchIntermediate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Looks at SKS_BR_BankTran records and attempts to pre-match
+    /// </summary>
+    /// <param name="_SKS_BR_BankHeaderRecID">
+    /// RecId of SKS_BR_BankHeader.  If 0 will look through all SKS_BR_BankTran records.
+    /// </param>
+    /// <param name="_ServiceImport">
+    /// Boolean to limit service specific behaviors to only calls from the service
+    /// </param>
+    /// <remarks>
+    /// Attempt to pre-match records.
+    /// </remarks>
+    public void matchIntermediate(SKS_BR_BankHeaderRecID _SKS_BR_BankHeaderRecID, boolean _ServiceImport = false)
+    {
+        SKS_BR_BankTran locSKS_BR_BankTran;
+        int64 recordCount = 0;
+        int64 recordCountTotal = 0;
+        boolean matchFound;
+        boolean displayMessage;
+
+        BankAccountTrans bankAccountTrans;
+
+        
+        // If importing, there will be a _SKS_BR_BankHeaderRecID
+        // Don't display message since this is running as a service
+        if(!_SKS_BR_BankHeaderRecID)
+        {
+            displayMessage = true;
+        }
+
+        
+        locSKS_BR_BankTran = null;
+        // Match for all unmatched transactions
+        locSKS_BR_BankTran = SKS_BR_DDRMatching::getSKS_BR_BankTransIntermediate(_SKS_BR_BankHeaderRecID);
+
+        while(locSKS_BR_BankTran)
+        {
+            isPosted = false;
+            matchFound = false;
+            bankAccountTrans = null;
+
+            this.DDRmatch(locSKS_BR_BankTran);               
+            
+                 
+            if(isPosted)
+            {
+                bankAccountTrans = this.glMatch(locSKS_BR_BankTran);
+            }
+
+            if(bankAccountTrans)
+            {
+                ttsbegin;
+                matchFound = true;
+                guid lGuid = newGuid();
+                this.stampIntermBankAccountTrans(locSKS_BR_BankTran,bankAccountTrans, lGuid);
+                this.stampIntermSKS_BR_BankTran(locSKS_BR_BankTran, lGuid, false, true);
+                ttscommit;
+            }
+
+            if(matchFound)
+            {
+                recordCount++;
+            }
+            recordCountTotal++;
+            next locSKS_BR_BankTran;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_BR_BankTransIntermediate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updating sks_br_banktrans with empty Guid
+    /// </summary>
+    /// <param name = "_SKS_BR_BankHeaderRecID">_SKS_BR_BankHeaderRecID</param>
+    /// <returns>_SKS_BR_BankHeaderRecID</returns>
+    // Get SKS_BR_BankTran records that need matched
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer sks_br_banktrans is selected forUpdate and is passed to other methods where it is modified.")]
+    public static SKS_BR_BankTran getSKS_BR_BankTransIntermediate( SKS_BR_BankHeaderRecID _SKS_BR_BankHeaderRecID = 0)
+    {
+        SKS_BR_BankTran sks_br_banktran;
+        ;
+        if(_SKS_BR_BankHeaderRecID)
+        {
+            select firstonly forupdate crosscompany sks_br_banktran
+                order by sks_br_banktran.dataAreaId where
+                sks_br_banktran.BankHeaderRecId == _SKS_BR_BankHeaderRecID &&
+                sks_br_banktran.GLMatchOrCreate == SKS_BR_GLMatchOrCreate::DDReversal &&
+                sks_br_banktran.ManualReconciliationID == str2Guid(#EmptyGuidString);  //this will prevent interm matches as well as full matches from being found
+        }
+        else
+        {
+            select firstonly forupdate crosscompany sks_br_banktran
+                order by sks_br_banktran.dataAreaId where
+                sks_br_banktran.ManualReconciliationID == str2Guid(#EmptyGuidString); //this will prevent interm matches as well as final matches from being found
+        }
+        return sks_br_banktran;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DDRmatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Matching process
+    /// </summary>
+    /// <param name = "_sks_br_banktran">_sks_br_banktran</param>
+    /// <returns>Current record of _sks_br_banktran</returns>
+    public boolean DDRmatch(SKS_BR_BankTran _sks_br_banktran)
+    {
+        SKS_BR_DDRMappingRuleGroup lSKS_BR_DDRMappingRuleGroup;
+        boolean matchFound;
+        SKS_BR_BankTran mSKS_BR_BankTran;
+        CustTrans locCustTrans;
+
+        mSKS_BR_BankTran = null;
+        
+        //ttsBegin;
+
+        mSKS_BR_BankTran = _sks_br_banktran;
+
+        if(mSKS_BR_BankTran.DDRMappingRuleGroupId)
+        { 
+            // Delete any existing duplicates
+            SKS_BR_Matching::duplicateDelete(mSKS_BR_BankTran.RecId);
+
+            select firstonly lSKS_BR_DDRMappingRuleGroup where
+                lSKS_BR_DDRMappingRuleGroup.RuleGroupId == mSKS_BR_BankTran.DDRMappingRuleGroupId;
+
+            select firstonly crosscompany * from locCustTrans where locCustTrans.PaymReference == mSKS_BR_BankTran.DDRReferenceNumber && 
+                locCustTrans.AmountCur == mSKS_BR_BankTran.TranAmount &&
+                locCustTrans.CompanyBankAccountId == mSKS_BR_BankTran.AccountId;
+
+            if(!locCustTrans)
+            {
+                select crosscompany * from locCustTrans where locCustTrans.PaymReference == mSKS_BR_BankTran.DDRReferenceNumber &&
+                    locCustTrans.AmountCur == mSKS_BR_BankTran.TranAmount;
+            }
+
+            CustSettlement     lCustSettlement;
+
+            changecompany(locCustTrans.company())
+            {
+                select firstonly lCustSettlement
+                    where lCustSettlement.transrecid == locCustTrans.recid
+                    && lCustSettlement.transcompany == locCustTrans.dataAreaId 
+                    && lCustSettlement.accountnum == locCustTrans.accountnum;
+            }
+
+            if(lCustSettlement.CanBeReversed == NoYes::Yes)
+            {
+                this.postGL(mSKS_BR_BankTran, locCustTrans);
+            }
+        }
+        //ttsCommit;
+
+        return matchFound;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampIntermBankAccountTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stamping Bank account trans table
+    /// </summary>
+    /// <param name = "_mSKS_BR_BankTran">_mSKS_BR_BankTran</param>
+    /// <param name = "_bankAccountTrans">_bankAccountTrans</param>
+    /// <param name = "_guid">_guid</param>
+    public void stampIntermBankAccountTrans(SKS_BR_BankTran _mSKS_BR_BankTran, BankAccountTrans _bankAccountTrans, Guid _guid)
+    {
+        _bankAccountTrans.SKS_BR_IntermMatch = NoYes::Yes;
+        _bankAccountTrans.SKS_BR_ManualReconciliationID = _guid;
+        _bankAccountTrans.AccountStatement = _mSKS_BR_BankTran.ImportedStatementNum;
+        _bankAccountTrans.AccountStatementDate = _mSKS_BR_BankTran.ImportedStatementDate;
+        _bankAccountTrans.Included = NoYes::Yes;
+        _bankAccountTrans.SKS_BR_AlreadyMarked = NoYes::Yes;
+
+        if(_mSKS_BR_BankTran.TranAmount != _bankAccountTrans.AmountCur)
+        {
+            _bankAccountTrans.AmountCorrect = _mSKS_BR_BankTran.TranAmount - _bankAccountTrans.AmountCur;
+            _bankAccountTrans.LedgerDimension = BankTransType::find(_bankAccountTrans.BankTransType).LedgerDimension;
+        }
+
+        //Bug 10342 -->
+        if(_mSKS_BR_BankTran.ValueDate != _bankAccountTrans.SKS_IHB_ValueDate)
+        {
+            _bankAccountTrans.SKS_IHB_ValueDate = _mSKS_BR_BankTran.ValueDate;
+        }
+        //Bug 10342 <--
+        _bankAccountTrans.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>glCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// GL Checking
+    /// </summary>
+    /// <param name = "mSKS_BR_BankTran">mSKS_BR_BankTran</param>
+    /// <returns>Cuurent record mSKS_BR_BankTran</returns>
+    // If no match found see if GL still exists.
+    // GL that was created may have been changed or deleted.
+    private boolean glCheck(SKS_BR_BankTran mSKS_BR_BankTran)
+    {
+        LedgerJournalTrans LedgerJournalTrans;
+        DimensionDynamicAccount locDimensionDynamicAccount;
+        ;
+
+        locDimensionDynamicAccount = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(mSKS_BR_BankTran.AccountId, LedgerJournalACType::Bank);
+        changeCompany(mSKS_BR_BankTran.GLCreationCompany)
+        {
+            select firstOnly RecId, LedgerDimension, AmountCurCredit, AmountCurDebit from LedgerJournalTrans where
+                LedgerJournalTrans.RecId == mSKS_BR_BankTran.LedgerJournalRecId &&
+                LedgerJournalTrans.LedgerDimension ==  locDimensionDynamicAccount &&
+                (LedgerJournalTrans.AmountCurCredit == mSKS_BR_BankTran.TranAmount ||
+                    LedgerJournalTrans.AmountCurDebit == mSKS_BR_BankTran.TranAmount);
+        }
+        if(LedgerJournalTrans)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>glMatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// GL Match
+    /// </summary>
+    /// <param name = "mSKS_BR_BankTran">mSKS_BR_BankTran</param>
+    /// <returns>Current record of mSKS_BR_BankTran</returns>
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer findBankAccountTrans is selected forUpdate and is passed to other methods where it is modified.")]
+    public BankAccountTrans glMatch(SKS_BR_BankTran mSKS_BR_BankTran)
+    {
+        BankAccountTrans findBankAccountTrans;
+        ;
+        select firstonly forupdate * from findBankAccountTrans where
+            findBankAccountTrans.AccountID == mSKS_BR_BankTran.AccountId &&
+            findBankAccountTrans.AmountCur == mSKS_BR_BankTran.TranAmount &&
+            findBankAccountTrans.AccountStatementDate == datenull() &&
+            findBankAccountTrans.AccountStatement == '' &&
+            findBankAccountTrans.Included == 0 &&
+            findBankAccountTrans.Reconciled == 0 &&
+            findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+            findBankAccountTrans.Voucher == mSKS_BR_BankTran.Voucher;
+        
+
+        // If not found either GL was not posted yet
+        // or GL was altered or deleted and may no longer be valid
+        if(!findBankAccountTrans)
+        {
+            if(!this.glCheck(mSKS_BR_BankTran))
+            {
+                mSKS_BR_BankTran.Voucher = '';
+                mSKS_BR_BankTran.LedgerJournalRecId = 0;
+                mSKS_BR_BankTran.GLMappingRuleGroupId = '';
+
+                SKS_BR_ReadFile::setDefaultMatchGroup(mSKS_BR_BankTran); // Set default matching rule
+
+                ttsbegin;
+
+                mSKS_BR_BankTran.update();
+                ttscommit;
+            }
+        }
+        return findBankAccountTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampIntermSKS_BR_BankTran</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the SKS_BR_BankTran for match
+    /// </summary>
+    /// <param name="_mSKS_BR_BankTran">
+    /// Current _mSKS_BR_BankTran record
+    /// </param>
+    /// <param name="_guid">
+    /// Guid to use for matching
+    /// </param>
+    /// <param name="_duplicate">
+    /// Indicates if a duplicate was found
+    /// </param>
+    /// <param name="_match">
+    /// Indicates if a match was found
+    /// </param>
+    public void stampIntermSKS_BR_BankTran(SKS_BR_BankTran _mSKS_BR_BankTran, Guid _guid, boolean _duplicate = false, boolean _match = true)
+    {
+
+        if(_match)
+        {
+            _mSKS_BR_BankTran.AccountStatementNum = _mSKS_BR_BankTran.ImportedStatementNum;
+            _mSKS_BR_BankTran.AccountStatementDate = _mSKS_BR_BankTran.ImportedStatementDate;
+            _mSKS_BR_BankTran.IntermMatch = NoYes::Yes;
+            _mSKS_BR_BankTran.ManualReconciliationID = _guid;
+            _mSKS_BR_BankTran.MatchIndicator = SKS_BR_MatchIndicator::Green;
+            _mSKS_BR_BankTran.MatchConfidence = 100;
+            _mSKS_BR_BankTran.Matched        = NoYes::Yes;
+        }
+
+        _mSKS_BR_BankTran.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postGL</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Match and post the GL
+    /// </summary>
+    /// <param name = "lSKS_BR_BankTran"> lSKS_BR_BankTran </param>
+    /// <param name = "lCustTrans"> lCustTrans </param>
+    /// <param name = "manual"> manual flag </param>
+    /// <returns> Return match found or not </returns>    
+    public boolean postGL(SKS_BR_BankTran lSKS_BR_BankTran, CustTrans lCustTrans, Boolean manual = false)
+    {
+        SKS_PP_Setup sKS_PP_Setup;
+        LedgerJournalTable      header;
+        LedgerJournalTrans      lLedgerJournalTrans;
+        MapIterator             mi;
+        LedgerJournalNameId     revJournalName;
+        VendPaymMode            revPaymMode;
+        LedgerJournalName       ledgerJournalName;
+        NumberSequenceTable     numberSequenceTable;
+        Voucher                 nextRec;
+        NumberSeq               numSeq;
+        NumberSeqScope          locNumberSeqScope;
+        LedgerJournalTrans locLedgerJournalTrans1;
+        
+        changecompany(lSKS_BR_BankTran.company())
+        {
+            if(manual)
+            {
+                if(lCustTrans.company() != curext())
+                {
+                    select firstonly lLedgerJournalTrans
+                        where lLedgerJournalTrans.PaymReference == lCustTrans.PaymReference &&
+                        lLedgerJournalTrans.AmountCurCredit == lCustTrans.AmountCur * -1    &&
+                        lLedgerJournalTrans.CURRENCYCODE == lCustTrans.CURRENCYCODE         &&
+                        lLedgerJournalTrans.AccountType == LedgerJournalACType::Cust        &&
+                        lLedgerJournalTrans.OffsetLedgerDimension;
+                }
+                else
+                {
+                    select firstonly lLedgerJournalTrans
+                        where lLedgerJournalTrans.CustTransId == lCustTrans.RecId;
+                }
+            }
+            else
+            {
+                select * from lLedgerJournalTrans
+                    where lLedgerJournalTrans.PaymReference == lSKS_BR_BankTran.DDRReferenceNumber &&
+                    lLedgerJournalTrans.AmountCurCredit == lSKS_BR_BankTran.TranAmount * -1        &&
+                    lLedgerJournalTrans.AccountType == LedgerJournalACType::Cust                   &&
+                    lLedgerJournalTrans.CURRENCYCODE == lSKS_BR_BankTran.getCurrencyCode();
+            }
+        }
+
+        TransDate reversalDate = lSKS_BR_BankTran.getGLPostingDate();
+
+        Map                     insertCompanydetails;
+        insertCompanydetails = new Map(Types::String, Types::Record);
+
+        if(insertCompanydetails.exists(lSKS_BR_BankTran.company()))
+        {
+            header = insertCompanydetails.lookup(lSKS_BR_BankTran.company());
+        }        
+
+        changecompany(lSKS_BR_BankTran.company())
+        {
+            sKS_PP_Setup = SKS_BR_BankTran::findDDRevSetup();
+            revJournalName = sKS_PP_Setup.BRDDRevJournalName;
+            revPaymMode = sKS_PP_Setup.BRDDRevPaymMode;
+            ledgerJournalName = LedgerJournalName::find(revJournalName);
+
+
+            if(!revJournalName)
+            {
+                throw error(strFmt("@SKS:SKSErrorDDRRevSetup", lSKS_BR_BankTran.company()));
+            }
+            else
+            {
+                select firstonly NumberSequence, NumberSequenceScope from numberSequenceTable
+                    where numberSequenceTable.RecId == ledgerJournalName.NumberSequenceTable;
+
+                ttsbegin;
+                locNumberSeqScope = NumberSeqScope::find(numberSequenceTable.NumberSequenceScope);
+                numSeq = numberseq::newGetNumFromCode(numberSequenceTable.NumberSequence, locNumberSeqScope);
+                nextRec = numSeq.num();
+                ttscommit;
+
+                header = SKS_BR_DDRMatching::createCustReversal(header, lLedgerJournalTrans, reversalDate, nextRec, revJournalName, revPaymMode);
+
+                if(header)
+                {
+                    SKS_BR_HistoryTable::insertEvent(SKS_BR_Action::DDRAutoCreated, lSKS_BR_BankTran.BankHeaderRecId,'',dateNull(),'',header.JournalNum);
+
+                    insertCompanydetails.insert(lSKS_BR_BankTran.company(), header);                    
+
+                    select firstonly Voucher from locLedgerJournalTrans1 where locLedgerJournalTrans1.JournalNum == header.JournalNum;
+
+                    ttsbegin;
+                    lSKS_BR_BankTran.selectForUpdate(true);
+                    lSKS_BR_BankTran.Voucher = locLedgerJournalTrans1.Voucher;
+                    lSKS_BR_BankTran.PaymentJournalNum = header.JournalNum;
+                    lSKS_BR_BankTran.LedgerJournalRecId = locLedgerJournalTrans1.RecId;
+                    lSKS_BR_BankTran.DDRReversalDate = reversalDate;
+                    lSKS_BR_BankTran.update();
+                    ttscommit;
+                }
+
+                header = null;
+                
+                mi = new MapIterator(insertCompanydetails);
+            }
+        }
+
+
+        while (mi.more())
+        {
+            header = mi.value();
+
+            changecompany(header.company())
+            {
+                try
+                {
+                    if(manual)
+                    {
+                        this.AutoPostJournal(true, header);
+                    }
+                    else
+                    {
+                        this.AutoPostJournal(sKS_PP_Setup.BRDDRevAutoPostReversalJournal, header);
+                    }
+
+                    if(isPosted)
+                    {
+                        SKS_BR_HistoryTable::insertEvent(SKS_BR_Action::DDRAutoPosted, lSKS_BR_BankTran.BankHeaderRecId,'',dateNull(),'',header.JournalNum);
+                    }
+                }
+                catch
+                {
+                    SKS_BR_HistoryTable::insertEvent(SKS_BR_Action::DDRAutoPostingFailed, lSKS_BR_BankTran.BankHeaderRecId,'',dateNull(),'',header.JournalNum,strFmt("@SKS3079", "@SYS25908"));
+                }
+            }
+            mi.next();
+        }
+
+        return isPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustReversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reversal for customer related transactions
+    /// </summary>
+    /// <param name = "_ledgerJournalTable">_ledgerJournalTable</param>
+    /// <param name = "_ledgerJournalTrans">_ledgerJournalTrans</param>
+    /// <param name = "_reversalDate">_reversalDate</param>
+    /// <param name = "_voucher">_voucher</param>
+    /// <param name = "_revJournalName">_revJournalName</param>
+    /// <param name = "_revPaymMode">_revPaymMode</param>
+    /// <returns>Returns LedgerJournalTable</returns>
+    public static LedgerJournalTable createCustReversal(
+        LedgerJournalTable          _ledgerJournalTable,
+        LedgerJournalTrans          _ledgerJournalTrans,
+        TransDate                   _reversalDate,
+        Voucher                     _voucher,
+        LedgerJournalNameId         _revJournalName,
+        PaymMode                    _revPaymMode) // SKS_FDD_9664
+    {
+        SpecTrans           specTrans;
+        CustTrans           lCustTrans;
+        CustTransOpen       lCustTransOpen;
+        SpecTransManager    specTransManager;
+        LedgerJournalTable  paymJournal;
+
+        ttsbegin;
+
+        if(_ledgerJournalTrans.AccountType == LedgerJournalACType::Cust)
+        {
+            // 9192 CR -->
+            if(_ledgerJournalTrans.Company != curext())
+            {
+                changeCompany(_ledgerJournalTrans.Company)
+                {
+                    LedgerJournalTrans  localLedgerjournaltrans;
+                    select localLedgerjournaltrans where localLedgerjournaltrans.ForeignVoucher == _ledgerJournalTrans.voucher
+                        && localLedgerJournalTrans.ForeignCompany == _ledgerJournalTrans.DataAreaId
+                        && localLedgerjournaltrans.Invoice == _ledgerJournalTrans.Invoice
+                        && localLedgerjournaltrans.AmountCurCredit == _ledgerJournalTrans.AmountCurCredit
+                        && localLedgerjournaltrans.AmountCurDebit == _ledgerJournalTrans.AmountCurDebit
+                        && localLedgerjournaltrans.TransDate == _ledgerJournalTrans.TransDate
+                        && localLedgerjournaltrans.LedgerDimension == _ledgerJournalTrans.LedgerDimension
+                        && localLedgerjournaltrans.CustTransId != 0;
+
+                    lcustTransOpen = SKS_EFT_Reversal::custReversal(localLedgerjournaltrans, specTransManager, _reversalDate);
+                    lcustTrans = lcustTransOpen.custTrans();
+                }
+            }
+            else
+            {
+                lcustTransOpen = SKS_BR_DDRMatching::custReversal(_ledgerJournalTrans, specTransManager, _reversalDate);
+                lcustTrans = lcustTransOpen.custTrans();
+            }
+            // 9192 CR <--
+            if(lcustTransOpen)
+            {
+                select firstOnly SpecTrans where SpecTrans.refrecid == lcustTransopen.recid && SpecTrans.reftableid == tableNum(custTransOpen)
+                            && SpecTrans.refcompany == lcustTransopen.company();
+
+                if(SpecTrans)
+                {
+                    throw error("@SYS117108");
+                }
+                else
+                {
+                    PaymJournal = SKS_EFT_Reversal::CreatePaymJournal(lcustTrans, _ledgerJournalTrans, _revPaymMode, _reversalDate, _revJournalName, _ledgerJournalTable, _voucher, false /*SKS_FDD_9664*/); // 9192 CR
+                }
+            }
+            else
+            {
+                throw error("@SKS3016");
+            }
+        }
+        ttscommit;
+        return PaymJournal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custReversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reverse the customer transactions based on company
+    /// </summary>
+    /// <param name = "lLedgerJournalTrans">lLedgerJournalTrans</param>
+    /// <param name = "_specTransManager">SpecTransManager</param>
+    /// <param name = "_reversalDate">_reversalDate</param>
+    /// <returns>CustTransOpen</returns>
+    public static CustTransOpen custReversal(LedgerJournalTrans lLedgerJournalTrans, SpectransManager _specTransManager, TransDate _reversalDate)
+    {
+        CustTable           lCustTable;
+        CustTrans           lCustTrans;
+        CustSettlement      lCustSettlement;
+        CustSettlement      localCustSettlement;
+        CustTransOpen       lCustTransOpen;
+
+        SpectransManager specTransManager = _specTransManager;
+
+        while select lCustSettlement join Accountnum, RecId, DataAreaId, currencyCode from lCustTrans order by lCustSettlement.RecId
+            where lCustSettlement.transrecid == lCustTrans.recid
+            && lCustSettlement.transcompany == lCustTrans.dataAreaId && lCustSettlement.accountnum == lCustTrans.accountnum
+            && lCustTrans.recid == lLedgerJournalTrans.CustTransId
+        {
+            if(lCustSettlement)
+            {
+                if(lCustSettlement.CanBeReversed == NoYes::Yes)
+                {
+                    lCusttable = CustTable::findByCompany(curext(), lcustTrans.AccountNum);
+
+                    specTransManager = SpecTransManager::newRefTableId(lCustTable, tableNum(CustSettlement), true);
+
+                    if (specTransManager.existForOtherSpec(lCustSettlement.DataAreaId, lCustSettlement.TableId, lCustSettlement.RecId) == false)
+                    {
+                        specTransManager.insert(lCustSettlement.DataAreaId, lCustSettlement.TableId, lCustSettlement.RecId, lCustSettlement.SettleAmountCur, lCustTrans.CurrencyCode);
+                        lCustSettlement.CustVendSettlement::markThisAndRelatedOffsets(specTransManager, lCustTrans.CurrencyCode);
+                    }
+                    else
+                    {
+                        throw error("@SYS117108");
+                    }
+
+                    if(custTrans::reverseTransact(lCustTable, null, SettleDatePrinc::SelectDate, _reversalDate))
+                    {
+                        specTransManager.deleteAll();
+
+                        select firstonly forUpdate localCustSettlement where localCustSettlement.TransRecId == lcustTrans.RecId;
+                        localCustSettlement.CanBeReversed = NoYes::No;
+                        localCustSettlement.update();
+                    }
+                    else
+                    {
+                        throw error("@SKS3016");
+                    }
+                }
+                else
+                {
+                    // SKS_Bug_11989 -->
+                    throw error("@SKS3016");
+                    // SKS_Bug_11989 <--
+                }
+            }
+        }
+        select firstonly lCustTransOpen join RecId from lCustTrans where lCustTransOpen.RefRecId == lCustTrans.RecId
+            && lLedgerJournalTrans.CustTransId == lCustTrans.recid;
+
+        return lCustTransOpen;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AutoPostJournal</Name>
+				<Source><![CDATA[
+    // SKS_FDD_13903 <--
+    /// <summary>
+    /// To post the reversed journal, if autopost is set to yes in TAS parameters.
+    /// </summary>
+    /// <param name = "autopost">The value to post reversed journal.</param>
+    /// <param name = "_jourTable">The <c>LedgerJournalTable</c> record to post.</param>
+    // CR-9541
+    public void AutoPostJournal(boolean autopost, LedgerJournalTable _jourTable)
+    {
+        LedgerJournalCheckPost  jourCheckPost;
+
+        try
+        {
+            if(autopost)
+            {
+                jourCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(_jourTable, NoYes::Yes, NoYes::Yes);
+                jourCheckPost.run();
+                info(strFmt("@SKS:SKGIHBCreatedInCompany", _jourTable.JournalNum,_jourTable.DataAreaId)); // SKS_FDD_9664
+                isPosted = true;
+            }
+            else
+            {
+                info("@SKS3017");
+                info(strFmt("@SKS:SKGIHBCreatedInCompany", _jourTable.JournalNum, _jourTable.DataAreaId)); // SKS_FDD_9664
+            }
+        }
+        catch
+        {
+            error("@SYS23002");
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GGIPrintBOLCOAHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class GGIPrintBOLCOAHelper
+{
+
+    boolean             createMasterBOL;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>printBOLForLoad</Name>
+				<Source><![CDATA[
+    public void printBOLForLoad(WHSLoadId _loadId)
+    {
+        WHSLoadTable loadTable = WHSLoadTable::find(_loadId);
+        WHSLoadTable multiLoadTable;
+
+        if (!WHSShipConfirm::isBOLEnabledForLoad(loadTable))
+        {
+            warning(strFmt("@WAX1967", loadTable.LoadId, loadTable.LoadStatus));
+            return;
+        }
+
+        if (TMSRoute::find(loadTable.RouteCode).numOfLoads() > 1)
+        {
+            while select multiLoadTable
+                where multiLoadTable.RouteCode == loadTable.RouteCode
+            {
+                if (WHSShipConfirm::isBOLEnabledForLoad(multiLoadTable))
+                {
+                    this.runBOLForLoad(multiLoadTable.LoadId);
+                }
+                else
+                {
+                    warning(strFmt("@WAX1967", multiLoadTable.LoadId, multiLoadTable.LoadStatus));
+                }
+            }
+        }
+        else
+        {
+            this.runBOLForLoad(_loadId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runBOLForLoad</Name>
+				<Source><![CDATA[
+    private void runBOLForLoad(WHSLoadId _loadId)
+    {
+        WHSShipmentTable    shipmentTable;
+        WHSLoadLine         loadLine;
+        WHSBillOfLading     masterBOL;
+        boolean             printMasterBOL; // Need to print master BOL report after all shipment BOLs have been created.
+
+        if (TMSParameters::find().CreateMasterBOL)
+        {
+            select count(RecId) from shipmentTable
+                where shipmentTable.LoadId == _loadId
+                exists join loadLine
+                    where loadLine.ShipmentId == shipmentTable.ShipmentId;
+
+            if (int642int(shipmentTable.RecId > 1))
+            {
+                createMasterBOL = true;
+                printMasterBOL  = true;
+            }
+        }
+
+        while select ShipmentId, LoadId from shipmentTable
+            where shipmentTable.LoadId == _loadId
+            exists join loadLine
+                where shipmentTable.ShipmentId == loadLine.ShipmentId
+        {
+            if (!WHSShipConfirm::isBOLEnabledForShipment(WHSShipmentTable::find(shipmentTable.ShipmentId)))
+            {
+                warning(strFmt("@WAX1966", shipmentTable.ShipmentId, WHSShipmentTable::find(shipmentTable.ShipmentId).ShipmentStatus));
+            }
+            else
+            {
+                this.runBOLForShipment(shipmentTable.ShipmentId);
+            }
+
+            // Only need to create the master BOL once per load.
+            createMasterBOL = false;
+        }
+
+        if (printMasterBOL)
+        {
+            masterBOL = WHSBillOfLading::find(WHSLoadTable::find(_loadId).BillOfLadingId);
+
+            this.printBOL(masterBOL.BillOfLadingId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runBOLForShipment</Name>
+				<Source><![CDATA[
+    private void runBOLForShipment(WHSShipmentId _shipmentId)
+    {
+        WHSShipmentTable            shipmentTable;
+        WHSBillOfLading             billOfLading;
+        WHSBillOfLadingDataUtil     billOfLadingDataUtil;
+        boolean                     updateShipmentTable = false;
+        boolean                     constructBOLData    = false;
+
+        shipmentTable = WHSShipmentTable::find(_shipmentId, true);
+
+        if (shipmentTable.RecId != 0)
+        {
+            if (!shipmentTable.BillOfLadingId)
+            {
+                shipmentTable.setBillOfLadingId();
+                updateShipmentTable = true;
+            }
+
+            constructBOLData = true;
+        }
+
+        ttsbegin;
+
+        if (updateShipmentTable)
+        {
+            shipmentTable.update();
+            TMSFreightBillDetail::setBillOfLadingId(shipmentTable);
+        }
+
+        if (constructBOLData)
+        {
+            billOfLadingDataUtil = WHSBillOfLadingDataUtil::construct();
+            billOfLadingDataUtil.parmShipmentCriteria(shipmentTable);
+            billOfLadingDataUtil.parmCreateMasterBOL(createMasterBOL);
+            billOfLadingDataUtil.populateBillOfLadingTables();
+        }
+
+        ttscommit;
+
+        if (shipmentTable.RecId != 0)
+        {
+            // It is possible to manually create multiple Bill of Lading reports on the same shipment
+            while select billOfLading
+                where billOfLading.ShipmentId       == shipmentTable.ShipmentId
+                &&    billOfLading.MasterBOLFlag    == NoYes::No
+            {
+                this.printBOL(billOfLading.BillOfLadingId,true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printBOL</Name>
+				<Source><![CDATA[
+    public void printBOL(WHSBillOfLadingId _whsBillOfLadingId,boolean isShipmentBOL = false )
+    {
+        WHSBillofLadingController     whsBillofLadingController;
+        Args args = new Args(ssrsReportStr(WHSBillOfLading, Report));
+        WHSBillOfLading     masterBOL;
+
+        masterBOL = WHSBillOfLading::find(_whsBillOfLadingId);
+
+        // Add record to be printed.
+        // In order to have the context table we need to set args.record().
+        args.record(masterBOL);
+        args.caller(this);
+        args.menuItemName(menuItemOutputStr(WHSBillofLading));
+        args.menuItemType(MenuItemType::Output);
+
+        if(isShipmentBOL)
+        {
+            args.parmEnum(NoYes::No);
+        }
+
+        whsBillofLadingController = new WHSBillofLadingController();
+        whsBillofLadingController.parmReportName(ssrsReportStr(WHSBillOfLading, Report));
+        whsBillofLadingController.parmArgs(args);
+        whsBillofLadingController.parmShowDialog(false);
+
+        if(isShipmentBOL)
+        {
+            whsBillofLadingController.run();
+        }
+        else
+        {
+            whsBillofLadingController.startOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printCOA</Name>
+				<Source><![CDATA[
+    public void printCOA(WHSLoadId _loadId)
+    {
+        PIPInventTestCustSpecificCOAController controller;
+        PIPInventTestCustSpecificCOAGenerate custSpecificCOAGenerate;
+        List                                    coaDetailsList;
+        WHSLoadTable        loadTable;
+        WHSWorkLine         workLine;
+        InventBatch         inventBatch;
+        InventDim           inventDim;
+        WHSWorkInventTrans  workInventTrans;
+        InventTrans         inventTrans, inventTransBatch;
+        InventTransOrigin   inventTransOrigin;
+        SalesTable          salesTable;
+        SalesLine           salesLine;
+        container           coaDetail;
+        InventBatchId       batch;
+        InventDim           inventDimBatchNum;
+        InventBatchId       custSpecificCOABatchNum;
+        WHSOrderNum         orderNum;
+        InventTransOrigin   inventTransOriginBatch;
+        NoYes               printCoA;
+
+        InventTestCertOfAnalysisTable   custSpecificCOA;
+        InventDim                       inventDimCOA, inventDimBatch;
+        ListEnumerator                  listEnumerator;
+        GGILoadIdCOAHelper              ggiLoadIdCOAHelper;
+        Args                            args;
+
+        args = new Args();
+               
+        custSpecificCOAGenerate = PIPInventTestCustSpecificCOAGenerate::construct();
+
+        controller = new PIPInventTestCustSpecificCOAController();
+
+        select firstonly loadTable
+                    where loadTable.LoadId == _loadId;
+
+        while select workInventTrans
+            join workLine
+                where workLine.WorkId == workInventTrans.WorkId
+                    && workLine.LoadId == _loadId
+                    && workLine.WorkType == WHSWorkType::Put
+            join inventTransOrigin
+                where inventTransOrigin.InventTransId == workInventTrans.InventTransIdTo
+            join inventTrans
+                where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+            join inventDim
+                group by inventDim.inventBatchId
+                    where inventDim.inventDimId == inventTrans.inventDimId
+            join inventBatch
+                where inventBatch.inventBatchId == inventDim.inventBatchId
+        {
+            while select firstonly custSpecificCOA
+                order by CreatedDateTime desc
+                exists join inventDimCOA
+                    where inventDimCOA.inventDimId == custSpecificCOA.InventDimId
+                        && inventDimCOA.inventBatchId == inventDim.inventBatchId
+                        && custSpecificCOA.PIPCustAccount == loadTable.AccountNum
+            {
+                select firstonly inventDimBatchNum
+                    where inventDimBatchNum.inventDimId == custSpecificCOA.InventDimId;
+
+                custSpecificCOABatchNum = inventDimBatchNum.inventBatchId;
+                orderNum = loadTable.OrderNum;
+                
+                select firstonly ggiLoadIdCOAHelper
+                    where ggiLoadIdCOAHelper.LoadId == _loadId
+                        && ggiLoadIdCOAHelper.QualityOrderId == custSpecificCOA.QualityOrderId
+                        && ggiLoadIdCOAHelper.InventCertificateOfAnalysisId == custSpecificCOA.InventCertificateOfAnalysisId;
+                
+                if (!ggiLoadIdCOAHelper)
+                {
+                    ttsbegin;                   
+                    ggiLoadIdCOAHelper.LoadId = _loadId;
+                    ggiLoadIdCOAHelper.AccountRelation = custSpecificCOA.AccountRelation;
+                    ggiLoadIdCOAHelper.ContactPersonId = custSpecificCOA.ContactPersonId;
+                    ggiLoadIdCOAHelper.InventCertificateOfAnalysisId = custSpecificCOA.InventCertificateOfAnalysisId;
+                    ggiLoadIdCOAHelper.InventDimId = custSpecificCOA.InventDimId;
+                    ggiLoadIdCOAHelper.InventRefId = custSpecificCOA.InventRefId;
+                    ggiLoadIdCOAHelper.InventRefTransId = custSpecificCOA.InventRefTransId;
+                    ggiLoadIdCOAHelper.ItemId = custSpecificCOA.ItemId;
+                    ggiLoadIdCOAHelper.QualityOrderId = custSpecificCOA.QualityOrderId;
+                    ggiLoadIdCOAHelper.ReferenceType = custSpecificCOA.ReferenceType;
+                    ggiLoadIdCOAHelper.RouteId = custSpecificCOA.RouteId;
+                    ggiLoadIdCOAHelper.insert();
+                    ttscommit;
+                }
+
+                select firstonly SalesTable
+                    where salesTable.SalesId == orderNum;
+
+                while select SalesLine
+                    where salesLine.SalesId == orderNum
+                {
+                    select firstonly inventTransOriginBatch
+                        where inventTransOriginBatch.InventTransId == salesLine.InventTransId
+                            join inventTransBatch
+                        where inventTransBatch.InventTransOrigin == inventTransOriginBatch.RecId
+                            join inventDimBatch
+                        where inventDimBatch.inventDimId == inventTransBatch.inventDimId;
+
+                    if (inventDimBatch.inventBatchId == custSpecificCOABatchNum)
+                    {
+                        printCoA = NoYes::Yes;
+                    }
+                }
+
+                if (loadTable.AccountNum == custSpecificCOA.PIPCustAccount && printCoA == NoYes::Yes)
+                {
+                    args.record(custSpecificCOA);
+                    args.parm(custSpecificCOA.InventCertificateOfAnalysisId);
+                    args.menuItemName(menuItemOutputStr(InventTestCertOfAnalysis));
+                    args.menuItemType(MenuItemType::Output);
+    
+                    // generate report
+                    controller.parmArgs(args);
+                    controller.parmReportName(ssrsReportStr(PIPInventTestCustSpecificCOA, Report));
+                    controller.parmShowDialog(false);
+                    controller.startOperation();
+                }
+                printCoA = NoYes::No;
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

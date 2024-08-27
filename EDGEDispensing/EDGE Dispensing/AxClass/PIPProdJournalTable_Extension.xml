@@ -1,0 +1,301 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PIPProdJournalTable_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(tableStr(ProdJournalTable))]
+public final class PIPProdJournalTable_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>pipCreateDispensingQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates a query for retrieving the production journal BOM lines that are dispensing controlled.
+    /// </summary>
+    /// <param name="_dispensingOrderData">
+    ///    A container with the dispensing status for the production orders in this production journal; optional. The container has 2 values:
+    ///    <list type="bullet">
+    ///       <item>
+    ///         <description>A boolean true if all the productions orders referenced by this journal have dispensing
+    ///         enabled and at least one dispensing contolled item; otherwise false.</description>
+    ///       </item>
+    ///       <item>
+    ///         <description>A container that contains the production order IDs of the production orders referenced by
+    ///         this journal for which dispensing is required. This second container is only valid if the
+    ///         first value is <i>false</i>.</description>
+    ///       </item>
+    ///    </list>
+    ///    This parameter is provided for performance reasons; use <see cref="pipDispensingOrders method"/> to get this contaier.
+    /// </param>
+    /// <returns>
+    ///    A query for retrieving the production journal BOM lines for this journal that are dispensing controlled.
+    /// </returns>
+    public Query pipCreateDispensingQuery(container _dispensingOrderData = conNull())
+    {
+        Query                   query;
+        QueryBuildDataSource    dsProdJournalBOM;
+        QueryBuildDataSource    dsInventTable;
+    
+        boolean                 allOrders;
+        container               orderIds;
+    
+        if (_dispensingOrderData == conNull())
+        {
+            [allOrders, orderIds] = this.pipDispensingOrders();
+        }
+        else
+        {
+            [allOrders, orderIds] = _dispensingOrderData;
+        }
+    
+        query = new Query();
+        dsProdJournalBOM = query.addDataSource(tableNum(ProdJournalBOM));
+    
+        if (!allOrders)
+        {
+            dsProdJournalBOM.addRange(fieldNum(ProdJournalBOM, ProdId)).value(con2Str(orderIds));
+        }
+    
+        dsInventTable = dsProdJournalBOM.addDataSource(tableNum(InventTable));
+        dsInventTable.joinMode(JoinMode::ExistsJoin);
+        dsInventTable.relations(true);
+        dsInventTable.addRange(fieldNum(InventTable, PIPDispensingControl)).value(queryValue(NoYes::Yes));
+    
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipDispensingOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets a container with information on the dispensing status for all the production orders on this
+    ///    production journal.
+    /// </summary>
+    /// <returns>
+    ///    A container identifying if all the production orders referenced by this journal have dispensing
+    ///    enabled or a list of the production orders that do. The container has 2 values:
+    ///    <list type="bullet">
+    ///       <item>
+    ///         <description>A boolean true if all the productions orders referenced by this journal have dispensing
+    ///         enabled and at least one dispensing contolled item; otherwise false.</description>
+    ///       </item>
+    ///       <item>
+    ///         <description>A container that contains the production order IDs of the production orders referenced by
+    ///         this journal for which dispensing is required. This second container is only valid if the
+    ///         first value is <i>false</i>.</description>
+    ///       </item>
+    ///    </list>
+    /// </returns>
+    public container pipDispensingOrders()
+    {
+        if (!#PIPDispensingEnabled || this.JournalType != ProdJournalType::Picklist)
+        {
+            return [false, conNull()];
+        }
+    
+        return ProdJournalTable::pipDispensingOrdersOnServer(this);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipHasDispensingControlledItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets a value indicating if the production journal has any item that is dispensing controlled.
+    /// </summary>
+    /// <returns>
+    ///    true if the production journal has at least one item that is dispensing controlled; otherwise, false.
+    /// </returns>
+    public boolean pipHasDispensingControlledItem()
+    {
+        boolean                 allOrders;
+        container               orderIds;
+    
+        QueryRun                queryRun;
+        Query                   query;
+        QueryBuildDataSource    dsProdJournalBOM;
+    
+        boolean                 ret = false;
+    
+        [allOrders, orderIds] = this.pipDispensingOrders();
+        if (allOrders || conLen(orderIds) > 0)
+        {
+            query = this.pipCreateDispensingQuery([allOrders, orderIds]);
+            dsProdJournalBOM = query.dataSourceTable(tableNum(ProdJournalBOM));
+            dsProdJournalBOM.addSelectionField(fieldNum(ProdJournalBOM, RecId));
+            dsProdJournalBOM.firstOnly(true);
+    
+            queryRun = new QueryRun(query);
+            ret = queryRun.next();
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipPostDispensingTicket</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Posts the dispensed values in the dispensing tickets associated with the production journal BOM liens on this journal.
+    /// </summary>
+    /// <returns>
+    ///    true if at least one production journal BOM line was updated; otherwise, false.
+    /// </returns>
+    public boolean pipPostDispensingTicket()
+    {
+        PIPDispensingTicket dispensingTicket;
+        ProdJournalBOM      prodJournalBOM;
+        boolean             ret = false;
+    
+        ttsBegin;
+    
+        setPrefix("@PIP971");
+    
+        while select forUpdate prodJournalBOM
+            where prodJournalBOM.JournalId                    == this.JournalId
+            join dispensingTicket
+                where dispensingTicket.ProdJournalBOMRefRecId == prodJournalBOM.RecId
+                    && (dispensingTicket.DispensedQty         != prodJournalBOM.PIPDispensedQty
+                        || dispensingTicket.DispensedCWQty    != prodJournalBOM.PIPDispensedCWQty)
+        {
+            setPrefix(prodJournalBOM.ItemId);
+    
+            prodJournalBOM.PIPDispensedQty   = dispensingTicket.DispensedQty;
+            prodJournalBOM.PIPDispensedCWQty = dispensingTicket.DispensedCWQty;
+    
+            if (prodJournalBOM.BOMConsump == 0 || (prodJournalBOM.BOMConsump == prodJournalBOM.BOMProposal && prodJournalBOM.BOMConsump != prodJournalBOM.PIPDispensedQty))
+            {
+                prodJournalBOM.BOMConsump         = prodJournalBOM.PIPDispensedQty;
+                prodJournalBOM.InventConsump      = prodJournalBOM.inventTable().pipToUnit(prodJournalBOM.BOMConsump, prodJournalBOM.BOMUnitId);
+            }
+    
+            if (prodJournalBOM.PdsCWInventConsump == 0 || prodJournalBOM.PdsCWInventConsump == prodJournalBOM.PdsCWInventProposal)
+            {
+                prodJournalBOM.PdsCWInventConsump = prodJournalBOM.PIPDispensedCWQty;
+            }
+    
+            if (prodJournalBOM.validateWrite())
+            {
+                prodJournalBOM.update();
+                ret = true;
+            }
+        }
+    
+        ttsCommit;
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipHasDispensingJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a value indicating if the given production order has at least one dispensing journal.
+    /// </summary>
+    /// <param name = "_prodId">The ID of the production order to check for.</param>
+    /// <returns>true if production order <paramref name="_prodId"/> has at least one dispensing journal; otherwise, false.</returns>
+    public static boolean pipHasDispensingJournal(ProdId _prodId)
+    {
+        return (select ProdJournalTable
+            where ProdJournalTable.ProdId == _prodId
+            && ProdJournalTable.JournalType == ProdJournalType::Picklist
+            && ProdJournalTable.PIPIsDispensingJournal).RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipDispensingOrdersOnServer</Name>
+				<Source><![CDATA[
+    private static server container pipDispensingOrdersOnServer(ProdJournalTable _journalTable)
+    {
+        ProdParameters  prodParameters;
+        ProdJournalBOM  prodJournalBOM;
+        boolean         allOrders;
+        container       prodIds;
+    
+        prodParameters = ProdParameters::find();
+    
+        allOrders =
+            (prodParameters.ProdParamInventDimLookup == ProdParamInventDimLookup::Company
+                && ProdParametersDim::findDefault().PIPDispensingEnabled)
+            || (_journalTable.ProdId
+                && ProdTable::find(_journalTable.ProdId).pipIsDispensingEnabled());
+    
+        if (!allOrders && _journalTable.RecId)
+        {
+            allOrders = true;
+            while select ProdId from prodJournalBOM
+                group by ProdId
+                where prodJournalBOM.JournalId == _journalTable.JournalId
+            {
+                if (prodJournalBOM.prodTable().pipIsDispensingEnabled())
+                {
+                    prodIds += [prodJournalBOM.ProdId];
+                }
+                else
+                {
+                    allOrders = false;
+                }
+            }
+    
+            allOrders = allOrders && conLen(prodIds) > 0;
+    
+            // No need to send back the list of production order IDs since all of them have dispensing enabled.
+            if (allOrders)
+            {
+                prodIds = conNull();
+            }
+        }
+    
+        return [allOrders, prodIds];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipDeleteProdIdReferences</Name>
+				<Source><![CDATA[
+    public server static void pipDeleteProdIdReferences(ProdId _prodId, PIPProdGenerationSource _generationSource)
+    {
+        #isoCountryRegionCodes
+    
+        ProdJournalTable    journalTable;
+    
+        ttsbegin;
+    
+        while select forupdate journalTable
+            where journalTable.ProdId == _prodId
+               && journalTable.Posted == NoYes::No
+                && (journalTable.PIPProdGenerationSource    == _generationSource
+                    || journalTable.PIPProdGenerationSource == PIPProdGenerationSource::None)
+        {
+            journalTable.delete();
+        }
+    
+        ProdJournalBOM::pipDeleteProdIdLines(_prodId, _generationSource);
+        ProdJournalRoute::deleteProdIdLines(_prodId);
+        ProdJournalProd::deleteProdIdLines(_prodId);
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+        {
+            ProdJournalRelease_RU::deleteProdIdLines(_prodId);
+        }
+    
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

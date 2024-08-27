@@ -1,0 +1,292 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CreditCardPaymentJournal</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_CreditCardPaymentJournal
+{
+    LedgerJournalTable      ledgerJournalTable;
+    LedgerJournalTrans      ledgerJournalTrans;
+    CreditCardAuthTrans     creditCardAuthTrans;
+    ProjInvoiceJour         projInvoiceJour;
+
+    LedgerJournalEngine_CustPayment     ledgerJournalEngine;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    protected void createJournal()
+    {
+        LedgerJournalName       ledgerJournalName;
+        CustParameters          custParameters = CustParameters::find();
+        SKS_PP_Setup            sks_PP_Setup = SKS_PP_Setup::find();
+        CreditCardProcessors    creditCardProcessor = CreditCardProcessors::find(creditCardAuthTrans.CreditCardProcessors);
+        CustPaymModeTable       custPaymModeTable;
+
+        if (!sks_PP_Setup.CCProjSvcOrderPaymMode)
+        {
+            throw error(strFmt("@SKS6724", projInvoiceJour.ProjInvoiceId));
+        }
+
+        // create journal table
+        ledgerJournalTable.initValue();
+
+        ledgerJournalTable.JournalNum  = JournalTableData::newTable(ledgerJournalTable).nextJournalId();
+        ledgerJournalTable.JournalName = CreditCardTypeSetup::find(creditCardProcessor, creditCardAuthTrans.CreditCardTypeName).PaymentJournal;
+
+        if (!ledgerJournalTable.JournalName)
+        {
+            throw error(strFmt("@SKS6723", projInvoiceJour.ProjInvoiceId, creditCardAuthTrans.CreditCardTypeName));
+        }
+
+        ledgerJournalTable.initFromLedgerJournalName();
+        ledgerJournalName = LedgerJournalName::find(ledgerJournalTable.JournalName);
+
+        custPaymModeTable = CustPaymModeTable::find(sks_PP_Setup.CCProjSvcOrderPaymMode);
+
+        if (ledgerJournalName.OffsetLedgerDimension)
+        {
+            ledgerJournalTable.OffsetLedgerDimension = ledgerJournalName.OffsetLedgerDimension;
+            ledgerJournalTable.OffsetAccountType = ledgerJournalName.OffsetAccountType;
+        }
+        else if (custPaymModeTable.offsetLedgerDimension())
+        {
+            ledgerJournalTable.OffsetLedgerDimension = custPaymModeTable.offsetLedgerDimension();
+            ledgerJournalTable.OffsetAccountType = custPaymModeTable.AccountType;
+        }
+
+        ledgerJournalTable.DefaultDimension = projInvoiceJour.DefaultDimension;
+
+        ledgerJournalTable.insert();
+
+        // create journal line
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+
+        ledgerJournalEngine.newJournalActive(ledgerJournalTable);
+        ledgerJournalEngine.initValue(ledgerJournalTrans);
+
+        ledgerJournalTrans.parmAccount(projInvoiceJour.InvoiceAccount);
+        ledgerJournalTrans.DefaultDimension = projInvoiceJour.DefaultDimension;
+        ledgerJournalEngine.initFromCustTable(ledgerJournalTrans);
+
+        ledgerJournalTrans.TransDate = projInvoiceJour.InvoiceDate;
+        ledgerJournalTrans.CurrencyCode = projInvoiceJour.CurrencyId;
+        ledgerJournalEngine.currencyModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.PaymMode = custPaymModeTable.PaymMode;
+        ledgerJournalTrans.BankTransType = custPaymModeTable.BankTransType;
+
+        // make sure offset account setting are getting from journal table,
+        // if that in journal table is empty getting from cust parameter table
+        if (ledgerJournalTable.parmOffsetLedgerDimension())
+        {
+            if (ledgerJournalTable.OffsetAccountType == LedgerJournalACType::Ledger)
+            {
+                ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+                ledgerJournalTrans.parmOffsetLedgerDimension(
+                ledgerJournalTrans.getOffsetLedgerDimensionForLedgerType(ledgerJournalTable.parmOffsetLedgerDimension(), ledgerJournalTrans.getOffsetCompany()));
+            }
+            else
+            {
+                ledgerJournalTrans.parmOffsetAccount(ledgerJournalTable.parmOffsetAccount(), ledgerJournalTable.OffsetAccountType);
+            }
+        }
+        else
+        {
+            if (custParameters.CreditCardPostingAccountType == LedgerJournalACType::Ledger)
+            {
+                ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+                ledgerJournalTrans.parmOffsetLedgerDimension(
+                ledgerJournalTrans.getOffsetLedgerDimensionForLedgerType(custParameters.parmCreditCardPostingLedgerDimension(), ledgerJournalTrans.getOffsetCompany()));
+            }
+            else
+            {
+                ledgerJournalTrans.parmOffsetAccount(custParameters.parmCreditCardPostingAccount(), custParameters.CreditCardPostingAccountType);
+            }
+        }
+
+        if (!ledgerJournalTrans.parmOffsetLedgerDimension())
+        {
+            throw error("@SYS122148");
+        }
+
+        ledgerJournalEngine.initOffsetDefaultDimension(ledgerJournalTrans);
+
+        ledgerJournalTrans.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    void init()
+    {
+        if (projInvoiceJour)
+        {
+            // get the credit card transaction
+            select firstonly creditCardAuthTrans
+                order by LineNum desc
+                where creditCardAuthTrans.SKS_CC_ProjInvoiceId == projInvoiceJour.ProjInvoiceId
+                   && creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+                   && (creditCardAuthTrans.ApprovalType == CreditCardOperation::AuthorizeAndCapture ||
+                       creditCardAuthTrans.ApprovalType == CreditCardOperation::CaptureAfterAuthorize ||
+                       creditCardAuthTrans.ApprovalType == CreditCardOperation::Refund);
+        }
+
+        if (!creditCardAuthTrans)
+        {
+            throw error("@SYS122144");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRecord</Name>
+				<Source><![CDATA[
+    protected void initRecord(Common _record)
+    {
+        switch(_record.TableId)
+        {
+            case tableNum(ProjInvoiceJour):
+                projInvoiceJour = _record;
+                break;
+            default:
+                throw error(Error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        ledgerJournalEngine = new LedgerJournalEngine_CustPayment();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    void postJournal()
+    {
+        Args args = new Args();
+
+        args.record(ledgerJournalTable);
+        LedgerJournalPost::main(args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    boolean run()
+    {
+        try
+        {
+            ttsbegin;
+            this.init();
+            if ((creditCardAuthTrans.ApprovalType == CreditCardOperation::Refund && creditCardAuthTrans.ApprovalAmountCur < 0) ||
+                (creditCardAuthTrans.ApprovalType != CreditCardOperation::Refund && creditCardAuthTrans.ApprovalAmountCur > 0))
+            {
+                this.createJournal();
+                this.settlePayment();
+                this.postJournal();
+            }
+            ttscommit;
+        }
+        catch
+        {
+            // CCA: This catch has been added here for any future usage of this function.
+            // This class is currently called from a class that is instantiated from FormLetterService
+            // and is already inside a ttsBegin/ttsCommit transaction thus if an error is encountered
+            // it will be handled in that class and our code in the 'postFailed' method should attempt
+            // to void any approved capture/refund transaction.
+
+            ttsabort;
+            throw error(strFmt("@SKS6722", projInvoiceJour.ProjInvoiceId));
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settlePayment</Name>
+				<Source><![CDATA[
+    protected void settlePayment()
+    {
+        CustTransOpen                   custTransOpen;
+        CustTrans                       custTrans;
+        SpecTransManager                specTransManager = SpecTransManager::newFromSpec(ledgerJournalTrans);
+
+        select firstonly custTransOpen
+        join custTrans
+            where custTransOpen.AccountNum  == custTrans.AccountNum
+                && custTransOpen.RefRecId    == custTrans.RecId
+                && custTrans.Invoice         == projInvoiceJour.ProjInvoiceId
+                && custTrans.AccountNum      == projInvoiceJour.InvoiceAccount
+                && custTrans.TransDate       == projInvoiceJour.InvoiceDate;
+
+        if (!custTransOpen)
+        {
+            throw error("@SYS122147");
+        }
+
+        specTransManager.insert(
+        custTransOpen.company(),
+        custTransOpen.TableId,
+        custTransOpen.RecId,
+        projInvoiceJour.InvoiceAmount,
+        projInvoiceJour.CurrencyId);
+
+        ledgerJournalTrans.MarkedInvoice        = custTrans.Invoice;
+        ledgerJournalTrans.MarkedInvoiceCompany = custTrans.company();
+        ledgerJournalTrans.MarkedInvoiceRecId   = custTransOpen.RecId;
+        ledgerJournalTrans.SettleVoucher        = SettlementType::SelectedTransact;
+
+        if (creditCardAuthTrans.ApprovalAmountCur < 0)
+        {
+            ledgerJournalTrans.AmountCurDebit  = abs(creditCardAuthTrans.ApprovalAmountCur);
+            ledgerJournalTrans.AmountCurCredit = 0;
+        }
+        else
+        {
+            ledgerJournalTrans.AmountCurDebit  = 0;
+            ledgerJournalTrans.AmountCurCredit = abs(creditCardAuthTrans.ApprovalAmountCur);
+        }
+
+        ledgerJournalTrans.PaymReference        = creditCardAuthTrans.Authorization;
+        ledgerJournalTrans.DocumentNum          = creditCardAuthTrans.CreditCardTypeName;
+        ledgerJournalTrans.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_CreditCardPaymentJournal construct(Common _record)
+    {
+        SKS_CC_CreditCardPaymentJournal sKS_CC_CreditCardPaymentJournal = new SKS_CC_CreditCardPaymentJournal();
+
+        sKS_CC_CreditCardPaymentJournal.initRecord(_record);
+
+        return sKS_CC_CreditCardPaymentJournal;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_VoidAuthTrans</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CC_VoidAuthTrans
+{
+    CreditCardAuthTrans creditCardAuthTrans2Cancel;    
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmCreditCardAuthTrans2Cancel</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to pass CreditCardAuthTrans record that needs to be canceled.
+    /// </summary>
+    public CreditCardAuthTrans parmCreditCardAuthTrans2Cancel(CreditCardAuthTrans _creditCardAuthTrans2Cancel = creditCardAuthTrans2Cancel)
+    {
+        creditCardAuthTrans2Cancel = _creditCardAuthTrans2Cancel;
+        return creditCardAuthTrans2Cancel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>voidCaptureTrans</Name>
+				<Source><![CDATA[
+    public void voidCaptureTrans()
+    {
+        Dialog                  dialog;
+        DialogText              dialogText;
+        boolean                 ok;
+        CreditCardProcessors    creditCardProcessors;
+        CreditCardAccountSetup  creditCardAccountSetup;
+        CreditCardProcessors    activeCreditCardProcessors;
+        utcDateTime             approvalDateTimeWithTZ, cutOffDateTimeWithTZ;
+        int64                   diff;
+        str                     transTypeForVoid;
+
+        if (!creditCardAuthTrans2Cancel)
+        {
+            return;
+        }
+
+        if (creditCardAuthTrans2Cancel.ApprovalType != CreditCardOperation::AuthorizeAndCapture &&
+            creditCardAuthTrans2Cancel.ApprovalType != CreditCardOperation::CaptureAfterAuthorize &&
+            creditCardAuthTrans2Cancel.ApprovalType != CreditCardOperation::Refund)
+        {
+            throw error("@SKS6409");
+        }
+
+        if (creditCardAuthTrans2Cancel.ProcessorStatus != CreditCardProcessorStatus::Approved)
+        {
+            throw error(strFmt("@SKS6410", enum2str(CreditCardProcessorStatus::Approved)));
+        }
+
+        transTypeForVoid = creditCardAuthTrans2Cancel.ApprovalType == CreditCardOperation::Refund ? "@SKS6506" : "@SKS6507";
+
+        if (creditCardAuthTrans2Cancel.ApprovalVoid == NoYes::Yes)
+        {
+            throw error(strFmt("@SKS6411", transTypeForVoid));
+        }
+
+        activeCreditCardProcessors = CreditCardProcessors::findActiveProcessor();
+
+        select firstOnly1 creditCardAccountSetup
+        exists join creditCardProcessors
+            where creditCardProcessors.RecId == creditCardAccountSetup.CreditCardProcessors
+               && creditCardProcessors.Name  == activeCreditCardProcessors.Name;
+
+        if (!creditCardAccountSetup)
+        {
+            throw error(strFmt("@SYS4040016", activeCreditCardProcessors.Name));
+        }
+
+        if (creditCardAccountSetup.ConnectorName != SKS_CC_PayFabricWalletHandler::getPayFabricConnectorName())
+        {
+            throw error("@SKS6412");
+        }
+
+        if (!creditCardAccountSetup.SKS_CC_GatewayVoidCutoffTime)
+        {
+            throw error("@SKS6413");
+        }
+
+        approvalDateTimeWithTZ = DateTimeUtil::applyTimeZoneOffset(creditCardAuthTrans2Cancel.ApprovedDateTime,
+                                                               creditCardAccountSetup.SKS_CC_GatewayVoidCutoffTimeZone);
+
+        cutOffDateTimeWithTZ = DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
+            creditCardAccountSetup.SKS_CC_GatewayVoidCutoffTime);
+        diff = DateTimeUtil::getDifference(approvalDateTimeWithTZ, cutOffDateTimeWithTZ);
+        if (diff > 86400 || diff < -86400)
+        {
+            throw error(strFmt("@SKS6414", strLwr(transTypeForVoid)));
+        }
+
+        dialog = new Dialog(strFmt("@SKS6415", strLwr(transTypeForVoid)));
+        dialogText = dialog.addText(strFmt("@SKS6416", strLwr(transTypeForVoid)));
+
+        if (!creditCardAuthTrans2Cancel.SKS_CC_JournalNum ||
+            (creditCardAuthTrans2Cancel.SKS_CC_JournalNum &&
+            LedgerJournalTable::find(creditCardAuthTrans2Cancel.SKS_CC_JournalNum).Posted == NoYes::Yes))
+        {
+            dialogText = dialog.addText(strFmt("@SKS6417", strLwr(transTypeForVoid)));
+            dialogText = dialog.addText("@SKS6419");
+            dialogText = dialog.addText("@SKS6420");
+        }
+        else
+        {
+            dialogText = dialog.addText(strFmt("@SKS6445", strLwr(transTypeForVoid)));
+            dialogText = dialog.addText("@SKS6446");
+        }
+        dialogText = dialog.addText("@SKS6421");
+
+        if (!dialog.run())
+        {
+            return;
+        }
+
+        try
+        {
+            ok = SKS_CC_CreditCardProcess::sKS_CC_DoVoidCapture(creditCardAuthTrans2Cancel, true, strFmt("@SKS6494", transTypeForVoid, creditCardAuthTrans2Cancel.Authorization));
+            if (!ok)
+            {
+                warning(strFmt("@SKS6422", strLwr(transTypeForVoid), creditCardAuthTrans2Cancel.Authorization));
+            }
+            else
+            {
+                if (creditCardAuthTrans2Cancel.SalesId)
+                {
+                    SalesTable salesTableSKS = SalesTable::find(creditCardAuthTrans2Cancel.SalesId);
+                    if (salesTableSKS && salesTableSKS.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTableSKS))
+                    {                        
+                        MCRCustPaymTable mcrCustPaymTable = mcrCustPaymTable::findByRecID(creditCardAuthTrans2Cancel.MCRPaymRecId, true);
+                        if (mcrCustPaymTable && mcrCustPaymTable.Status == MCRCustPaymStatus::Paid)
+                        {
+                            ttsbegin;
+                            mcrCustPaymTable.Status = MCRCustPaymStatus::NotSubmitted;
+                            mcrCustPaymTable.Amount = 0;
+                            mcrCustPaymTable.PostedAmount = 0;
+                            mcrCustPaymTable.update();                            
+
+                            salesTableSKS.reread();
+                            if (salesTableSKS.MCROrderStopped == NoYes::No &&
+                                salesTableSKS.SalesStatus != SalesStatus::Invoiced &&
+                                salesTableSKS.SalesStatus != SalesStatus::Canceled)
+                            {
+                                salesTableSKS.selectForUpdate(true);                                
+                                salesTableSKS.mcrOpenSalesOrder();                                
+                            }
+                            ttscommit;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception::Error)
+        {
+            throw error(strFmt("@SKS6423", strLwr(transTypeForVoid), creditCardAuthTrans2Cancel.Authorization));
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>voidPreAuthTrans</Name>
+				<Source><![CDATA[
+    public void voidPreAuthTrans()
+    {
+        SalesTable      salesTableUpd;
+        Dialog          dialog;
+        DialogText      dialogText;
+        boolean         ok;
+        str             infoMsg;
+
+        if (!creditCardAuthTrans2Cancel)
+        {
+            return;
+        }
+
+        if (creditCardAuthTrans2Cancel.ApprovalType != CreditCardOperation::Authorize)
+        {
+            throw error("@SKS6431");
+        }
+
+        if (creditCardAuthTrans2Cancel.ProcessorStatus != CreditCardProcessorStatus::Approved)
+        {
+            throw error(strFmt("@SKS6424", enum2str(CreditCardProcessorStatus::Approved)));
+        }
+
+        if (creditCardAuthTrans2Cancel.ApprovalVoid == NoYes::Yes)
+        {
+            throw error("@SKS6425");
+        }
+
+        if (creditCardAuthTrans2Cancel.ApprovalExpired == NoYes::Yes)
+        {
+            throw error("@SKS6426");
+        }
+
+        dialog = new Dialog("@SKS6427");
+        dialogText = dialog.addText("@SKS6428");
+
+        if (!dialog.run())
+        {
+            return;
+        }
+
+        try
+        {
+            ok = SKS_CC_CreditCardProcess::sKS_CC_doVoidAuth(creditCardAuthTrans2Cancel, true, strFmt("@SKS6430", creditCardAuthTrans2Cancel.Authorization));
+            if (ok)
+            {
+                if (creditCardAuthTrans2Cancel.SalesId)
+                {
+                    salesTableUpd = SalesTable::find(creditCardAuthTrans2Cancel.SalesId);
+                    if (salesTableUpd)
+                    {
+                        if (salesTableUpd.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTableUpd))
+                        {
+                            MCRCustPaymTable mcrCustPaymTable = mcrCustPaymTable::findByRecID(creditCardAuthTrans2Cancel.MCRPaymRecId, true);
+                            if (mcrCustPaymTable && mcrCustPaymTable.Status == MCRCustPaymStatus::Authorized)
+                            {
+                                ttsbegin;
+                                mcrCustPaymTable.Status = MCRCustPaymStatus::NotSubmitted;                                
+                                mcrCustPaymTable.PostedAmount = 0;
+                                mcrCustPaymTable.update();
+
+                                salesTableUpd.reread();
+                                if (salesTableUpd.MCROrderStopped == NoYes::No &&
+                                    salesTableUpd.SalesStatus != SalesStatus::Invoiced &&
+                                    salesTableUpd.SalesStatus != SalesStatus::Canceled)
+                                {
+                                    salesTableUpd.selectForUpdate(true);
+                                    salesTableUpd.mcrOpenSalesOrder();
+                                }
+                                ttscommit;
+                            }
+                        }
+                        else
+                        {
+                            if (SKS_PP_Setup::find().CCRemoveCCFromSOForCCPaymVoid == NoYes::Yes)
+                            {
+                                try
+                                {
+                                    salesTableUpd.selectForUpdate(true);
+                                    ttsBegin;
+                                    salesTableUpd.CreditCardApprovalAmount = 0;
+                                    salesTableUpd.CreditCardAuthorization = '';
+                                    salesTableUpd.CreditCardCustRefId = 0;
+                                    salesTableUpd.doUpdate();
+                                    ttsCommit;
+                                    infoMsg = "@SKS6432";
+                                    info(infoMsg);
+                                }
+                                catch (Exception::Error)
+                                {
+                                    ttsAbort;
+                                    throw error(strFmt("@SKS6433", creditCardAuthTrans2Cancel.SalesId));
+                                }
+                            }
+                            else
+                            {
+                                infoMsg = "@SKS6434" + ' ';
+                                infoMsg += "@SKS6435";
+                                info(infoMsg);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                warning(strFmt("@SKS6436", creditCardAuthTrans2Cancel.Authorization));
+            }
+        }
+        catch (Exception::Error)
+        {
+            throw error(strFmt("@SKS6437", creditCardAuthTrans2Cancel.Authorization));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_CC_VoidAuthTrans construct()
+    {
+        return new SKS_CC_VoidAuthTrans();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    private static void main(Args _args)
+    {
+        SKS_CC_VoidAuthTrans    voidAuthTrans;
+
+        if (!_args || _args.dataset() != tableNum(CreditCardAuthTrans) || !_args.record())
+        {
+            throw error(strFmt("@SKS6394", formStr(CreditCardAuthTrans)));
+        }
+
+        voidAuthTrans = SKS_CC_VoidAuthTrans::construct();
+        voidAuthTrans.parmCreditCardAuthTrans2Cancel(_args.record());
+
+        if (_args.menuItemName() == menuitemActionStr(SKS_CC_VoidPreAuthTrans))
+        {
+            voidAuthTrans.voidPreAuthTrans();
+        }
+        else if (_args.menuItemName() == menuitemActionStr(SKS_CC_VoidCaptureTrans))
+        {
+            voidAuthTrans.voidCaptureTrans();
+        }
+        else
+        {
+            throw error(strFmt("@SKS6394", formStr(CreditCardAuthTrans)));
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

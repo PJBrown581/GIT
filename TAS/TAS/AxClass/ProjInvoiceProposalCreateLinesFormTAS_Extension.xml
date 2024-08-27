@@ -1,0 +1,447 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProjInvoiceProposalCreateLinesFormTAS_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(formstr(ProjInvoiceProposalCreateLines))]
+final class ProjInvoiceProposalCreateLinesFormTAS_Extension
+{
+    public AmountCur sKS_CC_AuthAmount;
+    public RecIdCount sKS_CC_CountOfServiceOrders;
+    public RecIdCount sKS_CC_CountOfServiceOrdersWithAuth;
+    public SKS_CC_SvcOrderInvPropAurhStatus sKS_CC_AuthStatus;
+    public PSATmpProjProposalTrans pSATmpProjProposalTransSKS;
+    public boolean sKS_CC_IsServiceOrderEnabled;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>SKS_CC_InitFromSMAServiceOrderTable</Name>
+				<Source><![CDATA[
+    void SKS_CC_InitFromSMAServiceOrderTable(SMAServiceOrderTable _serviceOrderTable)
+    {
+        ProjTable   projTableLocal = ProjTable::find(_serviceOrderTable.ProjId);
+
+        serviceOrderTable = _serviceOrderTable;
+
+        projInvoiceProjIdLocked = projTableLocal.ProjInvoiceProjId;
+
+        this.initFromProjTable(projTableLocal);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetServiceOrderAuthValues</Name>
+				<Source><![CDATA[
+    public void sKS_CC_SetServiceOrderAuthValues()
+    {
+        if (sKS_CC_IsServiceOrderEnabled)
+        {            
+            if (proposalCreateLines)
+            {
+                [sKS_CC_AuthAmount, sKS_CC_CountOfServiceOrdersWithAuth,
+                    sKS_CC_CountOfServiceOrders, sKS_CC_AuthStatus] = proposalCreateLines.sKS_CC_ServiceOrderAuthValues(invoiceAmount);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_ValidateInvoiceProposalLines</Name>
+				<Source><![CDATA[
+    public boolean SKS_CC_ValidateInvoiceProposalLines()
+    {
+        Set                         serviceOrderIdSelected = null;
+        SetEnumerator               setEnumeratorServiceOrderId;
+        Set                         serviceOrdersWithAuth = null;
+        boolean                     hasNonServiceOrderLines;
+        boolean                     hasMultipleFundingSources;
+        boolean                     fundingSourceCheckCompleted;
+        int                         serviceOrdersCount;
+        SMAServiceOrderId           curServiceOrderId;
+        SMAServiceOrderTable        serviceOrderTableSKS;
+        PaymTermId                  projFundingSourcePaymTermId;
+        ProjFundingSource           projFundingSourceSKS;
+        ProjTable                   projTableSKS;
+
+        if (!sKS_CC_IsServiceOrderEnabled)
+        {
+            return true;
+        }
+
+        pSATmpProjProposalTransSKS.setTmpData(this.PSATmpProjProposalTrans);
+
+        while select pSATmpProjProposalTransSKS
+            where pSATmpProjProposalTransSKS.Selected == NoYes::Yes
+        {
+            if (pSATmpProjProposalTransSKS.SKS_CC_ServiceOrderId)
+            {
+                if (!serviceOrderIdSelected)
+                {
+                    serviceOrderIdSelected = new Set(Types::String);
+                }
+
+                if (!serviceOrderIdSelected.in(pSATmpProjProposalTransSKS.SKS_CC_ServiceOrderId))
+                {
+                    serviceOrderIdSelected.add(pSATmpProjProposalTransSKS.SKS_CC_ServiceOrderId);
+                }
+            }
+            else
+            {
+                if (!hasNonServiceOrderLines)
+                {
+                    hasNonServiceOrderLines = true;
+                }
+            }
+        }
+
+        if (!serviceOrderIdSelected)
+        {
+            return true;
+        }
+
+        if (serviceOrderIdSelected.empty())
+        {
+            return true;
+        }
+
+        serviceOrdersCount = serviceOrderIdSelected.elements();
+
+        setEnumeratorServiceOrderId = serviceOrderIdSelected.getEnumerator();
+        while (setEnumeratorServiceOrderId.moveNext())
+        {
+            curServiceOrderId = setEnumeratorServiceOrderId.current();
+            serviceOrderTableSKS = SMAServiceOrderTable::find(curServiceOrderId);
+
+            if (!serviceOrderTableSKS)
+            {
+                continue;
+            }
+
+            if (!fundingSourceCheckCompleted)
+            {
+                projTableSKS = ProjTable::find(serviceOrderTableSKS.ProjId);
+                if (ProjFundingSource::numberOfFundingSources(projTableSKS.ProjInvoiceProjId) > 1)
+                {
+                    hasMultipleFundingSources = true;
+                }
+                else
+                {
+                    select firstonly PaymentTermsId from projFundingSourceSKS
+                        where projFundingSourceSKS.ContractId == projTableSKS.ProjInvoiceProjId
+                           && projFundingSourceSKS.FundingType == ProjFundingType::Customer;
+
+                    if (projFundingSourceSKS.PaymentTermsId)
+                    {
+                        projFundingSourcePaymTermId = projFundingSourceSKS.PaymentTermsId;
+                    }
+                }
+
+                fundingSourceCheckCompleted = true;
+            }
+
+            if (SKS_CC_CustPaymTable::hasApprovedAuthorization(serviceOrderTableSKS.TableId, serviceOrderTableSKS.RecId))
+            {
+                if (!serviceOrdersWithAuth)
+                {
+                    serviceOrdersWithAuth = new Set(Types::String);
+                }
+
+                if (!serviceOrdersWithAuth.in(serviceOrderTableSKS.ServiceOrderId))
+                {
+                    serviceOrdersWithAuth.add(serviceOrderTableSKS.ServiceOrderId);
+                }
+            }
+        }
+
+        if (serviceOrdersWithAuth)
+        {
+            if (serviceOrdersWithAuth.elements() > 1)
+            {
+                // Has multiple authorizations.
+                if (Box::okCancel(strFmt("@SKS6690", '\n', projFundingSourcePaymTermId), DialogButton::Cancel, "@SKS6691") == DialogButton::Cancel)
+                {
+                    return false;
+                }
+
+                SKS_CC_CustPaymTable::voidServiceOrderAuthorization(serviceOrdersWithAuth);
+                return true;
+            }
+
+            if (hasMultipleFundingSources)
+            {
+                // Has multiple funding sources
+                if (Box::okCancel(strFmt("@SKS6692", '\n', projFundingSourcePaymTermId), DialogButton::Cancel, "@SKS6691") == DialogButton::Cancel)
+                {
+                    return false;
+                }
+
+                SKS_CC_CustPaymTable::voidServiceOrderAuthorization(serviceOrdersWithAuth);
+                return true;
+            }
+
+            if (hasNonServiceOrderLines)
+            {
+                // Has one authorization but non-service order lines are also selected.
+                if (Box::okCancel(strFmt("@SKS6693", '\n', projFundingSourcePaymTermId), DialogButton::Cancel, "@SKS6691") == DialogButton::Cancel)
+                {
+                    return false;
+                }
+
+                SKS_CC_CustPaymTable::voidServiceOrderAuthorization(serviceOrdersWithAuth);
+                return true;
+
+            }
+
+            if (serviceOrdersCount > 1)
+            {
+                // Has one authorization but lines from multiple service orders are selected.
+                if (Box::okCancel(strFmt("@SKS6694", '\n', projFundingSourcePaymTermId), DialogButton::Cancel, "@SKS6691") == DialogButton::Cancel)
+                {
+                    return false;
+                }
+
+                SKS_CC_CustPaymTable::voidServiceOrderAuthorization(serviceOrdersWithAuth);
+                return true;
+            }
+        }
+        else
+        {
+            // Has multiple service orders but no authorizations
+            if (serviceOrdersCount > 1)
+            {
+                if (Box::okCancel(strFmt("@SKS6695", '\n', projFundingSourcePaymTermId), DialogButton::Cancel, "@SKS6698") == DialogButton::Cancel)
+                {
+                    return false;
+                }
+
+                return true;
+            }
+            else
+            {
+                if (hasNonServiceOrderLines)
+                {
+                    // Has one service order but non-service order lines are also selected.
+                    if (Box::okCancel(strFmt("@SKS6697", '\n', projFundingSourcePaymTermId), DialogButton::Cancel, "@SKS6698") == DialogButton::Cancel)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sKS_CC_SetValueOnServiceOrderAuthCtrls</Name>
+				<Source><![CDATA[
+    public void sKS_CC_SetValueOnServiceOrderAuthCtrls()
+    {
+        if (SKS_CC_ServiceOrderGroup.visible())
+        {
+            SKS_CC_SvcOrderAuthStatus.text(enum2str(sKS_CC_AuthStatus));
+            SKS_CC_ServiceOrderAuthAmount.realValue(sKS_CC_AuthAmount);
+            SKS_CC_SvcOrderWithAuthCount.value(sKS_CC_CountOfServiceOrdersWithAuth);
+            SKS_CC_SvcOrderCount.value(sKS_CC_CountOfServiceOrders);
+
+            SKS_CC_ServiceOrderGroup.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SelectProjId_OnValidated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to clear value from <c>SKS_CC_SelectServiceOrderId</c> CCA control.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormControlEventHandler(formControlStr(ProjInvoiceProposalCreateLines, SelectProjId), FormControlEventType::Validated)]
+    public void SelectProjId_OnValidated(FormControl _sender, FormControlEventArgs _e)
+    {
+        if (SKS_CC_SelectServiceOrderId.visible())
+        {
+            SKS_CC_SelectServiceOrderId.text('');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProjInvoiceProposalCreateLines_OnInitialized</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to set visibility of CCA controls.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormEventHandler(formStr(ProjInvoiceProposalCreateLines), FormEventType::Initialized)]
+    public void ProjInvoiceProposalCreateLines_OnInitialized(xFormRun _sender, FormEventArgs _e)
+    {
+        SKS_PP_Setup sKS_PP_Setup = SKS_PP_Setup::find();
+
+        if (sKS_PP_Setup.ModCC == NoYes::Yes && sKS_PP_Setup.CCAllowCCProcFromSvcOrder == NoYes::Yes)
+        {
+            sKS_CC_IsServiceOrderEnabled = true;
+        }
+        else
+        {
+            sKS_CC_IsServiceOrderEnabled = false;
+        }
+        
+        PSATmpProjProposalTrans_SKS_CC_ServiceOrderId.visible(sKS_CC_IsServiceOrderEnabled);
+        SKS_CC_SelectServiceOrderId.visible(sKS_CC_IsServiceOrderEnabled);
+        SKS_CC_ServiceOrderGroup.visible(sKS_CC_IsServiceOrderEnabled);
+
+        if (sKS_CC_IsServiceOrderEnabled)
+        {
+            if (_sender.args().dataset())
+            {
+                switch(_sender.args().dataset())
+                {
+                    case tableNum(SMAServiceOrderTable):
+                        SMAServiceOrderTable serviceOrderTableLocalSKS = _sender.args().record();
+                        if (serviceOrderTableLocalSKS)
+                        {
+                            SKS_CC_SelectServiceOrderId.text(serviceOrderTableLocalSKS.ServiceOrderId);
+                        }
+                        break;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SelectProjId_OnModified</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Used to clear vallue from <c>SKS_CC_SelectServiceOrderId</c>
+    /// control whenever project has been changed.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormControlEventHandler(formControlStr(ProjInvoiceProposalCreateLines, SelectProjId), FormControlEventType::Modified)]
+    public void SelectProjId_OnModified(FormControl _sender, FormControlEventArgs _e)
+    {
+        if (SKS_CC_SelectServiceOrderId.visible())
+        {
+            SKS_CC_SelectServiceOrderId.text('');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_SelectServiceOrderId_OnModified</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The OnModified event handler for the <c>SKS_CC_SelectServiceOrderId</c> control.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormControlEventHandler(formControlStr(ProjInvoiceProposalCreateLines, SKS_CC_SelectServiceOrderId), FormControlEventType::Modified)]
+    public void SKS_CC_SelectServiceOrderId_OnModified(FormControl _sender, FormControlEventArgs _e)
+    {
+        SMAServiceOrderTable    sMAServiceOrderTableSKS;
+
+        if (SKS_CC_SelectServiceOrderId.text())
+        {
+            sMAServiceOrderTableSKS = SMAServiceOrderTable::find(SKS_CC_SelectServiceOrderId.text());
+            this.SKS_CC_InitFromSMAServiceOrderTable(sMAServiceOrderTableSKS);
+        }
+        else
+        {
+            serviceOrderTable = null;
+            this.modifiedTransFilter();
+        }
+
+        this.enableProjectFilters();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_SelectServiceOrderId_OnValidated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The OnValidated event handler for the <c>SKS_CC_SelectServiceOrderId</c> control.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormControlEventHandler(formControlStr(ProjInvoiceProposalCreateLines, SKS_CC_SelectServiceOrderId), FormControlEventType::Validated)]
+    public void SKS_CC_SelectServiceOrderId_OnValidated(FormControl _sender, FormControlEventArgs _e)
+    {
+        SMAServiceOrderTable sMAServiceOrderTableSKS;
+        SMAServiceOrderId serviceOrderIdLocal;
+
+        if (SKS_CC_SelectServiceOrderId.text())
+        {
+            serviceOrderIdLocal = SKS_CC_SelectServiceOrderId.text();
+
+            sMAServiceOrderTableSKS = SMAServiceOrderTable::find(serviceOrderIdLocal);
+
+            if (!sMAServiceOrderTableSKS)
+            {
+                checkFailed(strFmt("@GLS92381", serviceOrderIdLocal));
+                FormControlCancelEventArgs cancelArgs = _e as FormControlCancelEventArgs;
+                cancelArgs.cancel(true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_SelectServiceOrderId_OnLookup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds a lookup to the <c>SKS_CC_SelectServiceOrderId</c> control
+    /// on <c>ProjInvoiceProposalCreateLines.TAS</c> form extension.
+    /// </summary>
+    /// <param name="_sender"></param>
+    /// <param name="_e"></param>
+    [FormControlEventHandler(formControlStr(ProjInvoiceProposalCreateLines, SKS_CC_SelectServiceOrderId), FormControlEventType::Lookup)]
+    public void SKS_CC_SelectServiceOrderId_OnLookup(FormControl _sender, FormControlEventArgs _e)
+    {
+        SysTableLookup          sysTableLookup = SysTableLookup::newParameters(tableNum(SMAServiceOrderTable), _sender);
+        Query                   query = new Query();
+
+        QueryBuildDataSource    qbds  = query.addDataSource(tableNum(SMAServiceOrderTable));
+
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, ServiceOrderId));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, Description));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, ProjId));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, CustAccount));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, AgreementId));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, Priority));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, SignOff));
+        sysTableLookup.addLookupfield(fieldNum(SMAServiceOrderTable, SignOffDateTime));
+
+        if(SelectProjId.text())
+        {
+            qbds.addRange(fieldNum(SMAServiceOrderTable, ProjId)).value(queryValue(SelectProjId.text()));
+        }
+
+        sysTableLookup.parmQuery(query);
+        sysTableLookup.performFormLookup();
+
+        FormControlCancelableSuperEventArgs ce = _e as FormControlCancelableSuperEventArgs;
+        ce.CancelSuperCall();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

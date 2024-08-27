@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_Reversal</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This is the class for CCR Reversal
+/// </summary>
+// SKS_FDD_9664
+class SKS_CCR_Reversal
+{
+    LedgerJournalId         ledgerJournalId;
+    MapIterator             miIHBJournals;
+    int                     countRecId;
+    boolean                 isCallFromIHBInterCompRev;
+    Map                     insertIHBJournals = new Map(Types::String, Types::Record);
+    container               conInHouseVoucher;
+    ListEnumerator          listEnumInHouseVoucher;
+    container               peekInHouseVoucher;
+    List listInHouseVoucher = new List(Types::Container);
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void  run()
+    {
+        LedgerJournalTrans      ledgerJourTransLoc;
+        LedgerJournalTrans      ledgerJournalTransReversed;
+        LedgerJournalTrans      ledgerJournalTransIntercompany;
+        LedgerJournalTable      ledgerJournalTableReversal;
+        SKS_CCR_BankTran        locSKS_CCR_BankTran;
+
+        if(countRecId > 0)
+        {
+            while select SKS_CCR_BankTranRecId,Voucher from ledgerJourTransLoc
+                    group by SKS_CCR_BankTranRecId,Voucher
+                where ledgerJourTransLoc.JournalNum == ledgerJournalId
+            {
+                select crosscompany RevVoucher, OrigBankVoucher, RecId
+                    from locSKS_CCR_BankTran
+                        where (locSKS_CCR_BankTran.RecId == ledgerJourTransLoc.SKS_CCR_BankTranRecId
+                            && locSKS_CCR_BankTran.RevVoucher == ledgerJourTransLoc.Voucher);
+                if(locSKS_CCR_BankTran)
+                {
+                    SKS_EFT_Reversal::markBankAccountTrans(ledgerJourTransLoc.SKS_CCR_BankTranRecId, ledgerJourTransLoc.Voucher);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markCCRAccountTrans</Name>
+				<Source><![CDATA[
+    public static void markCCRAccountTrans(Recid _SKS_CCR_BankTranRecID, Voucher _voucher)
+    {
+        SKS_CCR_BankTran        locSKS_CCR_BankTran;
+        BankAccountStatement    locBankAccountStatement;
+        LedgerJournalTrans      ledgerJournalTrans;
+
+        select forupdate crosscompany locSKS_CCR_BankTran
+                where (locSKS_CCR_BankTran.RecId == _SKS_CCR_BankTranRecID ||
+                    locSKS_CCR_BankTran.RevVoucher == _voucher);
+
+        select sum(AmountCurCredit), sum(AmountCurDebit) from ledgerJournalTrans
+            where ledgerJournalTrans.voucher == _voucher &&
+                ledgerJournalTrans.AccountType == LedgerJournalACType::Bank;
+
+        select crosscompany RecId,ReconcileDate from locBankAccountStatement
+            where locBankAccountStatement.RecId == locSKS_CCR_BankTran.OriginalStatementRecId &&
+                locBankAccountStatement.DataAreaId == locSKS_CCR_BankTran.DataAreaId;
+
+        if(locBankAccountStatement.ReconcileDate != dateNull())
+        {
+            throw error("@SKS:SKSErrorStatementReconciled");
+        }
+        else
+        {
+            if(locSKS_CCR_BankTran.RevVoucher == _voucher)
+            {
+                changeCompany(locSKS_CCR_BankTran.company())
+                {
+                    if((abs(ledgerJournalTrans.AmountCurCredit) == abs(locSKS_CCR_BankTran.TranAmount)) ||
+                        abs(ledgerJournalTrans.AmountCurDebit) == abs(locSKS_CCR_BankTran.TranAmount))
+                    {
+                        SKS_CCR_Reversal::clearBankAccountTrans(_voucher, locSKS_CCR_BankTran);
+                    }
+                }
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearBankAccountTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Original bank transaction and the reversing transaction should be marked as “Cleared”.
+    /// </summary>
+    /// <param name = "_voucher">The voucher number to cleared.</param>
+    /// <param name = "_sks_BR_BankTran">The bank transaction record.</param>
+    // CR-9541
+    public static void clearBankAccountTrans(Voucher _voucher, SKS_CCR_BankTran _SKS_CCR_BankTran)
+    {
+        BankAccountTrans    locBankAccountTransUpd;
+
+        ttsBegin;
+        while select forupdate locBankAccountTransUpd
+            where (locBankAccountTransUpd.Voucher == _voucher ||
+                locBankAccountTransUpd.Voucher == _SKS_CCR_BankTran.OrigBankVoucher) &&
+                locBankAccountTransUpd.AccountId == _SKS_CCR_BankTran.AccountId
+        {
+            if(locBankAccountTransUpd)
+            {
+                locBankAccountTransUpd.AccountStatement = _SKS_CCR_BankTran.ImportedStatementNum;
+                locBankAccountTransUpd.AccountStatementDate = _SKS_CCR_BankTran.ImportedStatementDate; //Bug 10853
+                locBankAccountTransUpd.Included = NOYES::Yes;
+                locBankAccountTransUpd.update();
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setledgerJournalId</Name>
+				<Source><![CDATA[
+    void setledgerJournalId(LedgerJournalId _ledgerJournalId)
+    {
+        ledgerJournalId = _ledgerJournalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLedgeralTransCount</Name>
+				<Source><![CDATA[
+    void setLedgeralTransCount(int _countRecId)
+    {
+        countRecId = _countRecId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CCR_ReadParseDelimited</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_CCR_ReadParseDelimited extends SKS_CCR_ReadParseBase
+{
+    //*********
+    //*** do NOT use :CommaStreamIo
+    //*** do NOT use :CommaTextStreamIo
+    //*** implments a broken fields parse and malfuctions on non-comma separated files(like semi-colon delimited) with empty fields.
+    //*** use TextStreamIO this implements it's own classes and will fucntion with any infielddelimiter
+    //*** Referce link: https://www.yammer.com/dynamicsaxfeedbackprograms/#/threads/show?threadId=396866031673344
+    //*********
+    TextStreamIo locTextStreamIO;
+    container FieldFormat[];
+    int maxFieldFormats;
+    str Fields[];
+    str Raw_Fields[];
+
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>GetInboundFile</Name>
+				<Source><![CDATA[
+    public SKS_CCR_InboundFile GetInboundFile(SKS_EB_FilePathName _FilePathAndName, SKS_BF_BankIntType _SKS_BF_BankIntType)
+    {
+        //str locTempTagName;
+        ;
+
+        this.InitializeFileInfo(_FilePathAndName, _SKS_BF_BankIntType);
+        if (!this.openFile())
+        {
+            return null;
+        }
+
+        return this.parseFile();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openFile</Name>
+				<Source><![CDATA[
+    boolean openFile()
+    {
+        SKS_BR_FileFormatDetail locSKS_BR_FileFormatDetail;
+        System.Text.StringBuilder locStringBuilder;
+        SKS_PP_StringFormats locSKS_PP_StringFormats = new SKS_PP_StringFormats();
+        str locRecordDelimiter = '\n';
+
+        gSKS_EB_FileHub.runFileLoad(gSKS_EB_FileHub.getSKS_BF_BankIntType() == SKS_BF_BankIntType::FileHubLocal ? gSKS_EB_FileHub.fileName() : strFmt(@'%1\%2', gSKS_EB_FileHub.getBFFilePath(),gSKS_EB_FileHub.fileName()),
+                                    gBRPreReadScript,
+                                    gBRPreReadScriptParams,
+                                    gBRPostReadScript,
+                                    gBRPostReadScriptParams);
+        locStringBuilder = new System.Text.StringBuilder(gSKS_EB_FileHub.fileBody());
+
+        locStringBuilder = locStringBuilder.Replace('\r\n',locRecordDelimiter);
+        locStringBuilder = locStringBuilder.replace('\n\r', locRecordDelimiter);
+        locStringBuilder = locStringBuilder.replace('\r', locRecordDelimiter);
+
+        locTextStreamIO = TextStreamIo::constructForRead(locSKS_PP_StringFormats.str2Stream(locStringBuilder.ToString()));
+        locTextStreamIO.inFieldDelimiter(gFieldDelimiter);
+        locTextStreamIO.inRecordDelimiter(locRecordDelimiter);
+        if (!locTextStreamIO || locTextStreamIO.status() != IO_Status::Ok )
+        {
+            //file could not be opened
+            error(strfmt("@SYS19312",gSKS_EB_FileHub.fileName()));
+            this.closeFile();
+            return false;
+        }
+        
+
+        maxFieldFormats = 0;
+
+        //while select * from csvFormat order by FieldNbr
+            //where csvFormat.FormatId ==  gSKS_BR_FileFormat.FormatID
+            //&& csvFormat.CCR_IsCCRFormat == NoYes::Yes  /// SKS_FDD_13903 - To make sure that its picking only CCR format
+        
+        /*while select CCR_FieldType from locSKS_BR_FileFormatDetail
+            order by locSKS_BR_FileFormatDetail.FieldNbr
+            where locSKS_BR_FileFormatDetail.FormatID == gSKS_BR_FileFormat.FormatID
+            && locSKS_BR_FileFormatDetail.CCR_IsCCRFormat == NoYes::Yes*/
+        while select * from locSKS_BR_FileFormatDetail order by FieldNbr where
+            locSKS_BR_FileFormatDetail.FormatId ==  gSKS_BR_FileFormat.FormatID
+            && locSKS_BR_FileFormatDetail.CCR_IsCCRFormat == NoYes::Yes
+        {
+            // Preload each field information to reduce database calls below.
+            maxFieldFormats += 1;
+            FieldFormat[maxFieldFormats] += locSKS_BR_FileFormatDetail.CCR_FieldType;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseFile</Name>
+				<Source><![CDATA[
+    protected SKS_CCR_InboundFile parseFile()
+    {
+        //  the variable locEndingBalancesSet is used for setting the ending balance of a statment in
+        //  a file with a SKS_BR_EndingBalancePosition of FIRST.  This way, if the file contains
+        //  multiple, non-grouped accounts, hitting the same account twice won't cause the balance
+        // to be reset.
+        AmountMST locTranAmount;
+        //BankAccountTable locBankAccountTable;
+        //boolean locBankCredit;
+        Container line;
+        SKS_BR_AltBankID locCompanyBankAccount;
+        NoYes locHasBankAccount = NoYes::No;
+        //date locStatementDate;
+        date locBankAccountStatementDate;
+        BankAccountStatementNum locBankAccountStatementNum;
+        int fieldPos;
+        int i;
+        int locImportCount;
+        int linecnt = 0;
+        int num_lines_in_file = this.fileLineCount();
+        real locEndingBalance;
+        //RecId locBankAccountRecId;
+        //RecId locFileBankAccountRecId;
+        str value;
+        utcDateTime locFileUtcDateTime;
+        SKS_CCR_FieldType FieldType;
+        System.DateTime locDtemp = System.DateTime::Now;
+        int locSecond = locDtemp.Second;
+        int locMillisecond = locDtemp.Millisecond;
+        locSecond = locSecond * 1000;
+
+        locImportCount = 0;
+        if (!this.openFile())
+        {
+            return null;
+        }
+
+        locFileUtcDateTime = gSKS_EB_FileHub.attrFileCreated();
+
+        locBankAccountStatementDate = mkDate(DateTimeUtil::day(locFileUtcDateTime),
+                                    DateTimeUtil::month(locFileUtcDateTime),
+                                    DateTimeUtil::year(locFileUtcDateTime));
+        locBankAccountStatementNum  = date2str(locBankAccountStatementDate, 321, DateDay::Digits2, DateSeparator::None, DateMonth::Digits2, DateSeparator::None, DateYear::Digits4, DateFlags::None) +
+                            SKS_PP_StringFormats::strFill(2,int2str(DateTimeUtil::hour(locFileUtcDateTime)), SKS_PP_FillCharacter::Zero, SKS_PP_FillSide::Left) +
+                            SKS_PP_StringFormats::strFill(2,int2str(DateTimeUtil::minute(locFileUtcDateTime)), SKS_PP_FillCharacter::Zero, SKS_PP_FillSide::Left) + SKS_PP_StringFormats::int642BaseSKG34(locSecond + locMillisecond);
+
+        while(locTextStreamIO.status() == IO_status::Ok)
+        {
+            if(!gSKS_CCR_InboundFile)
+                gSKS_CCR_InboundFile = new SKS_CCR_InboundFile();
+
+            if(!gSKS_CCR_InboundStmt)
+            {
+                gSKS_CCR_InboundStmt = new SKS_CCR_InboundStmt();
+                gSKS_CCR_InboundStmt.SetDate(SKS_PP_StringFormats::strDateYYYYMMDD(locBankAccountStatementDate));
+                gSKS_CCR_InboundStmt.SetNbr(locBankAccountStatementNum);
+            }
+
+            if(!gSKS_CCR_InboundTran)
+                gSKS_CCR_InboundTran = new SKS_CCR_InboundTran();
+
+            locCompanyBankAccount = null;
+            fieldPos = 1;
+            line = locTextStreamIO.read();
+            linecnt++;
+            // If we are within the range of records we care about, then process the line of data
+            if(line && linecnt > gSKS_BR_FileFormat.OmitHeaderRecs && linecnt < (num_lines_in_file - gSKS_BR_FileFormat.OmitTrailerRecs + 1))
+            {
+                if(strlen(con2Str(line)) == 0) //skip blank lines
+                {
+                    continue;
+                }
+
+                for (i=1; i<=maxFieldFormats; i+=1)
+                {
+                    FieldType = conPeek(FieldFormat[i], 1);
+                    value = conpeek(line, fieldPos);
+                    value = strrem(value, '\n\r');
+                    if(gSKS_CCR_ReadFileClassesCustomActionsBase)
+                        value = gSKS_CCR_ReadFileClassesCustomActionsBase.modifyAllParsedValues(value);
+
+                    switch(FieldType)
+                    {
+                        case SKS_CCR_FieldType::BankAccountNumber:
+                            locCompanyBankAccount = global::strLRTrim(value);
+                            locHasBankAccount = NoYes::Yes;
+                            break;
+                        case SKS_CCR_FieldType::Amount,
+                            SKS_CCR_FieldType::BankCreditAmount:
+                            locTranAmount = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            if(locTranAmount != 0)
+                            {
+                                gSKS_CCR_InboundTran.setImportAsPositive(true);
+                                gSKS_CCR_InboundTran.SetAmt(locTranAmount);
+                            }
+                            break;
+                        case SKS_CCR_FieldType::BankDebitAmount:
+                            locTranAmount = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            if(locTranAmount != 0)
+                            {
+                                gSKS_CCR_InboundTran.setImportAsPositive(false);
+                                gSKS_CCR_InboundTran.SetAmt(locTranAmount);
+                            }
+                            break;
+                        case SKS_CCR_FieldType::DateMM_DD_YY,
+                              SKS_CCR_FieldType::DateMM_DD_YYYY,
+                              SKS_CCR_FieldType::DateMMDDYY,
+                              SKS_CCR_FieldType::DateMMDDYYYY:
+                                gSKS_CCR_InboundTran.SetDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(value,213)));
+                            break;
+                        case SKS_CCR_FieldType::DateYY_MM_DD,
+                              SKS_CCR_FieldType::DateYYMMDD,
+                              SKS_CCR_FieldType::DateYYYY_MM_DD,
+                              SKS_CCR_FieldType::DateYYYYMMDD:
+                                gSKS_CCR_InboundTran.SetDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(value,321)));
+                            break;
+                        case SKS_CCR_FieldType::DateDD_MM_YY,
+                              SKS_CCR_FieldType::DateDD_MM_YYYY,
+                              SKS_CCR_FieldType::DateDD_MM_YYYY_Dashes,
+                              SKS_CCR_FieldType::DateDDMMYY,
+                              SKS_CCR_FieldType::DateDDMMYYYY:
+                                gSKS_CCR_InboundTran.SetDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(value,123)));
+                            break;
+                        case SKS_CCR_FieldType::ValueuDateMM_DD_YY,
+                             SKS_CCR_FieldType::ValueDateMM_DD_YYYY,
+                              SKS_CCR_FieldType::ValueDateMMDDYY,
+                              SKS_CCR_FieldType::ValueDateMMDDYYYY:
+                                gSKS_CCR_InboundTran.SetValueDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(value,213)));
+                            break;
+                        case SKS_CCR_FieldType::ValueDateYY_MM_DD,
+                            SKS_CCR_FieldType::ValueDateYYMMDD,
+                              SKS_CCR_FieldType::ValueDateYYYY_MM_DD,
+                              SKS_CCR_FieldType::ValueDateYYYYMMDD:
+                                gSKS_CCR_InboundTran.SetValueDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(value,321)));
+                            break;
+                        case SKS_CCR_FieldType::ValueDateDD_MM_YY,
+                            SKS_CCR_FieldType::ValueDateDD_MM_YYYY,
+                              SKS_CCR_FieldType::ValueDateDD_MM_YYYY_Dashes,
+                              SKS_CCR_FieldType::ValueDateDDMMYY,
+                              SKS_CCR_FieldType::ValueDateDDMMYYYY:
+                                gSKS_CCR_InboundTran.SetValueDate(SKS_PP_StringFormats::strDateYYYYMMDD(this.str2date(value,123)));
+                            break;
+                        case SKS_CCR_FieldType::TxnDescription:
+                                gSKS_CCR_InboundTran.AppendDesc(value);
+                            // Populate User note also here
+                            gSKS_CCR_InboundTran.AppendDescUser(gSKS_CCR_InboundTran.GetDesc());
+                            break;
+                        case SKS_CCR_FieldType::BankReferenceNumber:
+                            if(gSKS_CCR_InboundTran.GetBankRefNbr() == '')
+                            {
+                                gSKS_CCR_InboundTran.SetBankRefNbr(this.parseRefernceNumber(value));
+                            }
+                            else
+                            {
+                                gSKS_CCR_InboundTran.SetBankRefNbr(' ' + this.parseRefernceNumber(value));
+                            }
+                            break;
+                        case SKS_CCR_FieldType::BankCustomerReferenceNumber:
+                            if( gSKS_CCR_InboundTran.GetCustRefNbr() == '')
+                            {
+                                gSKS_CCR_InboundTran.SetCustRefNbr(this.parseRefernceNumber(value));
+                            }
+                            else
+                            {
+                                gSKS_CCR_InboundTran.SetCustRefNbr( ' ' + this.parseRefernceNumber(value));
+                            }
+                            break;
+                        case SKS_CCR_FieldType::TxnType:
+                            if(gSKS_CCR_InboundTran.GetTranType() == '')
+                            {
+                                gSKS_CCR_InboundTran.SetTranType(global::strLRTrim(value));
+                            }
+                            else
+                            {
+                                gSKS_CCR_InboundTran.SetTranType(' ' + global::strLRTrim(value));
+                            }
+                            break;
+                        case SKS_CCR_FieldType::Balance:
+                            locEndingBalance = SKS_PP_StringFormats::CurrStr2CurrNum(value);
+                            break;
+                        case SKS_CCR_FieldType::FeeAmount:
+                            gSKS_CCR_InboundTran.addToFeeSum(SKS_PP_StringFormats::CurrStr2CurrNum(value));
+                            break;
+                        case SKS_CCR_FieldType::MarkupAmount:   //SKS_FDD_15121
+                            gSKS_CCR_InboundTran.addToMarkupSum(SKS_PP_StringFormats::CurrStr2CurrNum(value));
+                            break;
+                        case SKS_CCR_FieldType::Currency:
+                            gSKS_CCR_InboundTran.SetCurrency(strLRTrim(value));
+                            break;
+
+                    }
+                    fieldPos++;
+                }
+                if(locHasBankAccount == NoYes::Yes)
+                {
+                    gSKS_CCR_InboundStmt.SetAccount(locCompanyBankAccount);
+                    locCompanyBankAccount = '';
+                }
+                if(gSKS_CCR_InboundFile.findSKS_CCR_InboundStmt(gSKS_CCR_InboundStmt.GetAccount(), gSKS_CCR_InboundStmt.GetNbr(), gSKS_CCR_InboundStmt.GetDate()) != null)
+                {
+                    gSKS_CCR_InboundStmt = gSKS_CCR_InboundFile.findSKS_CCR_InboundStmt(gSKS_CCR_InboundStmt.GetAccount(), gSKS_CCR_InboundStmt.GetNbr(), gSKS_CCR_InboundStmt.GetDate());
+                }
+                //Push the trans into the statement;
+                gSKS_CCR_InboundStmt.PushTrans(gSKS_CCR_InboundTran);
+                if(gSKS_BR_FileFormat.UpdateEndBalance && gSKS_BR_FileFormat.EndBalancePosition == SKS_BR_EndingBalancePosition::First && gSKS_CCR_InboundStmt.GetEndingBalanceSet() == false)
+                {
+                    gSKS_CCR_InboundStmt.SetEndingBalance(locEndingBalance);
+                    gSKS_CCR_InboundStmt.SetIsCredit(true);
+                }
+                else if(gSKS_BR_FileFormat.EndBalancePosition == SKS_BR_EndingBalancePosition::Last)
+                {
+                    gSKS_CCR_InboundStmt.SetEndingBalance(locEndingBalance);
+                    gSKS_CCR_InboundStmt.SetIsCredit(true);
+                }
+
+                if(gSKS_CCR_InboundFile.findSKS_CCR_InboundStmt(gSKS_CCR_InboundStmt.GetAccount(), gSKS_CCR_InboundStmt.GetNbr(), gSKS_CCR_InboundStmt.GetDate()) == null)
+                {
+                    gSKS_CCR_InboundFile.PushStmt(gSKS_CCR_InboundStmt);
+                }
+                gSKS_CCR_InboundTran = null;
+                gSKS_CCR_InboundStmt = null;
+            }
+        }
+
+        this.closeFile();
+
+        return gSKS_CCR_InboundFile;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fileLineCount</Name>
+				<Source><![CDATA[
+    private int fileLineCount()
+    {
+        int linecnt = 0;
+        Container line;
+
+        if (!this.openFile())
+        {
+            return 0;
+        }
+
+        while(locTextStreamIO.status() == IO_status::Ok)
+        {
+            line = locTextStreamIO.read();
+            if(line)
+            {
+                linecnt++;
+            }
+        }
+        this.closeFile();
+        return linecnt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeFile</Name>
+				<Source><![CDATA[
+    void closeFile()
+    {
+        if(locTextStreamIO)
+        {
+            locTextStreamIO.finalize();
+            locTextStreamIO = null;
+            gSKS_EB_fileHub.streamClose();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

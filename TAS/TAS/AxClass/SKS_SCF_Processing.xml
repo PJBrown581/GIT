@@ -1,0 +1,796 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_SCF_Processing</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_SCF_Processing
+{
+    SKS_SCF_File msks_scf_file, msks_scf_fileTmp,locmsks_scf_file;
+    SKS_SCF_InvoiceFileFormat mSKS_SCF_InvoiceFileFormat;
+    str gInvokingClass;
+    int mNbrGoodRecs;
+    str mReturnMsg;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>AProcess_SCF</Name>
+				<Source><![CDATA[
+    public void AProcess_SCF(SKS_SCF_FileNbr _FileNbr,
+                                SKS_PP_NextActionDisplay _nextAction,
+                                SKS_EB_CommProcess _SKS_EB_CommProcess,
+                                boolean _isInBatch,
+                                boolean _AutoCreateSCF = false) 
+    {
+
+        boolean recordCreated = false;
+        ExecutePermission perm;
+        str formatName;
+        str locParamters;
+        SysDictClass obj;
+        Object classInstance;
+        //boolean keepDelete;
+        boolean locErrorFileExists = false;
+        boolean locControlErrorFileExists = false;
+        boolean locSendSuccess = false;
+        boolean locErrorFreeSend = true;
+        SKS_EB_CommProcess locSKS_EB_CommProcess;
+        str locErrFilePathName;
+        str locFilePathName;
+        System.Xml.XmlDocument locXmlDocument;
+        SKS_PP_NextActionDisplay nextAction;
+        Str FormatID;
+        SKS_SCF_Provider    scfProvider;
+        SKS_PP_500PPBas sks_pp_500ppbas = new SKS_PP_500PPBas();
+        SKS_SCF_Provider locSKS_SCF_Provider;
+
+        nextAction = _nextAction;
+        select forupdate msks_scf_file where msks_scf_file.FileNbr == _FileNbr;
+
+        
+        select OutboundFilePath , OutCommID, InvoiceFormatId from scfProvider where scfProvider.ProviderID == msks_scf_file.ProviderID;
+        ttsbegin;
+        msks_scf_file.FilePath = scfProvider.OutboundFilePath;
+        msks_scf_file.FormatId = scfProvider.InvoiceFormatId;
+
+        if(!msks_scf_file.Filename)
+        {
+            mReturnMsg = "@SKS:SCFFileNameValidation";
+            error(mReturnMsg);
+            return;
+        }
+        msks_scf_file.update();
+        ttscommit;
+
+        locFilePathName = msks_scf_file.FilePath + '\\' + msks_scf_file.FileName;
+        locErrFilePathName = msks_scf_file.FilePath + '\\LOG\\' + msks_scf_file.FileName + '.err';
+
+        mNbrGoodRecs = msks_scf_file.Ret_NbrGoodRecs;
+
+        FormatID = msks_scf_file.FormatID;
+
+        if(nextAction == SKS_PP_NextActionDisplay::CreateSendFile)
+        {
+            mReturnMsg = this.CheckUserSelectionAP(msks_scf_file.RecId);
+
+            if(mReturnMsg != '') //errors were found
+            {
+                error(mReturnMsg);
+                return;
+            }
+           
+            recordCreated = this.BuildWorkingTable(FormatID, msks_scf_file.FileNbr);
+
+            if(mReturnMsg != '') //errors were found
+            {
+                error(mReturnMsg);
+                return;
+            }
+            else if(!recordCreated)
+            {
+                mReturnMsg = "@SYS4205";
+                error(mReturnMsg); //no records found
+                return;
+            }
+
+
+            if(mNbrGoodRecs > 0)
+            {
+                formatName = strReplace('SKS_SCF_Format_' + msks_scf_file.FormatId, '-', '_');
+                mReturnMsg = this.ValidateClass(formatName, msks_scf_file.FormatId);
+
+                if(mReturnMsg != '') //errors were found
+                {
+                    error(mReturnMsg);
+                    return;
+                }
+
+                perm = new ExecutePermission();
+                perm.assert();
+
+                // BP deviation documented
+                obj = new SysDictClass(className2Id(formatName));
+                classInstance = obj.makeObject(); // Instantiate class
+                // BP deviation documented
+                obj.callObject('setFileNbr', classInstance, msks_scf_file.FileNbr); // Call method to set variable
+                // BP deviation documented
+                locXmlDocument = obj.callObject('run', classInstance); // Run
+
+                // BP deviation documented
+                mReturnMsg = obj.callObject('getErrorText', classInstance);
+
+                obj = null;
+                classInstance = null;
+                CodeAccessPermission::revertAssert();
+            }
+            if(mReturnMsg != '') //errors were found
+            {
+                error(mReturnMsg);
+                return;
+            }
+
+            // Cleanup/delete files becuase we had no records
+            if(mNbrGoodRecs == 0)
+            {
+                sks_pp_500ppbas.Kill(locFilePathName);
+
+                mReturnMsg = "@SYS4205";
+                error(mReturnMsg);
+                return;
+            }
+
+            //The following block retrieves and sets the InOutFormatKey field used later in matching with inbound files
+            select locSKS_SCF_Provider
+                where locSKS_SCF_Provider.ProviderID  == msks_scf_file.ProviderID;
+
+            ttsbegin;
+            msks_scf_file.Ret_NbrGoodRecs = mNbrGoodRecs;
+            msks_scf_file.update();
+            ttscommit;
+        }
+
+        // CreateSendFile
+
+        // ----------------------------------
+        // FILE CREATED STAGE - FINISHED
+        // ----------------------------------
+
+
+        // ----------------------------------
+        // TRANSMITTED - STARTED
+        // ----------------------------------
+        locSKS_EB_CommProcess = SKS_SCF_Processing::getSKS_EB_CommProcess(_SKS_EB_CommProcess, scfProvider.OutCommID);
+        
+        if(msks_scf_file.CommID == '')
+        {
+            this.Update_SKS_SCF_File_CommID(locSKS_EB_CommProcess.CommID);
+        }
+
+        if((nextAction == SKS_PP_NextActionDisplay::CreateSendFile
+                || nextAction == SKS_PP_NextActionDisplay::Send
+                || nextAction == SKS_PP_NextActionDisplay::RetryComm))
+        {
+            if(locSKS_EB_CommProcess.CommType != SKS_PP_CommunicationsType::None)
+            {
+                //Build params list.
+                locParamters = SKS_EB_Send::getParams(locSKS_EB_CommProcess,
+                                                                msks_scf_file.FileName,
+                                                                msks_scf_file.FilePath,
+                                                                locFilePathName,
+                                                                SKS_EB_ParamGroup::unclassified,
+                                                                msks_scf_file.ControlFileName,
+                                                                '');
+
+                //Launch communications, if any.
+                locSendSuccess = SKS_EB_Send::Send(locSKS_EB_CommProcess,
+                                                    locParamters,
+                                                    locSKS_EB_CommProcess.CommUserProg,
+                                                    locFilePathName,
+                                                    _isInBatch);
+
+                //because the error file could come from AP or AR, you have to use a variable to store if it exist for shared code later.
+                SKS_EB_FileHub fileHub = SKS_EB_FileHub::construct();
+                fileHub.parmThrowErrorIfException(false);
+                fileHub.runFileInquire(locErrFilePathName);
+                locErrorFileExists = fileHub.attrFileExists();
+                //if commfailed and the previous run wasn't a commfailure, set it to commfailed status
+                if(locErrorFileExists || !locSendSuccess)
+                {
+                    if(_AutoCreateSCF)
+                    {
+                        mReturnMsg = "@SKS3755";
+                        error(mReturnMsg);
+                        return;
+                    }
+                    locErrorFreeSend = false;
+                    if(msks_scf_file.FileStatus != SKS_SCF_FileStatus::CommFailed)
+                    {
+                        this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::CommFailed);
+                    }
+                }
+                else
+                {
+                    locControlErrorFileExists = fileHub.attrFileExists();
+
+                    if(locControlErrorFileExists)
+                    {
+                        locErrorFreeSend = false;
+                        if(msks_scf_file.FileStatus != SKS_SCF_FileStatus::CommFailed)
+                        {
+                            this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::CommFailed);
+                        }
+                    }
+                    else
+                    {
+                        this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::Completed);
+                        this.Update_SKS_SCF_FileDetail(SKS_SCF_FileStatus::Completed);
+                    }
+                }
+            }
+            else
+            {
+                this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::Completed);
+                this.Update_SKS_SCF_FileDetail(SKS_SCF_FileStatus::Completed);
+            }
+
+            if( mNbrGoodRecs > 0 && !locErrorFileExists)
+            {
+                if(!locSendSuccess)
+                {
+                    info(strFmt("@SKS:SKGFileCreated", locFilePathName));
+                }
+              
+            }
+        }
+
+        // ----------------------------------
+        // COMPLETE NOW/KEEP - STARTED
+        // ----------------------------------
+
+        
+        if(nextAction == SKS_PP_NextActionDisplay::CompleteKeep)
+        {
+            this.KeepAP(locFilePathName);
+        }
+        /*
+        else if(nextAction == SKS_PP_NextActionDisplay::CreateSendFile
+                || nextAction == SKS_PP_NextActionDisplay::Send
+                || nextAction == SKS_PP_NextActionDisplay::RetryComm)
+        {
+            keepDelete = true;
+
+            if(keepDelete)
+            {
+                this.KeepDeleteDialog(locFilePathName, locSKS_EB_CommProcess, locErrorFreeSend, _AutoCreateSCF);
+            }
+        }*/
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>BuildWorkingTable</Name>
+				<Source><![CDATA[
+    // Return true if records were built;
+    protected boolean BuildWorkingTable(str _FormatID, Num _scf_FileID)
+    {
+        SKS_SCF_FileDetail sks_scf_filedetail;
+        ClassId locClassid;
+        EventHandlerResult locCreateOutboundFileDetailsResult = new EventHandlerResult();
+
+        locClassid = classIdGet(this);
+        gInvokingClass = classId2Name(locClassid);
+        
+        delete_from sks_scf_filedetail
+            where sks_scf_filedetail.FileNbr == _scf_FileID;
+
+        this.CreateOutboundFileDetails(_scf_FileID, msks_scf_file, locCreateOutboundFileDetailsResult);
+        if(locCreateOutboundFileDetailsResult.result().getType().ToString() == 'System.String')
+        {
+            error(locCreateOutboundFileDetailsResult.result());
+            mNbrGoodRecs = 0;
+            throw Exception::Error;
+        }
+        else
+            mNbrGoodRecs = locCreateOutboundFileDetailsResult.result();
+
+        if(mNbrGoodRecs > 0)
+            return true;
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CheckUserSelectionAP</Name>
+				<Source><![CDATA[
+    public str CheckUserSelectionAP(RefRecId _fileRecId)
+    {
+        SKS_SCF_ProviderAdditionalOptions sKS_SCF_ProviderAdditionalOptions;
+        SKS_SCF_FileFormatAdditionalOptions sKS_SCF_FileFormatAdditionalOptions;
+        SKS_SCF_InvoiceFileFormat sKS_SCF_InvoiceFileFormat;
+        SKS_SCF_Provider locSKS_SCF_Provider;
+        VendTransOpen locVendTransOpen;
+        VendTable locVendTable;
+        SKS_SCF_VendorAdditionalOptions sKS_SCF_VendorAdditionalOptions;
+
+       
+        select sKS_SCF_InvoiceFileFormat where sKS_SCF_InvoiceFileFormat.FormatId == msks_scf_file.FormatId;
+
+        select locSKS_SCF_Provider where locSKS_SCF_Provider.ProviderID == msks_scf_file.ProviderID;
+
+        while select FileFormatPaymSpecRecId, RecId, FixedValue, Required from
+                            sKS_SCF_FileFormatAdditionalOptions where
+                            sKS_SCF_FileFormatAdditionalOptions.FileFormatPaymSpecRecId == sKS_SCF_InvoiceFileFormat.RecId &&
+                            sKS_SCF_FileFormatAdditionalOptions.Required == NoYes::Yes
+                            join CodeLookupValuesRecId, FixedValue, FileFormatAddOptsRecId from
+                                sKS_SCF_ProviderAdditionalOptions where
+                                sKS_SCF_ProviderAdditionalOptions.FileFormatAddOptsRecId == sKS_SCF_FileFormatAdditionalOptions.RecId &&
+                                sKS_SCF_ProviderAdditionalOptions.VendorPaymRecId == locSKS_SCF_Provider.RecId
+        {
+            if(sKS_SCF_ProviderAdditionalOptions.fixedvalue == '' && sKS_SCF_ProviderAdditionalOptions.CodeLookupValuesRecId == 0)
+            {
+                this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::Error);
+                return(strFmt("@SKS:SCFProviderAddFieldReq", locSKS_SCF_Provider.ProviderID,msks_scf_file.FileNbr));
+            }
+        }
+
+        while select RefRecId, SKS_SCF_FileNbr, AccountNum from locVendTransOpen
+                where locVendTransOpen.SKS_SCF_FileNbr == msks_scf_file.FileNbr
+        {
+            select RecId from locVendTable where locVendTable.AccountNum == locVendTransOpen.AccountNum;
+
+            while select FileFormatPaymSpecRecId, RecId, FixedValue, Required,ProviderVendor from sKS_SCF_FileFormatAdditionalOptions
+                where sKS_SCF_FileFormatAdditionalOptions.FileFormatPaymSpecRecId == sKS_SCF_InvoiceFileFormat.RecId &&
+                        sKS_SCF_FileFormatAdditionalOptions.Required == NoYes::Yes &&
+                            sKS_SCF_FileFormatAdditionalOptions.ProviderVendor == SKS_SCF_ProviderVendor::Vendor
+            {
+                select CodeLookupValuesRecId, FixedValue, FileFormatAddOptsRecId from sKS_SCF_VendorAdditionalOptions
+                    where sKS_SCF_VendorAdditionalOptions.FileFormatAddOptsRecId == sKS_SCF_FileFormatAdditionalOptions.RecId &&
+                            sKS_SCF_VendorAdditionalOptions.VendorPaymRecId == locVendTable.RecId;
+
+                if(sKS_SCF_VendorAdditionalOptions.fixedvalue == '' && sKS_SCF_VendorAdditionalOptions.CodeLookupValuesRecId == 0)
+                {
+                    this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::Error);
+                    return(strFmt("@SKS:SCFVendorAddFieldReq", locVendTable.AccountNum,msks_scf_file.FileNbr));
+                }
+            }
+        }
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateOutboundFileDetails</Name>
+				<Source><![CDATA[
+    delegate void CreateOutboundFileDetails(Num _scf_FileID, SKS_SCF_File _SKS_SCF_File, EventHandlerResult _result)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Delete_Exit</Name>
+				<Source><![CDATA[
+    void Delete_Exit(boolean _CommSuccess)
+    {
+        ;
+        ttsbegin;
+        if(_CommSuccess)
+        {
+            this.Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus::Completed);
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReturnMsg</Name>
+				<Source><![CDATA[
+    public str getReturnMsg()
+    {
+        return mReturnMsg;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InsertOpenInvoices</Name>
+				<Source><![CDATA[
+    public static void InsertOpenInvoices(VendTransOpen _VendorTransOpen, SKS_SCF_File _SKS_SCF_File)
+    {
+        SKS_SCF_FileDetail LocSKS_SCF_FileDetail;
+        SKS_SCF_Provider locSKS_SCF_Provider;
+        VendTrans   vendTrans;
+        ;
+
+        select  AmountCur, DueDate, CurrencyCode, ExchRate, Invoice,RecId from vendTrans
+                    where vendTrans.RecId == _VendorTransOpen.RefRecId;
+
+        LocSKS_SCF_FileDetail.FileNbr = _VendorTransOpen.SKS_SCF_FileNbr;
+        LocSKS_SCF_FileDetail.VendorAccount = _VendorTransOpen.AccountNum;
+        LocSKS_SCF_FileDetail.VendName = VendTable::getVendorName(_VendorTransOpen.AccountNum);
+        LocSKS_SCF_FileDetail.Invoice = vendTrans.Invoice;
+        LocSKS_SCF_FileDetail.DueDate = vendTrans.DueDate;
+        LocSKS_SCF_FileDetail.CurrencyCode = vendTrans.CurrencyCode;
+        LocSKS_SCF_FileDetail.Amount = vendTrans.AmountCur * -1;
+        LocSKS_SCF_FileDetail.FileRecId = _SKS_SCF_File.RecId;
+
+        locSKS_SCF_Provider = SKS_SCF_Provider::find(_SKS_SCF_File.ProviderID);
+
+        LocSKS_SCF_FileDetail.FormatId = locSKS_SCF_Provider.InvoiceFormatId;
+        LocSKS_SCF_FileDetail.InvoiceDate = vendTrans.DocumentDate;
+
+        //insert the new record into the db.
+        LocSKS_SCF_FileDetail.Insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>KeepAP</Name>
+				<Source><![CDATA[
+    private void KeepAP(str _filePathName = '',
+                        boolean _AutoCreateSCF = false)
+    {
+        SKS_SCF_FileStatus keepDeleteStatus;
+
+        keepDeleteStatus = SKS_SCF_FileStatus::Completed;
+
+        ttsbegin;
+        this.Update_SKS_SCF_FileDetail(keepDeleteStatus);
+        this.Update_SKS_SCF_File_FileStatus(keepDeleteStatus);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Update_SKS_SCF_FileDetail</Name>
+				<Source><![CDATA[
+    /*
+    private DialogButton KeepDeleteDialog(
+                                    str _filePathName,
+                                    SKS_EB_CommProcess _SKS_EB_CommProcess,
+                                    boolean _CommSuccess,
+                                    boolean _AutoCreateSCF = false)
+    {
+        DialogButton diagBut;
+        ;
+        //PROMPT
+        if(_SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::Prompt)
+        {
+            
+            //diagBut = Box::yesNo(
+            //    "@SKS:SCFFileComplete",
+            //    DialogButton::Yes, // Initial focus is on the No button.
+            //    "@SKS3068");
+        }
+        //IF NO ERROR, ALWAYS MARK COMPLETE
+        else if(_SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::AlwaysMarkIfNoError)
+        {
+            //if CommType = none, they communications are complete and there can't be an error.
+            if(_SKS_EB_CommProcess.CommType == SKS_PP_CommunicationsType::None)
+                diagBut = DialogButton::Yes;
+            else
+            {
+                //if communications type is something else.  Base this on the error file
+                if(_CommSuccess)
+                    diagBut = DialogButton::Yes;
+                else
+                    diagBut= DialogButton::No;
+            }
+        }
+        //NEVER MARK COMPLETE OR Based on inbound file.
+        else //(_SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::AlwaysMarkIfNoError || _SKS_EB_CommProcess.FileComplete == SKS_EB_FileComplete::BasedOnInboundSettings
+            diagBut = DialogButton::No;
+
+        if (diagBut == DialogButton::Yes)
+        {
+            
+            this.KeepAP(_filePathName, _AutoCreateSCF);
+        }
+        else
+        {
+            this.Delete_Exit(_CommSuccess);
+        }
+
+        return diagBut;
+    }*/
+
+    private void Update_SKS_SCF_FileDetail(SKS_SCF_FileStatus _keepDeleteStatus)
+    {
+        SKS_SCF_FileDetail sks_scf_FileDetail;
+        ;
+
+        update_recordset sks_scf_FileDetail
+            setting FileStatus = _keepDeleteStatus
+            where
+              sks_scf_FileDetail.FileRecId == msks_scf_file.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Update_SKS_SCF_File_CommID</Name>
+				<Source><![CDATA[
+    private void Update_SKS_SCF_File_CommID(SKS_EB_CommID _SKS_EB_CommID)
+    {
+        ttsbegin;
+
+        if(msks_scf_file)
+        {
+            msks_scf_file.CommID = _SKS_EB_CommID;
+            msks_scf_file.update();
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Update_SKS_SCF_File_FileStatus</Name>
+				<Source><![CDATA[
+    //    '===============================================================================
+    //    ' update SKS_SCF_File
+    //    '
+    //    ' Parameters
+    //    '   Keep                I   True - Being called as part of Keep
+    //    '                       I   False - Being called as part of Delete
+    //    '   KeepDeleteStatus    I   Status to set
+
+    public void Update_SKS_SCF_File_FileStatus(SKS_SCF_FileStatus _keepDeleteStatus)
+    {
+        ttsbegin;
+
+        if(!msks_scf_file)
+        {
+            select forupdate msks_scf_file
+                where msks_scf_file.RecId == msks_scf_file.RecId;
+        }
+        if(msks_scf_file)
+        {
+            If (_keepDeleteStatus == SKS_SCF_FileStatus::Completed)
+            {
+                msks_scf_file.TransmitDateTime = DateTimeUtil::utcNow();
+            }
+            msks_scf_file.FileStatus = _KeepDeleteStatus;
+            changecompany(msks_scf_file.DataAreaId)
+            {
+                msks_scf_file.update();
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateClass</Name>
+				<Source><![CDATA[
+    private str ValidateClass(str className, str formatId)
+    {
+        TreeNode tnode2Enum;
+        ;
+
+        tnode2Enum = TreeNode::findNode('Classes');
+        tnode2Enum = tnode2Enum.AOTfindChild(className);
+
+        if (tnode2Enum == null)
+        {
+            return strFmt("@SKS1022", formatId);
+        }
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSCFCommon</Name>
+				<Source><![CDATA[
+    delegate void processSCFCommon(RefRecId _fileRecId,str _formatId, SKS_SCF_Processing _InvokingClass, EventHandlerResult _result)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>WriteWrkTable</Name>
+				<Source><![CDATA[
+    private boolean WriteWrkTable(str _formatId)
+    {
+        str                 responseErrorText;
+        EventHandlerResult  result = new EventHandlerResult();
+        responseErrorText = SKS_PP_Sys::ValidateSKSCommonModel();
+
+        if (responseErrorText != '')
+        {
+            throw error(responseErrorText);
+        }
+
+        this.processSCFCommon(msks_scf_file.RecId, _formatId, this, result);
+
+        responseErrorText = result.result();
+
+        if (responseErrorText != '')
+        {
+            // A response of '-1' is being used to indicate no records were created but no errors were encountered.
+            // If any other error is encountered it will be set on 'responseErrorText'.
+            if (responseErrorText != '-1')
+            {
+                mReturnMsg = responseErrorText;
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>WriteWrkTableSCF</Name>
+				<Source><![CDATA[
+    private boolean WriteWrkTableSCF(str _formatId)
+    {
+        str                 responseErrorText;
+        EventHandlerResult  result = new EventHandlerResult();
+        responseErrorText = SKS_PP_Sys::ValidateSKSCommonModel();
+        if (responseErrorText != '')
+        {
+            throw error(responseErrorText);
+        }
+
+        this.processSCFCommon(msks_scf_file.RecId, _formatId, this, result);
+
+        responseErrorText = result.result();
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPositiveAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns a positive amount
+    /// </summary>
+    /// <param name = "_amount"></param>
+    /// <returns></returns>
+    /// FDD-10590
+    static real getPositiveAmount(real _amount)
+    {
+        real amount;
+
+        amount = _amount;
+
+        if(amount < 0)
+        {
+            amount = amount * -1;
+        }
+
+        return amount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dateWeekendHoliday</Name>
+				<Source><![CDATA[
+    public static boolean dateWeekendHoliday(Date _date, SKS_EB_BankHolidayGroupID _bankHolidayID = '')
+    {
+        SKS_EB_BankHolidays sks_eb_bankholidays;
+        boolean ret = false;
+
+        if(dayOfWk(_date) >= 6)
+        {
+            ret = true;
+        }
+        else if(_bankHolidayID != '')
+        {
+            select firstOnly HolidayDate, GroupID from sks_eb_bankholidays where
+                sks_eb_bankholidays.GroupID == _bankHolidayID &&
+                sks_eb_bankholidays.HolidayDate == _date;
+            if(sks_eb_bankholidays)
+            {
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetOffsetDate</Name>
+				<Source><![CDATA[
+    public static Date GetOffsetDate(int _dueDateLeadDays, Date _currentEffDate, SKS_EB_BankHolidayGroupID _bankHolidayID)
+    {
+        int  dueDateDays;
+        int counter = 1;
+        NoYes  subtract = NoYes::No;
+        boolean isHolidayWeekend;
+
+        dueDateDays = _dueDateLeadDays;
+        void weekendHolidayLoop()
+        {
+            isHolidayWeekend = false;
+            do
+            {
+                isHolidayWeekend = SKS_SCF_Processing::dateWeekendHoliday(_currentEffDate, _bankHolidayID);
+                if(isHolidayWeekend)
+                {
+                    if(subtract == NoYes::Yes)
+                    {
+                        _currentEffDate--;
+                    }
+                    else
+                    {
+                        _currentEffDate++;
+                    }
+                }
+            }
+            while(isHolidayWeekend);
+        }
+
+        if(dueDateDays < 0) //days subtracted from effective date
+        {
+            dueDateDays = dueDateDays * -1;
+            subtract = NoYes::Yes;
+        }
+
+        while(counter <= dueDateDays)
+        {
+            if(subtract == NoYes::Yes)
+            {
+                _currentEffDate--;
+            }
+            else
+            {
+                _currentEffDate++;
+            }
+
+            weekendHolidayLoop();
+
+            counter++;
+        }
+
+        // Always call outside of counter in case offset is 0
+        weekendHolidayLoop();
+
+        return _currentEffDate;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_EB_CommProcess</Name>
+				<Source><![CDATA[
+    private static SKS_EB_CommProcess getSKS_EB_CommProcess(SKS_EB_CommProcess _SKS_EB_CommProcess, SKS_EB_CommID _CommID)
+    {
+        SKS_EB_CommProcess rtnval;
+        if(_SKS_EB_CommProcess)
+        {
+            rtnval = _SKS_EB_CommProcess;
+        }
+        else
+        {
+            select crossCompany * from rtnval where rtnval.CommID == _CommID;
+        }
+
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

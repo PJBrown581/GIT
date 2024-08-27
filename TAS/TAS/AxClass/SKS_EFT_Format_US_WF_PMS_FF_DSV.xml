@@ -1,0 +1,1462 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_EFT_Format_US_WF_PMS_FF_DSV</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// SKS_EFT_Format_US_WF_PMS_FF_DSV extends SKS_EFT_Format
+/// </summary>  
+class SKS_EFT_Format_US_WF_PMS_FF_DSV extends SKS_EFT_Format
+{
+    #define.FormatVersion('20230523')
+    #define.Separator('|')
+    #define.ACHCCD('ACH-CCD')
+    #define.ACHCTX('ACH-CTX')
+    #define.CHK('CHK')
+    #define.WIRE_MTS('WIRE-MTS')
+    #define.IWI('IWI')                      //SKS#DevOps:16965
+    #define.CCR('CCR')                      //SKS#DevOps:16965
+
+    #define.IAC('IAC')                      //SKS#DevOps:20347
+    #define.URG('URG')                      //SKS#DevOps:20347
+    #define.NRG('NRG')                      //SKS#DevOps:20347
+
+    int         paymentCount;
+    AmountMST   totalPaymentAmt;
+    str     telNo;
+    str         contactEmail;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getFormatVersion</Name>
+				<Source><![CDATA[
+    protected str getFormatVersion()
+    {
+        return #FormatVersion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatStructure</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckNestedLoopinCode","Necessary to allow the processing of every invoice(inner loop) for every relevant parent file detail record(outer loop)")]
+    protected void formatStructure()
+    {
+        SKS_EFT_FileDetail invSKS_EFT_FileDetail;
+        //Header Record
+        this.rec_Header();
+
+        while(mSKS_EFT_FileDetail)
+        {
+            // Get SKS_EFT_FileFormatPaymSpec
+            this.getSKS_EFT_FileFormatPaymSpec();
+
+            select msks_EFT_FileDetail_BankAddress where
+                msks_EFT_FileDetail_BankAddress.RefRecId == mSKS_EFT_FileDetail.RecID
+                && msks_EFT_FileDetail_BankAddress.AddressType == SKS_EFT_AddressType::BankAddress;
+
+            //Payment Record
+            this.rec_Payment();
+
+            //Payor Record
+            this.rec_PR();
+            //
+            switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+            {
+                case #NRG:
+                case #URG:
+                    this.rec_01();
+                    break;
+            }
+            //Payee Record
+            this.rec_PE();
+
+            //Receiving Bank Record
+            switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+            {
+                case #ACHCCD:
+                case #ACHCTX:
+                case #IAC:      //SKS#DevOps:20347
+                case #NRG:      //SKS#DevOps:20347
+                    this.rec_RB();
+                    this.rec_AC();
+                    break;
+                case #CHK:
+                    this.rec_CK();
+                    break;
+                case #IWI:
+                    this.rec_RB();
+                    break;
+                case #CCR:
+                    this.rec_CC();
+                    break;
+                case #WIRE_MTS:
+                case #URG:      //SKS#DevOps:20347
+                    this.rec_RB();
+                    this.rec_WR();
+                    break;
+            }
+            if(mSKS_EFT_FileFormatPaymSpec.TransactionCode != #URG)
+            {
+                while select invSKS_EFT_FileDetail where invSKS_EFT_FileDetail.RecordSummaryRecId == mSKS_EFT_FileDetail.RecId && invSKS_EFT_FileDetail.InvoiceNumber != ''
+                {
+                    this.rec_IN(invSKS_EFT_FileDetail);
+                }
+            }
+
+            next mSKS_EFT_FileDetail;
+        }        
+
+        this.rec_TR();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Header</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_Header
+    /// </summary>
+    /// <returns>true</returns>
+    public boolean rec_Header()
+    {
+        str controlNumber;
+
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1Record ID                    2
+        sb.Append(this.wrapField('HD'));
+
+        //2File Control Number            15
+        controlNumber = mSKS_EFT_File.FileNbr + '-' + SKS_EFT_Format::getCodelookupvalue('NextSequenceNumber', mSKS_EFT_FileDetail.RecId);
+        sb.Append(this.wrapField(subStr(controlNumber,1,15)));
+
+        //3File Date10
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),DateSeparator::Hyphen), 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_Payment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_Payment
+    /// </summary>
+    /// <returns>true</returns>
+    public boolean rec_Payment()
+    {
+        str value;
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        msks_EFT_FileDetail_PaymentLine = sks_EFT_FileDetail_PaymentLine::find(mSKS_EFT_FileDetail.RecId);
+        str bankCode     = this.CharacterReplacement(msks_EFT_FileDetail_PaymentLine.BankCentralBankPurposeCode);
+        str printNo;
+        str beneBankCtry = mSKS_EFT_FileDetail_BenBank.BenBankCountryRegionId;
+        
+        paymentCount++;
+
+        //1    Record ID
+        sb.Append(this.wrapField('PY'));
+
+        //2Payment Method
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #ACHCCD:
+            case #ACHCTX:
+                sb.Append(this.wrapField('DAC'));
+                break;
+            case #CHK:
+                sb.Append(this.wrapField('CHK'));
+                break;
+            case #WIRE_MTS:
+                sb.Append(this.wrapField('MTS'));
+                break;
+            case #CCR:
+                sb.Append(this.wrapField('CCR'));
+                break;
+            case #IWI:
+                sb.Append(this.wrapField('IWI'));
+                break;
+            case #IAC:
+                sb.Append(this.wrapField('IAC'));
+                break;
+            case #NRG:
+                sb.Append(this.wrapField('NRG'));
+                break;
+            case #URG:
+                sb.Append(this.wrapField('URG'));
+                break;
+        }
+        //3    Credit/Debit Flag
+        if(mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur < 0)
+        {
+            sb.Append(this.wrapField('C'));
+        }
+        else
+        {
+            sb.Append(this.wrapField('D'));
+        }
+
+        //4    Transaction Number 
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strRight(mSKS_EFT_FileDetail.PaymentReference, 30)));
+
+        //5    Value Date
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(mSKS_EFT_FileDetail.EffectiveDate, DateSeparator::Hyphen)));
+
+        //6    Not used
+        sb.Append(this.wrapField(''));
+
+        //7    Not used
+        sb.Append(this.wrapField(''));
+
+        //8    Payment Amount
+        totalPaymentAmt += mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur;
+
+        sb.Append(this.wrapField(num2str(abs(mSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur),0,2,0,0)));
+
+        //9    Currency
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.PaymentCurrencyCode));
+
+        //10Originating Account Type
+        if(mSKS_EFT_FileDetail.BankAcctType == BankAccountType::CheckingAccount)
+        {
+            sb.Append(this.wrapField('D'));
+        }
+        else
+        {
+            sb.Append(this.wrapField('G'));
+        }
+
+        //11Originating Account
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankAcct, 35));
+
+        //12Originating Account Currency
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.Currencycode));
+
+        //13Originating Bank ID Type
+        //14Originating Bank ID
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #NRG  &&
+           BankAccountTable::find(mSKS_EFT_FileDetail.BankAccountId).BankMultiCurrency == NoYes::No)
+        {
+            sb.Append(this.wrapField('CPA'));
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankTransit, 11));
+        }
+        
+        else if((mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IWI || 
+                 mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IAC ||
+                 mSKS_EFT_FileFormatPaymSpec.TransactionCode == #NRG ||
+                 mSKS_EFT_FileFormatPaymSpec.TransactionCode == #URG)&&
+                 mSKS_EFT_FileDetail.BankBankSwiftNo)
+        {
+            sb.Append(this.wrapField('SWT'));
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankSwiftNo, 11));            //SKS#DevOps:16965
+        }
+        else
+        {
+            sb.Append(this.wrapField('ABA'));
+            sb.Append(this.wrapField(mSKS_EFT_FileDetail.BankBankTransit, 11));
+        }
+
+        //15Receiving Party Account Type        
+        if(mSKS_EFT_FileDetail.DepBankAcctType == BankAccountType::CheckingAccount)
+        {
+            sb.Append(this.wrapField('D'));
+        }
+        else if(mSKS_EFT_FileDetail.DepBankAcctType == BankAccountType::SavingsAccount)
+        {
+            sb.Append(this.wrapField('S'));
+        }
+        else
+        {
+            sb.Append(this.wrapField('G'));
+        }
+
+        //16Receiving Party Account 
+        if (mSKS_EFT_FileDetail.DepBankIBAN)
+        {
+            printNo = mSKS_EFT_FileDetail.DepBankIBAN;
+        }
+        else if (mSKS_EFT_FileDetail.DepBankAcct)
+        {
+            printNo = mSKS_EFT_FileDetail.DepBankAcct;
+        }
+        else
+        {
+            printNo = '';
+        }
+
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #CHK:
+                sb.Append(this.wrapField(''));
+                break;
+            case #WIRE_MTS:
+            case #IWI:              //SKS#DevOsp:16965
+                sb.Append(this.wrapField(printNo, 34));
+                break;
+            case #IAC:              //SKS#DevOsp:20347
+            case #NRG:              //SKS#DevOsp:20347
+            case #URG:              //SKS#DevOsp:20347
+                sb.Append(this.wrapField(printNo, 35));
+                break;
+            case #ACHCCD:               //SKS#DevOsp:19631
+            case #ACHCTX:
+            case #CCR:
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankAcct, 35));
+                break;
+        }
+
+        //17Receiving Account Currency 
+        sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankCurrency));
+
+        //18Receiving Bank Primary ID Type
+        //19Receiving Bank Primary ID
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #CHK:
+            case #CCR:              //SKS#DevOps:16965
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                break;
+            case #IWI:
+            case #IAC:              //SKS#DevOps:20347
+                if(mSKS_EFT_FileDetail.DepSwiftNo)
+                {
+                    sb.Append(this.wrapField('SWT'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepSwiftNo, 11));
+                }
+                else
+                {
+                    sb.Append(this.wrapField('ABA'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit, 11));
+                }
+                break;
+            case #NRG:              //SKS#DevOps:21315
+            case #URG:              //SKS#DevOps:21315
+                if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #NRG  &&
+                BankAccountTable::find(mSKS_EFT_FileDetail.BankAccountId).BankMultiCurrency == NoYes::No)
+                {
+                    sb.Append(this.wrapField('CPA'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit, 11));
+                }
+                else if(mSKS_EFT_FileDetail.DepSwiftNo)
+                {
+                    sb.Append(this.wrapField('SWT'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepSwiftNo, 11));
+                }
+                else
+                {
+                    sb.Append(this.wrapField('ABA'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit, 11));
+                }
+                break;
+            case #WIRE_MTS:
+                if(mSKS_EFT_FileDetail.DepSwiftNo)
+                {
+                    sb.Append(this.wrapField('SWT'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepSwiftNo, 11));
+                }
+                else
+                {
+                    sb.Append(this.wrapField('ABA'));
+                    sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit, 11));
+                }
+                break;
+            case #ACHCCD://DevOps19631
+            case #ACHCTX:
+                {
+                    sb.Append(this.wrapField('ABA'));
+                    if(mSKS_EFT_FileDetail.DepBankTransit)
+                    {
+                        sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit, 11));
+                    }
+                }
+                break;
+        }
+        //20Receiving Bank Secondary ID 
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #URG:
+            case #IWI:
+            case #WIRE_MTS:
+                sb.Append(this.wrapField(mSKS_EFT_FileDetail.DepBankTransit));//DevOps21432
+                break;
+            default:
+                sb.Append(this.wrapField(''));
+                break;
+        }
+
+        //21Not used
+        sb.Append(this.wrapField(''));
+
+        //22Templated Payment Handling Code
+        sb.Append(this.wrapField(''));
+
+        //23Not Used
+        sb.Append(this.wrapField(''));
+
+        //24Invoice Manager Flag
+        sb.Append(this.wrapField(''));
+
+        //25CEO Company ID
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #CCR)
+        {
+            sb.Append(this.wrapField(subStr(mSKS_EFT_FileDetail.FileACHCompanyId, 1, 15)));
+        }
+        else
+        {
+            sb.Append(this.wrapField(''));
+        }
+
+        //26Originating Party to Receiving Party Information / Charge Description
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #ACHCCD:
+            case #ACHCTX:
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('OBI', mSKS_EFT_FileDetail.RecId)), 70));
+                break;            
+            case #URG:
+                sb.Append(this.wrapField(''));
+                break;
+            case #CCR:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum)));//DevOps21432
+                break;
+            case #NRG:      //SKS#DevOps:21315
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('OBI', mSKS_EFT_FileDetail.RecId)), 70));
+                break;
+            case #CHK:
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CheckMemo', mSKS_EFT_FileDetail.RecId)), 35));
+                break;
+            case #IWI:
+            case #WIRE_MTS:
+                this.getEmailandTelephonenumber();
+
+                if ((beneBankCtry =='CHN' || beneBankCtry == 'KOR' || beneBankCtry == 'TWN' || beneBankCtry == 'ZAF') && telNo)
+                {
+                    sb.Append(this.wrapField(this.CharacterReplacement(bankCode + ' / +' + telNo),140)); //DevOps21648
+                }
+                else 
+                {
+                    sb.Append(this.wrapField(this.CharacterReplacement(bankCode),140));//DevOps21432
+                }
+                break;
+            case #IAC:
+                value = msKS_EFT_FileDetail_Instructions.PmtInstText1;
+
+                if(msKS_EFT_FileDetail_Instructions.PmtInstText2)
+                {
+                    value = value + ', ' + msKS_EFT_FileDetail_Instructions.PmtInstText2;
+                }
+                if(msKS_EFT_FileDetail_Instructions.PmtInstText3)
+                {
+                    value = value + ', ' + msKS_EFT_FileDetail_Instructions.PmtInstText3;
+                }
+                if(msKS_EFT_FileDetail_Instructions.PmtInstText4)
+                {
+                    value = value + ', ' + msKS_EFT_FileDetail_Instructions.PmtInstText4;
+                }
+                sb.Append(this.wrapField(this.CharacterReplacement(value), 160));
+                break;
+        }
+        //27Exchange Rate
+        sb.Append(this.wrapField(''));
+
+        //28Consumer Payment Indicator
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #CCR   ||
+           mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IWI)
+        {
+            sb.Append(this.wrapField('', 0, false));
+        }
+        else
+        {
+            sb.Append(this.wrapField(''));
+
+            //29Filler
+            sb.Append(this.wrapField(''));
+
+            //30Payment Purpose Code
+            if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #NRG)         //SKS#DevOps:21315
+            {
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('PaymentPurpCode', mSKS_EFT_FileDetail.RecId)), 4));
+            }
+            else
+            {
+                sb.Append(this.wrapField(''));
+            }
+
+            //31Payment Purpose Description
+            if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #URG)         //SKS#DevOps:21315
+            {
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CPAPurpDecs', mSKS_EFT_FileDetail.RecId)), 35));
+            }
+            else
+            {
+                sb.Append(this.wrapField(''));
+            }
+
+            //32End to End Identifier
+            sb.Append(this.wrapField('', 0, false));
+        }
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_PR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_PR
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_PR()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                    2
+        sb.Append(this.wrapField('PA'));
+
+        //2        Address Indicator            2
+        sb.Append(this.wrapField('PR'));
+
+        //3        Name                        60*
+        //4        Additional Name                60*
+        //5        Identification Number        50*
+        //6        Address Line 1                55*
+        //7        Address Line 2                55*
+        //8        Address Line 3                55
+        //9        City                        30*
+        //10    State / Province            3
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #ACHCCD:
+            case #ACHCTX:
+            case #CHK:
+                if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #ACHCCD ||
+                   mSKS_EFT_FileFormatPaymSpec.TransactionCode == #ACHCTX)
+                {
+                    sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 16));
+                }
+                else
+                {
+                    sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 60));
+                }
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyId), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity), 30));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState), 3));
+                break;
+            case #WIRE_MTS:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyId), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr), 35));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr2), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity), 25));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState), 3));
+                break;
+            case #IAC:  //SKS#DevOps:20347
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyId), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity), 25));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState), 3));
+                break;
+            case #NRG:  //SKS#DevOps:20347
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 60));
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('OriginatorShortName', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank)), 15));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyId), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity), 30));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState), 3));
+                break;
+            case #URG:  //SKS#DevOps:20347
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 35));
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('OriginatorShortName', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank)), 35));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyId), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity), 30));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState), 3));
+                break;
+            case #CCR:
+            case #IWI:          //SKS#DevOps:16965
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyName), 40));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyId), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCity), 30));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyState), 3));
+                break;
+        }
+        
+        //11    Postal Code                    9
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BankAccount.WOrdPartyZipCode), 9));
+
+        //12    Country Code                2
+        sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_FileDetail_BankAccount.WOrdPartyCountryRegionId), 2));
+
+        //13    Country Name                    30
+        sb.Append(this.wrapField(''));
+
+        //14    Email Address                80*
+        sb.Append(this.wrapField(''));
+
+        //15    Phone Number                10
+        sb.Append(this.wrapField(''));
+
+        //16    Phone international access code3
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_01</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_PR
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_01()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                    2
+        sb.Append(this.wrapField('PA'));
+
+        //2        Address Indicator            2
+        sb.Append(this.wrapField('O1'));//DevOps21432
+
+        //3        Name                        60*
+        sb.Append(this.wrapField(this.CharacterReplacement(msks_EFT_FileDetail_BankAddress.Name), 35));
+
+        //4        Additional Name                60*
+        sb.Append(this.wrapField(''));
+
+        //5        Identification Number        50*
+        sb.Append(this.wrapField(''));
+
+        //6        Address Line 1                55*
+        sb.Append(this.wrapField(this.CharacterReplacement(msks_EFT_FileDetail_BankAddress.Addr), 35));
+
+        //7        Address Line 2                55*
+        sb.Append(this.wrapField(''));
+
+        //8        Address Line 3                55
+        sb.Append(this.wrapField(''));
+
+        //9        City                        30*
+        sb.Append(this.wrapField(this.CharacterReplacement(msks_EFT_FileDetail_BankAddress.City), 30));
+
+        //10        State / Province            3
+        sb.Append(this.wrapField(this.CharacterReplacement(msks_EFT_FileDetail_BankAddress.State), 3));
+        
+        //11    Postal Code                    9
+        sb.Append(this.wrapField(this.CharacterReplacement(msks_EFT_FileDetail_BankAddress.ZipCode), 9));
+
+        //12    Country Code                2
+        sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(msks_EFT_FileDetail_BankAddress.CountryRegionId), 2));
+
+        //13    Country Name                    30
+        sb.Append(this.wrapField(''));
+
+        //14    Email Address                80*
+        sb.Append(this.wrapField(''));
+
+        //15    Phone Number                10
+        sb.Append(this.wrapField(''));
+
+        //16    Phone international access code3
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_PE</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_PE
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_PE()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                    2
+        sb.Append(this.wrapField('PA'));
+
+        //2        Address Indicator            2
+        sb.Append(this.wrapField('PE'));
+
+        //3        Name                        60*
+        //4        Additional Name                60*
+        //5        Identification Number        50*
+        //6        Address Line 1                55*
+        //7        Address Line 2                55*
+        //8        Address Line 3                55
+        //9        City                        30*
+        //10    State / Province            3
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #ACHCCD:
+            case #ACHCTX:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 22));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum), 22));                
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 30));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #CHK:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 60));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum), 50));                
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 22));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #NRG:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 60));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 22));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #URG:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 22));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #WIRE_MTS:
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 60));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 35));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 25));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #CCR:                    //SKS#DevOps:16965
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 40));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 55));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 55));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 30));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #IWI:              //SKS#DevOps:16965
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 35));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr2), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 25));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+            case #IAC:              //SKS#DevOps:20347
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneName), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.AccountNum), 50));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneAddr), 35));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneCity), 25));
+                sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneState), 3));
+                break;
+        }        
+        //11    Postal Code                    9
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_VendAddress.BeneZipPostal), 9));
+
+        //12    Country Code                2
+        sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_FileDetail_VendAddress.BeneCountryRegionId), 2));
+        
+        //13    Country Name                30
+        sb.Append(this.wrapField(''));
+
+        //14    Email Address                80*
+        sb.Append(this.wrapField(''));
+
+        //15    Phone Number                10
+        this.getEmailandTelephonenumber();
+
+        if(telNo)
+        {
+            sb.Append(this.wrapField(telNo));
+        }
+        else
+        {
+            sb.Append(this.wrapField(''));
+        }
+
+        //16    Phone international access code3
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_RB</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_RB
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_RB()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                    2
+        sb.Append(this.wrapField('PA'));
+
+        //2        Address Indicator            2
+        sb.Append(this.wrapField('RB'));
+
+        //3        Name                        60*
+        sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankName), 35));
+
+        //4        Additional Name                60*
+        sb.Append(this.wrapField(''));
+
+        //5        Identification Number        50*
+        sb.Append(this.wrapField(''));
+
+        //6        Address Line 1                55*
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IAC)
+        {
+            sb.Append(this.wrapField(''));
+        }
+        else
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankAddr), 35));
+        }
+
+        //7        Address Line 2                55*
+        sb.Append(this.wrapField(''));
+
+        //8        Address Line 3                55
+        sb.Append(this.wrapField(''));
+
+        //9        City                        30*
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #ACHCCD ||
+           mSKS_EFT_FileFormatPaymSpec.TransactionCode == #ACHCTX)
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankCity), 30));
+        }
+        else if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IAC)
+        {
+            sb.Append(this.wrapField(''));
+        }
+        else
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_BenBank.BenBankCity), 25));
+        }
+        //10    State / Province            3
+        sb.Append(this.wrapField(''));
+        
+        //11    Postal Code                    9
+        sb.Append(this.wrapField(''));
+
+        //12    Country Code                2
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IWI)
+        {
+            sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_FileDetail_BenBank.BenBankCountryRegionId), 2, false));
+        }
+        else
+        {
+            sb.Append(this.wrapField(this.getLogisticsAddressCountryISO(mSKS_EFT_FileDetail_BenBank.BenBankCountryRegionId), 2));
+
+            //13    Country Name                30
+            sb.Append(this.wrapField(''));
+
+            //14    Email Address                80*
+            sb.Append(this.wrapField(''));
+
+            //15    Phone Number                10
+            sb.Append(this.wrapField(''));
+
+            //16    Phone international access code3
+            sb.Append(this.wrapField('', 0, false));
+        }
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEmailandTelephonenumber</Name>
+				<Source><![CDATA[
+    private void getEmailandTelephonenumber()
+    {
+        VendTable   lVendTable;
+        DirPartyContactInfoview DirPartyContactInfoview;
+
+        lVendTable = VendTable::findByCompany(mSKS_EFT_FileDetail.AccountCompany, mSKS_EFT_FileDetail.AccountNum);
+
+        select firstonly DirPartyContactInfoview where DirPartyContactInfoview.Party == lVendTable.Party && DirPartyContactInfoview.IsPrimary == true
+            &&  DirPartyContactInfoview.Type == LogisticsElectronicAddressMethodType::Phone;
+
+        if(DirPartyContactInfoView.Locator)
+        {
+            telNo = this.CharacterReplacement(DirPartyContactInfoView.Locator);
+        }
+        return;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_CC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_CC
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_CC()
+    {
+        str value;
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                    2
+        sb.Append(this.wrapField('CC'));
+
+        //2        Batch Id                    10
+        value = this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('NextSequenceNumber', mSKS_EFT_FileDetail.RecId));
+        sb.Append(this.wrapField(value, 10));
+
+        //3        Expiration Date                 10
+        sb.Append(this.wrapField(''));
+
+        //4
+        sb.Append(this.wrapField(''));
+
+        //5        Merchant ID                     16
+        sb.Append(this.wrapField(''));
+
+        //6MCC code                                04
+        sb.Append(this.wrapField(''));
+
+        //7Payee Email                             80
+        this.getEmail();
+        if(contactEmail)
+        {
+            sb.Append(this.wrapField(subStr(contactEmail, 1, 80)));
+        }
+        else
+        {
+            sb.Append(this.wrapField(subStr(mSKS_EFT_FileDetail_VendAddress.Locator, 1, 80)));
+        }
+        //8Division                                50
+        sb.Append(this.wrapField(subStr(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CCRDivisionNumber', mSKS_EFT_FileDetail.RecId)), 1, 50)));
+
+        //9Payment Tolerance Percent Over
+        sb.Append(this.wrapField(''));
+
+        //10 Payment Tolerance Percent Under
+        sb.Append(this.wrapField('', 0, false));
+
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEmail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// getEmail
+    /// </summary>
+    private void getEmail()
+    
+    {
+        VendTable   lVendTable;
+        DirPartyLocation                dirPartyLocation;
+        LogisticsElectronicAddress      lLogisticsElectronicAddress;
+        LogisticsElectronicAddressRole  lLogisticsElectronicAddressRole;
+        LogisticsLocationRole           lLogisticsLocationRole;
+
+        lVendTable = VendTable::findByCompany(mSKS_EFT_FileDetail.AccountCompany, mSKS_EFT_FileDetail.AccountNum);
+
+
+        while select DirPartyLocation where dirPartyLocation.party == lVendTable.Party join lLogisticsElectronicAddress where lLogisticsElectronicAddress.Location == dirPartyLocation.Location
+                    join LocationRole from lLogisticsElectronicAddressRole where lLogisticsElectronicAddressRole.ElectronicAddress == lLogisticsElectronicAddress.RecId
+                                join Name from lLogisticsLocationRole
+                                    where lLogisticsLocationRole.RecId == lLogisticsElectronicAddressRole.LocationRole && lLogisticsLocationRole.Name == 'AP EFT'
+        {
+            if(LogisticsElectronicAddressMethodType::Email)
+            {
+                if(lLogisticsElectronicAddress.Locator)
+                {
+                    contactEmail = lLogisticsElectronicAddress.Locator;
+                }
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_CK</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_CK
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_CK()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1Record ID                                    2
+        sb.Append(this.wrapField('CK'));
+
+        //2Check Number                                15*
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strRight(mSKS_EFT_FileDetail.PaymentReference,15)));
+
+        //3Document Template Number                    18
+        sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CheckFaceStyleId', mSKS_EFT_FileDetail.RecId, SKS_EFT_CodeLookupType::CodeLookupBank)), 18));
+
+        //4Delivery Code                                3
+        sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('DeliveryCode', mSKS_EFT_FileDetail.RecId)), 3));
+
+        //5Courier Name                                60
+        sb.Append(this.wrapField(''));
+
+        //6Courier Account                                55
+        sb.Append(this.wrapField(''));
+
+        //7Delivery/Return Location Code                10
+        sb.Append(this.wrapField(''));
+
+        //8Delivery Label Text                            50*
+        sb.Append(this.wrapField(''));
+
+        //9Check Imaging Identifier                    50
+        sb.Append(this.wrapField(''));
+
+        //10Check Imaging Description                80
+        sb.Append(this.wrapField(''));
+
+        //11Matching to print-ready documents flag    1
+        sb.Append(this.wrapField(''));
+
+        //12Disbursement with Zelle Marketing Description130
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_AC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_AC
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_AC()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1    Record ID                                    2
+        sb.Append(this.wrapField('AC'));
+
+        //2    Not Used                                    10
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #NRG)
+        {
+            sb.Append(this.wrapField(''));
+        }
+        else
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail.FileACHCompanyId), 10));
+        }
+
+        //3    FX Contract Number                            15
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #NRG)
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('FXContractNumber', mSKS_EFT_FileDetail.RecId)), 15));
+        }
+        else
+        {
+            sb.Append(this.wrapField(''));
+        }
+
+        //4    FX Type                                        2
+        sb.Append(this.wrapField(''));
+
+        //5    ACH Format Code                                4
+        switch(mSKS_EFT_FileFormatPaymSpec.TransactionCode)
+        {
+            case #ACHCCD:
+                sb.Append(this.wrapField('CCD'));
+                break;
+            case #ACHCTX:
+                sb.Append(this.wrapField('CTX'));
+                break;
+            case #IAC:
+                sb.Append(this.wrapField('IAT'));
+                break;
+            case #NRG:          //SKS#DevOps:21315
+                sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('CPATransactionCode', mSKS_EFT_FileDetail.RecId))));
+                break;
+            default:
+                sb.Append(this.wrapField(''));
+                break;
+        }
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #IAC)
+        {
+            //6    ACH International Type Code                    3
+            sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('SECCode', mSKS_EFT_FileDetail.RecId))));
+
+            //7    Intermediary Bank ID Type                    3
+            //8    Intermediary Bank ID                        11
+            if(mSKS_EFT_FileDetail_Intermediary.IntBankId)
+            {
+                sb.Append(this.wrapField('ABA'));
+                sb.Append(this.wrapField(subStr(mSKS_EFT_FileDetail_Intermediary.IntBankId, 1, 11)));
+            }
+            else if(mSKS_EFT_FileDetail_Intermediary.IntBankSwift)
+            {
+                sb.Append(this.wrapField('SWT'));
+                sb.Append(this.wrapField(subStr(mSKS_EFT_FileDetail_Intermediary.IntBankSwift, 1, 11)));
+            }
+            else
+            {
+                sb.Append(this.wrapField(''));
+                sb.Append(this.wrapField(''));
+            }
+            
+        }
+        else
+        {
+            //6    ACH International Type Code                    3
+            sb.Append(this.wrapField(''));
+
+            //7    Intermediary Bank ID Type                    3
+            sb.Append(this.wrapField(''));
+
+            //8    Intermediary Bank ID                        11
+            sb.Append(this.wrapField(''));
+        }
+
+        //9    Second Intermediary Bank ID Type            3
+        sb.Append(this.wrapField(''));
+
+        //10Second Intermediary Bank ID                    11
+        sb.Append(this.wrapField(''));
+
+        //11SEPA end to end reference number            35*
+        sb.Append(this.wrapField(''));
+
+        //12SEPA Category Purpose Code                    4
+        sb.Append(this.wrapField(''));
+
+        //13SEPA/International Payment Purpose Code        4
+        sb.Append(this.wrapField(''));
+
+        //14Batch Identification                        35
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_WR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_WR
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_WR()
+    {
+        str value;
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                                2
+        sb.Append(this.wrapField('WR'));
+
+        //2        FX Contract Number                        15
+        sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('FXContractNumber', mSKS_EFT_FileDetail.RecId)), 15));
+
+        //3        Wire Payment Format Type                4
+        if(mSKS_EFT_FileFormatPaymSpec.TransactionCode == #URG)
+        {
+            sb.Append(this.wrapField(this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('PMTFormatType', mSKS_EFT_FileDetail.RecId)), 4));
+        }
+        else
+        {
+            sb.Append(this.wrapField(''));
+        }
+
+        //4        Wire Charges Indicator                    3
+        value = this.CharacterReplacement(SKS_EFT_Format::getCodelookupvalue('Charges', mSKS_EFT_FileDetail.RecId));
+        if(value)
+        {
+            sb.Append(this.wrapField(value));
+        }
+        else
+        {
+            sb.Append(this.wrapField('BEN'));       
+        }       
+
+        //5        CEO Template ID                            16
+        sb.Append(this.wrapField(''));
+
+        //6        Batch ID                                15
+        sb.Append(this.wrapField(''));
+
+        //7        Operator ID                                15
+        sb.Append(this.wrapField(''));
+
+        //8        Intermediary Bank ID Type                3
+        //9        Intermediary Bank ID                    11
+        if(mSKS_EFT_FileDetail_Intermediary.IntBankSwift)
+        {
+            sb.Append(this.wrapField('SWT'));
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_Intermediary.IntBankSwift), 11));
+        }
+        else if(mSKS_EFT_FileDetail_Intermediary.IntBankId)
+        {
+            sb.Append(this.wrapField('ABA'));
+            sb.Append(this.wrapField(this.CharacterReplacement(mSKS_EFT_FileDetail_Intermediary.IntBankId), 11));
+        }
+        
+        //10    Second Intermediary Bank ID Type        3
+        sb.Append(this.wrapField(''));
+
+        //11    Second Intermediary Bank ID                11
+        sb.Append(this.wrapField(''));
+
+        //12    Bank-to-bank Information                210
+        sb.Append(this.wrapField(''));
+
+        //13    Wire Extended Remittance (ERI) Format    4
+        sb.Append(this.wrapField(''));
+
+        //14    Expanded CEO Template ID                35
+        sb.Append(this.wrapField(''));
+
+        //15    Request for Transfer Instruction code    4
+        sb.Append(this.wrapField(''));
+
+        //16    Bank-to-bank Beneficiary Bank ID        11
+        sb.Append(this.wrapField(''));
+
+        //17    Request for Transfer Instruction description30
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_IN
+    /// </summary>
+    /// <param name="invSKS_EFT_FileDetail">SKS_EFT_FileDetail</param>
+    /// <returns>true/false</returns>
+    public boolean rec_IN(SKS_EFT_FileDetail invSKS_EFT_FileDetail)
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1        Record ID                                2
+        sb.Append(this.wrapField('IN'));
+
+        //2        Invoice Number                            100*
+        sb.Append(this.wrapField(invSKS_EFT_FileDetail.InvoiceNumber, 100));
+
+        //3        Invoice Date                            10
+        sb.Append(this.wrapField(SKS_PP_StringFormats::strDateYYYYMMDD(invSKS_EFT_FileDetail.InvoiceDate,DateSeparator::Hyphen), 10));
+
+        //4        Invoice Description                        80
+        sb.Append(this.wrapField(''));
+
+        //5        Invoice (payment) Net Amount            18
+        sb.Append(this.wrapField(num2str(invSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur * -1,0,2,0,0), 18));
+
+        //6        Invoice Gross Amount                    18
+        sb.Append(this.wrapField(num2str((invSKS_EFT_FileDetail.InvoiceSettleAmountPmtCur + invSKS_EFT_FileDetail.InvoiceDiscAmountPmtCur) * -1,0,2,0,0)));
+
+        //7        Discount Taken                            18
+        sb.Append(this.wrapField(num2str(invSKS_EFT_FileDetail.InvoiceDiscAmountPmtCur * -1,0,2,0,0)));
+
+        //8        Related PO Number                        15
+        sb.Append(this.wrapField(''));
+
+        //9        Invoice Type                            3
+        if(invSKS_EFT_FileDetail.InvoiceSettleAmountCur < 0)          
+        {
+            //          InvoiceType (Attribute)
+            sb.Append(this.wrapField('IV'));
+        }
+        else
+        {
+            sb.Append(this.wrapField('CM'));
+        }
+
+        //10    Facility Name                            70
+        sb.Append(this.wrapField(''));
+
+        //11    Purchase Order Description                80
+        sb.Append(this.wrapField('', 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rec_TR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// rec_TR
+    /// </summary>
+    /// <returns>true/false</returns>
+    public boolean rec_TR()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        //1Record ID                    2
+        sb.Append(this.wrapField('TR'));
+
+        //2Payment count8
+        sb.Append(this.wrapField(num2str(paymentCount,0,0,0,0)));
+
+        //3Payment amount21
+        sb.Append(this.wrapField(num2str(abs(totalPaymentAmt),0,2,0,0), 0, false));
+
+        this.fileWrite(sb.ToString());
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wrapField</Name>
+				<Source><![CDATA[
+    private str wrapField(str _field = '', int _fieldLength = 0, boolean _addSeparator = true)
+    {
+        str text;
+
+        if(_fieldLength > 0)
+        {
+            text = subStr(_field, 1, _fieldLength);
+        }
+        else
+        {
+            text = _field;
+        }
+        if(_addSeparator)
+        {
+            text += #Separator;
+        }
+        return text;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectPaymentRecords</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning('BPErrorSelectUsingFirstOnly', 'The buffer is used in next statement or in a datasource query loop.')]
+    protected void selectPaymentRecords()
+    {
+        //------------------------------------------------------------------------------------------------------
+        // Standard payment selction
+        // Override if different selection is need for a format
+        //------------------------------------------------------------------------------------------------------
+    
+        //Order by clause must match the clause in the SKS_EFT_Processing.SumByPayment
+        select * from mSKS_EFT_FileDetail
+            join mSKS_EFT_FileDetail_VendAddress
+            join mSKS_EFT_FileDetail_BenBank
+            join mSKS_EFT_FileDetail_Intermediary
+            join msKS_EFT_FileDetail_Instructions
+            join mSKS_EFT_FileDetail_BankAccount
+                order by mSKS_EFT_FileDetail.PaymentCompany,
+        mSKS_EFT_FileDetail.RecordSection,
+                   mSKS_EFT_FileDetail.PaymMode,
+                   mSKS_EFT_FileDetail.BankAccountId,
+                   mSKS_EFT_FileDetail.PaymentCurrencyCode,
+                   mSKS_EFT_FileDetail.PaymSpec,
+                   mSKS_EFT_FileDetail.EffectiveDate,
+                   mSKS_EFT_FileDetail.DepCountryRegionId,
+                   mSKS_EFT_FileDetail.RecordType,
+                   mSKS_EFT_FileDetail.AccountNum,
+                   mSKS_EFT_FileDetail.PaymentReference,
+                   mSKS_EFT_FileDetail.RecId
+          where mSKS_EFT_FileDetail.FileRecId == mSKS_EFT_File.RecId &&
+                mSKS_EFT_FileDetail.RecordSection == SKS_EFT_RecordSection::Payments &&
+                mSKS_EFT_FileDetail.RecordSummary != SKS_EFT_RecordSummary::NonSummary &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_VendAddress.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_BenBank.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_Intermediary.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == msKS_EFT_FileDetail_Instructions.RefRecId &&
+                mSKS_EFT_FileDetail.RecId == mSKS_EFT_FileDetail_BankAccount.RefRecId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

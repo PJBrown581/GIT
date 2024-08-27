@@ -1,0 +1,1409 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_DD_CustVendMandPaymValidate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+//FDD- AR/AP payment validation
+class SKS_DD_CustVendMandPaymValidate
+{
+    LedgerJournalId                 ledgerJournalId;
+    boolean                         isPaymentWithDueDate; //7324
+    CustDirectDebitMandate          custDirectDebitMandateExisting; //CR-7416
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>availableLimit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns limt amount
+    /// </summary>
+    /// <param name = "_custAccount">Customer account</param>
+    /// <param name = "_paymDate">Payment date</param>
+    /// <param name = "_company">Company</param>
+    /// <returns>returns available limit amount</returns>
+    private AmountCur availableLimit(CustAccount _custAccount, TransDate _paymDate, DataAreaId  _company) //CR-7416
+    {
+        SKS_DD_CustTransMandApplied     custTransMandApplied;
+        
+        //SKS_Bug_8704 -->
+        if(_company)
+        {
+            //SKS_Bug_8704 <--
+            changecompany (_company) //CR-7416
+            {
+                select sum(AppliedMandateLimit) from custTransMandApplied
+                    where custTransMandApplied.CustAccount == _custAccount
+                        && custTransMandApplied.PaymentDate == _paymDate;
+            }
+            //SKS_Bug_8704 <--
+        }
+        //SKS_Bug_8704 -->
+        return custTransMandApplied.AppliedMandateLimit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateVendPaymentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate vendor payment journal
+    /// </summary>
+    /// <param name = "enableLog">enable log</param>
+    /// <returns>boolean value</returns>
+    public boolean validateVendPaymentJournal(boolean enableLog)
+    {
+        SKS_EB_Vendor                   eB_Vendor;
+        VendTable                       vendTable;
+        VendPaymModeTable               vendPaymModeTable;
+        SKS_DD_PaymError                dd_PaymError;
+        LedgerJournalTrans              ledgerJournalTrans;
+        LedgerJournalAC                 vendAccountLJ;
+        SKS_EFT_VendorPaym              vendorPaym; // VP4 MOP issue
+        SKS_EFT_VendorPaym              sks_eft_VendorPaym; //Sks_Bug_7592
+
+        while select ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == ledgerJournalId
+        {
+            vendAccountLJ = LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(ledgerJournalTrans.parmLedgerDimension());
+            //SKS_Bug_8704 -->
+            if(ledgerJournalTrans.Company)
+            {
+                eB_Vendor = SKS_EB_Vendor::find(ledgerJournalTrans.Company, vendAccountLJ);
+                vendPaymModeTable = VendPaymModeTable::find(ledgerJournalTrans.PaymMode);
+
+                changecompany (ledgerJournalTrans.Company) //CR-7416
+                {
+                    vendTable = VendTable::find(eB_Vendor.VendAccount);
+                }
+            }
+            //SKS_Bug_8704 <--
+            //Sks_Bug_7592 --->
+            if(eB_Vendor.Active && vendPaymModeTable.SKS_EFT_PaymMode)
+            {
+                //Sks_Bug_7592 <---
+                ttsBegin;
+
+                if (vendTable.Blocked == CustVendorBlocked::All ||
+                    vendTable.Blocked == CustVendorBlocked::Payment)
+                {
+                    dd_PaymError = strFmt("@SKS6149", vendTable.Blocked);
+                    SKS_EFT_JournalValidate::errorLog(dd_PaymError, ledgerJournalTrans, false, ledgerJournalTrans.Amount());
+                }
+
+                // >> VP4 MOP issue
+                select PaymMode from vendorPaym
+                    where vendorPaym.VendAccount       ==  vendTable.AccountNum;
+                //Sks_Bug_7592 --->
+                if(vendorPaym)
+                {
+                    sks_eft_VendorPaym = SKS_EFT_VendorPaym::find(
+                            ledgerJournalTrans.Company,
+                            vendTable.AccountNum,
+                            ledgerJournalTrans.PaymMode,
+                            ledgerJournalTrans.PaymSpec,
+                            ledgerJournalTrans.CustVendBankAccountId);
+                    //Sks_Bug_7592 <---
+                    if (ledgerJournalTrans.PaymMode != sks_eft_VendorPaym.PaymMode) // << VP4 MOP Issue (Modofied condition)
+                    {
+                        dd_PaymError = "@SKS6148";
+                        SKS_EFT_JournalValidate::errorLog(dd_PaymError, ledgerJournalTrans, false, ledgerJournalTrans.Amount());
+                    }
+                    //Sks_Bug_7592 --->
+                }
+                //Sks_Bug_7592 <---
+                ttsCommit;
+                //Sks_Bug_7592 --->
+            }
+            //Sks_Bug_7592 <---
+
+        }
+
+        if (dd_PaymError != '')
+        {
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditMemoAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// credit memo amount
+    /// </summary>
+    /// <param name = "creditMemoDDLimit">credit memo limit</param>
+    /// <param name = "_custTransOpen">CustTransOpen table</param>
+    /// <param name = "_amountCur">Amount</param>
+    /// <param name = "_paymDate">Payment date</param>
+    /// <param name = "_company">Company</param>
+    /// <returns>SKS_DD_CreditMemoDDLimit table</returns>
+    public SKS_DD_CreditMemoDDLimit creditMemoAmount(SKS_DD_CreditMemoDDLimit    creditMemoDDLimit, CustTransOpen _custTransOpen, AmountCur _amountCur, TransDate _paymDate,DataAreaId  _company) //7324 //CR-7416
+    {
+        boolean                     isCreditNote;
+        CustTrans                   custTrans;
+        CustInvoiceJour             custInvoiceJour;
+        
+
+        custTrans = _custTransOpen.custTrans();
+        custInvoiceJour = CustInvoiceJour::findFromCustTrans(custTrans.Invoice,
+                                                            custTrans.TransDate,
+                                                            custTrans.AccountNum,
+                                                            false,
+                                                            custTrans.Voucher);
+        //Add credit note amount to the invoice amount
+        isCreditNote = this.determineIsCreditNote(_amountCur, custInvoiceJour.Qty);
+
+        if (isCreditNote)
+        {
+            //CR-7416 -->
+            select firstonly creditMemoDDLimit
+                where creditMemoDDLimit.CustAccount  == custTrans.AccountNum
+                    && creditMemoDDLimit.PaymentDate == _paymDate
+                    && creditMemoDDLimit.company     == custTrans.company();
+            if(creditMemoDDLimit)
+            {                               
+                ttsbegin;
+                creditMemoDDLimit.selectForUpdate(true);
+                creditMemoDDLimit.CreditMemoLimit = abs(creditMemoDDLimit.CreditMemoLimit) + abs(_amountCur);
+                creditMemoDDLimit.doUpdate();
+                ttscommit;               
+            }
+            else
+            {
+                creditMemoDDLimit.PaymentDate     = _paymDate; //7324
+                creditMemoDDLimit.CustAccount     = custTrans.AccountNum;
+                creditMemoDDLimit.CreditMemoLimit = abs(creditMemoDDLimit.CreditMemoLimit) + abs(_amountCur);
+                creditMemoDDLimit.company         = _company;          
+                creditMemoDDLimit.doInsert();
+            }                      
+        }
+        return creditMemoDDLimit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineIsCreditNote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// determines if credit not
+    /// </summary>
+    /// <param name = "_amount">amount</param>
+    /// <param name = "_qty">quantity</param>
+    /// <returns>boolean</returns>
+    protected boolean determineIsCreditNote(AmountCur _amount, InventQty _qty)
+    {
+        return _amount < 0 || (!_amount && _qty < 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>editCustTransOpenAmount</Name>
+				<Source><![CDATA[
+    private AmountCur editCustTransOpenAmount(AmountCur         _settleAmountCur,
+                                              common            _originator,
+                                              CustTransOpen     _custTransOpen)
+    {
+        //CR-7416 -->
+        SpecTrans                   specTransUpdate;
+        //CustVendPaymProposalLine    custVendPaymProposalLine;
+        //LedgerJournalTrans          ledgerJournalTran;
+
+        ttsbegin;
+        select forupdate specTransUpdate
+            where  specTransUpdate.SpecTableId    == _originator.TableId
+               &&  specTransUpdate.SpecRecId      == _originator.RecId
+               &&  specTransUpdate.SpecCompany    == _originator.company()
+               &&  specTransUpdate.RefTableId     == _custTransOpen.TableId
+               &&  specTransUpdate.RefRecId       == _custTransOpen.RecId
+               &&  specTransUpdate.RefCompany     == _custTransOpen.company();
+        if(specTransUpdate)
+        {
+            specTransUpdate.Balance01 = _settleAmountCur;
+            specTransUpdate.update();
+        }
+        ttscommit;
+        //CR-7416 <--
+        return _settleAmountCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init method
+    /// </summary>
+    /// <param name = "_journalId">JournalId</param>
+    public void init(LedgerJournalId _journalId)
+    {
+        ledgerJournalId = _journalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertExceptionList</Name>
+				<Source><![CDATA[
+    private void insertExceptionList(CustVendAC         _custVendAC,
+                                    SKS_DD_ErrorWarning _errorWarning,
+                                    SKS_DD_PaymError    _paymError,
+                                    Voucher             _voucher,
+                                    RecId               _transRecId,
+                                    AmountCur           _invoiceAmount)
+    {
+        SKS_DD_CustVendPaymExceptionList    custVendPaymExceptionList;
+
+        ttsBegin;
+        custVendPaymExceptionList.CustVendAC = _custVendAC;
+        custVendPaymExceptionList.Error = _paymError;
+        custVendPaymExceptionList.JournalId = ledgerJournalId;
+        custVendPaymExceptionList.Voucher = _voucher;
+        custVendPaymExceptionList.ErrorWarning = _errorWarning;
+        custVendPaymExceptionList.InvoiceAmount = _invoiceAmount;
+        custVendPaymExceptionList.TransId = _transRecId;
+        custVendPaymExceptionList.TransTableId = tableNum(CustTrans);
+        custVendPaymExceptionList.insert();
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCustPayment_PaymProposal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// validate customer payment proposal
+    /// </summary>
+    public void validateCustPayment_PaymProposal()
+    {
+        CustVendPaymProposalLine        custVendPaymProposalLine;
+        CustTransOpen                   custTransOpen;
+        SKS_DD_CreditMemoDDLimit        creditMemoDDLimit;
+        SpecTrans                       specTrans;        
+        boolean                         mandateFlag = false;
+
+        if (!SKS_PP_Setup::find().RegMandateAutomation)
+        {
+            return;
+        }
+
+        while select crosscompany * from custVendPaymProposalLine
+            where custVendPaymProposalLine.JournalId == ledgerJournalId
+        join RefTableId,RefRecId from specTrans
+            where specTrans.SpecTableId == tableNum(CustVendPaymProposalLine)
+                && specTrans.SpecRecId == custVendPaymProposalLine.RecId
+        join custTransOpen
+            where custTransOpen.TableId == specTrans.RefTableId
+                && custTransOpen.RecId == specTrans.RefRecId
+        {
+            //SKS_Bug_8704 -->
+            if(custTransOpen.company())
+            {
+                //SKS_Bug_8704 <--
+                changecompany(custTransOpen.company())
+                {
+                    CustDirectDebitMandate custDirectDebitMandate = CustDirectDebitMandate::find(CustTable::find(custTransOpen.AccountNum).DefaultDirectDebitMandate);
+                    if(custDirectDebitMandate)
+                    {
+                        mandateFlag = true;
+
+                        if(custDirectDebitMandate && custDirectDebitMandate.SKS_DD_IsBlocked == NoYes::Yes)
+                        {
+                            SKS_DD_PaymError dd_PaymError = strFmt("@SKS6180",custTransOpen.company());
+                        
+                            Error(dd_PaymError);
+                        }
+                        else
+                        {
+                            creditMemoDDLimit = this.creditMemoAmount(creditMemoDDLimit, custTransOpen, custTransOpen.AmountCur,custVendPaymProposalLine.PaymDate, custTransOpen.company());
+                        }
+                    }                       
+                }
+
+                //SKS_Bug_8704 -->
+            }            
+            //SKS_Bug_8704 <--
+        }
+
+        if(mandateFlag)
+        {
+            this.validateCustPaymentProposal(creditMemoDDLimit);   
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCustPaymentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// validate customer payment journal
+    /// </summary>
+    /// <param name = "_paymMode"></param>
+    /// <param name = "_custAccount"></param>
+    /// <param name = "_paymDate"></param>
+    /// <param name = "_amountCur"></param>
+    /// <param name = "_buffer"></param>
+    /// <param name = "_custTransOpen"></param>
+    /// <param name = "_enableLog"></param>
+    /// <returns></returns>
+    public boolean validateCustPaymentJournal(PaymMode          _paymMode,
+                                     CustAccount                _custAccount,
+                                     TransDate                  _paymDate,
+                                     AmountCur                  _amountCur,
+                                     Common                     _buffer,
+                                     CustTransOpen              _custTransOpen,
+                                     boolean                    _enableLog = false)
+    {
+        CustTable                       custTable;
+        CustDirectDebitMandate          custDirectDebitMandate;
+        CustPaymModeTable               custPaymModeTable;
+        SKS_DD_PaymError                dd_PaymError;
+        //DataAreaId                      company; //CR-7416
+        // SKS_EB_FDD-DD-NETS integration -->
+        SKS_EB_BankTable                sKS_EB_BankTable;
+        LedgerJournalTrans              ledgerJournalTrans;
+        boolean                         addMessage;
+        // SKS_EB_FDD-DD-NETS integration <--
+
+        custPaymModeTable = CustPaymModeTable::find(_paymMode);
+
+        //SKS_Bug_8704 -->
+        if(_custTransOpen.company())
+        {
+            //SKS_Bug_8704 <--
+            changecompany (_custTransOpen.company()) //CR-7416 <--
+            {
+                custTable = CustTable::find(_custAccount);
+            }
+
+            if (custPaymModeTable.SKS_EFT_PaymMode)
+            {
+                //check customer available limit
+                changecompany (_custTransOpen.company())  //CR-7416
+                {
+                    custDirectDebitMandate = CustDirectDebitMandate::find(custTable.DefaultDirectDebitMandate);
+                }
+                //Sks_Bug_7471 --->
+                if (custDirectDebitMandate.Status == CustMandateStatus::Canceled ||
+                custDirectDebitMandate.Status     == CustMandateStatus::Expired  ||
+                custDirectDebitMandate.Status     == CustMandateStatus::Incomplete)
+                {
+                    //CR-7416 -->
+                    changecompany (_custTransOpen.company())
+                    {
+                        custDirectDebitMandateExisting =  this.findActiveMandate(custTable.AccountNum);
+                        if(custDirectDebitMandateExisting)
+                        {
+                            custDirectDebitMandate = custDirectDebitMandateExisting;
+                        }
+                    }
+                    //CR-7416<--
+                }
+                //Sks_Bug_7471 <---
+                if (custPaymModeTable.IsSEPA == NoYes::Yes)
+                {
+                    ttsBegin;
+                    _buffer.selectForUpdate(true);
+
+                    if (custDirectDebitMandate.RecId)
+                    {
+                        //As we have mandate limit - start consider invoice transactions for validation
+                        //a.    Payment date is before the expiration date insert record into exception list
+                        //b.    Mandate is cancelled
+                        //c.    Method of payment is different from default method of payment
+                        //d.    Active mandate but field “Blocked for mandate” is checked insert record into exception list
+
+                        if (custDirectDebitMandate.Status == CustMandateStatus::Incomplete)
+                        {
+                            dd_PaymError = "@SKS4186";
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                            ttscommit;
+                            return false;
+                        }
+                        if (custDirectDebitMandate.Status == CustMandateStatus::Canceled)
+                        {
+                            dd_PaymError = "@SKS4424";
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                            ttscommit;
+                            return false;
+                        }
+
+                        if (custDirectDebitMandate.Status == CustMandateStatus::Expired || _paymDate  > custDirectDebitMandate.ExpirationDate)
+                        {
+                            dd_PaymError = "@SKS4219";
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+
+                        if (custDirectDebitMandate.SKS_DD_IsBlocked == NoYes::Yes)
+                        {
+                            dd_PaymError = "@SKS4197";
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+                        /// SKS_EB_FDD-DD-NETS integration -->
+                        // Validation check for mandate scheme b2b
+                        if ((custDirectDebitMandate.MandateScheme == CustMandateScheme::B2B
+                                && custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Standard)
+                                    && (custDirectDebitMandate.Status == CustMandateStatus::Expired
+                                        || custDirectDebitMandate.Status == CustMandateStatus::Canceled
+                                        || custDirectDebitMandate.Status == CustMandateStatus::Incomplete))
+                        {
+                            dd_PaymError = strFmt("@SKS:SKGMandateSchemeStatusValidation", custDirectDebitMandate.Status);
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+
+                        // Validation check for mandate scheme core
+                        if ((custDirectDebitMandate.MandateScheme == CustMandateScheme::CORE
+                                && custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Standard)
+                                    && (custDirectDebitMandate.Status == CustMandateStatus::Expired
+                                        || custDirectDebitMandate.Status == CustMandateStatus::Canceled
+                                        || custDirectDebitMandate.Status == CustMandateStatus::Incomplete))
+                        {
+                            dd_PaymError = strFmt("@SKS:SKGMandateSchemeStatusValidation", custDirectDebitMandate.Status);
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+
+                        // Validation check for mandate scheme Leverander
+                        if ((custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Leverander)
+                                && (custDirectDebitMandate.Status == CustMandateStatus::Expired
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Canceled
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Incomplete))
+                        {
+                            dd_PaymError = strFmt("@SKS:SKGMandateSchemeStatusValidation", custDirectDebitMandate.Status);
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+
+                        // Validation check for mandate scheme Betalings
+                        if ((custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Betalings)
+                                && (custDirectDebitMandate.Status == CustMandateStatus::Expired
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Canceled
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Incomplete))
+                        {
+                            dd_PaymError = strFmt("@SKS:SKGMandateSchemeStatusValidation", custDirectDebitMandate.Status);
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+                        ledgerJournalTrans =  _buffer;
+                        sKS_EB_BankTable = SKS_EB_BankTable::find(SKS_PP_Bank::find(custDirectDebitMandate.CreditorBankAccount).BankID);
+
+                        // Validation check for mandate scheme leverander
+                        if ((custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Leverander
+                              && (custDirectDebitMandate.Status == CustMandateStatus::New
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Modified
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Active)))
+                        {
+                            if ((sKS_EB_BankTable.LeverandOrServicePaymMode != _paymMode || sKS_EB_BankTable.LeverandOrServicePaymSpec != ledgerJournalTrans.PaymSpec))
+                            {
+                                addMessage = true;
+                            }
+                        }
+
+                        // Validation check for mandate scheme betalings
+                        if (custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::Betalings
+                             && (custDirectDebitMandate.Status == CustMandateStatus::New
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Modified
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Active))
+                        {
+                            if ((sKS_EB_BankTable.BetalingsServicePaymMode != _paymMode || sKS_EB_BankTable.BetalingsServicePaymSpec != ledgerJournalTrans.PaymSpec))
+                            {
+                                addMessage = true;
+                            }
+                        }
+
+                        // Validation check for mandate scheme betalings total
+                        if (custDirectDebitMandate.SKS_EB_MandateType == SKS_EB_MandateType::BetalingsTotal
+                             && (custDirectDebitMandate.Status == CustMandateStatus::New
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Modified
+                                    || custDirectDebitMandate.Status == CustMandateStatus::Active))
+                        {
+                            if ((sKS_EB_BankTable.BetalingsServiceTotalPaymMode != _paymMode || sKS_EB_BankTable.BetalingsServiceTotalPaymSpec != ledgerJournalTrans.PaymSpec))
+                            {
+                                addMessage = true;
+                            }
+                        }
+                        if (addMessage)
+                        {
+                            dd_PaymError = "@SKS:SKGMandateStatusMessage";
+                            SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                        }
+                        // SKS_EB_FDD-DD-NETS integration <--
+                    }
+                    else
+                    {
+                        dd_PaymError = "@SKS4239";
+                        SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+                    }
+                    ttscommit;
+                }
+                //SKS_Bug_8704 -->
+            }
+            //SKS_Bug_8704 <--
+        }
+
+
+        ttsbegin;
+        if (_paymMode != custTable.PaymMode)
+        {
+            //<Issue21650>
+            if(!ledgerJournalTrans)
+            {
+                ledgerJournalTrans = _buffer;
+            }
+
+            if(!SKS_EFT_CustomerPaym::find(custTable.company(), custTable.AccountNum, ledgerJournalTrans.PaymMode, ledgerJournalTrans.PaymSpec, ledgerJournalTrans.CustVendBankAccountId).RecId)
+            {
+                dd_PaymError = "@SKS4208";
+                SKS_EFT_JournalValidate::errorLog(dd_PaymError, _buffer, _enableLog, _amountCur);
+            }
+            //</Issue21650>
+        }
+        ttscommit;
+
+        if(dd_PaymError != '')
+        {
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkMandate</Name>
+				<Source><![CDATA[
+    public AmountCur checkMandate(CustVendAC _custVendAC,
+                                  TransDate  _transDate)
+    {
+        CustTable                       custTable;
+        CustDirectDebitMandate          custDirectDebitMandate;
+        AmountCur                       custMandLimit;
+        AmountCur                       totalLimit = 0;
+
+        if(SKS_PP_Setup::find().RegAREFT)
+        {
+            custTable = CustTable::find(_custVendAC);
+            custDirectDebitMandate = CustDirectDebitMandate::find(custTable.DefaultDirectDebitMandate);
+            //Sks_Bug_7471 --->
+            if (custDirectDebitMandate.Status   == CustMandateStatus::Canceled ||
+                custDirectDebitMandate.Status   == CustMandateStatus::Expired  ||
+                custDirectDebitMandate.Status   == CustMandateStatus::Incomplete)
+            {
+                custDirectDebitMandateExisting =  this.findActiveMandate(custTable.AccountNum);
+                if(custDirectDebitMandateExisting) //CR-7416
+                {
+                    custDirectDebitMandate = custDirectDebitMandateExisting;
+                }
+            }
+
+            if(custDirectDebitMandate.SKS_DD_Limitamount == 0)
+            {
+                custDirectDebitMandate.SKS_DD_Limitamount = 999999999.00;
+            }
+            totalLimit = custDirectDebitMandate.SKS_DD_Limitamount;
+
+            //Sks_Bug_7471 <---
+            
+            if(custDirectDebitMandate.SKS_DD_Limitamount)
+            {
+                custMandLimit = this.availableLimit(custTable.AccountNum, _transDate,custTable.company());
+                totalLimit = custDirectDebitMandate.SKS_DD_Limitamount - custMandLimit;
+                
+                if (totalLimit < 0)
+                {
+                    totalLimit = 0;
+                }
+            }
+            else
+            {
+                totalLimit = 0;
+            }           
+            
+        }
+
+        return totalLimit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSettlementAmount</Name>
+				<Source><![CDATA[
+    public boolean validateSettlementAmount(boolean _enableLog = false)
+    {
+        LedgerJournalTrans              ledgerJournalTrans;
+        CustTable                       custTable;
+        CustDirectDebitMandate          custDirectDebitMandate;
+        AmountCur                       custMandLimit, mandateLimit;
+        SKS_DD_PaymError                dd_PaymError;
+        AmountCur                       creditTotal;
+        AmountCur                       debitTotal;
+        LedgerJournalTrans              ledgerJournalTransBuff;
+        LedgerJournalTrans              ledgerJournalTransUpt;
+        boolean                         ret= true;
+
+        while select LedgerDimension,RecId from ledgerJournalTrans
+            group by LedgerDimension, RecId
+            where ledgerJournalTrans.JournalNum == ledgerJournalId
+        {
+            custMandLimit = 0;
+            mandateLimit = 0;
+            creditTotal = 0;
+            debitTotal = 0;
+
+            custTable = CustTable::findByLedgerDimension(ledgerJournalTrans.LedgerDimension);
+            custDirectDebitMandate = CustDirectDebitMandate::find(custTable.DefaultDirectDebitMandate);
+            //Sks_Bug_7471 --->
+            if(custDirectDebitMandate.Status    == CustMandateStatus::Canceled ||
+                custDirectDebitMandate.Status   == CustMandateStatus::Expired  ||
+                custDirectDebitMandate.Status   == CustMandateStatus::Incomplete)
+            {
+                custDirectDebitMandateExisting =  this.findActiveMandate(custTable.AccountNum);
+                if(custDirectDebitMandateExisting) //CR-7416
+                {
+                    custDirectDebitMandate = custDirectDebitMandateExisting;
+                }
+            }
+            //Sks_Bug_7471 <---
+            ledgerJournalTransBuff = LedgerJournalTrans::findRecId(ledgerJournalTrans.RecId,false);
+
+            select sum(AmountCurCredit) from ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == ledgerJournalId
+                && ledgerJournalTrans.AmountCurCredit > 0
+                && ledgerJournalTrans.LedgerDimension;
+
+            creditTotal = ledgerJournalTrans.AmountCurCredit;
+
+            select sum( AmountCurDebit), TransDate from ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == ledgerJournalId
+                    && ledgerJournalTrans.AmountCurDebit > 0
+                    && ledgerJournalTrans.LedgerDimension;
+
+            debitTotal = ledgerJournalTrans.AmountCurDebit;
+
+            mandateLimit = debitTotal + custDirectDebitMandate.SKS_DD_Limitamount;
+
+            custMandLimit = this.availableLimit(custTable.AccountNum, ledgerJournalTrans.TransDate,custTable.company());
+
+            mandateLimit += custMandLimit;
+            if(custDirectDebitMandate)
+            {
+                if (custDirectDebitMandate.SKS_DD_Limitamount == 0)
+                {
+                    dd_PaymError = "@SKS4238";
+                    SKS_EFT_JournalValidate::warningLog(dd_PaymError, ledgerJournalTransBuff, _enableLog,0);
+                    ttsBegin;
+                    ledgerJournalTransUpt.skipDataMethods(true);            //TAS_CAR
+                    ledgerJournalTransUpt.skipEvents(true);
+                    update_recordSet ledgerJournalTransUpt setting
+                        SKS_DD_ExceptionStatus = SKS_DD_ExceptionStatus::Warning
+                        where ledgerJournalTransUpt.JournalNum == ledgerJournalId;
+                    ttsCommit;
+                    ret = false;
+                }
+                else
+                {
+                    if(mandateLimit < creditTotal)
+                    {
+                        dd_PaymError = strfmt("@SKS4240",mandateLimit);
+                        SKS_EFT_JournalValidate::errorLog(dd_PaymError, ledgerJournalTransBuff, _enableLog,creditTotal);
+                        ttsBegin;
+                        ledgerJournalTransUpt.skipDataMethods(true);    //TAS_CAR
+                        ledgerJournalTransUpt.skipEvents(true);
+                        update_recordSet ledgerJournalTransUpt setting
+                            SKS_DD_ExceptionStatus = SKS_DD_ExceptionStatus::Warning
+                            where ledgerJournalTransUpt.JournalNum == ledgerJournalId
+                                && ledgerJournalTransUpt.SKS_DD_ExceptionStatus != SKS_DD_ExceptionStatus::Error;
+                        ttsCommit;
+                        ret = false;
+                    }
+                }
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static SKS_DD_CustVendMandPaymValidate construct(LedgerJournalId _journalId)
+    {
+        SKS_DD_CustVendMandPaymValidate custVendMandPaymValidate;
+
+        custVendMandPaymValidate = new SKS_DD_CustVendMandPaymValidate();
+        custVendMandPaymValidate.init(_journalId);
+        return custVendMandPaymValidate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCreditNoteTransaction</Name>
+				<Source><![CDATA[
+    public boolean isCreditNoteTransaction(CustTransOpen    _custTransOpen)
+    {
+        CustTrans       custTrans;
+        CustInvoiceJour custInvoiceJour;
+        boolean         isCreditNote;
+
+        custTrans = CustTrans::find(_custTransOpen.RefRecId);
+
+        custInvoiceJour = CustInvoiceJour::findFromCustTrans(custTrans.Invoice,
+                                                                    custTrans.TransDate,
+                                                                    custTrans.AccountNum,
+                                                                    false,
+                                                                    custTrans.Voucher);
+
+        isCreditNote = this.determineIsCreditNote(custInvoiceJour.InvoiceAmount, custInvoiceJour.Qty);
+
+        return (isCreditNote ? true: false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findActiveMandate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the active direct debit mandate for the customer.
+    /// </summary>
+    /// Sks_7471
+    public CustDirectDebitMandate findActiveMandate(CustAccount _custAccount)
+    {
+        CustDirectDebitMandate custDirectDebitMandate;
+        CustDirectDebitMandate custDirectDebitMandateRet;
+
+        while select  custDirectDebitMandate
+            where custDirectDebitMandate.CustAccount   ==  _custAccount &&
+            custDirectDebitMandate.SKS_DD_IsBlocked    ==  NoYes::No
+        {
+            if(custDirectDebitMandate.Status    ==  CustMandateStatus::New ||
+            custDirectDebitMandate.Status       ==  CustMandateStatus::Active ||
+            custDirectDebitMandate.Status       ==  CustMandateStatus::Modified)
+            {
+                custDirectDebitMandateRet = custDirectDebitMandate;
+                break;
+            }
+        }
+        return custDirectDebitMandateRet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTotalWithDueDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// To identify whether payment is with due or not.
+    /// </summary>
+    /// CR-7324
+    public void isTotalWithDueDate(boolean _isProposal = false)
+    {
+        CustVendPaymProposalLine        custVendPaymProposalLine;
+        CustTransOpen                   custTransOpen;
+        SpecTrans                       specTrans;
+        CustPaymModeTable               custPaymModeTable;
+        LedgerJournalTrans              ledgerJournalTrans;
+
+        isPaymentWithDueDate = true;
+        if(_isProposal)
+        {
+            while select * from custVendPaymProposalLine
+                where custVendPaymProposalLine.JournalId == ledgerJournalId
+                    join PaymMode,PaymSumBy from custPaymModeTable
+                        where custPaymModeTable.PaymMode    == custVendPaymProposalLine.PaymMode
+                            && custPaymModeTable.PaymSumBy  == PaymSumBy::Total
+            {
+                {
+                    while select crosscompany DueDate from custTransOpen
+                        join forupdate specTrans
+                            where specTrans.SpecTableId == custVendPaymProposalLine.TableId
+                                && specTrans.SpecRecId  == custVendPaymProposalLine.RecId
+                                && specTrans.RefTableId == custTransOpen.TableId
+                                && specTrans.RefRecId   == custTransOpen.RecId
+                    {
+                        isPaymentWithDueDate = false;
+                    }
+                }
+            }
+        }
+        else
+        {
+            while select ledgerJournalTrans
+                    where ledgerJournalTrans.JournalNum == ledgerJournalId
+                        && ledgerJournalTrans.AccountType == LedgerJournalACType::Cust
+
+            {
+                select crosscompany RefTableId,RefRecId from specTrans
+                    where specTrans.SpecTableId == tableNum(ledgerJournalTrans)
+                        && specTrans.SpecRecId  == ledgerJournalTrans.RecId
+                join TableId,DueDate,RecId from custTransOpen
+                    where custTransOpen.TableId == specTrans.RefTableId
+                        && custTransOpen.RecId  == specTrans.RefRecId
+                join PaymMode,PaymSumBy from custPaymModeTable
+                    where custPaymModeTable.PaymMode    == ledgerJournalTrans.PaymMode
+                        && custPaymModeTable.PaymSumBy  == PaymSumBy::Total;
+                if (custTransOpen.RecId)
+                {
+                    //if records has MOP period Total and the payment date is other than due date and due date is not older than today then treating as payment date specified
+                    if((ledgerJournalTrans.TransDate != custTransOpen.DueDate) && custTransOpen.DueDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+                    {
+                        isPaymentWithDueDate = false;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCustPaymentProposal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// validate proposal
+    /// </summary>
+    /// <param name = "creditMemoDDLimit">credit memo limit</param>    
+    public void validateCustPaymentProposal(SKS_DD_CreditMemoDDLimit    creditMemoDDLimit)
+    {
+        CustVendPaymProposalLine        custVendPaymProposalLine, custVendPaymProposalLine_cust;
+        AmountCur                       totalLimit;
+        CustTransOpen                   custTransOpen;
+        SpecTrans                       specTrans;
+        TransDate                       transDate;
+        
+        this.isTotalWithDueDate(true);
+        
+        while select crosscompany custVendPaymProposalLine
+            group by AccountNum, PaymDate
+                    where custVendPaymProposalLine.JournalId == ledgerJournalId
+                join specTrans //CR-7416
+                    group by RefCompany
+                        where specTrans.SpecTableId == tableNum(CustVendPaymProposalLine)
+                            && specTrans.SpecRecId  == custVendPaymProposalLine.RecId
+                join custTransOpen
+                    where custTransOpen.TableId     == specTrans.RefTableId
+                            && custTransOpen.RecId  == specTrans.RefRecId
+        {
+            transDate = custVendPaymProposalLine.PaymDate;
+            //SKS_Bug_8704 -->
+            if(specTrans.RefCompany)
+            {
+                //SKS_Bug_8704 <--
+                changecompany (specTrans.RefCompany) //CR-7416
+                {
+                    //Total limit amount for customer on payment date
+                    totalLimit = this.checkMandate(custVendPaymProposalLine.AccountNum, custVendPaymProposalLine.PaymDate);
+                }
+                //SKS_Bug_8704 -->
+            }
+            //SKS_Bug_8704 <--
+            while select custVendPaymProposalLine_cust
+                order by PaymDate asc
+                    where custVendPaymProposalLine_cust.JournalId   == ledgerJournalId
+                        && custVendPaymProposalLine_cust.AccountNum == custVendPaymProposalLine.AccountNum
+                        && custVendPaymProposalLine_cust.PaymDate   == custVendPaymProposalLine.PaymDate
+            {
+                totalLimit = this.applyLimitAmount(creditMemoDDLimit, custVendPaymProposalLine_cust.TableId, custVendPaymProposalLine_cust.RecId, totalLimit, custVendPaymProposalLine_cust.AccountNum, custVendPaymProposalLine_cust, specTrans.RefCompany);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyLimitAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Apply limit amount
+    /// </summary>
+    /// <param name = "creditMemoDDLimit">credit memo limit</param>
+    /// <param name = "_specTableId">table id</param>
+    /// <param name = "_specRecId">rec id</param>
+    /// <param name = "_totalLimit">total limit</param>
+    /// <param name = "_custAccount">customer account</param>
+    /// <param name = "_buffer">table buffer </param>
+    /// <param name = "_company">company</param>
+    /// <returns>Limit amount</returns>
+    public AmountCur applyLimitAmount(SKS_DD_CreditMemoDDLimit    creditMemoDDLimit,
+                                    TableId    _specTableId,
+                                    RecId       _specRecId,
+                                    AmountCur   _totalLimit,
+                                    CustAccount _custAccount,
+                                    common      _buffer,
+                                    DataAreaId  _company)
+
+    {
+        SpecTrans                       specTrans;
+        specTrans                       lSpecTrans;
+        CustTransOpen                   custTransOpen;        
+        AmountCur                       specBalance;
+        CustPaymModeTable               custPaymModeTable;
+        CustVendPaymProposalLine        custVendPaymProposalLine;
+        LedgerJournalTrans              ledgerJournalTrans;
+        TransDate                       paymDate;
+       
+        switch(_buffer.TableId)
+        {
+            case tableNum(CustVendPaymProposalLine):
+                custVendPaymProposalLine = _buffer as CustVendPaymProposalLine;
+                paymDate = custVendPaymProposalLine.PaymDate;
+                break;
+            case tableNum(LedgerJournalTrans):
+                ledgerJournalTrans = _buffer as LedgerJournalTrans;
+                paymDate = LedgerJournalTrans.TransDate;
+                ledgerJournalTrans.selectForUpdate(true);
+                break;
+
+        }
+        //SKS_Bug_8704 -->
+        if(_company)
+        {
+            //SKS_Bug_8704 <--
+            changecompany (_company)
+            {
+                while select  custTransOpen
+                    order by DueDate
+                        join forupdate specTrans
+                            where specTrans.SpecTableId == _specTableId
+                                && specTrans.SpecRecId  == _specRecId
+                                && specTrans.RefTableId == custTransOpen.TableId
+                                && specTrans.RefRecId   == custTransOpen.RecId
+                                && specTrans.RefCompany == _company
+                                && specTrans.Balance01   > 0
+                {
+                    //fetching method of payment record to identify the Period
+                    custPaymModeTable.clear();
+                    if(custVendPaymProposalLine)
+                    {
+                        custPaymModeTable = custPaymModeTable::find(custVendPaymProposalLine.PaymMode);
+                    }
+                    else
+                    {
+                        custPaymModeTable = custPaymModeTable::find(ledgerJournalTrans.PaymMode);
+                    }
+
+                    if(custPaymModeTable.IsSEPA == NoYes::No) //|| custPaymModeTable.SKS_EFT_PaymMode == NoYes::No
+                    {
+                        continue;
+                    }
+
+                    //if method of payment period is total and the payment date same as due date skipping the limit apply logic
+                    if(custPaymModeTable.PaymSumBy == PaymSumBy::Total && isPaymentWithDueDate)
+                    {
+                        continue;
+                    }
+
+                    select firstonly creditMemoDDLimit
+                        where creditMemoDDLimit.CustAccount  == _custAccount
+                            && creditMemoDDLimit.PaymentDate == paymDate
+                            && creditMemoDDLimit.company     == custTransOpen.company();
+
+                    //if either limit amount or credit memo amount is positive applying the value
+                    if (_totalLimit > 0 || creditMemoDDLimit.CreditMemoLimit > 0)
+                    {
+                        specBalance = 0;
+                            
+                        if(specTrans.Balance01 > 0)
+                        {
+                            if (specTrans.Balance01 <= creditMemoDDLimit.CreditMemoLimit)
+                            {
+                                ttsbegin;
+                                creditMemoDDLimit.selectForUpdate(true);
+                                creditMemoDDLimit.CreditMemoLimit = creditMemoDDLimit.CreditMemoLimit - specTrans.Balance01;
+                                creditMemoDDLimit.update();
+                                ttscommit;
+                            }
+                            else if (specTrans.Balance01 <= (creditMemoDDLimit.CreditMemoLimit + _totalLimit))
+                            {
+                                _totalLimit -= specTrans.Balance01 - creditMemoDDLimit.CreditMemoLimit;
+                                if(creditMemoDDLimit.RecId && creditMemoDDLimit.CreditMemoLimit)
+                                {
+                                    ttsbegin;
+                                    creditMemoDDLimit.selectForUpdate(true);
+                                    creditMemoDDLimit.CreditMemoLimit = 0;
+                                    creditMemoDDLimit.update();
+                                    ttscommit;
+                                }
+                            }
+                            else if (specTrans.Balance01 > (creditMemoDDLimit.CreditMemoLimit + _totalLimit))
+                            {
+                                specBalance = creditMemoDDLimit.CreditMemoLimit + _totalLimit;
+                                if(creditMemoDDLimit.RecId && creditMemoDDLimit.CreditMemoLimit)
+                                {
+                                    ttsbegin;
+                                    creditMemoDDLimit.selectForUpdate(true);
+                                    creditMemoDDLimit.CreditMemoLimit = 0;
+                                    creditMemoDDLimit.update();
+                                    ttscommit;
+                                }
+                                this.editCustTransOpenAmount(specBalance, _buffer, custTransOpen);
+                                _totalLimit = 0;
+                            }
+
+                        }                              
+                    }
+                    //if limit and credit memo values less than zero, deleting the line from spectrans
+                    else if (specTrans.Balance01 > 0)
+                    {
+                        ttsBegin;
+                        while select forupdate lSpecTrans
+                        where lSpecTrans.SpecTableId == _specTableId
+                            && lSpecTrans.SpecRecId  == _specRecId
+                            && lSpecTrans.RefTableId == custTransOpen.TableId
+                            && lSpecTrans.RefRecId   == custTransOpen.RecId
+                        {
+                            lSpecTrans.delete();
+                        }
+                        ttsCommit;
+                    }
+
+                }
+            }
+            //SKS_Bug_8704 -->
+        }
+        
+        //SKS_Bug_8704 <--
+        return _totalLimit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// validate ledger journal transactions
+    /// </summary>
+    /// <param name = "creditMemoDDLimit">credit memo limit</param>
+    /// <param name = "_enableLog">determines whether to enable log</param>
+    /// <returns></returns>
+    public boolean validateLedgerJournalTrans(SKS_DD_CreditMemoDDLimit creditMemoDDLimit, boolean _enableLog = false)
+    {
+        LedgerJournalTrans              ledgerJournalTrans,ledgerJournalTransCopy;
+        //LedgerJournalTrans              ledgerJournalTransCust;
+        CustTransOpen                   custTransOpen;
+        CustPaymModeTable               custPaymModeTable;
+        LedgerJournalAC                 custAccountLJ,custAccountLJCopy;
+        boolean                         isValid = true;
+        SpecTrans                       specTrans;
+        SpecTransManager                specTransManager;
+        boolean                         ret;
+        AmountCur                       totalLimit;        
+        AmountCur                       specAmount;
+        ExchangeRateHelper              exchangeRateHelper;
+        Transdate                       paymDate;
+
+        this.isTotalWithDueDate();
+
+        while select ledgerJournalTrans
+                order by TransDate asc
+                    where ledgerJournalTrans.JournalNum == ledgerJournalId
+            join RecId from custPaymModeTable
+                    where custPaymModeTable.PaymMode == ledgerJournalTrans.PaymMode
+                        //&& custPaymModeTable.IsSEPA  == NoYes::Yes
+                        && custPaymModeTable.SKS_EFT_PaymMode == NoYes::Yes
+        {
+            select crosscompany specTrans
+                group by RefCompany
+                        where specTrans.SpecTableId == tableNum(ledgerJournalTrans)
+                            && specTrans.SpecRecId == ledgerJournalTrans.RecId
+                            join custTransOpen
+                                where custTransOpen.TableId == specTrans.RefTableId
+                                    && custTransOpen.RecId == specTrans.RefRecId;
+            //SKS_Bug_8704 -->
+            if(specTrans.RefCompany)
+            {
+                //SKS_Bug_8704 <--
+                changecompany (specTrans.RefCompany)
+                {
+                    custAccountLJ = LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(ledgerJournalTrans.LedgerDimension);
+                }
+                changecompany (specTrans.RefCompany)
+                {
+                    if((!custAccountLJCopy && !paymDate) || custAccountLJCopy != custAccountLJ || paymDate != ledgerJournalTrans.TransDate)
+                    {
+                        totalLimit = this.checkMandate(custAccountLJ, ledgerJournalTrans.TransDate);
+                        custAccountLJCopy = custAccountLJ;
+                        paymDate    = ledgerJournalTrans.TransDate;
+                    }
+
+
+                    select firstonly creditMemoDDLimit
+                        where creditMemoDDLimit.CustAccount  == custAccountLJ
+                            && creditMemoDDLimit.PaymentDate == ledgerJournalTrans.TransDate 
+                            && creditMemoDDLimit.company     == specTrans.RefCompany;
+
+                    if (totalLimit != 0 || creditMemoDDLimit.CreditMemoLimit != 0)
+                    {
+                        custAccountLJCopy = '';
+                    }
+                }
+                //SKS_Bug_8704 -->
+            }
+            //SKS_Bug_8704 <--
+
+            ttsbegin;
+
+
+            select forupdate ledgerJournalTransCopy
+                order by TransDate asc
+                    where ledgerJournalTransCopy.RecId == ledgerJournalTrans.RecId;
+
+            specTransManager = SpecTransManager::newFromSpec(ledgerJournalTransCopy);
+
+            exchangeRateHelper = ExchangeRateHelper::newCurrency(Ledger::primaryLedger(CompanyInfo::findDataArea(specTrans.RefCompany).RecId), ledgerJournalTransCopy.CurrencyCode);
+
+            specAmount = SpecTransManager::getTotalSettleAmountForSpecReference(
+                        ledgerJournalTransCopy.company(),
+                        ledgerJournalTransCopy.TableId,
+                        ledgerJournalTransCopy.RecId,
+                        ledgerJournalTransCopy.CurrencyCode,
+                        specTrans.RefCompany,
+                        ledgerJournalTransCopy.TransDate,
+                        exchangeRateHelper.prepareExchangeRateForStorage(ledgerJournalTransCopy.crossrate()));
+
+            if ((specAmount != - ledgerJournalTransCopy.amount()) && specAmount != 0)//JU: SKS_Bug_8704 <--
+            {
+                if (specAmount < 0)
+                {
+                    ledgerJournalTransCopy.AmountCurDebit  = abs(specAmount);
+                    ledgerJournalTransCopy.AmountCurCredit = 0;
+                }
+                else
+                {
+                    ledgerJournalTransCopy.AmountCurCredit = abs(specAmount);
+                    ledgerJournalTransCopy.AmountCurDebit  = 0;
+                }
+
+            }
+            ledgerJournalTransCopy.update();
+            ttscommit;
+
+            select crosscompany specTrans
+                where specTrans.SpecTableId == tableNum(ledgerJournalTrans)
+                        && specTrans.SpecRecId == ledgerJournalTrans.RecId
+                        join custTransOpen
+                            where custTransOpen.TableId == specTrans.RefTableId
+                                && custTransOpen.RecId == specTrans.RefRecId;
+
+            //SKS_Bug_8704 -->
+            if(!specTrans.RefCompany)
+            {
+                SKS_Table_LedgerJournalTrans::validateCustPaymentJournal(ledgerJournalTrans.PaymMode,
+                                                        LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(ledgerJournalTrans.LedgerDimension),
+                                                        ledgerJournalTrans.TransDate,
+                                                        ledgerJournalTrans.amount(),
+                                                        ledgerJournalTrans,
+                                                        ledgerJournalTrans.Company,
+                                                        false);
+            }
+            else
+            {
+                ret = this.validateCustPaymentJournal(ledgerJournalTrans.PaymMode,
+                                                        custAccountLJ,
+                                                        ledgerJournalTrans.TransDate,
+                                                        ledgerJournalTrans.amount(),
+                                                        ledgerJournalTrans,
+                                                        custTransOpen,
+                                                        _enableLog);
+            }
+            //SKS_Bug_8704 <--
+
+            if (isValid == true && ret == false)
+            {
+                isValid = false;
+            }
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCustPayment_LedgerJournalTrans</Name>
+				<Source><![CDATA[
+    public boolean validateCustPayment_LedgerJournalTrans(boolean _enableLog = false)
+    {
+        LedgerJournalTrans              ledgerJournalTrans;
+        CustTransOpen                   custTransOpen;
+        SpecTrans                       specTrans;
+        boolean                         isValid;
+        SKS_DD_CreditMemoDDLimit        creditMemoDDLimit;
+        SKS_DD_CustTransMandApplied     custTransMandApplied;
+
+        isValid = false;
+
+        if(SKS_EFT_Setup::find().ModAREFT)
+        {
+            while select crosscompany ledgerJournalTrans
+            order by TransDate asc
+                where ledgerJournalTrans.JournalNum == ledgerJournalId
+                join specTrans
+                    group by RefCompany
+                        where specTrans.SpecTableId == tableNum(LedgerJournalTrans)
+                            && specTrans.SpecRecId  == ledgerJournalTrans.RecId
+            {
+                custTransMandApplied.clear();
+                //SKS_Bug_8704 -->
+                if(specTrans.RefCompany)
+                {
+                    //SKS_Bug_8704 <--
+                    changecompany(specTrans.RefCompany)
+                    {
+                        ttsBegin;
+                        while select custTransMandApplied
+                            where custTransMandApplied.JournalNum == ledgerJournalId
+                                && custTransMandApplied.company == specTrans.RefCompany
+                        {
+                            custTransMandApplied.selectForUpdate(true);
+                            custTransMandApplied.delete();
+                        }
+                        ttsCommit;
+                    }
+                    //SKS_Bug_8704 -->
+                }
+                //SKS_Bug_8704 <--
+            }
+            while select crosscompany TransDate,RecId from ledgerJournalTrans
+                order by TransDate asc
+                    where ledgerJournalTrans.JournalNum == ledgerJournalId
+                join Balance01,RefCompany,RefTableId,RefRecId from specTrans
+                    where specTrans.SpecTableId     == tableNum(ledgerJournalTrans)
+                        && specTrans.SpecRecId      == ledgerJournalTrans.RecId
+                join custTransOpen
+                    where custTransOpen.TableId == specTrans.RefTableId
+                        && custTransOpen.RecId  == specTrans.RefRecId
+            {
+                creditMemoDDLimit = this.creditMemoAmount(creditMemoDDLimit, custTransOpen, specTrans.Balance01,ledgerJournalTrans.TransDate,specTrans.RefCompany);
+            }
+
+            isValid = this.validateLedgerJournalTrans(creditMemoDDLimit, _enableLog);
+
+            this.updateCustTransMandApplied_LJTrans();
+            
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCustTransMandApplied_LJTrans</Name>
+				<Source><![CDATA[
+    public void updateCustTransMandApplied_LJTrans()
+    {
+        LedgerJournalTrans          ledgerJournalTrans;
+        //LedgerJournalTable          ledgerJournalTable;
+        SpecTrans                   specTrans;
+        SpecTrans                   specTransLoc;
+        CustTransOpen               custTransOpen;
+        SKS_DD_CustTransMandApplied custTransMandApplied;
+        LedgerJournalAC             custAccount;
+        CustDirectDebitMandate      custDirectDebitMandate;
+        CustTable                   custTable;
+        CustPaymModeTable           custPaymModeTable;
+        //CustVendPaymProposalLine    custVendPaymProposalLine;
+        AmountCur                   specBalance;
+        //Clear unposted journal blocked limit to update it here
+
+        while select ledgerJournalTrans
+            order by TransDate asc
+                where ledgerJournalTrans.JournalNum == ledgerJournalId
+                   && ledgerJournalTrans.AmountCurCredit > 0
+            join custPaymModeTable
+                where custPaymModeTable.PaymMode == ledgerJournalTrans.PaymMode
+                    && custPaymModeTable.IsSEPA  == NoYes::Yes
+        {
+            while select crosscompany specTransLoc
+                group by RefCompany
+                        where specTransLoc.SpecTableId == tableNum(LedgerJournalTrans)
+                            && specTransLoc.SpecRecId  == ledgerJournalTrans.RecId
+            {
+                select  crosscompany sum(Balance01), count(RecId) from specTrans
+                        where specTrans.SpecTableId == tableNum(ledgerJournalTrans)
+                            && specTrans.SpecRecId  == ledgerJournalTrans.RecId
+                            && specTrans.RefCompany == specTransLoc.RefCompany
+                        join  custTransOpen
+                            where custTransOpen.TableId == specTrans.RefTableId
+                                && custTransOpen.RecId  == specTrans.RefRecId;
+                if(specTrans.Balance01 > 0 && ledgerJournalTrans.AmountCurCredit > 0)
+                {
+                    if(ledgerJournalTrans.AmountCurCredit <= specTrans.Balance01)
+                    {
+                        specBalance = ledgerJournalTrans.AmountCurCredit;
+                    }
+                    else
+                    {
+                        specBalance = specTrans.Balance01;
+                    }
+                }
+                if (specTrans.Balance01 > 0 && specTransLoc.RefCompany)//SKS_Bug_8704
+                {
+                    changecompany (specTransLoc.RefCompany)
+                    {
+                        ttsbegin;
+                        custTransMandApplied.clear();
+                        custAccount = LedgerDynamicAccountHelper::getAccountNumberFromDynamicAccount(ledgerJournalTrans.parmLedgerDimension());
+
+                        custTable = CustTable::find(custAccount);
+                        custDirectDebitMandate = CustDirectDebitMandate::find(custTable.DefaultDirectDebitMandate);
+                        //Sks_Bug_7471 --->
+                        if(custDirectDebitMandate.Status    == CustMandateStatus::Canceled ||
+                            custDirectDebitMandate.Status   == CustMandateStatus::Expired  ||
+                            custDirectDebitMandate.Status   == CustMandateStatus::Incomplete)
+                        {
+                            custDirectDebitMandateExisting =  this.findActiveMandate(custTable.AccountNum);
+                            if(custDirectDebitMandateExisting)
+                            {
+                                custDirectDebitMandate = custDirectDebitMandateExisting;
+                            }
+                        }
+                        //Sks_Bug_7471 <---
+                        if (custDirectDebitMandate.SKS_DD_Limitamount && specTrans.Balance01 > 0)
+                        {
+                            custTransMandApplied = SKS_DD_CustTransMandApplied::find(custAccount, ledgerJournalTrans.TransDate,specTransLoc.RefCompany, true);
+
+                            custTransMandApplied.CustAccount = custAccount;
+                            custTransMandApplied.AppliedMandateLimit += specBalance;
+                            custTransMandApplied.JournalNum  = ledgerJournalTrans.JournalNum;
+                            custTransMandApplied.PaymentDate = ledgerJournalTrans.TransDate;
+                            custTransMandApplied.company     = specTransLoc.RefCompany;
+
+                            if (custTransMandApplied.RecId)
+                            {
+                                custTransMandApplied.update();
+                            }
+                            else
+                            {
+                                custTransMandApplied.insert();
+                            }
+                        }
+                        ttscommit;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

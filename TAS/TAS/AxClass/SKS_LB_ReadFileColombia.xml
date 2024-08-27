@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_LB_ReadFileColombia</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_LB_ReadFileColombia extends SKS_LB_ReadFileBAI2
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>readfile</Name>
+				<Source><![CDATA[
+    TmpSKS_LB_Importing readfile()
+    {
+        int RecordCode;
+        int PrevRecordCode = 0;
+        int linecnt = 0;
+        Container line;
+        str prevLine;
+        str lineStr;
+        str nextLineStr;
+        boolean FileHeaderFound = false;
+        boolean FileTrailerFound = false;
+        boolean LockboxHeaderFound = false;
+        boolean InvoiceFound = false;
+        boolean WriteTransaction = false;
+        boolean ValidAcctPathcombo = false;
+        int PaymentRecId = 0;
+        ListEnumerator fieldFormatsListEnumeratorCheck;
+        ListEnumerator fieldFormatsListEnumeratorInvoice;
+        ListEnumerator fieldFormatsListEnumeratorBatch;
+        ListEnumerator fieldFormatsListEnumeratorBatchTrailer;
+        SKS_LB_FileFormatDet localSKS_LB_FileFormatDet;
+        str value;
+        SKS_EB_FilePath         lbpath;
+    
+        ImportCount = 0;
+    
+        fieldFormatsListEnumeratorCheck = FieldFormatsListCheck.getEnumerator();
+        fieldFormatsListEnumeratorInvoice = FieldFormatsListInvoice.getEnumerator();
+        fieldFormatsListEnumeratorBatch = FieldFormatsListBatch.getEnumerator();
+        fieldFormatsListEnumeratorBatchTrailer = FieldFormatsListBatchTrailer.getEnumerator();
+    
+        NoSettlements = false;
+    
+        //this.openFile();
+        ttsbegin;
+        lbpath =  System.IO.Path::GetDirectoryName(Filename);
+        line = BAI2File.read();
+        [lineStr] = line;
+    
+        while(BAI2File.status() == IO_status::Ok || (line != conNull() && BAI2File.status() == IO_Status::FileTooShort))
+        {
+            fieldFormatsListEnumeratorCheck.reset();
+            fieldFormatsListEnumeratorInvoice.reset();
+            fieldformatslistEnumeratorBatch.reset();
+            fieldFormatsListEnumeratorBatchTrailer.reset();
+            linecnt++;
+            lineStr = strrem(lineStr, '\n\r');
+    
+            if (strlen(con2Str(line)) == 0) //skip blank lines
+            {
+                RecordCode=0;
+            }
+            else
+            {
+                RecordCode = str2int(substr(lineStr,1,2)); // Get the record code
+            }
+            //This loop will skip over 6 and 4 records that belong to a 5 record that contains a bank account that is invalid for the directory
+            //this loop will end when a record that is not a 6 or a 4 is found
+            while(FileHeaderFound == true && ValidAcctPathcombo == false
+                && RecordCode == #recordCodeCheckTran 
+                && BAI2File.status() == IO_status::Ok)
+            {
+                line = BAI2File.read();
+                [lineStr] = line;
+    
+                if (strlen(con2Str(line)) == 0) //skip blank lines
+                {
+                    RecordCode=0;
+                }
+                else
+                {
+                    RecordCode = str2int(substr(lineStr,1,2)); // Get the record code
+                }
+            }
+    
+            switch(RecordCode)
+            {
+                case #RecordCodeFileHeader:
+                    if (FileHeaderFound == true)
+                    {
+                        ImportCount = 0;
+                        ttsabort;
+                        // only 1 allowed
+                        error("@SKS330");
+                        importing = null;
+                        return importing;
+                    }
+                    FileHeaderFound = true;
+                    break;
+                //5 Records
+                case #RecordCodeLockboxHeader:
+                    if (FileHeaderFound == false)
+                    {
+                        // missing: 01
+                        this.BAI2FormatError(#RecordCodeFileHeader, linecnt);
+                        return importing;
+                    }
+                    // Get processing date - this will be used if no check date is supplied
+    
+                    while(fieldFormatsListEnumeratorBatch.moveNext())
+                    {
+                        localSKS_LB_FileFormatDet = fieldFormatsListEnumeratorBatch.current();
+                        value = subStr(lineStr, localSKS_LB_FileFormatDet.FieldStart, localSKS_LB_FileFormatDet.FieldEnd - localSKS_LB_FileFormatDet.FieldStart + 1);
+                        this.ReadOneField(value, localSKS_LB_FileFormatDet.FieldType);
+                    }
+                    ValidAcctPathcombo = this.validatepathacctcombo(lbpath);
+    
+                    LockBoxHeaderFound = True;
+                    break;
+    
+                // Check trans may or may not be followed by invoice details.
+                // Record Check info for now. If corresponding Invoice information is found later, it will be added
+                // to the line.
+                //6 Records
+                case #RecordCodeCheckTran:
+    
+                    if (LockBoxHeaderFound == false)
+                    {
+                        // missing: 5
+                        this.BAI2FormatError(#RecordCodeLockboxHeader, linecnt);
+                        return importing;
+                    }
+    
+                    // Save off the check sequence info to verify if Invoice records belong to this Check
+                    while (fieldFormatsListEnumeratorCheck.moveNext())
+                    {
+                        localSKS_LB_FileFormatDet = fieldFormatsListEnumeratorCheck.current();
+                        value = substr(lineStr, localSKS_LB_FileFormatDet.FieldStart, localSKS_LB_FileFormatDet.FieldEnd - localSKS_LB_FileFormatDet.FieldStart + 1);
+                        this.ReadOneField(value, localSKS_LB_FileFormatDet.FieldType);
+                    }
+                    PaymentRecId = linecnt;
+                    break;
+
+                case #RecordCodeLockboxTrailer:
+                    if (LockBoxHeaderFound == false
+                        && (str2int(substr(prevLine,1,2)) != #RecordCodeGroupHeader))
+                    {
+                        // missing: 3
+                        this.BAI2FormatError(#RecordCodeLockboxHeader, linecnt);
+                        return importing;
+                    }
+                    LockBoxHeaderFound = false;
+                    break;
+    
+                case #RecordCodeFileTrailer:
+                    if (LockboxHeaderFound == true)
+                    {
+                        // missing: 8
+                        this.BAI2FormatError(#RecordCodeLockboxTrailer, linecnt);
+                        return importing;
+                    }
+                    FileTrailerFound  = true;
+                    break;
+    
+                default:
+                    break;
+    
+            }
+            // If this is an invoice line, or a check followed by a non-invoice line, a record should be written.
+            // get next line to determine what record follows this one.
+            line = BAI2File.read();
+            [nextLineStr] = line;
+    
+            if(RecordCode == #RecordCodeGroupHeader
+                && BAI2File.status() == IO_status::OK
+                && (str2int(substr(nextLineStr, 1, 2)) == #RecordCodeFileTrailer
+                    ||str2int(substr(nextLineStr, 1, 2)) == #RecordCodeLockboxTrailer))
+            {
+                NoSettlements = true;
+            }
+       
+            if (RecordCode == #RecordCodeCheckTran && ValidAcctPathcombo)
+            {
+                if (BAI2File.status() == IO_status::OK)
+                {
+                    WriteTransaction = true;
+                }
+            }
+    
+            if (WriteTransaction)
+            {
+                WriteTransaction = false;
+                importing.FileDate = FileDate;
+                if (BAI2File.status() == IO_status::OK && str2int(substr(nextLineStr, 1, 2)) == #RecordCodeBatchTotal )
+                {
+                    while(fieldFormatsListEnumeratorBatchTrailer.moveNext())
+                    {
+                        localSKS_LB_FileFormatDet = fieldFormatsListEnumeratorBatchTrailer.current();
+                        value = subStr(nextlineStr, localSKS_LB_FileFormatDet.FieldStart, localSKS_LB_FileFormatDet.FieldEnd - localSKS_LB_FileFormatDet.FieldStart + 1);
+                        this.ReadOneField(value, localSKS_LB_FileFormatDet.FieldType);
+                    }
+                }
+                ImportCount++;
+                importing.FileLineNbrBegin = linecnt;
+                importing.ParentRecId = PaymentRecId;
+                importing.insert();
+    
+                // reset invoice info from line, if terminating invoice reset check info too
+                importing.InvAmount = 0;
+                importing.InvoiceNumber = ' ';
+                importing.BankPmtCnt = 0;
+                importing.BankPmtTotal = 0;
+                importing.DiscAmount = 0;
+                importing.LBInvoice = '';
+                importing.Description = '';
+                importing.PaymNote = '';
+            }
+            prevLine = lineStr;
+            lineStr = nextLineStr;
+        }
+        // end while
+        if (FileHeaderFound == false)
+        {
+            // missing: 01
+            this.BAI2FormatError(#RecordCodeFileHeader, linecnt);
+            return importing;
+        }
+        if (FileTrailerFound == false)
+        {
+            // missing: 01
+            this.BAI2FormatError(#RecordCodeFileTrailer, linecnt);
+            return importing;
+        }
+        ttscommit;
+    
+        return importing;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

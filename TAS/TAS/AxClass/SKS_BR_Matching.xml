@@ -1,0 +1,2337 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_BR_Matching</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// THis class is used for linking imported SKS_BR_BankTrans to BankAccountTrans
+/// </summary>
+class SKS_BR_Matching
+{
+    #SKS_Global
+
+    SKS_PP_Setup globalSKS_PP_Setup;
+
+    SKS_BR_MatchingRulesMast mSKS_BR_MatchingRulesMast;
+    SKS_BR_BankTran mSKS_BR_BankTran;
+    str mTranTypeFilterString;
+    LedgerJournalId mPaymentJournalNum;
+
+    Query mQuery;  // Create a new query.
+    QueryRun mQueryRun;
+    QueryBuildDataSource mQbr;
+    str StructFieldJournalNum,
+        StructFieldTransDate,
+        StructFieldAmountCur,
+        StructFieldJournalOccurenceCount,
+        StructFieldDataAreaId,
+        StructFieldJounalNumsContainer;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>duplicateCreate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle the creation of duplicate matches in the BankAccountTrans table when importing
+    /// </summary>
+    /// <param name = "_BankAccountTransRecId">The recid of the duplicate bank account trans</param>
+    public void duplicateCreate(RefRecId _BankAccountTransRecId)
+    {
+        SKS_BR_MatchingDuplicate SKS_BR_MatchingDuplicate;
+
+        changeCompany(mSKS_BR_BankTran.company())
+        {
+            select firstOnly SKS_BR_MatchingDuplicate where
+                SKS_BR_MatchingDuplicate.SKS_BR_BankTran == mSKS_BR_BankTran.RecId &&
+                SKS_BR_MatchingDuplicate.BankAccountTrans == _BankAccountTransRecId;
+
+            if(!SKS_BR_MatchingDuplicate)
+            {
+                SKS_BR_MatchingDuplicate.SKS_BR_BankTran = mSKS_BR_BankTran.RecId;
+                SKS_BR_MatchingDuplicate.BankAccountTrans = _BankAccountTransRecId;
+                SKS_BR_MatchingDuplicate.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getImportReferenceNbr</Name>
+				<Source><![CDATA[
+    public str getImportReferenceNbr(SKS_BR_ImportReference _importReferenceType)
+    {
+        str importReferenceNbr;
+
+        // Set import reference number
+        switch(_importReferenceType)
+        {
+            case SKS_BR_ImportReference::BankRefNbr:
+                importReferenceNbr = mSKS_BR_BankTran.BankNum;
+                break;
+            case SKS_BR_ImportReference::CustomerRefNbr:
+                importReferenceNbr = mSKS_BR_BankTran.BankCustomerNum;
+                break;
+            case SKS_BR_ImportReference::ParseValue:
+                importReferenceNbr = mSKS_BR_BankTran.ParsedValue;
+                break;
+        }
+
+        return importReferenceNbr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_BR_MatchingRulesMast</Name>
+				<Source><![CDATA[
+    public void getSKS_BR_MatchingRulesMast()
+    {
+        mSKS_BR_MatchingRulesMast = null;  // Re-set in case company changed
+        select mSKS_BR_MatchingRulesMast
+            where mSKS_BR_MatchingRulesMast.RuleGroupId == mSKS_BR_BankTran.MatchingRuleGroupId
+            && mSKS_BR_MatchingRulesMast.CCR_IsCCReconciliation == NoYes::No;/// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_PP_Setup</Name>
+				<Source><![CDATA[
+    private void getSKS_PP_Setup()
+    {
+        ;
+        globalSKS_PP_Setup = null;  // Re-set in case company changed
+        select * from globalSKS_PP_Setup;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>glCheck</Name>
+				<Source><![CDATA[
+    // If no match found see if GL still exists.
+    // GL that was created may have been changed or deleted.
+    private boolean glCheck()
+    {
+        LedgerJournalTrans LedgerJournalTrans;
+        DimensionDynamicAccount locDimensionDynamicAccount;
+        ;
+
+        locDimensionDynamicAccount = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(mSKS_BR_BankTran.AccountId, LedgerJournalACType::Bank);
+        changeCompany(mSKS_BR_BankTran.GLCreationCompany)
+        {
+            select firstOnly RecId, LedgerDimension, AmountCurCredit, AmountCurDebit from LedgerJournalTrans where
+                LedgerJournalTrans.RecId == mSKS_BR_BankTran.LedgerJournalRecId &&
+                LedgerJournalTrans.LedgerDimension ==  locDimensionDynamicAccount &&
+                (LedgerJournalTrans.AmountCurCredit == mSKS_BR_BankTran.TranAmount * -1 ||
+                    LedgerJournalTrans.AmountCurDebit == mSKS_BR_BankTran.TranAmount);
+        }
+        if(LedgerJournalTrans)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>glMatch</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer findBankAccountTrans is selected forUpdate and is passed to other methods where it is modified.")]
+    public BankAccountTrans glMatch()
+    {
+        BankAccountTrans findBankAccountTrans;
+        LedgerJournalTrans locLedgerJournalTrans;
+        DimensionDynamicAccount bankDim;
+        ;
+
+        select firstonly forupdate * from findBankAccountTrans where
+             findBankAccountTrans.AccountID == mSKS_BR_BankTran.AccountId &&
+             findBankAccountTrans.AmountCur == mSKS_BR_BankTran.TranAmount &&
+             findBankAccountTrans.AccountStatementDate == datenull() &&
+             findBankAccountTrans.AccountStatement == '' &&
+             findBankAccountTrans.Included == 0 &&
+             findBankAccountTrans.Reconciled == 0 &&
+             findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+             findBankAccountTrans.Voucher == mSKS_BR_BankTran.Voucher;
+
+        if(!findBankAccountTrans)
+        {
+
+            bankDim = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(mSKS_BR_BankTran.AccountId, LedgerJournalACType::Bank);
+            select firstonly locLedgerJournalTrans where
+                locLedgerJournalTrans.SKS_BR_BankTranRecId  == mSKS_BR_BankTran.RecId &&
+                locLedgerJournalTrans.LedgerDimension == bankDim;
+
+            if(locLedgerJournalTrans)
+            {
+                select firstonly forupdate * from findBankAccountTrans where
+                 findBankAccountTrans.AccountID == mSKS_BR_BankTran.AccountId &&
+                 findBankAccountTrans.AmountCur == mSKS_BR_BankTran.TranAmount &&
+                 findBankAccountTrans.AccountStatementDate == datenull() &&
+                 findBankAccountTrans.AccountStatement == '' &&
+                 findBankAccountTrans.Included == 0 &&
+                 findBankAccountTrans.Reconciled == 0 &&
+                 findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+                 findBankAccountTrans.Voucher == locLedgerJournalTrans.Voucher;
+            }
+        }
+
+        // If not found either GL was not posted yet
+        // or GL was altered or deleted and may no longer be valid
+        if(!findBankAccountTrans)
+        {
+            if(!this.glCheck())
+            {
+                mSKS_BR_BankTran.Voucher = '';
+                mSKS_BR_BankTran.LedgerJournalRecId = 0;
+                mSKS_BR_BankTran.GLMappingRuleGroupId = '';
+
+                SKS_BR_ReadFile::setDefaultMatchGroup(mSKS_BR_BankTran); // Set default matching rule
+
+                mSKS_BR_BankTran.update();
+            }
+        }
+        return findBankAccountTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>match</Name>
+				<Source><![CDATA[
+    public boolean match(SKS_BR_BankTran _sks_br_banktran, Guid _guid)
+    {
+        SKS_BR_MatchingRuleDetails SKS_BR_MatchingRuleDetails;
+        int recordCount;
+        BankAccountTrans bankAccountTrans;
+        boolean duplicateFound;
+        boolean matchFound;
+        str importReferenceNumber;
+
+        mSKS_BR_BankTran = null; // Re-set in case company changed
+
+        changeCompany(_sks_br_banktran.company())
+        {
+            ttsBegin;
+
+            mSKS_BR_BankTran = _sks_br_banktran;
+
+            this.queryCreateQuery();
+
+            // Match to GL that was created
+            if(mSKS_BR_BankTran.GLMappingRuleGroupId && mSKS_BR_BankTran.GLMatchOrCreate != SKS_BR_GLMatchOrCreate::Manual)
+            {
+                bankAccountTrans = this.glMatch();
+                if(bankAccountTrans)
+                {
+                    matchFound = true;
+                    this.stampIntermBankAccountTrans(bankAccountTrans, _guid);
+                    this.stampIntermSKS_BR_BankTran(null, _guid, false, true, bankAccountTrans, true);
+                }
+            }
+
+            if(mSKS_BR_BankTran.MatchingRuleGroupId)
+            {
+                // Delete any existing duplicates
+                SKS_BR_Matching::duplicateDelete(mSKS_BR_BankTran.RecId);
+
+                this.getSKS_BR_MatchingRulesMast();
+
+                this.queryBuildExcludeTranTypeFilterString();
+
+                while select SKS_BR_MatchingRuleDetails order by step where
+                    SKS_BR_MatchingRuleDetails.SKS_BR_MatchingRulesMast == mSKS_BR_MatchingRulesMast.RuleGroupId
+                    && SKS_BR_MatchingRuleDetails.CCR_IsCCReconciliation == NoYes::No/// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+                {
+                    if(SKS_BR_MatchingRuleDetails.Rule == SKS_BR_MatchingRules::JournalSummary)
+                    {
+                        //Journal summary
+                        matchFound =  this.matchFindPaymentJournal(mSKS_BR_BankTran, SKS_BR_MatchingRuleDetails, _guid);
+
+                        if(matchFound)
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        this.queryRange_Base();
+
+                        if(SKS_BR_MatchingRuleDetails.Rule == SKS_BR_MatchingRules::RefNbrAndAmt)
+                        {
+                            // Reference number
+                            importReferenceNumber = this.getImportReferenceNbr(SKS_BR_MatchingRuleDetails.ImportReference);
+
+                            // If no reference number, don't attempt to match on an empty reference number
+                            if(importReferenceNumber)
+                            {
+                                this.queryRange_RefNbr(SKS_BR_MatchingRuleDetails, importReferenceNumber);
+                            }
+                            else
+                            {
+                                continue;
+                            }
+                        }
+                        else if(SKS_BR_MatchingRuleDetails.Rule == SKS_BR_MatchingRules::DateAndAmt)
+                        {
+                            // Date
+                            this.queryRange_Date(SKS_BR_MatchingRuleDetails.DateTolerance);
+                        }
+
+                        // Amount
+                        this.queryRange_Amount(SKS_BR_MatchingRuleDetails.AmountTolerance);
+
+                        // Tran type filter
+                        this.queryRange_TranTypeFilter();
+
+                        // Run the query
+                        mQueryRun = new QueryRun(mQuery);
+
+                        recordCount = SysQuery::countTotal(mQueryRun);
+                        if(recordCount)
+                        {
+                            // Set duplicate flag
+                            if(recordCount > 1)
+                            {
+                                duplicateFound = true;
+                            }
+
+                            // If more than one record and not matching duplicates, fill out duplicate table
+                            if(duplicateFound && SKS_BR_MatchingRuleDetails.OnDuplicate == SKS_BR_DuplicateTransHandling::DontMatch)
+                            {
+                                // Loop through duplicates and create records in duplicate table
+                                while (mQueryRun.next())
+                                {
+                                    if (mQueryRun.changedNo(1))
+                                    {
+                                        bankAccountTrans = mQueryRun.getNo(1);
+                                        this.duplicateCreate(bankAccountTrans.RecId);
+                                    }
+                                }
+
+                                this.stampIntermSKS_BR_BankTran(SKS_BR_MatchingRuleDetails, _guid, duplicateFound, false);
+                                matchFound = false;
+                            }
+                            // Update matched record
+                            else if(recordCount == 1 || (duplicateFound && SKS_BR_MatchingRuleDetails.OnDuplicate == SKS_BR_DuplicateTransHandling::Match))
+                            {
+                                mQueryRun.next();
+                                if (mQueryRun.changedNo(1))
+                                {
+                                    bankAccountTrans = mQueryRun.getNo(1);
+                                    bankAccountTrans.selectForUpdate(true);
+                                    this.stampIntermBankAccountTrans(bankAccountTrans, _guid);
+                                    this.stampIntermSKS_BR_BankTran(SKS_BR_MatchingRuleDetails, _guid, false, true, bankAccountTrans);
+                                    SKS_BR_Matching::ClearCheck(bankAccountTrans, _sks_br_banktran.TranDate);
+                                }
+                                matchFound = true;
+                            }
+                            break; // Don't do next rule if a record was found.  This could be a match or a duplicate match
+                        }
+                    }
+                }
+            }
+            ttsCommit;
+        }
+        return matchFound;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchFindPaymentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// WHen matching based on Jounral Summaries, this method takes the imported SKS_BR_BankTran and locates candidate Payment Journals
+    /// </summary>
+    /// <param name = "_sks_br_banktran">The imported SKS_BR_BankTran</param>
+    /// <param name = "_sbmRule"></param>
+    /// <param name = "_guid"></param>
+    /// <returns></returns>
+    [SuppressBPWarningAttribute("BPCheckInsertMethodInLoop","The locSKS_BR_MatchingDuplicateJournal.recid, which is generated by the insert, is needed within the loop.  RecordInsertList usage is not possible here.")]
+    public boolean matchFindPaymentJournal(SKS_BR_BankTran _sks_br_banktran, SKS_BR_MatchingRuleDetails _sbmRule, guid _guid)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        BankAccountTrans findBankAccountTrans;
+        LedgerJournalTable localLedgerJournalTable;
+        boolean duplicate = false;
+        boolean matchfound = false;
+        BankAccountStatement bankAccountStatement;
+        TransDate transdate = Global::dateNull();
+        Voucher locVoucher = '';
+        SKS_BR_BankCustomerNum  InboundRefNum = '';
+        container containerJournalPostedDateTimes;
+        container containerJournalDescriptions;
+        container containerJournalNames;
+        container containerJournalNums;
+        container containerJournalDates;
+        container locContainerJournalVouchers;
+        container locInboundRefNums;
+        container containerJournalAmts;
+
+        List locContainersOfLedgerJournalNumsThatMatchedList = new List(Types::AnyType);
+        ListIterator locContainersOfLedgerJournalNumsThatMatchedListIterator;
+        int i;
+        SKS_BR_MatchingDuplicateJournal locSKS_BR_MatchingDuplicateJournal;
+        recordinsertlist        ril;
+        RecordInsertList        matchingDuplicateRecordInsertList = new RecordInsertList(tableNum(SKS_BR_MatchingDuplicateJournal));  //TAS_CAR
+        ;
+
+        ril = new recordinsertlist(locSKS_BR_MatchingDuplicateJournal.TableId);
+        //LEDGER BASED SUMMARY TYPES WILL ALL BE SUB GROUPS UNDER THIS
+        //Your Ledger journal summary type just needs to return a list of journals to match the SKS_BR_BankTran to.
+        If(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::DateMultiJournal)//Add your ledger journal summary type here
+        {
+            //the IF clause is for SKS_BR_SUmmary::DateMultiJournal ONLY.  Add your new ledger based SKS_BR_SummaryBy
+            // type to a new ELSE clause.  Return a list of containers of matching LedgerJournalNumbers. if more than
+            // one container of ledgerjournalnumbers, it is considered a duplciate and... there is NO handling  for
+            // Duplciates of multijournal matches.  For now, we'll just skip out.
+            if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::DateMultiJournal)
+            {
+                locContainersOfLedgerJournalNumsThatMatchedList = this.SKS_BR_SummaryByDateMultiJournal(_sks_br_banktran, _sbmRule);
+            }
+
+            if(locContainersOfLedgerJournalNumsThatMatchedList.elements() == 1)
+            {
+                matchfound = true;
+                duplicate = false;
+                locContainersOfLedgerJournalNumsThatMatchedListIterator = new ListIterator(locContainersOfLedgerJournalNumsThatMatchedList);
+                while(locContainersOfLedgerJournalNumsThatMatchedListIterator.more())
+                {
+
+                    containerJournalNums = locContainersOfLedgerJournalNumsThatMatchedListIterator.value();
+                    for(i = 1; i <= conLen(containerJournalNums); i++)
+                    {
+                        SKS_BR_Matching::matchUpdatePaymentJournal(_sks_br_banktran,conPeek(containerJournalNums, i),false,_sbmRule,true,bankAccountStatement,false,false,0,_sks_br_banktran.TranDate,null,'',_guid);
+                                                                 //  _sks_br_banktran,conPeek(containerJournalNums, 1),false,_sbmRule,true,bankAccountStatement,false,false, 0,transDate, locVoucher, InboundRefNum, _guid)
+                    }
+                    locContainersOfLedgerJournalNumsThatMatchedListIterator.next();
+                }
+            }
+        }
+        else //Bank account trans based summmary groups go under this group
+        {
+            // Summarize Payment journal transactions & date and compare to bank amount
+            if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date)
+            {
+                select sum(AmountCur) from findBankAccountTrans
+                    order by ledgerJournalTrans.TransDate
+                    join ledgerJournalTrans
+                    group by ledgerJournalTrans.JournalNum, ledgerJournalTrans.TransDate
+                    where  findBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                        findBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                        findBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                        findBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                        findBankAccountTrans.AccountStatementDate == datenull() &&
+                        findBankAccountTrans.AccountStatement == '' &&
+                        findBankAccountTrans.Included == 0 &&
+                        findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+                        ledgerJournalTrans.TransDate  <= _sks_br_banktran.TranDate + _sbmRule.DateTolerance  &&
+                        ledgerJournalTrans.TransDate >= _sks_br_banktran.TranDate - _sbmRule.DateTolerance;
+            }
+            else if (_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher)
+            {
+                select sum(AmountCur) from findBankAccountTrans
+                        order by ledgerJournalTrans.TransDate
+                    join ledgerJournalTrans
+                        group by ledgerJournalTrans.JournalNum, ledgerJournalTrans.Voucher
+                        where  findBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                            findBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                            findBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                            findBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                            findBankAccountTrans.AccountStatementDate == datenull() &&
+                            findBankAccountTrans.AccountStatement == '' &&
+                            findBankAccountTrans.Included == 0 &&
+                            findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString);
+            }
+            else if (_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum)
+            {
+                select sum(AmountCur) from findBankAccountTrans
+                        order by ledgerJournalTrans.TransDate
+                    join ledgerJournalTrans
+                    group by ledgerJournalTrans.JournalNum, LedgerJournalTrans.SKS_EFTAP_InboundRefNum
+                        where findBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                            findBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                            findBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                            findBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                            findBankAccountTrans.AccountStatementDate == datenull() &&
+                            findBankAccountTrans.AccountStatement == '' &&
+                            findBankAccountTrans.Included == 0 &&
+                            findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+                            ledgerJournalTrans.SKS_EFTAP_InboundRefNum == _sks_br_banktran.BankCustomerNum;
+            }
+            else
+            {
+                select sum(AmountCur) from findBankAccountTrans
+                        order by ledgerJournalTrans.TransDate
+                    join ledgerJournalTrans
+                        group by ledgerJournalTrans.JournalNum
+                    where findBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                        findBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                        findBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                        findBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                        findBankAccountTrans.AccountStatementDate == datenull() &&
+                        findBankAccountTrans.AccountStatement == '' &&
+                        findBankAccountTrans.Included == 0 &&
+                        findBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString);
+
+            }
+
+            while(findBankAccountTrans)
+            {
+                //clear the date field
+                transDate = Global::dateNull();
+                locVoucher = '';
+
+                // Compare amounts to see if it is a match and verfiy no duplicates exist
+                if(SKS_BR_Matching::matchCheckPaymentJournal(findBankAccountTrans, ledgerJournalTrans.JournalNum, _sks_br_banktran.TranAmount))
+                {
+                    mPaymentJournalNum = ledgerJournalTrans.JournalNum;
+                    // If matchFound is true and another match is found, this indicates multiple matches exist
+                    select firstOnly Name,JournalName,PostedDateTime  from localLedgerJournalTable where localLedgerJournalTable.journalnum == ledgerJournalTrans.JournalNum;
+                    containerJournalNums += [ledgerJournalTrans.JournalNum];
+                    containerJournalAmts += [findBankAccountTrans.AmountCur];
+                    containerJournalPostedDateTimes += [localLedgerJournalTable.PostedDateTime];
+                    containerJournalDescriptions += [localLedgerJournalTable.Name];
+                    containerJournalNames += [localLedgerJournalTable.JournalName];
+                    if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date)
+                    {
+                        containerJournalDates += [ledgerJournalTrans.TransDate];
+                    }
+                    else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher)
+                    {
+                        LocContainerJournalVouchers += [ledgerJournalTrans.Voucher];
+                    }
+                    else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum)
+                    {
+                        locInboundRefNums += [ledgerJournalTrans.SKS_EFTAP_InboundRefNum];
+                    }
+                }
+                next findBankAccountTrans;
+            }
+
+
+            if(conLen(containerJournalNums) == 1)
+            {
+                if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date)
+                {
+                    transDate = conPeek(containerJournalDates, 1);
+                }
+                else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher)
+                {
+                    locVoucher = conPeek(locContainerJournalVouchers, 1);
+                }
+                else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum)
+                {
+                    InboundRefNum = conPeek(locInboundRefNums, 1);
+                }
+                // If a match exists, update the fields to indicate a match
+                // Final match updates are done in SKS.Common.dll
+                SKS_BR_Matching::matchUpdatePaymentJournal(_sks_br_banktran, conPeek(containerJournalNums, 1), false, _sbmRule, true, bankAccountStatement, false, false, 0, transDate, locVoucher, InboundRefNum, _guid);
+                matchfound = true;//this needs to be true for matches and duplicates
+            }
+            else if(conLen(containerJournalNums) > 1)
+            {
+                duplicate = true;
+                if(_sbmRule.OnDuplicate == SKS_BR_DuplicateTransHandling::Match)
+                {
+                    if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date)
+                    {
+                        transDate = conPeek(containerJournalDates, 1);
+                    }
+                    else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher)
+                    {
+                        locVoucher = conPeek(locContainerJournalVouchers, 1);
+                    }
+                    else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum)
+                    {
+                        InboundRefNum = conPeek(locInboundRefNums, 1);
+                    }
+                    SKS_BR_Matching::matchUpdatePaymentJournal(_sks_br_banktran, conPeek(containerJournalNums, 1), false, _sbmRule,  true, bankAccountStatement, (_sbmRule.OnDuplicate == SKS_BR_DuplicateTransHandling::DontMatch), false, 0, transDate, locVoucher, InboundRefNum, _guid);
+                    matchfound = true;//this needs to be true for matches and duplicates
+                }
+                else
+                {
+                    for(i = 1; i <= conLen(containerJournalNums); i++)
+                    {
+                        locSKS_BR_MatchingDuplicateJournal.JournalNum = conPeek(containerJournalNums, i);
+                        locSKS_BR_MatchingDuplicateJournal.AmountCur = conPeek(containerJournalAmts, i);
+                        locSKS_BR_MatchingDuplicateJournal.SKS_BR_BankTran = _sks_br_banktran.RecId;
+                        locSKS_BR_MatchingDuplicateJournal.JournalName = conPeek(containerJournalNames, i);
+                        locSKS_BR_MatchingDuplicateJournal.JournalDescription = conPeek(containerJournalDescriptions, i);
+                        locSKS_BR_MatchingDuplicateJournal.PostedDateTime = conPeek(containerJournalPostedDateTimes, i);
+                        if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date) //no dates to push if it isn't Summary By Date
+                        {
+                            locSKS_BR_MatchingDuplicateJournal.TransDate = conPeek(containerJournalDates, i);
+                        }
+                        else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher) //no Vouchers to push if it isn't Summary By Voucher
+                        {
+                            locSKS_BR_MatchingDuplicateJournal.Voucher = conPeek(locContainerJournalVouchers, i);
+                        }
+                        else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum) //no Vouchers to push if it isn't Summary By Voucher
+                        {
+                            locSKS_BR_MatchingDuplicateJournal.Voucher = conPeek(locInboundRefNums, i);
+                        }
+                        else
+                        {
+                            locSKS_BR_MatchingDuplicateJournal.TransDate = Global::dateNull();
+                        }
+                        matchingDuplicateRecordInsertList.add(locSKS_BR_MatchingDuplicateJournal);   //TAS_CAR
+
+                        if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date)
+                        {
+                            transDate = conPeek(containerJournalDates, i);
+                        }
+                        else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher)
+                        {
+                            locVoucher = conPeek(locContainerJournalVouchers, i);
+                        }
+                        else if(_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum)
+                        {
+                            InboundRefNum = conPeek(locInboundRefNums, i);
+                        }
+                        //populate the duplicates detail table
+                        SKS_BR_Matching::matchUpdatePaymentJournal(_sks_br_banktran, conPeek(containerJournalNums, i), false, _sbmRule,  true, bankAccountStatement, true, true, locSKS_BR_MatchingDuplicateJournal.RecId, transDate, locVoucher, InboundRefNum, _guid);
+                    }
+                    ril.insertDatabase();
+                    matchingDuplicateRecordInsertList.insertDatabase(); //TAS_CAR
+                }
+            }
+        }
+
+        //was a match or dulicate found?
+        if(conLen(containerJournalNums) > 0 && matchfound)
+        {
+            this.stampIntermSKS_BR_BankTran(_sbmRule, _guid, duplicate, matchfound, null, false);
+        }
+
+
+
+        return matchfound;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchIntermediate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Looks at SKS_BR_BankTran records and attempts to pre-match
+    /// </summary>
+    /// <param name="_SKS_BR_BankHeaderRecID">
+    /// RecId of SKS_BR_BankHeader.  If 0 will look through all SKS_BR_BankTran records.
+    /// </param>
+    /// <param name="_ServiceImport">
+    /// Boolean to limit service specific behaviors to only calls from the service
+    /// </param>
+    /// <remarks>
+    /// Attempt to pre-match records.
+    /// </remarks>
+    public void matchIntermediate(SKS_BR_BankHeaderRecID _SKS_BR_BankHeaderRecID, boolean _ServiceImport = false)
+    {
+        SKS_BR_BankTran locSKS_BR_BankTran;
+        BankAccountStatement locBankAccountStatement;
+        BankAccountTrans locBankAccountTrans;
+        int64 recordCount = 0;
+        int64 recordCountTotal = 0;
+        boolean matchFound;
+        boolean displayMessage;
+        boolean locContinueProcessing = true;
+        RefRecId origStatementRecId;
+
+        void finalizeIntermediateMatches()
+        {
+            if(locSKS_BR_BankTran.OriginalStatementRecId)
+            {
+                changeCompany(locSKS_BR_BankTran.company())
+                {
+                    if(locBankAccountStatement.RecId != locSKS_BR_BankTran.OriginalStatementRecId)
+                    {
+                        locBankAccountStatement = null;
+                        select firstonly AccountStatementNum, AccountStatementDate, ReconcileDate from locBankAccountStatement
+                                where locBankAccountStatement.RecId == locSKS_BR_BankTran.OriginalStatementRecId
+                                && locBankAccountStatement.ReconcileDate == dateNull();
+                    }
+                    if(locBankAccountStatement)
+                    {
+                        locBankAccountTrans = SKS_BR_Matching::getFinalBankAccountTrans(locSKS_BR_BankTran);
+                        ttsBegin;
+                        if(locBankAccountTrans)
+                        {
+                            locSKS_BR_BankTran.AccountStatementNum = locBankAccountStatement.AccountStatementNum;
+                            locSKS_BR_BankTran.AccountStatementDate = locBankAccountStatement.AccountStatementDate;
+                            locSKS_BR_BankTran.IntermMatch = NoYes::No;
+                            locSKS_BR_BankTran.update();
+
+                        }
+                        while(locBankAccountTrans)
+                        {
+                            locBankAccountTrans.AccountStatement = locBankAccountStatement.AccountStatementNum;
+                            locBankAccountTrans.AccountStatementDate = locBankAccountStatement.AccountStatementDate;
+                            locBankAccountTrans.Included = NoYes::Yes;
+                            locBankAccountTrans.SKS_BR_IntermMatch = NoYes::No;
+                            locBankAccountTrans.SKS_BR_AlreadyMarked = NoYes::Yes;
+                            locBankAccountTrans.SKS_BR_IsSelected = NoYes::Yes;
+                            locBankAccountTrans.update();
+                            next locBankAccountTrans;
+                        }
+                        ttsCommit;
+                    }
+                }
+            }
+        }
+        ;
+
+
+        // If importing, there will be a _SKS_BR_BankHeaderRecID
+        // Don't display message since this is running as a service
+        if(!_SKS_BR_BankHeaderRecID)
+        {
+            displayMessage = true;
+        }
+
+        while(locContinueProcessing)
+        {
+            locContinueProcessing = false;
+            locSKS_BR_BankTran = null;
+            // Match for all unmatched transactions
+            locSKS_BR_BankTran = SKS_BR_Matching::getSKS_BR_BankTransIntermediate(_SKS_BR_BankHeaderRecID);
+            if (origStatementRecId == 0)
+            {
+                origStatementRecId = locSKS_BR_BankTran.OriginalStatementRecId;
+            }
+            while(locSKS_BR_BankTran)
+            {
+                matchFound = this.match(locSKS_BR_BankTran, newGuid());
+                if(matchFound)
+                {
+                    recordCount++;
+                    if(!locContinueProcessing)
+                    {
+                        locContinueProcessing = true;
+                    }
+                    if(_ServiceImport)
+                    {
+                        finalizeIntermediateMatches();
+                    }
+                }
+                recordCountTotal++;
+                next locSKS_BR_BankTran;
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchBRTransactionsCommon</Name>
+				<Source><![CDATA[
+    delegate void matchBRTransactionsCommon(
+        SKS_BR_Edition              _BREdition,
+        CompanyBankAccountId        _bankAccountId,
+        BankAccountStatementNum     _accountStatementNum,
+        Date                        _fromDate,
+        TransDate                   _toDate,
+        UtcDateTime                 _FileDateTime,
+        SKS_EB_FilePath             _FileName,
+        SKS_BR_DateTolerance        _dateTolerance,
+        EventHandlerResult          _result,
+        Recid                       _StatementRecId)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchTransactions</Name>
+				<Source><![CDATA[
+    public void matchTransactions(BankAccountStatement _BankAccountStatement,
+                Date _fromDate,
+                UtcDateTime _FileDateTime,
+                SKS_EB_FilePath _FileName,
+                int _ImportCount,
+                Recid __StatementRecId  = 0)
+    {
+        int     matchCount;
+
+        if(!globalSKS_PP_Setup || (globalSKS_PP_Setup.company() != curext()))
+        {
+            this.getSKS_PP_Setup();
+        }
+
+        str responseErrorText = SKS_PP_Sys::ValidateSKSCommonModel();
+        if (responseErrorText != '')
+        {
+            throw error(responseErrorText);
+        }
+
+        EventHandlerResult result = new EventHandlerResult();
+
+        try
+        {
+            this.matchBRTransactionsCommon(
+                globalSKS_PP_Setup.BREdition,
+                _BankAccountStatement.AccountId,
+                _BankAccountStatement.AccountStatementNum,
+                _fromDate,
+                _BankAccountStatement.AccountStatementDate,
+                _FileDateTime,
+                _FileName,
+                globalSKS_PP_Setup.BRDateTolerance,
+                result,
+                __StatementRecId);
+
+            matchCount = result.result();
+        }
+        catch (Exception::CLRError)
+        {
+            error(AifUtil::getClrErrorMessage());
+        }
+        catch
+        {
+            error("@SKS319");
+        }
+
+        if(globalSKS_PP_Setup.BREdition == SKS_BR_Edition::Advanced)
+        {
+            SKS_BR_Matching::updateEndingBalance(_BankAccountStatement.AccountId, _BankAccountStatement);
+        }
+        else
+        {
+            info(strfmt("@SKS300",int2str(_ImportCount)));
+        }
+        info(strFmt("@SKS327"
+            ,_BankAccountStatement.company()
+            ,_BankAccountStatement.AccountId
+            ,SKS_PP_StringFormats::strDateMMDDYYYY(_BankAccountStatement.AccountStatementDate,DateSeparator::Slash)
+            ,_BankAccountStatement.AccountStatementNum
+            ,int2Str(matchCount)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateDuplicateSummaryDet</Name>
+				<Source><![CDATA[
+    private void populateDuplicateSummaryDet()
+    {
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryBuildExcludeTranTypeFilterString</Name>
+				<Source><![CDATA[
+    public void queryBuildExcludeTranTypeFilterString()
+    {
+        SKS_BR_MatchingExcludeTypes SKS_BR_MatchingExcludeTypes;
+        System.Text.StringBuilder filterSB = new System.Text.StringBuilder();
+
+        // Build TranType exclude list
+        if(mSKS_BR_MatchingRulesMast.AXBankTranTypeFilter == SKS_BR_AXBankTranTypeFilter::ExcludeList)
+        {
+            select SKS_BR_MatchingExcludeTypes where SKS_BR_MatchingExcludeTypes.RuleID == mSKS_BR_MatchingRulesMast.RuleGroupId;
+
+            if(SKS_BR_MatchingExcludeTypes)
+            {
+                while(SKS_BR_MatchingExcludeTypes)
+                {
+                    filterSB.Append(strFmt('(%1.%2 != "%3")', mQbr.name(), fieldStr(BankAccountTrans, BankTransType), SKS_BR_MatchingExcludeTypes.BankTransType));
+
+                    next SKS_BR_MatchingExcludeTypes;
+
+                    if(SKS_BR_MatchingExcludeTypes)
+                    {
+                        filterSB.Append(' && ');
+                    }
+                }
+                mTranTypeFilterString = filterSB.ToString();
+            }
+        }
+        else
+        {
+            mTranTypeFilterString = '';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryCreateQuery</Name>
+				<Source><![CDATA[
+    public void queryCreateQuery()
+    {
+        mQuery = null; // Re-set in case company changed
+        mQuery = new Query();
+        // Add a single datasource.
+        mQbr = mQuery.addDataSource(tablenum(BankAccountTrans));
+        // Name the datasource 'BankAccountTrans'.
+        mQuery.name('BankAccountTrans');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRange_Amount</Name>
+				<Source><![CDATA[
+    public void queryRange_Amount(Amount _amountTolerance)
+    {
+        AmountCur lowTolerance;
+        AmountCur highTolerance;
+
+        if(_amountTolerance == 0)
+        {
+            // Exact amount
+            mQbr.addRange(fieldNum(BankAccountTrans, AmountCur)).value(queryValue(mSKS_BR_BankTran.TranAmount));
+        }
+        else
+        {
+            // Amount with tolerance
+            lowTolerance = mSKS_BR_BankTran.TranAmount - _amountTolerance;
+            highTolerance = mSKS_BR_BankTran.TranAmount + _amountTolerance;
+
+            // If a positive amount, amount tolerance shouldn't include any negative bank transactions.
+            if(mSKS_BR_BankTran.TranAmount > 0 && lowTolerance < 0)
+            {
+                lowTolerance = 0;
+            }
+
+            // If a negative amount, amount tolerance shouldn't include any positive bank transactions.
+            if(mSKS_BR_BankTran.TranAmount < 0 && highTolerance > 0)
+            {
+                highTolerance = 0;
+            }
+
+            mQbr.addRange(fieldNum(BankAccountTrans, AmountCur)).value(queryRange(queryValue(lowTolerance), queryValue(highTolerance)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRange_Base</Name>
+				<Source><![CDATA[
+    public void queryRange_Base()
+    {
+        #SKS_Global
+
+        mQbr.clearRanges();
+
+        mQbr.addSortField(FieldNum(BankAccountTrans, TransDate));
+
+        mQbr.addRange(fieldNum(BankAccountTrans, AccountId)).value(queryValue(mSKS_BR_BankTran.AccountId));
+        mQbr.addRange(fieldNum(BankAccountTrans, AccountStatement)).value(SysQuery::valueEmptyString());
+        mQbr.addRange(fieldNum(BankAccountTrans, Included)).value('0');
+        mQbr.addRange(fieldNum(BankAccountTrans, Reconciled)).value('0');
+        mQbr.addRange(fieldNum(BankAccountTrans, AccountStatementDate)).value(queryValue(dateNull()));
+        mQbr.addRange(fieldNum(BankAccountTrans, SKS_BR_ManualReconciliationID)).value(queryValue(#EmptyGuidString));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRange_Date</Name>
+				<Source><![CDATA[
+    public void queryRange_Date(SKS_BR_DateTolerance _dateTolerance)
+    {
+        str startDate;
+        str endDate;
+
+        if(_dateTolerance == 0)
+        {
+            // Exact date
+            mQbr.addRange(fieldNum(BankAccountTrans, TransDate)).value(queryValue(mSKS_BR_BankTran.TranDate));
+        }
+        else
+        {
+            // Date with tolerance
+            startDate = date2StrUsr(mSKS_BR_BankTran.TranDate - _dateTolerance, DateFlags::None);
+            endDate = date2StrUsr(mSKS_BR_BankTran.TranDate + _dateTolerance, DateFlags::None);
+            mQbr.addRange(fieldNum(BankAccountTrans, TransDate)).value(queryRange(startDate, endDate));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRange_RefNbr</Name>
+				<Source><![CDATA[
+    public void queryRange_RefNbr(SKS_BR_MatchingRuleDetails _SKS_BR_MatchingRuleDetails, str _importReferenceNbr)
+    {
+        str importReferenceNbr;
+        importReferenceNbr = _importReferenceNbr;
+
+        if(_SKS_BR_MatchingRuleDetails.AXRefNbrType == SKS_BR_AXRefNbrType::ChkNbr)
+        {
+            importReferenceNbr = SKS_PP_StringFormats::strFill(20,_importReferenceNbr, SKS_PP_FillCharacter::Space, SKS_PP_FillSide::Left);
+        }
+
+        // Build query based on AX reference number type
+        switch(_SKS_BR_MatchingRuleDetails.AXRefNbrType)
+        {
+            case SKS_BR_AXRefNbrType::ChkNbr:
+                mQbr.addRange(fieldNum(BankAccountTrans, ChequeNum)).value(importReferenceNbr);
+                break;
+            case SKS_BR_AXRefNbrType::DepositNbr:
+                mQbr.addRange(fieldNum(BankAccountTrans, DepositNum)).value(importReferenceNbr);
+                break;
+            case SKS_BR_AXRefNbrType::PaymentRef:
+                mQbr.addRange(fieldNum(BankAccountTrans, PaymReference)).value(importReferenceNbr);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRange_TranTypeFilter</Name>
+				<Source><![CDATA[
+    public void queryRange_TranTypeFilter()
+    {
+        if(mSKS_BR_MatchingRulesMast.AXBankTranTypeFilter == SKS_BR_AXBankTranTypeFilter::ExcludeList && mTranTypeFilterString)
+        {
+            mQbr.addRange(fieldNum(BankAccountTrans, BankTransType)).value(mTranTypeFilterString);
+        }
+        else if(mSKS_BR_MatchingRulesMast.AXBankTranTypeFilter == SKS_BR_AXBankTranTypeFilter::ByTransactionType)
+        {
+            mQbr.addRange(fieldNum(BankAccountTrans, BankTransType)).value(mSKS_BR_BankTran.BankTranType);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampIntermBankAccountTrans</Name>
+				<Source><![CDATA[
+    public void stampIntermBankAccountTrans(BankAccountTrans _bankAccountTrans, Guid _guid)
+    {
+        _bankAccountTrans.SKS_BR_IntermMatch = NoYes::Yes;
+        _bankAccountTrans.SKS_BR_ManualReconciliationID = _guid;
+
+        if(mSKS_BR_BankTran.TranAmount != _bankAccountTrans.AmountCur)
+        {
+            _bankAccountTrans.AmountCorrect = mSKS_BR_BankTran.TranAmount - _bankAccountTrans.AmountCur;
+            _bankAccountTrans.LedgerDimension = BankTransType::find(_bankAccountTrans.BankTransType).LedgerDimension;
+        }
+
+		//Bug 10342 -->
+        if(mSKS_BR_BankTran.ValueDate != _bankAccountTrans.SKS_IHB_ValueDate)
+        {
+            _bankAccountTrans.SKS_IHB_ValueDate = mSKS_BR_BankTran.ValueDate;
+        }
+        //Bug 10342 <--
+        _bankAccountTrans.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampIntermSKS_BR_BankTran</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the SKS_BR_BankTran for match
+    /// </summary>
+    /// <param name="_SKS_BR_MatchingRuleDetails">
+    /// Current matching rule detail record
+    /// </param>
+    /// <param name="_guid">
+    /// Guid to use for matching
+    /// </param>
+    /// <param name="_duplicate">
+    /// Indicates if a duplicate was found
+    /// </param>
+    /// <param name="_match">
+    /// Indicates if a match was found
+    /// </param>
+    /// <param name="_bankAccountTrans">
+    /// BankAccountTrans record
+    /// </param>///
+    /// <param name="_glMatchType">
+    /// Indicates if this is a GL match
+    /// </param>
+    public void stampIntermSKS_BR_BankTran(SKS_BR_MatchingRuleDetails _SKS_BR_MatchingRuleDetails, Guid _guid, boolean _duplicate = false, boolean _match = true, BankAccountTrans _bankAccountTrans = null, boolean _glMatchType = false)
+    {
+
+        if(_match)
+        {
+            mSKS_BR_BankTran.IntermMatch = NoYes::Yes;
+            mSKS_BR_BankTran.ManualReconciliationID = _guid;
+            // Match indicator
+            //if (_SKS_BR_BankHeaderRecID != 0) // TODO: to verify if this check is required as Match indicator is set for manual matching also
+            mSKS_BR_BankTran.MatchIndicator = SKS_BR_MatchIndicator::Green;
+            mSKS_BR_BankTran.Matched        = NoYes::Yes;
+        }
+
+        if(_glMatchType)
+        {
+            mSKS_BR_BankTran.MatchedType = SKS_BR_MatchedType::GLCreated;
+            mSKS_BR_BankTran.MatchConfidence = 100;
+            // Match indicator
+            //if (_SKS_BR_BankHeaderRecID != 0) // TODO: to verify if this check is required as Match indicator is set for manual matching also
+            if (!_match)
+            {
+                mSKS_BR_BankTran.MatchIndicator = SKS_BR_MatchIndicator::Yellow;
+                //mSKS_BR_BankTran.MatchIndicator = SKS_BR_MatchIndicator::Green;
+            }
+        }
+        else
+        {
+            // Match step
+            mSKS_BR_BankTran.MatchStep = _SKS_BR_MatchingRuleDetails.Step;
+
+            //Journal Summaries need to be stamped with the journal number
+            if(_SKS_BR_MatchingRuleDetails.Rule == SKS_BR_MatchingRules::JournalSummary && _match)
+            {
+                mSKS_BR_BankTran.PaymentJournalNum = mPaymentJournalNum;
+            }
+
+
+            // Match confidence and duplicate
+            if(_duplicate)
+            {
+                mSKS_BR_BankTran.MultipleMatches = NoYes::Yes;
+                if(_match)
+                {
+                    mSKS_BR_BankTran.MatchConfidence = _SKS_BR_MatchingRuleDetails.MatchConfidenceOnDuplicate;
+                }
+            }
+            else if(_match)
+            {
+                mSKS_BR_BankTran.MultipleMatches = NoYes::No;
+                mSKS_BR_BankTran.MatchConfidence = _SKS_BR_MatchingRuleDetails.MatchConfidence;
+
+                // If match by reference number, set AX reference number (BookNum) field
+                if(_bankAccountTrans && _SKS_BR_MatchingRuleDetails.Rule == SKS_BR_MatchingRules::RefNbrAndAmt)
+                {
+                    switch(_SKS_BR_MatchingRuleDetails.AXRefNbrType)
+                    {
+                        case SKS_BR_AXRefNbrType::ChkNbr:
+                            mSKS_BR_BankTran.BookNum = _bankAccountTrans.ChequeNum;
+                            break;
+                        case SKS_BR_AXRefNbrType::DepositNbr:
+                            mSKS_BR_BankTran.BookNum = _bankAccountTrans.DepositNum;
+                            break;
+                        case SKS_BR_AXRefNbrType::PaymentRef:
+                            mSKS_BR_BankTran.BookNum = _bankAccountTrans.PaymReference;
+                            break;
+                    }
+                }
+            }
+
+            // Match rule
+            switch(_SKS_BR_MatchingRuleDetails.Rule)
+            {
+                case SKS_BR_MatchingRules::DateAndAmt:
+                    mSKS_BR_BankTran.MatchedType = SKS_BR_MatchedType::DateAndAmt;
+                    break;
+                case SKS_BR_MatchingRules::RefNbrAndAmt:
+                    mSKS_BR_BankTran.MatchedType = SKS_BR_MatchedType::RefNbrAndAmt;
+                    break;
+                case SKS_BR_MatchingRules::JournalSummary:
+                    mSKS_BR_BankTran.MatchedType = SKS_BR_MatchedType::JournalSummary;
+                    break;
+            }
+        }
+
+        mSKS_BR_BankTran.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AllowReconciliation</Name>
+				<Source><![CDATA[
+    public static boolean AllowReconciliation(BankAccountStatement _BankAccountStatement)
+    {
+        SKS_BR_ClickNMatchSessions locSKS_BR_ClickNMatchSessions;
+        boolean retval = true;
+        ;
+
+        select firstonly forupdate locSKS_BR_ClickNMatchSessions
+            where locSKS_BR_ClickNMatchSessions.AccountID == _BankAccountStatement.AccountID;
+
+
+
+        if(locSKS_BR_ClickNMatchSessions)
+        {
+            if(locSKS_BR_ClickNMatchSessions.SessionId)
+            {
+                if(SKS_LB_JournalInUse::canBeAutoUnlocked(locSKS_BR_ClickNMatchSessions))
+                {
+                    ttsBegin;
+                    SKS_BR_Matching::removeGuidMatch(locSKS_BR_ClickNMatchSessions.ManualReconciliationID);
+                    locSKS_BR_ClickNMatchSessions = SKS_LB_JournalInUse::updateBlockServer(locSKS_BR_ClickNMatchSessions,
+                                                                JournalBlockLevel::InUse,
+                                                                JournalBlockLevel::None,
+                                                                strFmt("@SKS3742",
+                                                                        _BankAccountStatement.AccountId,
+                                                                        new xSession(locSKS_BR_ClickNMatchSessions.SessionId).userId())
+                                                                );
+                    if(locSKS_BR_ClickNMatchSessions.SessionId)
+                    {
+                        ttsAbort;
+                        retval = false;
+                    }
+                    ttsCommit;
+                }
+                else
+                {
+                    retval = false;
+                    error(strFmt("@SKS3740",
+                            _BankAccountStatement.AccountId,
+                            new xSession(locSKS_BR_ClickNMatchSessions.SessionId).userId()));
+                }
+            }
+        }
+        return retval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>boolValidatePrematchedContine</Name>
+				<Source><![CDATA[
+    public static boolean boolValidatePrematchedContine(NoYes _NoYesIsInterm, str _strRecordType)
+    {
+        boolean ret = true;
+        DialogButton DialogButtonResult;
+        ;
+
+        if(_NoYesIsInterm)
+        {
+            //warn if prematch exists
+            DialogButtonResult = Box::yesNo(strFmt(strFmtLB("@SKS2340"), _strRecordType), DialogButton::No);
+            if(DialogButtonResult == DialogButton::No)
+            {
+                ret = false;
+            }
+        }
+        return ret;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>breakExistingPrematch</Name>
+				<Source><![CDATA[
+    //CLEAR EXISTING PREMATCH DATA
+    //REMEMBER, IF YOU CLEAR A BANKACCOUNTTRANS record, you need to clear ALL the assocaited SKS_BR_BankTran records
+    //           IF YOU CLEAR A SKS_BR_BankTran record, you need to clear ALL the assocaited BankAccountTrans records
+    //          Any prematch that shared this guid is no longer valid, so it must be removed
+    public static void breakExistingPrematch(recid _RecID,SKS_BR_ClearPrematches _SKS_BR_ClearPrematches)
+    {
+        BankAccountTrans locBankAccountTrans;
+        SKS_BR_BankTran locSKS_BR_BankTran;
+        guid guidLocalMatchID = str2guid(#EmptyGuidString);
+        ;
+
+        ttsbegin;
+        if((_SKS_BR_ClearPrematches == SKS_BR_ClearPrematches::ClearBankAccountTrans) && (_RecID > 0))
+        {
+            select firstonly sks_br_manualreconciliationid, Reconciled from locBankAccountTrans
+                where locBankAccountTrans.RecID == _RecID &&
+                      locBankAccountTrans.Reconciled == NoYes::No;
+            if(locBankAccountTrans)
+            {
+                guidLocalMatchID = locBankAccountTrans.SKS_BR_ManualReconciliationID;
+            }
+        }
+        else if((_SKS_BR_ClearPrematches == SKS_BR_ClearPrematches::ClearSKS_BR_BankTran) && (_RecID > 0))
+        {
+            select firstonly locSKS_BR_BankTran where locSKS_BR_BankTran.RecID == _RecID;
+            if(locSKS_BR_BankTran)
+            {
+                // Verify BankAccountTrans is not reconciled
+                select firstonly sks_br_manualreconciliationid, Reconciled from locBankAccountTrans
+                    where locBankAccountTrans.SKS_BR_ManualReconciliationID == locSKS_BR_BankTran.ManualReconciliationID &&
+                          locBankAccountTrans.Reconciled == NoYes::No;
+                if(locBankAccountTrans)
+                {
+                    guidLocalMatchID = locBankAccountTrans.SKS_BR_ManualReconciliationID;
+                }
+            }
+        }
+
+        if(guidLocalMatchID != str2guid(#EmptyguidString))
+        {
+            SKS_BR_Matching::breakMatchSKS_BR_BankTran(guidLocalMatchID);
+            SKS_BR_Matching::breakMatchBankAccountTrans(guidLocalMatchID);
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>breakMatchBankAccountTrans</Name>
+				<Source><![CDATA[
+    public static server void breakMatchBankAccountTrans(guid _guid)
+    {
+        BankAccountTrans locBankAccountTrans;
+
+        if(_guid != str2guid(#EmptyguidString))
+        {
+            while select forupdate locBankAccountTrans where locBankAccountTrans.SKS_BR_ManualReconciliationID == _guid
+            {
+                ttsbegin;
+                locBankAccountTrans.AccountStatement = Global::strMin();
+                locBankAccountTrans.AccountStatementDate = Global::dateNull();
+                locBankAccountTrans.Included = NoYes::No;
+                locBankAccountTrans.SKS_BR_ManualReconciliationID = str2guid(#Emptyguidstring);
+                locBankAccountTrans.SKS_BR_BankTranRecId = 0;
+                locBankAccountTrans.SKS_BR_IntermMatch = NoYes::No;
+                if(locBankAccountTrans.AmountCorrect != 0)
+                {
+                    locBankAccountTrans.AmountCorrect = 0;
+                    locBankAccountTrans.calcAmountMST();
+                }
+                locBankAccountTrans.SKS_BR_IsSelected = NoYes::No; // SKS_BR1
+                locBankAccountTrans.SKS_BR_AlreadyMarked = NoYes::No;  //8289
+                locBankAccountTrans.update();
+                ttscommit;
+                SKS_BR_Matching::UnclearCheck(locBankAccountTrans);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>breakMatchSKS_BR_BankTran</Name>
+				<Source><![CDATA[
+    public static server void breakMatchSKS_BR_BankTran(guid _guid)
+    {
+        SKS_BR_BankTran locSKS_BR_BankTran;
+
+        if(_guid != str2guid(#EmptyguidString))
+        {
+            while select forupdate locSKS_BR_BankTran where locSKS_BR_BankTran.ManualReconciliationID == _guid
+            {
+                ttsbegin;
+                SKS_BR_Matching::removeMatchSKS_BR_BankTran(locSKS_BR_BankTran);
+                locSKS_BR_BankTran.update();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ClearCheck</Name>
+				<Source><![CDATA[
+    Public static void ClearCheck(BankAccountTrans _BankAccountTrans, SKS_BR_ClearedDate _SKS_BR_ClearedDate)
+    {
+        VendTrans vendTrans;
+        BankChequeTable bankChequeTable;
+
+        container company;
+        ;
+
+
+        company = [_BankAccountTrans.company()];
+        ttsBegin;
+        if(_BankAccountTrans.AmountCur < 0)
+        {
+            if (strLen(strLRTrim(_BankAccountTrans.ChequeNum))  > 0)
+            {
+                select firstonly forUpdate crossCompany:company bankChequeTable
+                    where bankChequeTable.Voucher == _BankAccountTrans.Voucher
+                    && bankChequeTable.TransDate == _BankAccountTrans.TransDate
+                    && bankChequeTable.ChequeStatus != ChequeStatus::Rejected
+                    && bankChequeTable.AmountCur == (-1 * _BankAccountTrans.AmountCur)
+                    && bankChequeTable.SKS_BR_ClearedDate == Global::dateNull();
+
+
+                if(bankChequeTable)
+                {
+                    bankChequeTable.SKS_BR_ClearedDate = _SKS_BR_ClearedDate;
+                    bankChequeTable.update();
+                }
+            }
+            select firstonly forupdate crossCompany:company vendTrans
+                where vendTrans.Voucher == _BankAccountTrans.Voucher
+                && vendTrans.TransDate == _BankAccountTrans.TransDate
+                && vendTrans.AmountCur == (-1 * _BankAccountTrans.AmountCur)
+                && vendTrans.SKS_BR_ClearedDate == Global::dateNull();
+
+            if(vendTrans)
+            {
+                vendTrans.SKS_BR_ClearedDate = _SKS_BR_ClearedDate;
+                vendTrans.update();
+            }
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>duplicateDelete</Name>
+				<Source><![CDATA[
+    // Delete existing duplicates
+    public static server void duplicateDelete(RefRecId _RecId)
+    {
+        SKS_BR_MatchingDuplicate SKS_BR_MatchingDuplicate;
+        SKS_BR_MatchingDuplicateJournal  localSKS_BR_MatchingDuplicateJournal;
+
+        delete_from SKS_BR_MatchingDuplicate where
+            SKS_BR_MatchingDuplicate.SKS_BR_BankTran == _RecId;
+
+        delete_from localSKS_BR_MatchingDuplicateJournal where
+            localSKS_BR_MatchingDuplicateJournal.SKS_BR_BankTran == _RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>duplicateDeleteOther</Name>
+				<Source><![CDATA[
+    // Delete duplicates from other SKS_BR_BankTrans if it is matched
+    public static server void duplicateDeleteOther(RefRecId _RecId)
+    {
+        SKS_BR_MatchingDuplicate SKS_BR_MatchingDuplicate;
+        SKS_BR_MatchingDuplicateJournal deleteSKS_BR_MatchingDuplicateJournal;
+        SKS_BR_MatchingDuplicateJournalDet localSKS_BR_MatchingDuplicateJournalDet;
+
+        // Delete duplicates from refnbr/date match
+        delete_from SKS_BR_MatchingDuplicate where
+            SKS_BR_MatchingDuplicate.BankAccountTrans == _RecId;
+
+        // Delete duplicates from journal summary match
+        select firstonly SKS_BR_MatchingDuplicateJournalRECID from localSKS_BR_MatchingDuplicateJournalDet where
+            localSKS_BR_MatchingDuplicateJournalDet.BankAccountTransRecId == _RecId;
+
+        if(localSKS_BR_MatchingDuplicateJournalDet)
+        {
+            delete_from deleteSKS_BR_MatchingDuplicateJournal where
+                deleteSKS_BR_MatchingDuplicateJournal.RecId == localSKS_BR_MatchingDuplicateJournalDet.SKS_BR_MatchingDuplicateJournalRECID;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findMatchImport</Name>
+				<Source><![CDATA[
+    public static boolean findMatchImport(RecId _BankAccountTransRecId, BankAccountStatement _BankAcountStatement, SKS_BR_BankTran _SKS_BR_BankTran, boolean _isFinalMatch, guid guidCurrent)
+    {
+        BankAccountTrans bankAccountTrans;
+        boolean ret = false;
+        ;
+        select forupdate bankAccountTrans where
+          bankAccountTrans.RecId == _BankAccountTransRecId &&
+          bankAccountTrans.Included == NoYes::No &&
+          bankAccountTrans.Reconciled == NoYes::No &&
+          bankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString);
+
+        if(bankAccountTrans)
+        {
+            bankAccountTrans.SKS_BR_ManualReconciliationID = guidCurrent;//regarless of matchtype, set the guid
+
+            if(_isFinalMatch)
+            {
+                bankAccountTrans.AccountStatement = _BankAcountStatement.AccountStatementNum;
+                bankAccountTrans.AccountStatementDate = _BankAcountStatement.AccountStatementDate;
+                bankAccountTrans.Included = NoYes::Yes;
+                bankAccountTrans.SKS_BR_IntermMatch = NoYes::No;
+
+                if(_SKS_BR_BankTran.TranAmount != bankAccountTrans.AmountCur)
+                {
+                    bankAccountTrans.AmountMST = _SKS_BR_BankTran.TranAmount;
+                    bankAccountTrans.AmountCorrect = _SKS_BR_BankTran.TranAmount - bankAccountTrans.AmountCur;
+                }
+
+            }
+            else
+            {
+                bankAccountTrans.SKS_BR_IntermMatch = NoYes::Yes;
+            }
+
+            bankAccountTrans.update();
+            SKS_BR_Matching::ClearCheck(bankAccountTrans, _SKS_BR_BankTran.TranDate);
+
+            ret = true;
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFinalBankAccountTrans</Name>
+				<Source><![CDATA[
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer BankAccountTrans is selected forUpdate and is passed to other methods where it is modified.")]
+    public static BankAccountTrans getFinalBankAccountTrans(SKS_BR_BankTran _sks_br_banktran)
+    {
+        BankAccountTrans BankAccountTrans;
+
+        select forupdate BankAccountTrans where
+            BankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+            BankAccountTrans.SKS_BR_ManualReconciliationID == _sks_br_banktran.ManualReconciliationID &&
+            BankAccountTrans.SKS_BR_IntermMatch == NoYes::Yes &&
+            BankAccountTrans.AccountStatementDate == datenull() &&
+            BankAccountTrans.AccountStatement == '' &&
+            BankAccountTrans.Included == 0 &&
+            BankAccountTrans.Reconciled == 0;
+
+        return BankAccountTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFinalMatch</Name>
+				<Source><![CDATA[
+    // Get SKS_BR_BankTran records that are pre-matched and will be final matched
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer sks_br_banktran is selected forUpdate and is passed to other methods where it is modified.")]
+    public static SKS_BR_BankTran getFinalMatch(CompanyBankAccountId AccountId, Date _FromDate, Date _ToDate, boolean advancedBR, RecID _StatementRecId)
+    {
+        SKS_BR_BankTran sks_br_banktran;
+        ;
+
+        if(advancedBR)
+        {
+            if(_StatementRecId)
+            {
+                select forupdate sks_br_banktran where
+                 sks_br_banktran.AccountStatementDate == datenull()  &&
+                 sks_br_banktran.AccountStatementNum == '' &&
+                sks_br_banktran.AccountId == AccountId &&
+                 sks_br_banktran.OriginalStatementRecId == _StatementRecId &&
+                 sks_br_banktran.ManualReconciliationID != str2Guid(#EmptyGuidString) &&
+                 sks_br_banktran.IntermMatch == NoYes::Yes;
+            }
+            else
+            {
+                select forupdate sks_br_banktran where
+                 sks_br_banktran.AccountStatementDate == datenull()  &&
+                 sks_br_banktran.AccountStatementNum == '' &&
+                 sks_br_banktran.AccountId == AccountId &&
+                 sks_br_banktran.TranDate >= _FromDate &&
+                 sks_br_banktran.TranDate <= _ToDate &&
+                 sks_br_banktran.ManualReconciliationID != str2Guid(#EmptyGuidString) &&
+                 sks_br_banktran.IntermMatch == NoYes::Yes;
+            }
+        }
+        else
+        {
+            select forupdate sks_br_banktran where
+             sks_br_banktran.AccountStatementDate == datenull()  &&
+             sks_br_banktran.AccountStatementNum == '' &&
+             sks_br_banktran.AccountId == AccountId &&
+             sks_br_banktran.ManualReconciliationID != str2Guid(#EmptyGuidString) &&
+             sks_br_banktran.IntermMatch == NoYes::Yes;
+        }
+
+        return sks_br_banktran;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_BR_BankTrans</Name>
+				<Source><![CDATA[
+    // Get SKS_BR_BankTran records that need matched
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer sks_br_banktrans is selected forUpdate and is passed to other methods where it is modified.")]
+    public static SKS_BR_BankTran getSKS_BR_BankTrans(CompanyBankAccountId AccountId, Date FromDate, Date ToDate, boolean advancedBR, boolean _duplicateMatch, RecID _StatementRecId /*= 0*/)
+    {
+        Query locQuery;
+        QueryRun locQueryRun;
+        QueryBuildDataSource locQueryBuildDataSource;
+
+        locQuery = new Query();
+        locQueryBuildDataSource = locQuery.addDataSource(tableNum(SKS_BR_BankTran));
+        locQueryBuildDataSource.update(true);
+        locQueryBuildDataSource.addRange(FieldNum(SKS_BR_BankTran,AccountId)).value(queryValue(AccountId));
+        locQueryBuildDataSource.addRange(FieldNum(SKS_BR_BankTran,GLMatchOrCreate)).value(SysQuery::valueNot(SKS_BR_GLMatchOrCreate::CustomerSettlement));
+        locQueryBuildDataSource.addRange(FieldNum(SKS_BR_BankTran,GLMatchOrCreate)).value(SysQuery::valueNot(SKS_BR_GLMatchOrCreate::Manual));
+        locQueryBuildDataSource.addRange(FieldNum(SKS_BR_BankTran,ManualReconciliationID)).value(queryValue(emptyGuid()));
+        if(_StatementRecId)
+        {
+            locQueryBuildDataSource.addRange(FieldNum(SKS_BR_BankTran,OriginalStatementRecId)).value(queryValue(_StatementRecId));
+        }
+        else
+        {
+            locQueryBuildDataSource.addRange(fieldNum(SKS_BR_BankTran, TranDate)).value(SysQuery::range(FromDate,ToDate));
+        }
+        if(_duplicateMatch)
+        {
+            locQueryBuildDataSource.addRange(FieldNum(SKS_BR_BankTran,MultipleMatches)).value(queryValue(NoYes::Yes));
+        }
+        locQueryRun = new QueryRun(locQuery);
+        if(locQueryRun.next())
+        {
+            return locQueryRun.get(tableNum(SKS_BR_BankTran));
+        }
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSKS_BR_BankTransIntermediate</Name>
+				<Source><![CDATA[
+    // Get SKS_BR_BankTran records that need matched
+    [SuppressBPWarningAttribute("BPCheckSelectForUpdateAbsent","Buffer sks_br_banktrans is selected forUpdate and is passed to other methods where it is modified.")]
+    public static SKS_BR_BankTran getSKS_BR_BankTransIntermediate( SKS_BR_BankHeaderRecID _SKS_BR_BankHeaderRecID = 0)
+    {
+        SKS_BR_BankTran sks_br_banktran;
+        
+        if(_SKS_BR_BankHeaderRecID)
+        {
+            select forupdate crosscompany sks_br_banktran
+                order by sks_br_banktran.dataAreaId where
+                sks_br_banktran.BankHeaderRecId == _SKS_BR_BankHeaderRecID &&
+                sks_br_banktran.GLMatchOrCreate != SKS_BR_GLMatchOrCreate::CustomerSettlement &&
+                sks_br_banktran.GLMatchOrCreate != SKS_BR_GLMatchOrCreate::DDReversal &&
+                sks_br_banktran.GLMatchOrCreate != SKS_BR_GLMatchOrCreate::Manual &&
+                sks_br_banktran.ManualReconciliationID == str2Guid(#EmptyGuidString);  //this will prevent interm matches as well as full matches from being found
+        }
+        else
+        {
+            select forupdate crosscompany sks_br_banktran
+                order by sks_br_banktran.dataAreaId where
+                sks_br_banktran.ManualReconciliationID == str2Guid(#EmptyGuidString); //this will prevent interm matches as well as final matches from being found
+        }
+        return sks_br_banktran;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchBankNum</Name>
+				<Source><![CDATA[
+    static BankAccountTrans matchBankNum(SKS_BR_BankTran sks_br_banktran)
+    {
+        BankAccountTrans findBankAccountTrans;
+        ;
+        select * from findBankAccountTrans where    //TAS_CAR
+         findBankAccountTrans.AccountID == sks_br_banktran.AccountId &&
+         findBankAccountTrans.AmountCur == sks_br_banktran.TranAmount &&
+         findBankAccountTrans.AccountStatementDate == datenull() &&
+         findBankAccountTrans.AccountStatement == '' &&
+         findBankAccountTrans.Included == 0 &&
+         findBankAccountTrans.SKS_BR_ManualReconciliationID == str2guid(#EmptyGuidString) &&
+         (findBankAccountTrans.DepositNum == sks_br_banktran.BankNum ||
+          findBankAccountTrans.PaymReference == sks_br_banktran.BankNum);
+
+        return findBankAccountTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchCheckPaymentJournal</Name>
+				<Source><![CDATA[
+    // Check to see if amounts match and that it is not a duplicate match
+    private static boolean matchCheckPaymentJournal(BankAccountTrans findBankAccountTrans, LedgerJournalId journalNum, AmountCur tranAmount)
+    {
+        SKS_BR_BankTran dupSKS_BR_BankTran;
+        ;
+
+        if(findBankAccountTrans.AmountCur == tranAmount)
+        {
+            // Check to see if there is already a payment matched to this journal
+            select firstonly dupSKS_BR_BankTran
+            where dupSKS_BR_BankTran.AccountId == findBankAccountTrans.AccountId &&
+                            dupSKS_BR_BankTran.BankTranType == findBankAccountTrans.BankTransType &&
+                            dupSKS_BR_BankTran.PaymentJournalNum == journalNum;
+
+
+            if(!dupSKS_BR_BankTran)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchDate</Name>
+				<Source><![CDATA[
+    static BankAccountTrans matchDate(SKS_BR_BankTran sks_br_banktran, int brDateTolerance)
+    {
+        BankAccountTrans findBankAccountTrans;
+        ;
+
+        select * from findBankAccountTrans where            //TAS_CAR
+        findBankAccountTrans.AccountID == sks_br_banktran.AccountId &&
+        findBankAccountTrans.AmountCur == sks_br_banktran.TranAmount &&
+        findBankAccountTrans.AccountStatementDate == datenull() &&
+        findBankAccountTrans.AccountStatement == '' &&
+        findBankAccountTrans.Included == 0 &&
+        findBankAccountTrans.SKS_BR_ManualReconciliationID == str2guid(#EmptyGuidString) &&
+        (findBankAccountTrans.TransDate >= (sks_br_banktran.TranDate - brDateTolerance) &&
+        findBankAccountTrans.TransDate <= (sks_br_banktran.TranDate + brDateTolerance));
+
+        return findBankAccountTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchFinal</Name>
+				<Source><![CDATA[
+    public static boolean matchFinal(SKS_BR_BankTran _sks_br_banktran)
+    {        
+        SKS_BR_Matching SKS_BR_Matching = new SKS_BR_Matching();
+
+        return SKS_BR_Matching.match(_sks_br_banktran, newGuid());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchManualMatch</Name>
+				<Source><![CDATA[
+    public static void matchManualMatch(SKS_BR_BankTran _SKS_BR_BankTran, BankAccountStatement _BankAccountStatement, boolean _isFinalMatch, guid _guidCurrent)
+    {
+        ;
+
+        ttsBegin;
+
+        _SKS_BR_BankTran.ManualReconciliationID = _guidCurrent;
+        _SKS_BR_BankTran.MatchedType = SKS_BR_MatchedType::ManualMatch;
+        _SKS_BR_BankTran.MatchStep = 0;  //MANUAL MATCH, no step.
+        _SKS_BR_BankTran.MatchConfidence = 100;  //MANUAL MATCH = 100% confidence
+        _SKS_BR_BankTran.MatchDefaultRule = NoYes::No;
+        _SKS_BR_BankTran.MultipleMatches = NoYes::No;
+
+        if(_isFinalMatch)
+        {
+            _SKS_BR_BankTran.AccountStatementNum = _BankAccountStatement.AccountStatementNum;
+            _SKS_BR_BankTran.AccountStatementDate = _BankAccountStatement.AccountStatementDate;
+            _SKS_BR_BankTran.IntermMatch = NoYes::No;
+        }
+        else
+        {
+            _SKS_BR_BankTran.IntermMatch = NoYes::Yes;
+        }
+
+        _SKS_BR_BankTran.update();
+
+        // Delete duplicates
+        SKS_BR_Matching::duplicateDelete(_SKS_BR_BankTran.RecId);
+
+
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchUpdatePaymentJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the BankAccountTrans that belong to the associated payment journals
+    /// </summary>
+    /// <param name = "_sks_br_banktran">imported bank account trans</param>
+    /// <param name = "journalNum">journal number that sumamrized to match</param>
+    /// <param name = "manualMatch">Was this manually matched</param>
+    /// <param name = "_sbmRule">the Matching Rule Details</param>
+    /// <param name = "intermMatch">Is this a prematch</param>
+    /// <param name = "bankAccountStatement">related bank account statement</param>
+    /// <param name = "_populateDuplicates">should duplicates be populated</param>
+    /// <param name = "_hasDuplicate">do duplicates exist</param>
+    /// <param name = "_SKS_BR_MatchingDuplicateJournalRecID">recid of the duplicate journal</param>
+    /// <param name = "_TransDate">the transaction date</param>
+    /// <param name = "_Voucher">voucher number</param>
+    /// <param name = "_BankCustNum">bank customer number</param>
+    /// <param name = "_guid">Manual Reconciliation ID for this match</param>   
+    [SuppressBPWarning('BPErrorSelectUsingFirstOnly', 'The SELECT statements act a priming reads, and a subsequest "nextupdateBankAccountTrans" allows iteration through the resultset ')]
+    static void matchUpdatePaymentJournal(SKS_BR_BankTran _sks_br_banktran,
+                                            LedgerJournalId journalNum,
+                                            boolean manualMatch,
+                                            SKS_BR_MatchingRuleDetails _sbmRule,
+                                            boolean intermMatch,
+                                            BankAccountStatement bankAccountStatement,
+                                            boolean _populateDuplicates,
+                                            boolean _hasDuplicate,
+                                            recid _SKS_BR_MatchingDuplicateJournalRecID,
+                                            TransDate _TransDate,
+                                            Voucher _Voucher,
+                                            SKS_BR_BankCustomerNum _BankCustNum,
+                                            Guid _guid)
+    {
+        BankAccountTrans updateBankAccountTrans;
+        SKS_BR_MatchingDuplicateJournalDet insertSKS_BR_MatchingDuplicateJournalDet;
+        LedgerJournalTrans ledgerJournalTrans;
+        ;
+
+        if (_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::DateMultiJournal)
+        {
+            select forupdate updateBankAccountTrans
+                join ledgerJournalTrans
+                    where updateBankAccountTrans.Voucher == ledgerJournalTrans.Voucher
+                    && updateBankAccountTrans.TransDate == ledgerJournalTrans.TransDate
+                    && updateBankAccountTrans.BankTransType == ledgerJournalTrans.BankTransType
+                    && updateBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId
+                    && updateBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans')
+                    && ledgerJournalTrans.JournalNum == journalNum
+                    && updateBankAccountTrans.AccountId == _sks_br_banktran.AccountId
+                    && updateBankAccountTrans.AccountStatementDate == datenull()
+                    && updateBankAccountTrans.AccountStatement == ''
+                    && updateBankAccountTrans.Included == 0
+                    && updateBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString);
+        }
+        // Update BankAccountTrans that were found for a Payment journal to indicate an match was found
+        else if (_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Date)
+        {
+            select forupdate updateBankAccountTrans
+            join ledgerJournalTrans
+            where updateBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                    updateBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                    ledgerJournalTrans.JournalNum == journalNum &&
+                    updateBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                    updateBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                    updateBankAccountTrans.AccountStatementDate == datenull() &&
+                    updateBankAccountTrans.AccountStatement == '' &&
+                    updateBankAccountTrans.Included == 0 &&
+                    updateBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+                    ledgerJournalTrans.TransDate == _TransDate;
+        }
+        else if (_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::Voucher)
+        {
+            select forupdate updateBankAccountTrans
+            join ledgerJournalTrans
+            where updateBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                    updateBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                    ledgerJournalTrans.JournalNum == journalNum &&
+                    updateBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                    updateBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                    updateBankAccountTrans.AccountStatementDate == datenull() &&
+                    updateBankAccountTrans.AccountStatement == '' &&
+                    updateBankAccountTrans.Included == 0 &&
+                    updateBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+                    ledgerJournalTrans.Voucher == _Voucher;
+        }
+        else if (_sbmRule.SummarizeByDate == SKS_BR_SummaryBy::InboundRefNum)
+        {
+            select forupdate updateBankAccountTrans
+            join ledgerJournalTrans
+            where updateBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                    updateBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                    ledgerJournalTrans.JournalNum == journalNum &&
+                    updateBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                    updateBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                    updateBankAccountTrans.AccountStatementDate == datenull() &&
+                    updateBankAccountTrans.AccountStatement == '' &&
+                    updateBankAccountTrans.Included == 0 &&
+                    updateBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString) &&
+                    ledgerJournalTrans.SKS_EFTAP_InboundRefNum == _BankCustNum;
+        }
+        else
+        {
+            select forupdate updateBankAccountTrans
+            join ledgerJournalTrans
+            where updateBankAccountTrans.SourceRecId == ledgerJournalTrans.RecId &&
+                    updateBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans') &&
+                    ledgerJournalTrans.JournalNum == journalNum &&
+                    updateBankAccountTrans.BankTransType == _sks_br_banktran.BankTranType &&
+                    updateBankAccountTrans.AccountId == _sks_br_banktran.AccountId &&
+                    updateBankAccountTrans.AccountStatementDate == datenull() &&
+                    updateBankAccountTrans.AccountStatement == '' &&
+                    updateBankAccountTrans.Included == 0 &&
+                    updateBankAccountTrans.SKS_BR_ManualReconciliationID == str2Guid(#EmptyGuidString);
+        }
+        while (updateBankAccountTrans)
+        {
+            if (_populateDuplicates)
+            {
+                insertSKS_BR_MatchingDuplicateJournalDet.BankAccountTransRecId = updateBankAccountTrans.RecId;
+                insertSKS_BR_MatchingDuplicateJournalDet.SKS_BR_MatchingDuplicateJournalRECID = _SKS_BR_MatchingDuplicateJournalRecID;
+                insertSKS_BR_MatchingDuplicateJournalDet.insert();
+            }
+            else
+            {
+                updateBankAccountTrans.SKS_BR_ManualReconciliationID = _guid;
+
+                if (!intermMatch && manualMatch) // Update if using manual lookup on Import bank files screen
+                {
+                    updateBankAccountTrans.AccountStatement = bankAccountStatement.AccountStatementNum;
+                    updateBankAccountTrans.AccountStatementDate = bankAccountStatement.AccountStatementDate;
+                    updateBankAccountTrans.Included = NoYes::Yes;
+                }
+
+                if (intermMatch)
+                {
+                    updateBankAccountTrans.SKS_BR_IntermMatch = NoYes::Yes;
+                }
+
+                updateBankAccountTrans.update();
+                SKS_BR_Matching::ClearCheck(updateBankAccountTrans, _sks_br_banktran.TranDate);
+            }
+            next updateBankAccountTrans;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_BR_SummaryByDateMultiJournal_Filter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Take a container of structs with a field named locJournalNum.
+    /// return a container that contains structs that only occured once in the container
+    /// </summary>
+    /// <param name = "_unfilteredPossibleJournalsWithDuplicates">The List of journals that contains non-applicable journals, to be filterd out. The remainder will be aggregated.</param>
+    /// <returns>List of aggregated journals with a container of the jounrnal numbers that comprise the aggregated values</returns>
+    private List SKS_BR_SummaryByDateMultiJournal_Filter(List _unfilteredPossibleJournalsWithDuplicates)
+    {
+        ListIterator locUnfilteredPossibleJournalsWithDuplicatesListIterator = new ListIterator(_unfilteredPossibleJournalsWithDuplicates);
+        List locJournalsThatAreAllowedToBeIncluded = new List(Types::AnyType);
+        ListIterator locJournalsThatAreAllowedToBeIncludedListIterator;
+        List locJournalCollectionsSummedByDate = new List(Types::AnyType);
+        ListIterator locJournalCollectionsSummedByDateListIterator;
+        container locTempJournalNums;
+        Struct locTempJournalsStruct, locTempTargetJournalStruct;
+        //Discard any journal that spanned mulitple dates, or had multiple banktrantypes
+        //because of the "group by" in the original query, any journal occuring more than once in a company will have fialed
+        //one of these criteria.
+        while(locUnfilteredPossibleJournalsWithDuplicatesListIterator.more())
+        {
+            locTempJournalsStruct = null;
+            locTempJournalsStruct = locUnfilteredPossibleJournalsWithDuplicatesListIterator.value();
+            if(locTempJournalsStruct.value(StructFieldJournalOccurenceCount) == 1)
+            {
+                locJournalsThatAreAllowedToBeIncluded.addEnd(locTempJournalsStruct);
+            }
+            locUnfilteredPossibleJournalsWithDuplicatesListIterator.next();
+        }
+        //Sum up the remaning journals by date
+        locJournalsThatAreAllowedToBeIncludedListIterator = new ListIterator(locJournalsThatAreAllowedToBeIncluded);
+        while(locJournalsThatAreAllowedToBeIncludedListIterator.more())
+        {
+            locTempJournalsStruct = null;
+            locTempTargetJournalStruct = null;
+            locTempJournalsStruct = locJournalsThatAreAllowedToBeIncludedListIterator.value();
+            locJournalCollectionsSummedByDateListIterator = new ListIterator(locJournalCollectionsSummedByDate);
+            while(locJournalCollectionsSummedByDateListIterator.more())
+            {
+                if(locJournalCollectionsSummedByDateListIterator.value().value(StructFieldTransDate) == locTempJournalsStruct.value(StructFieldTransDate))
+                {
+                    locTempTargetJournalStruct = locJournalCollectionsSummedByDateListIterator.value();
+                    locJournalCollectionsSummedByDateListIterator.delete();
+                    break;
+                }
+                locJournalCollectionsSummedByDateListIterator.next();
+            }
+            if(locTempTargetJournalStruct != null)
+            {
+                locTempJournalNums = locTempTargetJournalStruct.value(StructFieldJounalNumsContainer);
+                locTempJournalNums += locTempJournalsStruct.value(StructFieldJournalNum);
+                locTempTargetJournalStruct.value(StructFieldJounalNumsContainer,  locTempJournalNums);
+                locTempTargetJournalStruct.value(StructFieldAmountCur,locTempTargetJournalStruct.value(StructFieldAmountCur) + locTempJournalsStruct.value(StructFieldAmountCur));
+            }
+            else
+            {
+                locTempTargetJournalStruct = new Struct(strFmt('Container %1; date %2; real %3; str %4',
+                                                            StructFieldJounalNumsContainer,
+                                                            StructFieldTransDate,
+                                                            StructFieldAmountCur,
+                                                            StructFieldDataAreaId));
+                locTempJournalNums = conNull();
+                locTempJournalNums = locTempJournalsStruct.value(StructFieldJournalNum);
+                locTempTargetJournalStruct.value(StructFieldJounalNumsContainer, locTempJournalNums);
+                locTempTargetJournalStruct.value(StructFieldTransDate, locTempJournalsStruct.value(StructFieldTransDate));
+                locTempTargetJournalStruct.value(StructFieldAmountCur,locTempJournalsStruct.value(StructFieldAmountCur));
+                locTempTargetJournalStruct.value(StructFieldDataAreaId,locTempJournalsStruct.value(StructFieldDataAreaId));
+            }
+            locJournalCollectionsSummedByDate.addEnd(locTempTargetJournalStruct);//append the updated or new struct to the list.
+            locJournalsThatAreAllowedToBeIncludedListIterator.next();
+        }
+        return locJournalCollectionsSummedByDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_BR_SummaryByDateMultiJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handles creating a list of containers of journal nums. Returning a single container of journal numbers implies a single match.
+    /// returing a List with muliple containers of journal numbers indicates duplicates were found.
+    /// </summary>
+    /// <param name = "_SKS_BR_BankTran">The imported transaction to be matched to one or more journals</param>
+    /// <param name = "_SKS_BR_MatchingRuleDetails">The matching rule details</param>
+    /// <returns>List of containers, each container matches the imported amount. Multiple containers implies duplicate matches.</returns>
+    public List SKS_BR_SummaryByDateMultiJournal(SKS_BR_BankTran _SKS_BR_BankTran, SKS_BR_MatchingRuleDetails _SKS_BR_MatchingRuleDetails)        
+    {
+        BankAccountTrans locBankAccountTrans;
+        LedgerJournalTrans locLedgerJournalTrans;
+        //LedgerJournalTrans locInTargetDateRangeLedgerJournalTrans;
+        LedgerJournalTrans locInTargetBankTransTypeLedgerJournalTrans;
+        List rtnval = new List(Types::AnyType);
+        List unfilteredPossibleJournalsWithDuplicates = new List(Types::AnyType);
+        ListIterator UnfilteredPossibleJournalsWithDuplicatesListIterator;
+        List locTempList;
+        ListIterator locTempListIterator;
+        StructFieldJournalNum = 'JournalNum';
+        StructFieldTransDate = 'TransDate';
+        StructFieldAmountCur = 'AmountCur';
+        StructFieldJournalOccurenceCount = 'JournalOccurenceCount';
+        StructFieldDataAreaId = 'DataAreaId';
+        StructFieldJounalNumsContainer = 'JournalsContainer';
+        Struct locAllJournalDateTypeStruct;
+               
+        while select JournalNum, TransDate, BankTransType, DataAreaId
+            from locLedgerJournalTrans
+            group by locLedgerJournalTrans.JournalNum,
+                    locLedgerJournalTrans.TransDate,
+                    locLedgerJournalTrans.BankTransType,
+                    locLedgerJournalTrans.DataAreaId
+            join sum(AmountCur) from locBankAccountTrans
+                where locBankAccountTrans.Voucher == locLedgerJournalTrans.Voucher
+                    && locBankAccountTrans.TransDate == locLedgerJournalTrans.TransDate
+                    && locBankAccountTrans.BankTransType == locLedgerJournalTrans.BankTransType
+                    && locBankAccountTrans.SourceRecId == locLedgerJournalTrans.RecId
+                    && locBankAccountTrans.SourceTableId == tableName2Id('ledgerJournalTrans')
+                    && locBankAccountTrans.AccountId == _SKS_BR_BankTran.AccountId
+                    && locBankAccountTrans.AccountStatement == ''
+                    && locBankAccountTrans.AccountStatementDate == dateNull()
+            //exists join locInTargetDateRangeLedgerJournalTrans
+            //    where locInTargetDateRangeLedgerJournalTrans.JournalNum == locLedgerJournalTrans.JournalNum
+            //        && locInTargetDateRangeLedgerJournalTrans.transDate >=  _SKS_BR_BankTran.TranDate - _SKS_BR_MatchingRuleDetails.DateTolerance
+            //        && locInTargetDateRangeLedgerJournalTrans.transDate <= _SKS_BR_BankTran.TranDate + _SKS_BR_MatchingRuleDetails.DateTolerance
+            exists join locInTargetBankTransTypeLedgerJournalTrans
+                where locInTargetBankTransTypeLedgerJournalTrans.JournalNum == locLedgerJournalTrans.JournalNum
+                    && locInTargetBankTransTypeLedgerJournalTrans.BankTransType == _SKS_BR_BankTran.BankTranType
+        {
+            locAllJournalDateTypeStruct = null;
+            UnfilteredPossibleJournalsWithDuplicatesListIterator = new ListIterator(unfilteredPossibleJournalsWithDuplicates);
+            while(UnfilteredPossibleJournalsWithDuplicatesListIterator.more())
+            {
+                //Object test = conPeek(unfilteredPossibleJournalsWithDuplicates, i);
+                locAllJournalDateTypeStruct = UnfilteredPossibleJournalsWithDuplicatesListIterator.value();
+                if(locAllJournalDateTypeStruct.value(StructFieldJournalNum) == locLedgerJournalTrans.JournalNum)
+                {
+                    //The struct will be repacked later, so delete it from the container for now.
+                    UnfilteredPossibleJournalsWithDuplicatesListIterator.delete();
+                    break;
+                }
+                else
+                {
+                    locAllJournalDateTypeStruct = null;
+                }
+                UnfilteredPossibleJournalsWithDuplicatesListIterator.next();
+            }
+            /*for(i = 1; i <= unfilteredPossibleJournalsWithDuplicates.elements(); i++)
+            {
+                Object test = conPeek(unfilteredPossibleJournalsWithDuplicates, i);
+                locAllJournalDateTypeStruct = conPeek(unfilteredPossibleJournalsWithDuplicates, i);
+                if(locAllJournalDateTypeStruct.value(StructFieldJournalNum) == locLedgerJournalTrans.JournalNum 
+                    && locAllJournalDateTypeStruct.value(StructFieldTransDate) == locLedgerJournalTrans.DataAreaId)
+                {
+                    //The struct will be repacked later, so delete it from the container for now.
+                    unfilteredPossibleJournalsWithDuplicates = conDel(unfilteredPossibleJournalsWithDuplicates, i, 1);
+                    break;
+                }
+            }*/
+            if(locAllJournalDateTypeStruct != null)
+            {
+                locAllJournalDateTypeStruct.value(StructFieldJournalOccurenceCount, locAllJournalDateTypeStruct.value(StructFieldJournalOccurenceCount) + 1);
+                //No other fields need recorded. Any Journal occuring more than once will be scrapped later in method SS_BR_SummaryByDateMultiJournal_Filter()
+            }
+            else
+            {
+                locAllJournalDateTypeStruct = new struct (strFmt('str %1; date %2; real %3; int %4; str %5',
+                                                            StructFieldJournalNum,
+                                                            StructFieldTransDate,
+                                                            StructFieldAmountCur,
+                                                            StructFieldJournalOccurenceCount,
+                                                            StructFieldDataAreaId));
+                locAllJournalDateTypeStruct.value(StructFieldJournalNum, locLedgerJournalTrans.JournalNum);
+                locAllJournalDateTypeStruct.value(StructFieldTransDate, locLedgerJournalTrans.TransDate);
+                locAllJournalDateTypeStruct.value(StructFieldJournalOccurenceCount, 1);
+                locAllJournalDateTypeStruct.value(StructFieldAmountCur, locBankAccountTrans.AmountCur);
+                locAllJournalDateTypeStruct.value(StructFieldDataAreaId, locLedgerJournalTrans.DataAreaId);
+            }
+            unfilteredPossibleJournalsWithDuplicates.addEnd(locAllJournalDateTypeStruct);
+        }
+        locTempList = this.SKS_BR_SummaryByDateMultiJournal_Filter(unfilteredPossibleJournalsWithDuplicates);
+        locTempList = this.SKS_BR_SummaryByDateMultiJournal_MatchAmts(locTempList, _SKS_BR_BankTran);
+        locTempListIterator = new ListIterator(locTempList);
+        while(locTempListIterator.more())
+        {
+            rtnval.addEnd(locTempListIterator.value().value(StructFieldJounalNumsContainer));
+            locTempListIterator.next();
+        }
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_BR_SummaryByDateMultiJournal_MatchAmts</Name>
+				<Source><![CDATA[
+    private List  SKS_BR_SummaryByDateMultiJournal_MatchAmts(List _SummarizedDaysAggregatedJournals, SKS_BR_BankTran _SKS_BR_BankTran)
+    {
+        
+        ListIterator locSummarizedDaysAggregatedJournalsListIterator;
+        List rtnval = new List(Types::AnyType);
+
+        locSummarizedDaysAggregatedJournalsListIterator = new ListIterator(_SummarizedDaysAggregatedJournals);
+        while( locSummarizedDaysAggregatedJournalsListIterator.more())
+        {
+            if(locSummarizedDaysAggregatedJournalsListIterator.value().value(StructFieldAmountCur) == _SKS_BR_BankTran.TranAmount)
+            {
+                rtnval.addEnd(locSummarizedDaysAggregatedJournalsListIterator.value());
+            }
+            locSummarizedDaysAggregatedJournalsListIterator.next();
+        }
+        return rtnval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchValidatePaymentJournal</Name>
+				<Source><![CDATA[
+    static boolean matchValidatePaymentJournal(SKS_BR_BankTran sks_br_banktran, boolean intermMatch)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        BankAccountTrans findBankAccountTrans;
+        LedgerJournalId journalNum;
+        boolean matchFound;
+        ;
+
+
+        journalNum = sks_br_banktran.PaymentJournalNum;
+
+
+        select sum(AmountCur) from findBankAccountTrans
+            join ledgerJournalTrans
+
+            group by ledgerJournalTrans.JournalNum
+
+            where findBankAccountTrans.Voucher == ledgerJournalTrans.Voucher &&
+                (findBankAccountTrans.AmountCur == ledgerJournalTrans.AmountCurCredit ||
+                findBankAccountTrans.AmountCur == ledgerJournalTrans.AmountCurCredit * -1 ||
+                findBankAccountTrans.AmountCur == ledgerJournalTrans.AmountCurDebit ||
+                findBankAccountTrans.AmountCur == ledgerJournalTrans.AmountCurDebit * -1) &&
+                ledgerJournalTrans.JournalNum == journalNum &&
+                findBankAccountTrans.BankTransType == sks_br_banktran.BankTranType &&
+                findBankAccountTrans.AccountId == sks_br_banktran.AccountId &&
+                findBankAccountTrans.AccountStatementDate == datenull() &&
+                findBankAccountTrans.AccountStatement == '' &&
+                findBankAccountTrans.Included == 0;
+
+        if(findBankAccountTrans)
+        {
+            // If found, verify amount is correct and no duplicates exist
+            matchFound = SKS_BR_Matching::matchCheckPaymentJournal(findBankAccountTrans, ledgerJournalTrans.JournalNum, sks_br_banktran.TranAmount);
+        }
+        return matchFound;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeMatchSKS_BR_BankTran</Name>
+				<Source><![CDATA[
+    public static void removeMatchSKS_BR_BankTran(SKS_BR_BankTran _SKS_BR_BankTran)
+    {
+        _SKS_BR_BankTran.AccountStatementNum = '';
+        _SKS_BR_BankTran.AccountStatementDate = Global::dateNull();
+        _SKS_BR_BankTran.BookNum = Global::strMin();
+        _SKS_BR_BankTran.CustAccount = '';
+        _SKS_BR_BankTran.IntermMatch = NoYes::No;
+        _SKS_BR_BankTran.LedgerJournalRecId = 0;
+        _SKS_BR_BankTran.ManualReconciliationID = emptyGuid();
+        _SKS_BR_BankTran.MatchConfidence = 0;
+        _SKS_BR_BankTran.Matched = NoYes::No;
+        _SKS_BR_BankTran.MatchedType = SKS_BR_MatchedType::NotMatched;
+        _SKS_BR_BankTran.MatchIndicator = SKS_BR_MatchIndicator::Red;
+        _SKS_BR_BankTran.MatchStep = 0;
+        _SKS_BR_BankTran.MultipleMatches = NoYes::No;
+        _SKS_BR_BankTran.PaymentJournalNum = '';
+        _SKS_BR_BankTran.Voucher = '';
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeGuidMatch</Name>
+				<Source><![CDATA[
+    public static void removeGuidMatch(SKS_BR_ManualReconciliationID _SKS_BR_ManualReconciliationID)
+    {
+        BankAccountTrans locBankAccountTrans;
+        SKS_BR_BankTran locSKS_BR_BankTran;
+        ;
+
+        if(_SKS_BR_ManualReconciliationID != emptyGuid())
+        {
+            ttsBegin;
+            while select forUpdate locSKS_BR_BankTran
+                where locSKS_BR_BankTran.ManualReconciliationID == _SKS_BR_ManualReconciliationID
+                //The NOTEXISTS is used to verify that this is NOT joined any reconciled transactions
+                notexists join locBankAccountTrans
+                    where locBankAccountTrans.SKS_BR_ManualReconciliationID == locSKS_BR_BankTran.ManualReconciliationID
+                        && locBankAccountTrans.Reconciled == NoYes::Yes
+            {
+                SKS_BR_Matching::removeMatchSKS_BR_BankTran(locSKS_BR_BankTran);
+                locSKS_BR_BankTran.update();
+            }
+
+            while select forupdate locBankAccountTrans
+                where locBankAccountTrans.Reconciled == NoYes::No
+                    && locBankAccountTrans.SKS_BR_ManualReconciliationID == _SKS_BR_ManualReconciliationID
+            {
+                //unclear any checks related to this BankAccountTrans
+                SKS_BR_Matching::UnclearCheck(locBankAccountTrans);
+                locBankAccountTrans.Included = NoYes::No;
+                locBankAccountTrans.AccountStatement = '';
+                locBankAccountTrans.AccountStatementDate = Global::dateNull();
+                locBankAccountTrans.SKS_BR_ManualReconciliationID = emptyGuid();
+                locBankAccountTrans.SKS_BR_IntermMatch = NoYes::No;
+                locBankAccountTrans.SKS_BR_ALREADYMARKED = 0;
+                locBankAccountTrans.SKS_BR_ISSELECTED = 0;
+                locBankAccountTrans.update();
+            }
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UnclearCheck</Name>
+				<Source><![CDATA[
+    Public static void UnclearCheck(BankAccountTrans _BankAccountTrans)
+    {
+        VendTrans vendTrans;
+        BankChequeTable bankChequeTable;
+
+        container company;
+        SKS_BR_ClearedDate sks_BR_ClearedDate;
+        ;
+
+        sks_BR_ClearedDate = utcDateTime2SystemDateTime(DateTimeUtil::utcNow());
+
+        company = [_BankAccountTrans.company()];
+        ttsBegin;
+        if(_BankAccountTrans.AmountCur < 0)
+        {
+            if (strLen(strLRTrim(_BankAccountTrans.ChequeNum))  > 0)
+            {
+                select firstonly forUpdate crossCompany:company bankChequeTable
+                    where bankChequeTable.Voucher == _BankAccountTrans.Voucher
+                    && bankChequeTable.TransDate == _BankAccountTrans.TransDate
+                    && bankChequeTable.ChequeStatus != ChequeStatus::Rejected
+                    && bankChequeTable.AmountCur == (-1 * _BankAccountTrans.AmountCur)
+                    && bankChequeTable.SKS_BR_ClearedDate != Global::dateNull();
+
+                if(bankChequeTable)
+                {
+                    bankChequeTable.SKS_BR_ClearedDate = Global::dateNull();
+                    bankChequeTable.update();
+                }
+            }
+            select firstonly forupdate crossCompany:company vendTrans
+                where vendTrans.Voucher == _BankAccountTrans.Voucher
+                && vendTrans.TransDate == _BankAccountTrans.TransDate
+                && vendTrans.AmountCur == (-1 * _BankAccountTrans.AmountCur)
+                && vendTrans.SKS_BR_ClearedDate != Global::dateNull();
+
+            if(vendTrans)
+            {
+                vendTrans.SKS_BR_ClearedDate = Global::dateNull();
+                vendTrans.update();
+            }
+        }
+        ttsCommit;
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateEndingBalance</Name>
+				<Source><![CDATA[
+    // Update ending balance of Bank Account Statement
+    Public Static void updateEndingBalance(CompanyBankAccountId _bankAcct,BankAccountStatement _BankAccountStatement )
+    {
+        SKS_PP_Bank sks_pp_bank;
+        SKS_BR_BankBalance sks_br_bankbalance;
+        BankAccountStatement sks_bankAccountStatement;
+        SKS_BR_FileFormat localSKS_BR_FileFormat;
+        ;
+
+        select firstonly * from localSKS_BR_FileFormat join BankAccountId, BRFormatID from sks_pp_bank where
+            sks_pp_bank.BankAccountId == _bankAcct &&
+            localSKS_BR_FileFormat.FormatID == sks_pp_bank.BRFormatID &&
+            localSKS_BR_FileFormat.CCR_IsCCRFormat == NoYes::No && /// SKS_FDD_13903 - To make sure that its picking only non-CCR format
+            (localSKS_BR_FileFormat.FileType == SKS_BR_FileType::BAI2 || localSKS_BR_FileFormat.FileType == SKS_BR_FileType::NAI);
+
+        if(localSKS_BR_FileFormat && localSKS_BR_FileFormat.UpdateEndBalance)
+        {
+            select firstonly * from sks_br_bankbalance where
+                sks_br_bankbalance.AccountId == _bankAcct &&
+                sks_br_bankbalance.AsOfDate == _BankAccountStatement.AccountStatementDate;
+
+            if(sks_br_bankbalance)
+            {
+                ttsbegin;
+                select firstonly forupdate * from sks_bankAccountStatement where
+                    sks_bankAccountStatement.AccountId == _BankAccountStatement.AccountId &&
+                    sks_bankAccountStatement.AccountStatementDate == _BankAccountStatement.AccountStatementDate &&
+                    sks_bankAccountStatement.AccountStatementNum == _BankAccountStatement.AccountStatementNum &&
+                    sks_bankAccountStatement.SKS_BR_BankHeaderRecId == 0; // Only update ending balance if eBankrec did not create the statement
+
+                if(sks_bankAccountStatement)
+                {
+                    sks_bankAccountStatement.EndingBalance = sks_br_bankbalance.EndBalance;
+                    sks_bankAccountStatement.update();
+                    info(strFmt("@SKS531", sks_br_bankbalance.EndBalance));
+                }
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateReversal</Name>
+				<Source><![CDATA[
+    public static boolean ValidateReversal(SKS_BR_BankTran _SKS_BR_BankTran)
+    {
+        LedgerJournalTrans  locLedgerJournalTrans;
+        boolean ret = true;
+
+        select firstonly locLedgerJournalTrans where locLedgerJournalTrans.SKS_BR_BANKTRANRECID == _SKS_BR_BankTran.recid
+            && locLedgerJournalTrans.JournalNum == _SKS_BR_BankTran.PaymentJournalNum
+            && locLedgerJournalTrans.AccountType == LedgerJournalACType::Cust;
+
+        if(locLedgerJournalTrans.Prepayment == NoYes::Yes &&
+            locLedgerJournalTrans.SettleVoucher != SettlementType::None)
+        {
+            error("@SKS3016");
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

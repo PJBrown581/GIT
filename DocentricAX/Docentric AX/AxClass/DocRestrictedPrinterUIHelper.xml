@@ -1,0 +1,864 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocRestrictedPrinterUIHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class DocRestrictedPrinterUIHelper
+{
+    Args args;
+    FormRun callerForm;
+    Common callerRecord;
+    FormDataSource netPrintersDs, printersInfoDs, reportTableDs;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmArgs</Name>
+				<Source><![CDATA[
+    public Args parmArgs(Args _args = args)
+    {
+        args = _args;
+        return args;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromCaller</Name>
+				<Source><![CDATA[
+    private void initFromCaller()
+    {
+        // We expect to be called from the Restricted reports by printer form.
+        if (!(args.caller() && (args.caller() is FormRun)))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: caller must be form');
+        }
+
+        callerForm = args.caller();
+
+        if (args.record())
+        {
+            callerRecord = args.record();
+        }
+        
+        for (int i = 1; i <= callerForm.dataSourceCount(); i++)
+        {
+            if (callerForm.dataSource(i).cursor() is SysCorpNetPrinters)
+            {
+                netPrintersDs = callerForm.dataSource(i);
+            }
+            else if (callerForm.dataSource(i).cursor() is DocRestrictedPrinterInfo)
+            {
+                printersInfoDs = callerForm.dataSource(i);
+            }
+            else if (callerForm.dataSource(i).cursor() is DocReportTable)
+            {
+                reportTableDs = callerForm.dataSource(i);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restrictAllExceptCurrentCombination</Name>
+				<Source><![CDATA[
+    private void restrictAllExceptCurrentCombination()
+    {
+        #Task
+
+        this.initFromCaller();
+
+        if (!(args.record() && (args.record() is DocRestrictedPrintersView)))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller record type');
+        }
+
+        DocRestrictedPrintersView currentCombination = args.record();
+
+        // Restrict all combinations of printers and reports except the one on the current record.
+        DocRestrictedPrinter restrictedPrinter;
+        DocRestrictedPrintersView view;
+
+        insert_recordset restrictedPrinter (PrinterName, ReportId)
+            select PrinterName, ReportId from view
+                where view.IsRestricted == NoYes::No 
+                    && (view.PrinterName != currentCombination.PrinterName || view.ReportId != currentCombination.ReportId);
+
+        callerForm.task(#taskRefresh);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restrictReportForOtherPrinters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Restrict or allow combinations of report on current record and all other printers 
+    /// except the printer on the currently selected DocRestrictedPrintersView record.
+    /// </summary>
+    private void restrictReportForOtherPrinters()
+    {
+        #Task
+
+        this.initFromCaller();
+
+        if (!(args.record() && (args.record() is DocRestrictedPrintersView)))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller record type');
+        }
+        if (!(args.parm()) && !(args.parm() == 'Restrict' || args.parm() == 'Allow'))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong parameter or no parameter');
+        }
+
+        DocRestrictedPrintersView currentCombination = args.record();
+        DocRestrictedPrinter restrictedPrinter;
+        DocRestrictedPrintersView view;
+        DocReportTable reportTable;
+        str param = args.parm();
+        
+        // Confirmation dialog with additional explanation of the expected result
+        if (param == 'Restrict' && !Box::confirm(strFmt("@DocentricAX3:ConfirmRestrictReportForOtherPrinters", 
+                                                    currentCombination.ReportId, currentCombination.PrinterName)))
+        {
+            return;
+        }
+        if (param == 'Allow' && !Box::confirm(strFmt("@DocentricAX4:ConfirmAllowReportForOtherPrinters", 
+                                                    currentCombination.ReportId)))
+        {
+            return;
+        }
+
+        try
+        {
+            ttsbegin;
+
+            if (param == 'Restrict')
+            {
+                // Restrict for ALL printers means also: restrict for any new printer
+                // that will be added in the future. Therefore, set the 'Restrict for new printers' 
+                // flag on current report.
+                update_recordset reportTable
+                    setting RestrictForNewPrinters = NoYes::Yes
+                        where reportTable.ReportId == currentCombination.ReportId;
+
+                // Restrict all other printers for this report --> add the matching combinations
+                // to the restriction table.
+                insert_recordset restrictedPrinter (PrinterName, ReportId)
+                    select PrinterName, ReportId from view
+                        where view.IsRestricted == NoYes::No
+                            && view.PrinterName != currentCombination.PrinterName
+                            && view.ReportId == currentCombination.ReportId;
+            }
+            else
+            {
+                // Allow for ALL printers means also: allow for any new printer
+                // that will be added in the future. Therefore, clear the 'Restrict for new printers' 
+                // flag on current report.
+                update_recordset reportTable
+                    setting RestrictForNewPrinters = NoYes::No
+                        where reportTable.ReportId == currentCombination.ReportId;
+
+                // Allow all other printers --> remove the matching combinations from the
+                // restriction table.
+                delete_from restrictedPrinter 
+                    where restrictedPrinter.PrinterName != currentCombination.PrinterName
+                        && restrictedPrinter.ReportId == currentCombination.ReportId;
+            }            
+
+            int64 recordCount = restrictedPrinter.RowCount();
+
+            ttscommit;
+
+            if (recordCount == 0)
+            {
+                DocGlobalHelper::handleInfo(strFmt((param == 'Restrict' ? "@DocentricAX3:NoNewRestrictionAddedForOtherPrinters" : 
+                                                                            "@DocentricAX4:NoRestrictionRemovedForOtherPrinters"),
+                                                    currentCombination.ReportId));
+            }
+            else
+            {
+                DocGlobalHelper::handleInfo(strFmt((param == 'Restrict' ? "@DocentricAX3:SuccessRestrictingOtherPrinters" :
+                                                                            "@DocentricAX4:SuccessAllowingOtherPrinters"), 
+                                                    recordCount, currentCombination.ReportId));
+            }
+
+            callerForm.task(#taskRefresh);
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt((param == 'Restrict' ? "@DocentricAX3:ErrorRestrictingForAllPrinters" :
+                                                                        "@DocentricAX4:ErrorAllowingForAllPrinters"), 
+                                                    currentCombination.ReportId, currentCombination.PrinterName));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restrictPrinterForOtherReports</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Restrict or allow combinations of printer on current record and all other reports 
+    /// except the report on the currently selected DocRestrictedPrintersView record.
+    /// </summary>
+    private void restrictPrinterForOtherReports()
+    {
+        #Task
+
+        this.initFromCaller();
+
+        if (!(args.record() && (args.record() is DocRestrictedPrintersView)))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller record type');
+        }
+        if (!(args.parm()) && !(args.parm() == 'Restrict' || args.parm() == 'Allow'))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong parameter or no parameter');
+        }
+
+        DocRestrictedPrintersView currentCombination = args.record();
+        DocRestrictedPrinter restrictedPrinter;
+        DocRestrictedPrintersView view;
+        DocRestrictedPrinterInfo printerInfo;
+        str param = args.parm();
+        
+        // Confirmation dialog with additional explanation of the expected result
+        if (param == 'Restrict' && !Box::confirm(strFmt("@DocentricAX3:ConfirmRestrictPrinterForOtherReports", 
+                                                            currentCombination.PrinterName, currentCombination.ReportId)))
+        {
+            return;
+        }
+        if (param == 'Allow' && !Box::confirm(strFmt("@DocentricAX4:ConfirmAllowPrinterForOtherReports", 
+                                                            currentCombination.PrinterName)))
+        {
+            return;
+        }
+
+        try
+        {
+            if (param == 'Restrict')
+            {
+                // Restrict for ALL reports means also: restrict for any new report
+                // that will be added to Docentric report setup, and for any report
+                // that exists in the system, but isn't registered in Docentric report setup.
+                // Therefore, set the 'Restrict for new printers' and 'Restrict for unregistered reports'
+                // flags for current printer.
+                update_recordset printerInfo
+                    setting RestrictForNewReports = NoYes::Yes, RestrictForUnregisteredReports = NoYes::Yes
+                        where printerInfo.PrinterName == currentCombination.PrinterName;
+                
+                // Restrict all other reports for this printer --> add the matching combinations
+                // to the restriction table.
+                insert_recordset restrictedPrinter (PrinterName, ReportId)
+                    select PrinterName, ReportId from view
+                        where view.IsRestricted == NoYes::No
+                            && view.PrinterName == currentCombination.PrinterName
+                            && view.ReportId != currentCombination.ReportId;
+            }     
+            else      
+            {
+                // Allow for ALL reports means also: allow for any new report
+                // that will be added to the system or to Docentric report setup in the future. 
+                // Therefore, clear the 'Restrict for new printers' and 'Restrict for unregistered reports'
+                // flags for current printer.
+                update_recordset printerInfo
+                    setting RestrictForNewReports = NoYes::No, RestrictForUnregisteredReports = NoYes::No
+                        where printerInfo.PrinterName == currentCombination.PrinterName;
+                
+                // Allow all other reports for this printer --> remove the matching combinations 
+                // from the restriction table.
+                delete_from restrictedPrinter 
+                    where restrictedPrinter.PrinterName == currentCombination.PrinterName
+                        && restrictedPrinter.ReportId != currentCombination.ReportId;
+
+            }
+
+            int64 recordCount = restrictedPrinter.RowCount();
+
+            if (recordCount == 0)
+            {
+                DocGlobalHelper::handleInfo(strFmt((param == 'Restrict' ? "@DocentricAX3:NoNewRestrictionAddedForOtherReports" :
+                                                                            "@DocentricAX4:NoNewRestrictionAddedForOtherReports"),
+                                                        currentCombination.PrinterName));
+            }
+            else
+            {
+                DocGlobalHelper::handleInfo(strFmt((param == 'Restrict' ? "@DocentricAX3:SuccessRestrictingOtherReports" :
+                                                                            "@DocentricAX4:SuccessAllowingOtherReports"), 
+                                                        recordCount, currentCombination.ReportId));
+            }
+
+            callerForm.task(#taskRefresh);
+        }
+        catch
+        {
+            DocGlobalHelper::handleError(strFmt((param == 'Restrict' ? "@DocentricAX3:ErrorRestrictingForAllReports" :
+                                                                        "@DocentricAX4:ErrorAllowingForAllReports"), 
+                                                        currentCombination.PrinterName, currentCombination.ReportId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>commonInit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialization common for different bulk operations, where we check the provided arguments
+    /// and request the user confirmation to continue.
+    /// </summary>
+    /// <returns>boolean: true if initialization and confirmation are successful, otherwise false</returns>
+    private boolean commonInit()
+    {
+        // Make sure that the caller record is provided        
+        if (!args.record())
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: caller record must be provided');
+        }
+        callerRecord = args.record();
+
+
+        // Check the combination of menu item and parameters.        
+        str parm = args.parm();
+
+        if (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)
+            && !(parm == 'Allow' || parm == 'Restrict'))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong menu item parameter');
+        }
+        if (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllPrinters)
+            && !(parm == 'Allow' || parm == 'Restrict'))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong menu item parameter');
+        }
+        if (args.menuItemName() == menuItemActionStr(DocRestrictionFlagsSetOrClear)
+            && !(parm == 'SetForUnregistered' || parm == 'SetForNew' 
+                || parm == 'ClearForUnregistered' || parm == 'ClearForNew' 
+                || parm == 'SetForNewPrinters' || parm == 'ClearForNewPrinters'))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong menu item parameter');
+        }
+
+        
+        // Show the confirmation dialog
+        str msg;
+        switch (parm)
+        {
+            case 'Allow':
+                msg = (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)) ?
+                                        "@DocentricAX3:ConfirmAllowAllReports" : "@DocentricAX4:ConfirmAllowAllPrinters";
+                break;
+                
+            case 'Restrict':                
+                msg = (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)) ?
+                                        "@DocentricAX3:ConfirmRestrictAllReports" : "@DocentricAX4:ConfirmRestrictAllPrinters";
+                break;
+                
+            case 'SetForUnregistered':
+                msg = "@DocentricAX3:ConfirmSetRestrictForUnregisteredReports";
+                break;
+                
+            case 'SetForNew':
+                msg = "@DocentricAX3:ConfirmSetRestrictForNewReports";
+                break;
+                
+            case 'ClearForUnregistered':
+                msg = "@DocentricAX3:ConfirmClearRestrictForUnregisteredReports";
+                break;
+                
+            case 'ClearForNew':
+                msg = "@DocentricAX3:ConfirmClearRestrictForNewReports";
+                break;
+                
+            case 'SetForNewPrinters':
+                msg = "@DocentricAX4:ConfirmRestrictForNewPrinters";
+                break;
+                
+            case 'ClearForNewPrinters':
+                msg = "@DocentricAX4:ConfirmAllowForNewPrinters";
+                break;
+
+            default:
+                // Should not happen
+                DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong menu item parameter');
+        }
+
+        if (!Box::confirm(msg))
+        {
+            return false;
+        }
+
+
+        // Check the combination of menu item and caller record type
+        if (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)
+            && !((args.record() is DocRestrictedPrinterInfo) || (args.record() is DocReportTable)))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller record type');
+        }
+        if (args.menuItemName() == menuItemActionStr(DocRestrictionFlagsSetOrClear)
+            && !((args.record() is DocRestrictedPrinterInfo) || (args.record() is DocReportTable)))
+        {
+            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller record type');
+        }
+        
+        // Initialize based on the caller form
+        this.initFromCaller();
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>commonInfoMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Info messages common for different bulk operations.
+    /// </summary>
+    /// <param name = "_processedNumber">A number of processed items</param>
+    private void commonInfoMessage(int _processedNumber)
+    {
+        str parm = args.parm();
+
+        str msg;
+        switch (parm)
+        {
+            case 'Allow':   
+                msg = (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)) ?
+                        "@DocentricAX3:SuccessAllowingAllReports" : "@DocentricAX4:SuccessAllowingAllPrinters";
+                break;
+            
+            case 'Restrict':
+                msg = (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)) ?
+                        "@DocentricAX3:SuccessRestrictingAllReports" : "@DocentricAX4:SuccessRestrictingAllPrinters";
+                break;
+
+            case 'SetForUnregistered':
+                msg = "@DocentricAX3:SuccessSettingForUnregistered";
+                break;
+
+            case 'SetForNew':
+                msg = "@DocentricAX3:SuccessSettingForNew";
+                break;
+
+            case 'ClearForUnregistered':
+                msg = "@DocentricAX3:SuccessClearingForUnregistered";
+                break;
+
+            case 'ClearForNew':
+                msg = "@DocentricAX3:SuccessClearingForNew";
+                break;
+                
+            case 'SetForNewPrinters':
+                msg = "@DocentricAX4:SuccessSettingForNewPrinters";
+                break;
+                
+            case 'ClearForNewPrinters':
+                msg = "@DocentricAX4:SuccessClearingForNewPrinters";
+                break;
+
+            default:
+                // Should not happen
+                DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller parameter type');
+        }
+        
+        DocGlobalHelper::handleInfo(strFmt(msg, _processedNumber));
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>commonErrorMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Error messages common for different bulk operations.
+    /// </summary>
+    private void commonErrorMessage()
+    {
+        str parm = args.parm();
+        
+        str msg;
+        switch (parm)
+        {
+            case 'Allow':
+                msg = (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)) ?
+                        "@DocentricAX3:ErrorAllowingAllReports" : "@DocentricAX4:ErrorAllowingAllPrinters";
+                break;
+            
+            case 'Restrict':
+                msg = (args.menuItemName() == menuItemActionStr(DocRestrictOrAllowAllReports)) ?
+                        "@DocentricAX3:ErrorRestrictingAllReports" : "@DocentricAX4:ErrorRestrictingAllPrinters";
+                break;
+
+            case 'SetForUnregistered':
+                msg = "@DocentricAX3:ErrorSettingForUnregistered";
+                break;
+
+            case 'SetForNew':
+                msg = "@DocentricAX3:ErrorSettingForNew";
+                break;
+
+            case 'ClearForUnregistered':
+                msg = "@DocentricAX3:ErrorClearingForUnregistered";
+                break;
+
+            case 'ClearForNew':
+                msg = "@DocentricAX3:ErrorClearingForNew";
+                break;
+                
+            case 'SetForNewPrinters':
+                msg = "@DocentricAX4:ErrorSettingForNewPrinters";
+                break;
+                
+            case 'ClearForNewPrinters':
+                msg = "@DocentricAX4:ErrorClearingForNewPrinters";
+                break;
+
+            default:
+                // Should not happen
+                DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller parameter type');
+        }
+        
+        DocGlobalHelper::handleError(msg);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restrictOrAllowAllReports</Name>
+				<Source><![CDATA[
+    private void restrictOrAllowAllReports()
+    {
+        if (!this.commonInit())
+        {
+            return;
+        }
+        
+        str parm = args.parm();        
+        
+        // Iterate through the selected printers and allow or restrict all reports
+        // for each of them.
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(printersInfoDs);
+
+        int printersProcessed = 0;
+        DocRestrictedPrinter restrictedPrinter, restrictedPrinterUpdate;
+        DocReportTable reportTable;
+        DocRestrictedPrinterInfo printerInfo = helper.getFirst();
+        try
+        {
+            ttsbegin;
+
+            while (printerInfo.RecId != 0)
+            {
+                printersProcessed++;
+
+                PrinterName printerName = printerInfo.PrinterName;
+                
+                if (parm == 'Allow')
+                {
+                    delete_from restrictedPrinterUpdate
+                        where restrictedPrinterUpdate.PrinterName == printerName;
+                }
+                else if (parm == 'Restrict')
+                {
+                    insert_recordset restrictedPrinterUpdate (PrinterName, ReportId)
+                    select printerName, ReportId from reportTable
+                        notexists join restrictedPrinter
+                            where restrictedPrinter.ReportId == reportTable.ReportId
+                                && restrictedPrinter.PrinterName == printerName;
+                }   
+                else             
+                {
+                    // Should not happen
+                    DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller parameter type');
+                }
+            
+                printerInfo = helper.getNext();
+            }
+
+            ttscommit;
+            
+            
+            // Show info
+            this.commonInfoMessage(printersProcessed);
+
+            // Refresh the printer info datasource
+            printersInfoDs.research(true);
+            if (callerRecord)
+            {
+                printersInfoDs.positionToRecord(callerRecord);
+            }
+        }
+        catch
+        {
+            this.commonErrorMessage();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restrictOrAllowAllPrinters</Name>
+				<Source><![CDATA[
+    private void restrictOrAllowAllPrinters()
+    {
+        if (!this.commonInit())
+        {
+            return;
+        }
+        
+        str parm = args.parm();
+        
+        // Iterate through the selected printers and allow or restrict all reports
+        // for each of them.
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        helper.parmDatasource(reportTableDs);
+
+        int reportsProcessed = 0;
+        DocRestrictedPrinter restrictedPrinter, restrictedPrinterUpdate;
+        SysCorpNetPrinters networkPrinters;
+        DocReportTable reportTable = helper.getFirst();
+        try
+        {
+            ttsbegin;
+
+            while (reportTable.RecId != 0)
+            {
+                reportsProcessed++;
+
+                DocReportId reportId = reportTable.ReportId;
+                
+                if (parm == 'Allow')
+                {
+                    delete_from restrictedPrinterUpdate
+                        where restrictedPrinterUpdate.ReportId == reportId;
+                }
+                else if (parm == 'Restrict')
+                {
+                    insert_recordset restrictedPrinterUpdate (ReportId, PrinterName)
+                    select reportId, PrinterName from networkPrinters
+                        notexists join restrictedPrinter
+                            where restrictedPrinter.PrinterName == networkPrinters.PrinterName
+                                && restrictedPrinter.ReportId == reportId;
+                }
+                else
+                {
+                    // Should not happen
+                    DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller parameter type');
+                }
+            
+                reportTable = helper.getNext();
+            }
+
+            ttscommit;
+            
+            
+            // Show info
+            this.commonInfoMessage(reportsProcessed);
+
+            // Refresh the printer info datasource
+            reportTableDs.research(true);
+            if (callerRecord)
+            {
+                reportTableDs.positionToRecord(callerRecord);
+            }
+        }
+        catch
+        {
+            this.commonErrorMessage();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOrClearRestrictionFlags</Name>
+				<Source><![CDATA[
+    private void setOrClearRestrictionFlags()
+    {
+        if (!this.commonInit())
+        {
+            return;
+        }
+        
+        str parm = args.parm(); 
+        
+        // Iterate through the selected records (printers or reports) and set/clear the required flags
+        // for each of them.
+        int recordsProcessed = 0;
+        boolean loopCondition;
+        DocRestrictedPrinterInfo printerInfo;
+        DocReportTable reportTable;
+
+        MultiSelectionHelper helper = MultiSelectionHelper::construct();
+        if (parm == 'SetForNewPrinters' || parm == 'ClearForNewPrinters')
+        {
+            helper.parmDatasource(reportTableDs);
+            reportTable = helper.getFirst();
+            loopCondition = reportTable.RecId;
+        }
+        else
+        {
+            helper.parmDatasource(printersInfoDs);
+            printerInfo = helper.getFirst();
+            loopCondition = printerInfo.RecId;
+        }
+
+        try
+        {
+            ttsbegin;
+
+            while (loopCondition)
+            {
+                recordsProcessed++;
+                
+                if (parm == 'SetForNewPrinters' || parm == 'ClearForNewPrinters')
+                {
+                    DocReportTable reportTableLocal = DocReportTable::find(reportTable.RecId, true);
+
+                    switch (parm)
+                    {
+                        case 'SetForNewPrinters':
+                            reportTableLocal.RestrictForNewPrinters = NoYes::Yes;
+                            break;
+
+                        case 'ClearForNewPrinters':
+                            reportTableLocal.RestrictForNewPrinters = NoYes::No;
+                            break;
+
+                        default:
+                            // Should not happen
+                            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller parameter type');
+                    }
+
+                    reportTableLocal.update();
+                    
+                    reportTable = helper.getNext();
+                    loopCondition = reportTable.RecId;                    
+                }
+                else
+                {
+                    DocRestrictedPrinterInfo printerInfoLocal = DocRestrictedPrinterInfo::find(printerInfo.RecId, true);                    
+
+                    switch (parm)
+                    {
+                        case 'SetForUnregistered':
+                            printerInfoLocal.RestrictForUnregisteredReports = NoYes::Yes;
+                            break;
+
+                        case 'SetForNew':
+                            printerInfoLocal.RestrictForNewReports = NoYes::Yes;
+                            break;
+
+                        case 'ClearForUnregistered':
+                            printerInfoLocal.RestrictForUnregisteredReports = NoYes::No;
+                            break;
+
+                        case 'ClearForNew':
+                            printerInfoLocal.RestrictForNewReports = NoYes::No;
+                            break;
+
+                        default:
+                            // Should not happen
+                            DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong caller parameter type');
+                    }
+
+                    printerInfoLocal.update();
+                    
+                    printerInfo = helper.getNext();
+                    loopCondition = printerInfo.RecId;
+                }
+            }
+
+            ttscommit;
+            
+            
+            // Show info
+            this.commonInfoMessage(recordsProcessed);
+
+            // Refresh the printer info / reports datasource            
+            if (parm == 'SetForNewPrinters' || parm == 'ClearForNewPrinters')
+            {
+                reportTableDs.research(true);
+                if (callerRecord)
+                {
+                    reportTableDs.positionToRecord(callerRecord);
+                }
+            }
+            else
+            {
+                printersInfoDs.research(true);
+                if (callerRecord)
+                {
+                    printersInfoDs.positionToRecord(callerRecord);
+                }
+            }
+        }
+        catch
+        {
+            this.commonErrorMessage();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleUIActions</Name>
+				<Source><![CDATA[
+    public void handleUIActions()
+    {
+        switch (args.menuItemName())
+        {
+            case menuItemActionStr(DocRestrictAllExceptCurrentCombination):
+                this.restrictAllExceptCurrentCombination();
+                break;
+            
+            case menuItemActionStr(DocRestrictReportForOtherPrinters):
+                this.restrictReportForOtherPrinters();
+                break;
+            
+            case menuItemActionStr(DocRestrictPrinterForOtherReports):
+                this.restrictPrinterForOtherReports();
+                break;
+            
+            case menuItemActionStr(DocRestrictOrAllowAllReports):
+                this.restrictOrAllowAllReports();
+                break;
+            
+            case menuItemActionStr(DocRestrictOrAllowAllPrinters):
+                this.restrictOrAllowAllPrinters();
+                break;
+            
+            case menuItemActionStr(DocRestrictionFlagsSetOrClear):
+                this.setOrClearRestrictionFlags();
+                break;
+
+            default:
+                DocGlobalHelper::handleException(funcName(), 'Invalid mehtod call: wrong menu item');
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        DocRestrictedPrinterUIHelper uiHelper = new DocRestrictedPrinterUIHelper();
+        uiHelper.parmArgs(_args);
+        uiHelper.handleUIActions();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

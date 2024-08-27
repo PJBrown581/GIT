@@ -1,0 +1,941 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_CC_CreditCardCustForm_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(formstr(CreditCardCust))]
+final class SKS_CC_CreditCardCustForm_Extension
+{
+    public boolean                          hasPayFabricProcessorSetup;
+    public boolean                          isPayFabricActiveProcessor;
+    public boolean                          isCurrentProcessorPayFabric;    
+    public SalesId                          callerSalesId;
+    public CustTable                        custTableArgs;
+    public SalesTable                       salesTableArgs;    
+    public CustAccount                      callerCustAccount;
+    public CreditCardProcessors             activeCreditCardProcessorLocal;
+    public CreditCardPaymentCardTokenize    cardTokenizeLocal;
+    public CreditCardCust                   creditCardCustLocal;
+    public FormStringControl                addrCountyCtrl, street2Ctrl, street3Ctrl;
+    public FormDataSource                   creditCardCustLocal_ds;
+    public FormRun                          elementLocal;
+    public boolean                          needsCreateSync;
+    public str                              pfCardId;
+    public SKS_PP_Setup                     sksParms;
+    public boolean                          calledFromCustPaymForm;
+    public NoYes                            sKS_CC_IsOneTimeCustomer;
+    public RefTableId                       sKS_CC_OneTimeCustRefTableId;
+    public RefRecId                         sKS_CC_OneTimeCustRefRecId;
+    public str                              sKS_CC_OneTimeCustOrigin, sKS_CC_OneTimeCustOrigId;
+    public str                              sks_CC_OneTimeCustPFNbr;
+    public boolean                          isOneTimeCustEnabledSKS;
+    public boolean                          needsOneTimeCustInfoMsgSKS;
+    public boolean                          disableCreateCCForOneTimeCustSKS;
+    public FormDataSource                   callerDataSource;
+    public SKS_CC_DisableCardSync           sKS_CC_DisableCardSync;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>refreshForm</Name>
+				<Source><![CDATA[
+    public void refreshForm()
+    {
+        if (!isPayFabricActiveProcessor)
+        {
+            return;
+        }
+
+        SKS_CC_PayFabricWalletHandler   pfWalletHandler;        
+
+        pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(callerCustAccount);
+        if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+        {
+            pfWalletHandler.parmOneTimeCustRefTableId(sKS_CC_OneTimeCustRefTableId);
+            pfWalletHandler.parmOneTimeCustRefRecId(sKS_CC_OneTimeCustRefRecId);
+        }
+        pfWalletHandler.setPayFabricCustomerNbr();
+
+        if (needsCreateSync)
+        {
+            CreditCardCust                  newCreditCardCust;
+            SalesTable                      salesTableUpd;
+            str                             pfCardTokens;
+
+            needsCreateSync = false;
+
+            pfCardTokens = pfWalletHandler.getPayFabricCreditCardTokensForCustomer();
+            if (pfCardTokens)
+            {
+                activeCreditCardProcessorLocal = CreditCardProcessors::findActiveProcessor();
+                if (pfWalletHandler.refreshCreditCardsFromPayFabric(pfCardTokens, activeCreditCardProcessorLocal.RecId, '', true, true))
+                {
+                    if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+                    {
+                        select firstOnly1 newCreditCardCust
+                            order by RecId desc
+                            where newCreditCardCust.SKS_CC_OneTimeCustRefTableId == sKS_CC_OneTimeCustRefTableId
+                               && newCreditCardCust.SKS_CC_OneTimeCustRefRecId == sKS_CC_OneTimeCustRefRecId
+                               && newCreditCardCust.CustAccount == callerCustAccount;
+                    }
+                    else
+                    {
+                        select firstOnly1 newCreditCardCust
+                            order by RecId desc
+                            where newCreditCardCust.CustAccount == callerCustAccount;
+                    }
+
+                    if (newCreditCardCust.RecId)
+                    {
+                        creditCardCustLocal_ds.positionToRecord(newCreditCardCust);
+
+                        if (callerSalesId)
+                        {
+                            salesTableUpd = SalesTable::find(callerSalesId, true);
+                            if (salesTableUpd.RecId && 
+                                salesTableUpd.SalesStatus != SalesStatus::Invoiced &&
+                                salesTableUpd.SalesStatus != SalesStatus::Canceled &&
+                                !(salesTableUpd.mcrIsCallCenter() && RetailMCRChannelTable::mcrEnableOrderCompletion(salesTableUpd)))
+                            {
+                                if (PaymTerm::find(salesTableUpd.Payment).CreditCardPaymentType == CreditCardPaymentType::CreditCard &&
+                                    !salesTableUpd.CreditCardCustRefId)
+                                {
+                                    ttsBegin;
+                                    salesTableUpd.CreditCardCustRefId = newCreditCardCust.RecId;
+                                    salesTableUpd.update();
+                                    ttsCommit;
+
+                                    if (callerDataSource)
+                                    {
+                                        callerDataSource.research(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }            
+            }
+        }
+        else
+        {
+            str pfReadWalletResponseXmlString;
+            pfReadWalletResponseXmlString = pfWalletHandler.readPayFabricWallet(pfCardId, creditCardCustLocal.CardNumber);
+            if (pfReadWalletResponseXmlString)
+            {
+                SKS_CC_PayFabricWalletHandler::updateCreditCardFromPayFabricResponse(pfReadWalletResponseXmlString, creditCardCustLocal.RecId, creditCardCustLocal.CardNumber);
+            }
+        }
+
+        creditCardCustLocal_ds.research(true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    // <17420>
+    public void init()
+    {
+        TableId tableId = this.args().record() ? this.args().record().TableId : 0;
+        
+        if (tableId == tableNum(ProjTable))
+        {
+            ProjTable projTable = this.args().record();
+
+            // find first funding source of type customer associated with the project contract
+            ProjInvoiceTable projInvoiceTable = ProjInvoiceTable::find(projTable.ProjInvoiceProjId);
+
+            ProjFundingSource projFundingSource;
+            select firstonly projFundingSource 
+                where projFundingSource.ContractId == projInvoiceTable.ProjInvoiceProjId
+                && projFundingSource.FundingType == ProjFundingType::Customer;
+            if(projFundingSource)
+            {
+                callerCustAccount = projFundingSource.CustAccount;
+                custTableArgs = CustTable::find(callerCustAccount);
+
+                this.args().record(custTableArgs);
+            }
+        }
+
+        next init();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializedFormHandler</Name>
+				<Source><![CDATA[
+    // </17420>
+
+    [FormEventHandler(formstr(CreditCardCust), FormEventType::Initialized)]    
+    public void initializedFormHandler(xFormRun _formRun, FormEventArgs _e)
+    {
+        const str constSKS_CC_CustPaymTable = 'SKS_CC_CustPaymTable';
+        const str constSKS_CC_OneTimeCustOriginSO = 'Sales order';
+        const str constSKS_CC_OneTimeCustOriginPJ = 'Payment journal';
+
+        creditCardCustLocal_ds = this.CreditCardCust_ds;
+        if (!creditCardCustLocal_ds)
+            return;
+
+        elementLocal = _formRun;
+        isOneTimeCustEnabledSKS = SKS_PP_Setup::isCreditCardOneTimeCustLogicEnabled();
+
+        SKS_CC_CustPaymTable    custPaymTable;
+        sKS_CC_OneTimeCustRefTableId = 0;
+        sKS_CC_OneTimeCustRefRecId = 0;
+        TableId tableId = this.args().record().TableId;
+        
+        if (tableId == tableNum(CustTable))
+        {
+            custTableArgs = this.args().record();
+            callerCustAccount = custTableArgs.AccountNum;
+
+            if (this.args().parm() == constSKS_CC_CustPaymTable)
+            {
+                calledFromCustPaymForm = true;
+            }
+
+            if (isOneTimeCustEnabledSKS)
+            {
+                sKS_CC_IsOneTimeCustomer = CustTable::find(callerCustAccount).OneTimeCustomer;
+                if (sKS_CC_IsOneTimeCustomer)
+                {
+                    if (this.args().parm())
+                    {
+                        if (this.args().callerName() == formStr(MCRCustPaymTable) ||
+                            this.args().callerName() == formStr(MCRCustPaymInstallments))
+                        {
+                            SalesTable salesTableSKSLoc = SalesTable::findRecId(str2Int64(this.args().parm()));
+                            if (salesTableSKSLoc)
+                            {
+                                sKS_CC_OneTimeCustRefTableId = salesTableSKSLoc.TableId;
+                                sKS_CC_OneTimeCustRefRecId = salesTableSKSLoc.RecId;
+                                sKS_CC_OneTimeCustOrigin = constSKS_CC_OneTimeCustOriginSO;
+                                sKS_CC_OneTimeCustOrigId = salesTableSKSLoc.SalesId;
+
+                                if (salesTableSKSLoc.SalesStatus == SalesStatus::Invoiced ||
+                                    salesTableSKSLoc.SalesStatus == SalesStatus::Canceled)
+                                {
+                                    disableCreateCCForOneTimeCustSKS = true;
+                                }
+                            }
+                        }
+                        else if (this.args().callerName() == formStr(SKS_CC_CustPaymTable))
+                        {
+                            LedgerJournalTable ledgerJournalTableSKS = LedgerJournalTable::findRecId(str2Int64(this.args().parm()));
+                            if (ledgerJournalTableSKS)
+                            {
+                                sKS_CC_OneTimeCustRefTableId = ledgerJournalTableSKS.TableId;
+                                sKS_CC_OneTimeCustRefRecId = ledgerJournalTableSKS.RecId;
+                                sKS_CC_OneTimeCustOrigin = constSKS_CC_OneTimeCustOriginPJ;
+                                sKS_CC_OneTimeCustOrigId = ledgerJournalTableSKS.JournalNum;
+
+                                if (ledgerJournalTableSKS.Posted)
+                                {
+                                    disableCreateCCForOneTimeCustSKS = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else if (tableId == tableNum(SalesTable))
+        {
+            salesTableArgs = this.args().record();
+            callerCustAccount = salesTableArgs.InvoiceAccount;
+            custTableArgs = CustTable::find(callerCustAccount);
+            callerSalesId = salesTableArgs.SalesId;
+
+            if (TradeFormHelper::isCalledFromForm(this.args(), formStr(SalesTable)))
+            {
+                callerDataSource = this.args().record().dataSource();
+            }
+            
+            if (isOneTimeCustEnabledSKS)
+            {
+                sKS_CC_IsOneTimeCustomer = custTableArgs.OneTimeCustomer;
+                if (sKS_CC_IsOneTimeCustomer)
+                {
+                    sKS_CC_OneTimeCustRefTableId = tableNum(SalesTable);
+                    sKS_CC_OneTimeCustRefRecId = salesTableArgs.RecId;
+                    sKS_CC_OneTimeCustOrigin = constSKS_CC_OneTimeCustOriginSO;
+                    sKS_CC_OneTimeCustOrigId = salesTableArgs.SalesId;
+
+                    if (salesTableArgs.SalesStatus == SalesStatus::Invoiced ||
+                        salesTableArgs.SalesStatus == SalesStatus::Canceled)
+                    {
+                        disableCreateCCForOneTimeCustSKS = true;
+                    }
+                }
+            }
+        }
+        else if (tableId == tableNum(SKS_CC_CustPaymTable))
+        {
+            custPaymTable = this.args().record();
+            callerCustAccount = custPaymTable.CustAccount;
+
+            if (isOneTimeCustEnabledSKS)
+            {
+                sKS_CC_IsOneTimeCustomer = CustTable::find(callerCustAccount).OneTimeCustomer;
+                if (sKS_CC_IsOneTimeCustomer)
+                {
+                    if (custPaymTable.RefTableId == tableNum(LedgerJournalTrans))
+                    {
+                        LedgerJournalTrans ledgerJournalTransSKS = LedgerJournalTrans::findRecId(custPaymTable.RefRecId, false);
+                        if (ledgerJournalTransSKS)
+                        {
+                            LedgerJournalTable ledgerJournalTableSKS = ledgerJournalTransSKS.ledgerJournalTable();
+                            if (ledgerJournalTableSKS)
+                            {
+                                sKS_CC_OneTimeCustRefTableId = ledgerJournalTableSKS.TableId;
+                                sKS_CC_OneTimeCustRefRecId = ledgerJournalTableSKS.RecId;
+                                sKS_CC_OneTimeCustOrigin = constSKS_CC_OneTimeCustOriginPJ;
+                                sKS_CC_OneTimeCustOrigId = ledgerJournalTableSKS.JournalNum;
+
+                                if (ledgerJournalTableSKS.Posted)
+                                {
+                                    disableCreateCCForOneTimeCustSKS = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isOneTimeCustEnabledSKS && sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+        {
+            sks_CC_OneTimeCustPFNbr = SKS_CC_PayFabricWalletHandler::getPayFabricCustomerNbrForOneTimeCust(
+                sKS_CC_OneTimeCustRefTableId,
+                sKS_CC_OneTimeCustRefRecId,
+                callerCustAccount);
+        }
+
+        activeCreditCardProcessorLocal = CreditCardProcessors::findActiveProcessor();
+        cardTokenizeLocal = CreditCardPaymentCardTokenize::construct();
+        cardTokenizeLocal.init(activeCreditCardProcessorLocal.Name);
+                
+        sksParms = SKS_PP_Setup::find();
+
+        // Confirm that CCA is active
+        if (sksParms.ModCC == NoYes::Yes)
+        {
+            isPayFabricActiveProcessor = SKS_CC_PayFabricWalletHandler::isPayFabricActiveProcessor();
+            if (isPayFabricActiveProcessor)
+            {
+                hasPayFabricProcessorSetup = true;
+                elementLocal.design().viewEditMode(ViewEditMode::View);
+                creditCardCustLocal_ds.allowCreate(false);
+                creditCardCustLocal_ds.allowEdit(false);
+                creditCardCustLocal_ds.allowDelete(false);
+                elementLocal.design().showDeleteButton(false);
+                elementLocal.design().showNewButton(false);
+
+                if (isOneTimeCustEnabledSKS && sKS_CC_IsOneTimeCustomer)
+                {
+                    QueryBuildDataSource qbdsCreditCardCustSKS = creditCardCustLocal_ds.queryBuildDataSource();
+                    QueryBuildRange qbrRefTableIdSKS = qbdsCreditCardCustSKS.addRange(fieldNum(CreditCardCust, SKS_CC_OneTimeCustRefTableId));
+                    if (sKS_CC_OneTimeCustRefTableId)
+                    {
+                        qbrRefTableIdSKS.value(SysQuery::value(sKS_CC_OneTimeCustRefTableId));
+                    }
+                    else
+                    {
+                        // Value below forced to (-1) to ensure no records are returned
+                        qbrRefTableIdSKS.value(SysQuery::value(-1));
+                        needsOneTimeCustInfoMsgSKS = true;
+                        elementLocal.design().caption("@SKS:SKGCCOneTimeCustInfoMsg");
+                    }
+                    qbrRefTableIdSKS.status(RangeStatus::Hidden);
+
+                    QueryBuildRange qbrRefRecIdSKS = qbdsCreditCardCustSKS.addRange(fieldNum(CreditCardCust, SKS_CC_OneTimeCustRefRecId));
+                    if (sKS_CC_OneTimeCustRefRecId)
+                    {
+                        qbrRefRecIdSKS.value(SysQuery::value(sKS_CC_OneTimeCustRefRecId));
+                    }
+                    else
+                    {
+                        // Value below forced to (-1) to ensure no records are returned
+                        qbrRefRecIdSKS.value(SysQuery::value(-1));
+                    }                    
+                    qbrRefRecIdSKS.status(RangeStatus::Hidden);
+
+                    if (sKS_CC_IsOneTimeCustomer && sKS_CC_OneTimeCustOrigin && sKS_CC_OneTimeCustOrigId)
+                    {
+                        FormGroupControl sKS_CC_OneTimeCustGroupCtrl;
+                        FormStringControl sKS_CC_OneTimeCustTransOriginCtrl, sKS_CC_OneTimeCustOriginIdCtrl;
+                        FormStringControl sKS_CC_OneTimeCustPFCustNbrCtrl;
+                        sKS_CC_OneTimeCustGroupCtrl =  this.SKS_CC_OneTimeCustGroup;
+                        sKS_CC_OneTimeCustGroupCtrl.visible(true);
+                        sKS_CC_OneTimeCustTransOriginCtrl = this.SKS_CC_OneTimeCustTransOrigin;
+                        sKS_CC_OneTimeCustTransOriginCtrl.text(sKS_CC_OneTimeCustOrigin);
+                        sKS_CC_OneTimeCustOriginIdCtrl = this.SKS_CC_OneTimeCustOriginId;
+                        sKS_CC_OneTimeCustOriginIdCtrl.text(sKS_CC_OneTimeCustOrigId);
+                        if (sks_CC_OneTimeCustPFNbr)
+                        {
+                            sKS_CC_OneTimeCustPFCustNbrCtrl = this.SKS_CC_OneTimeCustPFCustNbr;
+                            sKS_CC_OneTimeCustPFCustNbrCtrl.text(sks_CC_OneTimeCustPFNbr);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                hasPayFabricProcessorSetup = SKS_CC_PayFabricWalletHandler::hasPayFabricProcessorSetup();
+            }
+        }
+
+        addrCountyCtrl = this.Address_County;
+        street2Ctrl = this.SKS_CC_Address_Street2;
+        street3Ctrl = this.SKS_CC_Address_Street3;
+
+        if (hasPayFabricProcessorSetup && !needsOneTimeCustInfoMsgSKS)
+        {
+            SKS_CC_PayFabricCreateWallet.enabled(isPayFabricActiveProcessor && sksParms.CCWalletDisallowCreate == NoYes::No && !disableCreateCCForOneTimeCustSKS);
+            SKS_CC_PayFabricEditWallet.enabled(isPayFabricActiveProcessor && sksParms.CCWalletDisallowEdit == NoYes::No);
+            SKS_CC_PayFabricDeleteWallet.enabled(isPayFabricActiveProcessor && sksParms.CCWalletDisallowRemove == NoYes::No);
+            SKS_CC_PayFabricSetDefaultCard.visible(isPayFabricActiveProcessor && sksParms.CCAllowDefaultCardToBeSet == NoYes::Yes);
+            SKS_CC_SendWalletLink.enabled(isPayFabricActiveProcessor && sksParms.CCPLEnableWalletLinks == NoYes::Yes);
+            SKS_CC_PayLinkQueue.enabled(isPayFabricActiveProcessor && sksParms.CCPLEnableWalletLinks == NoYes::Yes);
+
+            if (custTableArgs)
+            {
+                sKS_CC_DisableCardSync = custTableArgs.SKS_CC_DisableCardSync;
+            }
+            else
+            {
+                if (callerCustAccount)
+                {
+                    sKS_CC_DisableCardSync = CustTable::find(callerCustAccount).SKS_CC_DisableCardSync;
+                }
+            }
+
+            SKS_CC_PayFabricRefreshWallet.visible(sKS_CC_DisableCardSync == SKS_CC_DisableCardSync::Off);
+            SKS_CC_PayFabricCreateWallet.visible(sKS_CC_DisableCardSync != SKS_CC_DisableCardSync::DisableSyncAndNewCard);
+        }
+        else
+        {
+            SKS_CC_PayFabricAPTab.visible(false);
+            CreditCardCust_SKS_CC_DefaultCard.visible(false);
+            CreditCardCust_SKS_CC_CardPriority.visible(false);
+            street2Ctrl.visible(false);
+            street3Ctrl.visible(false);
+            SKS_CC_OneTimeCustGroup.visible(false);
+        }
+        
+        needsCreateSync = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postRunFormHandler</Name>
+				<Source><![CDATA[
+    [FormEventHandler(formstr(CreditCardCust), FormEventType::PostRun)]
+    public void postRunFormHandler(xFormRun _formRun, FormEventArgs _e)
+    {
+        if (isPayFabricActiveProcessor && !needsOneTimeCustInfoMsgSKS)
+        {
+            if ((callerSalesId && sksParms.CCSalesOrderManageSync == NoYes::Yes) ||
+                (!callerSalesId && !calledFromCustPaymForm && sksParms.CCCustCrdrCrdARSync == NoYes::Yes) ||
+                (!callerSalesId && calledFromCustPaymForm && sksParms.CCCustCreditCardPaymSync == NoYes::Yes))
+            {
+                if (sKS_CC_DisableCardSync == SKS_CC_DisableCardSync::Off)
+                {
+                    this.synchronizePayFabricCards(true);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>synchronizePayFabricCards</Name>
+				<Source><![CDATA[
+    public void synchronizePayFabricCards(boolean _isSilent = true)
+    {
+        SKS_CC_PayFabricWalletHandler   pfWalletHandler;
+        CreditCardPaymentProperties     allCreditCardPaymentProperties;
+        SysOperationProgress            progressBar;
+
+        if (!isPayFabricActiveProcessor)
+        {
+            return;
+        }
+
+        if (sKS_CC_DisableCardSync != SKS_CC_DisableCardSync::Off)
+        {
+            return;
+        }
+
+        progressBar = new SysOperationProgress();        
+        progressBar.setTotal(2);
+        progressBar.setCaption("@SKS6027");
+        progressBar.setText("@SKS6027");
+
+        cardTokenizeLocal.init(activeCreditCardProcessorLocal.Name);
+        pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(callerCustAccount);
+        if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+        {
+            pfWalletHandler.parmOneTimeCustRefTableId(sKS_CC_OneTimeCustRefTableId);
+            pfWalletHandler.parmOneTimeCustRefRecId(sKS_CC_OneTimeCustRefRecId);
+        }
+        pfWalletHandler.setPayFabricCustomerNbr();
+
+        allCreditCardPaymentProperties = pfWalletHandler.getPayFabricCreditCardsForCustomer();
+
+        progressBar.incCount();
+
+        if (pfWalletHandler.synchronizeCreditCardsFromPayFabric(allCreditCardPaymentProperties, activeCreditCardProcessorLocal.RecId, creditCardCust.CardNumber, false, _isSilent))
+        {
+            creditCardCust_ds.research(false);
+        }
+
+        progressBar.incCount();
+        progressBar.kill();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardCust_OnValidatingDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validating Delete event handler
+    /// </summary>
+    /// <param name = "_sender">Sender</param>
+    /// <param name = "_e">Event args</param>
+    [FormDataSourceEventHandler(formDataSourceStr(CreditCardCust, CreditCardCust), FormDataSourceEventType::ValidatingDelete)]
+    public void CreditCardCust_OnValidatingDelete(FormDataSource _sender, FormDataSourceEventArgs _e)
+    {
+        if (sksParms.ModCC == NoYes::No)
+        {
+            return;
+        }
+        
+        CreditCardCust creditCardCustCurSKS = _sender.cursor();
+
+        if (creditCardCustCurSKS.CreditCardProcessors)
+        {
+            isCurrentProcessorPayFabric = SKS_CC_PayFabricWalletHandler::isPayFabricProcessor(creditCardCustCurSKS.CreditCardProcessors);
+        }
+        else
+        {
+            if (isPayFabricActiveProcessor)
+            {
+                isCurrentProcessorPayFabric = true;
+            }
+            else
+            {
+                isCurrentProcessorPayFabric = false;
+            }
+        }
+
+        if (isCurrentProcessorPayFabric)
+        {
+            FormDataSourceCancelEventArgs ce = _e as FormDataSourceCancelEventArgs;
+            if (ce != null)
+            {
+                ce.cancel(true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreditCardCust_OnDeleting</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CreditCardCust_OnDeleting method
+    /// </summary>
+    /// <param name="sender">sender</param>
+    /// <param name="e">e</param>
+    [FormDataSourceEventHandler(formDataSourceStr(CreditCardCust, CreditCardCust), FormDataSourceEventType::Deleting),
+    SuppressBPWarning('BPParameterNotUsed', 'Parameter e required in signature')]
+    public static void CreditCardCust_OnDeleting(FormDataSource sender, FormDataSourceEventArgs e)
+    {
+        //<Issue21747>
+        CreditCardCust creditCardCust = sender.cursor();
+        
+        creditCardCust.checkDeleteCC();
+        //<Issue21747>
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dataSourceOnActivatedFormHandler</Name>
+				<Source><![CDATA[
+    [FormDataSourceEventHandler(formDataSourceStr(CreditCardCust, CreditCardCust), FormDataSourceEventType::SelectionChanged),
+    SuppressBPWarning('BPParameterNotUsed', 'Parameter _e required in signature')]
+    public void dataSourceOnActivatedFormHandler(FormDataSource _sender, FormDataSourceEventArgs _e)
+    {
+        creditCardCustLocal = _sender.cursor();
+        cardTokenizeLocal.setXmlString(creditCardCustLocal.CardToken, CreditCardProcessors::find(creditCardCustLocal.CreditCardProcessors).Name);
+
+        if (creditCardCustLocal.CreditCardProcessors)
+        {
+            isCurrentProcessorPayFabric = SKS_CC_PayFabricWalletHandler::isPayFabricProcessor(creditCardCustLocal.CreditCardProcessors);
+        }
+        else
+        {
+            if (isPayFabricActiveProcessor)
+            {
+                isCurrentProcessorPayFabric = true;
+            }
+            else
+            {
+                isCurrentProcessorPayFabric = false;
+            }
+        }
+        
+        addrCountyCtrl.visible(!isCurrentProcessorPayFabric);
+        street2Ctrl.visible(isCurrentProcessorPayFabric);
+        street3Ctrl.visible(isCurrentProcessorPayFabric);
+        if (isCurrentProcessorPayFabric)
+        {
+            street2Ctrl.text(cardTokenizeLocal.getPropertyValue(Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.PaymentCardProperties::get_StreetAddress2()));
+            const str streetAddress3 = 'StreetAddress3';
+            street3Ctrl.text(cardTokenizeLocal.getPropertyValue(streetAddress3));
+            elementLocal.design().viewEditMode(ViewEditMode::View);            
+        }
+
+        CreditCardCust_ds.allowCreate(!isPayFabricActiveProcessor);
+        creditCardCust_ds.allowEdit(creditCardCust.CreditCardProcessors == activeCreditCardProcessorLocal.RecId && !isCurrentProcessorPayFabric);
+        AddressPage.allowEdit(creditCardCust.CreditCardProcessors == activeCreditCardProcessorLocal.RecId && !isCurrentProcessorPayFabric);
+        CreditCardCust_ds.allowDelete(!isCurrentProcessorPayFabric);
+
+        if (hasPayFabricProcessorSetup)
+        {
+            SKS_CC_PayFabricCreateWallet.enabled(isPayFabricActiveProcessor && sksParms.CCWalletDisallowCreate == NoYes::No);
+            SKS_CC_PayFabricEditWallet.enabled(isPayFabricActiveProcessor && isCurrentProcessorPayFabric
+                                           && sksParms.CCWalletDisallowEdit == NoYes::No);
+            SKS_CC_PayFabricDeleteWallet.enabled(isCurrentProcessorPayFabric && sksParms.CCWalletDisallowRemove == NoYes::No);
+            SKS_CC_PayFabricRefreshWallet.enabled(true);
+            if (SKS_CC_PayFabricSetDefaultCard.visible())
+            {
+                SKS_CC_PayFabricSetDefaultCard.enabled(true);
+                if (CreditCardCust.SKS_CC_DefaultCard)
+                {
+                    SKS_CC_PayFabricSetDefaultCard.caption("@SKS6309");
+                }
+                else
+                {
+                    SKS_CC_PayFabricSetDefaultCard.caption("@SKS6530");
+                }
+            }
+            SKS_CC_PayFabricSetCardPriority.enabled(isPayFabricActiveProcessor && !CreditCardCust.SKS_CC_DefaultCard);
+        }
+
+        if (sKS_CC_IsOneTimeCustomer && sKS_CC_OneTimeCustOrigin && sKS_CC_OneTimeCustOrigId)
+        {
+            FormStringControl sKS_CC_OneTimeCustTransOriginCtrl, sKS_CC_OneTimeCustOriginIdCtrl;
+            FormStringControl sKS_CC_OneTimeCustPFCustNbrCtrl;
+            sKS_CC_OneTimeCustTransOriginCtrl = this.SKS_CC_OneTimeCustTransOrigin;
+            sKS_CC_OneTimeCustTransOriginCtrl.text(sKS_CC_OneTimeCustOrigin);
+            sKS_CC_OneTimeCustOriginIdCtrl = this.SKS_CC_OneTimeCustOriginId;
+            sKS_CC_OneTimeCustOriginIdCtrl.text(sKS_CC_OneTimeCustOrigId);
+            sKS_CC_OneTimeCustPFCustNbrCtrl = this.SKS_CC_OneTimeCustPFCustNbr;
+            sKS_CC_OneTimeCustPFCustNbrCtrl.text(sks_CC_OneTimeCustPFNbr);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pfCreateWallet_Clicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(CreditCardCust, SKS_CC_PayFabricCreateWallet), FormControlEventType::Clicked)]
+    public void pfCreateWallet_Clicked(FormControl _sender, FormControlEventArgs _e)
+    {
+        SKS_CC_PayFabricWalletHandler   pfWalletHandler;        
+        str                             pfUrl;
+        Args                            args = new Args();        
+
+        if (!isPayFabricActiveProcessor)
+        {
+            return;
+        }
+
+        pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(callerCustAccount);
+        if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+        {
+            pfWalletHandler.parmOneTimeCustRefTableId(sKS_CC_OneTimeCustRefTableId);
+            pfWalletHandler.parmOneTimeCustRefRecId(sKS_CC_OneTimeCustRefRecId);
+        }
+        pfWalletHandler.setPayFabricCustomerNbr();
+
+        pfUrl = pfWalletHandler.getPayFabricCreateWalletUrl();
+        
+        if (custTableArgs)
+        {
+            args.record(custTableArgs);
+        }
+        else
+        {
+            args.record(CustTable::find(callerCustAccount));
+        }
+
+        args.caller(this);
+        args.parm(pfUrl);
+        args.parmEnumType(enumnum(NoYesCombo));
+        args.parmEnum(NoYesCombo::Yes);       
+        
+        MenuFunction menuFunction;
+        menuFunction = new MenuFunction(menuitemDisplayStr(SKS_CC_PayFabricWalletMaintain), MenuItemType::Display);        
+        menuFunction.run(args);              
+        needsCreateSync = true;        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pfEditWallet_Clicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(CreditCardCust, SKS_CC_PayFabricEditWallet), FormControlEventType::Clicked)]
+    public void pfEditWallet_Clicked(FormControl sender, FormControlEventArgs e)
+    {
+        SKS_CC_PayFabricWalletHandler   pfWalletHandler;
+        str                             pfUrl;
+        Args                            args = new Args();
+
+        if (!isCurrentProcessorPayFabric)
+        {
+            return;
+        }
+
+        if (!cardTokenizeLocal)
+        {
+            throw error(strFmt("@SKS6040", callerCustAccount, creditCardCustLocal.CardNumber));
+        }
+
+        pfCardId = '';
+        pfCardId = cardTokenizeLocal.getPropertyValue(Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.PaymentCardProperties::get_CardToken());
+        if (!pfCardId)
+        {
+            throw error(strFmt("@SKS6041", callerCustAccount, creditCardCustLocal.CardNumber));
+        }
+
+        pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+        pfWalletHandler.parmCustAccount(callerCustAccount);
+        if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+        {
+            pfWalletHandler.parmOneTimeCustRefTableId(sKS_CC_OneTimeCustRefTableId);
+            pfWalletHandler.parmOneTimeCustRefRecId(sKS_CC_OneTimeCustRefRecId);
+        }
+        pfWalletHandler.setPayFabricCustomerNbr();
+
+        pfUrl = pfWalletHandler.getPayFabricEditWalletUrl(pfCardId, creditCardCustLocal.CardNumber);        
+
+        if (custTableArgs)
+        {
+            args.record(custTableArgs);
+        }
+        else
+        {
+            args.record(CustTable::find(callerCustAccount));
+        }
+
+        args.caller(this);
+        args.parm(pfUrl);
+        args.parmEnumType(enumnum(NoYesCombo));
+        args.parmEnum(NoYesCombo::No);
+
+        MenuFunction menuFunction;
+        menuFunction = new MenuFunction(menuitemDisplayStr(SKS_CC_PayFabricWalletMaintain), MenuItemType::Display);
+        menuFunction.run(args);
+        needsCreateSync = false;        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pfDeleteWallet_Clicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(CreditCardCust, SKS_CC_PayFabricDeleteWallet), FormControlEventType::Clicked)]
+    public void pfDeleteWallet_Clicked(FormControl sender, FormControlEventArgs e)
+    {
+        SKS_CC_PayFabricWalletHandler   pfWalletHandler;        
+        boolean                         pfDeleteCardResult;
+
+        if (!isCurrentProcessorPayFabric)
+        {
+            return;
+        }
+
+        if (!cardTokenizeLocal)
+        {
+            throw error(strFmt("@SKS6035", callerCustAccount));
+        }
+        
+        pfCardId = '';
+        pfCardId = cardTokenizeLocal.getPropertyValue(Microsoft.Dynamics.Retail.PaymentSDK.Portable.Constants.PaymentCardProperties::get_CardToken());
+        if (!pfCardId)
+        {
+            throw error(strFmt("@SKS6036", callerCustAccount));
+        }
+
+        if (!creditCardCust.validateWrite())
+        {
+            return;
+        }
+
+        if (!SKS_CC_PayFabricWalletHandler::validateDeleteForOpenAuth(creditCardCustLocal.RecId))
+        {
+            return;
+        }
+
+        if (Box::yesNo(strFmt("@GLS93976", tableId2pname(tableNum(CreditCardCust))) + "@SKS6038",
+                       DialogButton::No, "@SYS24848") == DialogButton::Yes)
+        {
+            pfWalletHandler = SKS_CC_PayFabricWalletHandler::construct();
+            pfWalletHandler.parmCustAccount(callerCustAccount);
+            if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+            {
+                pfWalletHandler.parmOneTimeCustRefTableId(sKS_CC_OneTimeCustRefTableId);
+                pfWalletHandler.parmOneTimeCustRefRecId(sKS_CC_OneTimeCustRefRecId);
+            }
+            pfWalletHandler.setPayFabricCustomerNbr();
+
+            pfDeleteCardResult = pfWalletHandler.removePayFabricWallet(pfCardId, creditCardCustLocal.CardNumber);
+
+            if (pfDeleteCardResult)
+            {
+                try
+                {
+                    ttsBegin;
+                    creditCardCustLocal.selectForUpdate(true);
+                    creditCardCustLocal.delete();
+
+                    //<Issue21868>
+                    SKS_CC_Address_Street2.text('');
+                    SKS_CC_Address_Street3.text('');
+                    Address_Company.text('');
+                    Address_Street.text('');
+                    Address_City.text('');
+                    Address_County.text('');
+                    Address_State.text('');
+                    Address_ZipCode.text('');
+                    Address_CountryRegionId.text('');
+                    Contact_Phone.text('');
+                    Contact_EMail.text('');
+                    //</Issue21868>
+                    ttsCommit;
+
+                    creditCardCustLocal_ds.research(false);
+                }
+                catch (Exception::Error)
+                {
+                    ttsAbort;
+                    error("@SKS6039");
+                }
+            }            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pfRefreshWallet_Clicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(CreditCardCust, SKS_CC_PayFabricRefreshWallet), FormControlEventType::Clicked)]
+    public void pfRefreshWallet_Clicked(FormControl _sender, FormControlEventArgs _e)
+    {
+        if (sKS_CC_DisableCardSync == SKS_CC_DisableCardSync::Off)
+        {
+            this.synchronizePayFabricCards(false);    
+        }           
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pfSendWalletLink_Clicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(CreditCardCust, SKS_CC_SendWalletLink), FormControlEventType::Clicked)]
+    public void pfSendWalletLink_Clicked(FormControl _sender, FormControlEventArgs _e)
+    {
+        if (!isPayFabricActiveProcessor)
+        {
+            return;
+        }
+
+        if (sksParms.CCPLEnableWalletLinks == NoYes::No)
+        {
+            throw error("@SKS:SKGCCSendWalletLinkIsNotAllowedErrorMsg");
+        }
+
+        if (!sksParms.CCPayLinkEnumUpgraded)
+        {
+            throw error("@SKS:SKGCCRefreshLinkIsNotAllowedDueToUpgrade");
+        }        
+
+        if (!custTableArgs)
+        {
+            custTableArgs = CustTable::find(callerCustAccount);
+        }
+
+        SKS_CC_SendWalletLink sendWalletLink = SKS_CC_SendWalletLink::construct();
+        sendWalletLink.parmCallerCustTable(custTableArgs);
+        if (sKS_CC_OneTimeCustRefTableId && sKS_CC_OneTimeCustRefRecId)
+        {
+            sendWalletLink.parmOneTimeCustRefTableId(sKS_CC_OneTimeCustRefTableId);
+            sendWalletLink.parmOneTimeCustRefRecId(sKS_CC_OneTimeCustRefRecId);
+        }
+        sendWalletLink.setPayFabricCustomerNbr();
+
+        if (sendWalletLink.prompt())
+        {
+            sendWalletLink.run();
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SKS_CC_PayLinkQueue_OnClicked</Name>
+				<Source><![CDATA[
+    [FormControlEventHandler(formControlStr(CreditCardCust, SKS_CC_PayLinkQueue), FormControlEventType::Clicked)]
+    public void SKS_CC_PayLinkQueue_OnClicked(FormControl _sender, FormControlEventArgs _e)
+    {
+        Args args = new Args();
+
+        if (!isPayFabricActiveProcessor)
+        {
+            return;
+        }
+
+        if (sksParms.CCPLEnableWalletLinks == NoYes::No)
+        {
+            throw error("@SKS:SKGCCSendWalletLinkIsNotAllowedErrorMsg");
+        }
+
+        if (!custTableArgs)
+        {
+            custTableArgs = CustTable::find(callerCustAccount);
+        }
+
+        args.record(custTableArgs);
+        args.caller(this);
+        args.parm(enum2Str(SKS_CC_PayLinkTransactionType::WalletLink));
+
+        MenuFunction menuFunction;
+        menuFunction = new MenuFunction(menuitemDisplayStr(SKS_CC_PayLinkQueue), MenuItemType::Display);
+        menuFunction.run(args);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

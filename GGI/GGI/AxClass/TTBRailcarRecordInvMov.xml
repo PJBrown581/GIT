@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TTBRailcarRecordInvMov</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// TTB008 sublcass for inventory movemsnt
+/// </summary>
+[TTBRailCarRecordAttribute(TTBRailcarRecordSubclass::InventoryMovement)]
+class TTBRailcarRecordInvMov extends TTBRailCarRecord
+{
+    InventJournalTable inventJournalTable;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// initialize data
+    /// </summary>
+    public void init()
+    {
+        super();
+        subClassTYtpe = TTBRailcarRecordSubclass::InventoryMovement;
+            
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// process data based on mobile device
+    /// </summary>
+    public void run()
+    {
+        RailcarTable = TTBRailCarTable::findOpenRailcar( workTable.InventLocationId ,this.getLocation()) ;
+        if(RailcarTable.RecId ==0)
+        {
+            throw Error("Unable to find an open railcar record.");
+        }
+        if (RailcarTable.InventQualityOrderId && InventQualityOrderTable::find(RailcarTable.InventQualityOrderId).OrderStatus != InventTestOrderStatus::Pass)
+        {
+            throw error(strFmt("@GGI:QONeedsValidation", RailcarTable.InventQualityOrderId));
+        }
+        TTBRailCarLine line =  this.createRailCarLines();
+
+        if(customTypes.ConveyanceEmpty)
+        {
+            this.createGainLoss(line);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// gets the location of the workline pick for curfrdent worktable
+    /// </summary>
+    /// <returns>warehouse location Id</returns>
+    private WMSLocationId getLocation()
+    {
+        WHSWorkLine workLine;
+        select firstonly workLine
+            where workline.WorkId == workTable.WorkId
+                && workLine.WorkType == WHSWorkType::Pick;
+        
+        return workLine.wmslocationid;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createGainLoss</Name>
+				<Source><![CDATA[
+    public void createGainLoss(TTBRailCarLine _line)
+    {
+        TTBRailCarLine      railCarLineFirst;  
+        container           netQuantities   = this.lineQtyInLbs();
+        InventQtyJournal    qty             = conPeek(netQuantities, 1);
+        TTBWineGallon       wineGallon      = conPeek(netQuantities, 2);
+        TTBProofGallon      proofGallon     = conPeek(netQuantities, 3);       
+      
+        select firstonly railCarLineFirst
+            where railCarLineFirst.RailCarTable == RailcarTable.RecId
+                && railCarLineFirst.LineNumber  == 1;
+
+        if (qty)
+        {
+            InventJournalId journalId = this.createJournal(railCarLineFirst, qty * -1);
+            this.createGainLossLine(railCarLineFirst, journalId, qty * -1, wineGallon * -1, proofGallon * -1, _line);
+        } 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lineQtyInLbs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// return total qty
+    /// </summary>
+    /// <returns>container of total qty,total wine glalon, total proof gallons</returns>
+    protected container lineQtyInLbs()
+    {
+        InventQtyJournal        qty;
+        TTBWineGallon           wineGallon;
+        TTBProofGallon          proofGallon;
+        TTBRailCarLine          railcarLine;
+        WHSWorkLine             workLine;
+        UnitOfMeasure           uom;                    
+        TTBWineGALConversion    wineGallonConversion;
+
+        while select railcarLine where railcarLine.RailCarTable ==  RailcarTable.RecId
+        {
+            wineGallon += railcarLine.WineGallon;
+            proofGallon += railcarLine.ProofGallon;
+            workLine = WHSWorkLine::findByRecId(railcarLine.WhSWorkLine);
+            uom   = UnitOfMeasure::findBySymbol(InventTable::find(railcarLine.ItemId).inventUnitId());
+
+            wineGallonConversion    = TTBWineGALConversion::find(railcarLine.Proof);
+
+            if (workLine.UnitId == TTBUOM && uom.Symbol == 'lb' && wineGallonConversion.WineGALEquivalent)
+            {
+                Qty += railcarLine.qty/wineGallonConversion.WineGALEquivalent;
+            }
+            else
+            {
+                Qty += railcarLine.qty;
+            }
+        }
+        qty = decRound(qty, uom.DecimalPrecision);
+        return [qty, wineGallon, proofGallon];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRailCarLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init rialcar record line
+    /// </summary>
+    /// <param name = "_line">railcarline record</param>
+    /// <param name = "_workLine">whsWorkLine record</param>
+    protected void initRailCarLine(TTBRailCarLine _line, WHSWorkLine _workLine)
+    {
+        TTBProof                            proof;
+        LogisticsEntityPostalAddressView    postalAddress;
+        TTBPermitAddress				    ttbPermitAddress;
+        TTBPermitTable					    ttbPermitTable;
+        InventTable                         inventTable = InventTable::find(_line.ItemId);
+        LogisticsLocationRole               locationRole = LogisticsLocationRole::findBytype(LogisticsLocationRoleType::Delivery);
+
+        super(_line, _workLine);
+
+        _line.QualityOrderStatus =  this.qualityOrderStatus(_workLine.ItemId,_workLine.InventDimId);
+        _line.Qty = _line.Qty *-1;        
+  
+        if (inventTable.TTBAlcoholType() == TTBAlcoholType::PURE)
+        {
+            proof               = RailcarTable.InventQualityOrderId? RailcarTable.proofFromQO() : RailcarTable.Proof;
+            _line.Proof         = proof;
+            _line.WineGallon    = TTBWineGalConversion::find(proof).WineGALEquivalent * _line.Qty;
+            _line.ProofGallon   = (_line.WineGallon * proof) / 100;
+        } 
+        else 
+        {
+            proof = inventTable.TTBProof;
+        }
+
+        if (inventTable.ggiIsDenatured())
+        {
+            _line.WineGallon = this.convertWGToInventUOM(_line.Qty, _line.ItemId, ModuleInventPurchSales::Invent);
+        }    
+
+        _line.InventDimId = TTBUtilHelper::getDimFromWorkLineTrans(_workLine.WorkId).inventDimId;
+        _line.TransType = GGIRailcarTransType::InventMov;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// create a new journal for loss or gain of materials.
+    /// </summary>
+    /// <param name = "_line">railcarline record</param>
+    /// <param name = "_qty">Qty to create adjustment for.</param>
+    /// <param name = "_isMovemsnt"> set to uses a inventy movemsnt journal</param>
+    /// <returns>Inventory JournalId created </returns>
+    protected InventJournalId createJournal(TTBRailCarLine _line, Qty _qty)
+    {
+        
+        InventJournalTrans          inventJournalTrans;
+        InventJournalNameId         inventJournalName;
+        InventDim                   inventDim;
+        InventTable                 inventTable;
+        JournalCheckPost            journalCheckPost;
+
+        inventTable = InventTable::find(_line.ItemId);
+
+        ttsbegin;
+
+        inventJournalName = InventParameters::find().TTBRCROffloadInvAdjJournalNameId;
+    
+        inventJournalTable.initFromInventJournalName(InventJournalName::find(inventJournalName));
+        inventJournalTable.insert();
+        //Creation of Inventory Journal Lines
+        inventJournalTrans.clear();
+        inventJournalTrans.initFromInventJournalTable(inventJournalTable);
+        inventJournalTrans.TransDate = systemDateGet();
+        inventJournalTrans.ItemId = _line.ItemId;
+        inventJournalTrans.initFromInventTable(InventTable::find(_line.ItemId));
+        inventJournalTrans.Qty      = _qty;
+        inventJournalTrans.UnitQty  = inventJournalTrans.Qty;
+        inventJournalTrans.CostAmount = inventJournalTrans.calcCostAmount();        
+       
+        inventDim = InventDim::find(_line.InventDimId); 
+        inventJournalTrans.InventDimId = inventDim.inventDimId;
+        inventJournalTrans.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(inventTable.DefaultDimension, inventDim.inventSite().DefaultDimension);
+
+        inventJournalTrans.insert();
+        ttscommit;
+
+        //Posting the journal
+        journalCheckPost = InventJournalCheckPost::newPostJournal(inventJournalTable);
+        journalCheckPost.run();
+
+        return inventJournalTable.JournalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createGainLossLine</Name>
+				<Source><![CDATA[
+    protected LineNum createGainLossLine(TTBRailCarLine _line, InventJournalId _InventJournalId, Qty _gainLossQty, TTBWineGallon _wineGallon, TTBProofGallon _proofGallon, TTBRailCarLine _lastLine)
+    {
+        TTBRailCarLine profitLossline;
+        
+        profitLossline.clear();
+        profitLossline.railCarTable     = railCarTable.RecId;
+        profitLossline.TransDate        = systemDateGet();
+        profitLossline.ItemId           = _line.ItemId;
+        profitLossline.InventDimId      = _line.inventDimid;
+        profitLossline.Qty              = _gainLossQty;
+        profitLossline.WineGallon       = _wineGallon;
+        profitLossline.ProofGallon      = _proofGallon;
+        profitLossline.LineNumber       = _lastLine.LineNumber + 1 ;
+        profitLossline.TransType        = GGIRailcarTransType::InventLossProfit;
+        profitLossline.ReferenceId      = inventJournalTable.JournalId;
+        profitLossline.JournalNameId    = inventJournalTable.JournalNameId;
+        profitLossline.DSPNumber        = _lastLine.DSPNumber;
+       
+        profitLossline.insert();
+        return profitLossline.LineNumber;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

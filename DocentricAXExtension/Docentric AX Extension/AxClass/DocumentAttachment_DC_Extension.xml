@@ -1,0 +1,442 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>DocumentAttachment_DC_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The class DocumentAttachment_DC_Extension is an extension of the class DocumentAttachment.
+/// </summary>
+[ExtensionOf(classStr(DocumentAttachment))]
+final class DocumentAttachment_DC_Extension
+{
+    private DocumentAttachmentAttribute documentAttachmentAttribute;
+    private DocuTypeId attachmentDocuTypeId;
+    private str attachmentFilename;
+    private boolean saveWithSsrsWorkaround, saveWithDocentric, dontSave;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the processing.
+    /// </summary>
+    public void run()
+    {   
+        SRSPrintMediumType storedPds;
+        Common orgJournal;
+
+        this.setFlagsForSavingToJournalAttachments_DC();
+
+        // If SSRS Report Design is printed in the output format different than PDF to a Docentric print destination,
+        // we will let the original DocumentAttachment class to save the report to Journal Attachments.
+        // Otherwise, we would need to invoke SrsReportRunService as in the initReportDataContract() method,
+        // to fill the RDP tables once again, and then clean them up.
+        if (saveWithSsrsWorkaround)
+        {
+            // This is the case when SSRS Report Design is printed to a Docentric print destination.
+            // For some reason, original DocumentAttachment will fill the RDP tables only if the target PD was SSRS File,
+            // so we have to simulate this.
+            storedPds = innerReportDataContract.parmPrintSettings().printMediumType();
+            innerReportDataContract.parmPrintSettings().printMediumType(SRSPrintMediumType::File);
+        }
+
+        // Only if the report is printed in PDF output format (either generated using a Docentric template or SSRS original design)
+        // and printed to a Docentric print destination -> "skip" the execution of the original run() method,
+        // by annulling the journal and execute the Docentric logic for attaching e-Document instead.
+        // We will also skip saving the e-Invoice attachment if the Generate DS print destination was selected.
+        if (saveWithDocentric || dontSave)
+        {
+            orgJournal = journal;
+            journal = null;
+        }
+
+        // Just to mention that RDP tables don't get cleaned after the original DocumentAttachment class fills them!
+        next run();
+
+        if (saveWithSsrsWorkaround)
+        {
+            innerReportDataContract.parmPrintSettings().printMediumType(storedPds);
+        }
+
+        if (saveWithDocentric || dontSave)
+        {
+            // Restore the journal record.
+            journal = orgJournal;
+        }
+
+        if (saveWithDocentric)
+        {
+            // Check if the eInvoice should be attached.
+            if (this.isApplicableForPrintType_DC() && !this.isDocumentAttached_DC())
+            {
+                this.attachDocument_DC();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isApplicableForPrintType_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag indicating whether the attachment is applicable for the print type.
+    /// </summary>
+    /// <returns>True if the attachment is applicable for the print type; otherwise false</returns>
+    /// <remarks>>
+    /// This method is a copy of DocumentAttacment.isApplicableForPrintType().
+    /// </remarks>>
+    private boolean isApplicableForPrintType_DC()
+    {
+        return printCopyOriginal == PrintCopyOriginal::Original
+            || (printCopyOriginal == PrintCopyOriginal::OriginalPrint
+                && this.getPrintManagementType() == PrintMgmtDocInstanceType::Original);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isDocumentAttached_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag indicating whether the document is attached.
+    /// </summary>
+    /// <returns>True if the document is attached; otherwise false</returns>
+    /// <remarks>
+    /// This method is a copy of DocumentAttacment.isDocumentAttached().
+    /// </remarks>
+    private boolean isDocumentAttached_DC()
+    {
+        str name, ext;
+        [name, ext]  = Docu::splitFilename(this.getAttachmentFilename_DC());
+
+        DocuRef docuRef;
+        DocuValue docuValue;
+        select firstonly docuValue
+            where docuValue.FileName == name
+                && docuValue.FileType == ext
+            exists join docuRef
+                where docuRef.ValueRecId == docuValue.RecId
+                    && docuRef.RefCompanyId == journal.DataAreaId
+                    && docuRef.RefTableId == journal.TableId
+                    && docuRef.RefRecId == journal.RecId;
+
+        return docuValue.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>attachDocument_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Attaches the document.
+    /// </summary>
+    /// <returns>True if the document was successfully attached; otherwise false</returns>
+    private boolean attachDocument_DC()
+    {
+        if (innerReportDataContract.parmReportExecutionInfo() == null || 
+            innerReportDataContract.parmReportExecutionInfo().parmReportExecutionInfo_DC() == null)
+        {
+            return false;
+        }
+
+        // Create the report printing settings. Use the same template (Docentric or SSRS) as the just printed document.
+        DocReportExecutionInfo docReportExecutionInfo = innerReportDataContract.parmReportExecutionInfo().parmReportExecutionInfo_DC();
+        DocPrintReportSettings docPrintReportSettings = DocPrintReportSettings::constructWithSameArchiveAndSrsReportContracts(docReportExecutionInfo.parmPrintReportSettings());
+        docPrintReportSettings.parmSrsReportContract(innerReportDataContract);  // not initialized in constructor
+
+        docPrintReportSettings.parmPrintDestination(DocPrintDestination::File);
+
+        // Unlike the standard eInvoice attachment functionality, the generated attachment will not be saved to Print archive.
+        docPrintReportSettings.parmSaveToArchive(false);
+        docPrintReportSettings.parmPreviewBeforePrint(false);
+        docPrintReportSettings.parmSuppressSuccessMsg(true);
+        docPrintReportSettings.parmPrintedFrom(DocReportPrintedFrom::EDocAttachment);
+        
+        // Reuse the generated document, if it was printed in PDF format.
+        if (docReportExecutionInfo.parmPrintReportSettings().isPrintedReportProvidedAsPdf())
+        {
+            docPrintReportSettings.parmPrintedReport(docReportExecutionInfo.parmPrintReportSettings().parmPrintedReport());
+        }
+        
+        // Create the File print destination settings in order to save the report to Attachments of the related journal.
+        DocPrintDestSettingsFile filePds = DocPrintDestSettingsFile::constructFilename(this.getAttachmentFilename_DC(), DocOutputFileFormat::PDF);
+        filePds.parmUseSsrsBuiltInDesign(docPrintReportSettings.printSrsOriginalDesign());
+        filePds.parmOutputFileFormatSrs(SRSReportFileFormat::PDF);
+        filePds.parmSendOutputFileToUser(false);
+        filePds.parmSaveToAttachments(true);
+
+        // Note that the standard eInvoice attachment functionality always uses
+        // the Document type with the hardcoded TypeId "File" (always in english), like this:
+        // filePds.parmSaveToAttachmentsDocuTypeId(enum2Symbol(enumNum(SRSPrintMediumType), SRSPrintMediumType::File));
+        // Instead of that, we will use the DocuType value defined on the Accounts receivable parameters > Electronic documents > Document types on eInvoice attachment
+        filePds.parmSaveToAttachmentsDocuTypeId(this.getAttachmentDocuTypeId_DC());
+        filePds.parmSaveToAttachmentsRecordType(DocSaveToAttachmentsRecordType::Journal);
+        filePds.parmSaveToAttachmentsDocumentRestriction(DocDocumentRestriction::External);
+        filePds.parmSaveToAttachmentsOverridingMode(DocAttachmentsOverridingMode::DoNotSave);
+
+        // Save attachment with document hash number if applicable.
+        filePds.parmSaveToAttachmentsWithDocumentHashNumber(this.isApplicableForDocumentHashNumberAttachment_DC());
+
+        // Print the report as a journal attachment.
+        boolean success = true;
+        DocPrintReportToFileExecutionInfo fileExecutionInfo;
+        try
+        {
+            // Set the journal regardless if the journal is already set in the report's DSP class.
+            docPrintReportSettings.parmArchiveContract().setJournalTableRecord(journal);
+
+            // Publish event to enable subscribers to change the target Document type, output filename, etc.
+            DocReportRunDelegates::instance().onSavingEInvoiceAttachment(journal, innerReportDataContract, docPrintReportSettings, filePds);
+
+            // Save the report to Attachments of the journal.
+            fileExecutionInfo = DocOutputManager::printReportToFile(docPrintReportSettings, filePds);
+
+            // Inform the user on success/failure.
+            if (fileExecutionInfo.parmSaveToAttachmentsSuccess())
+            {
+                DocGlobalHelper::handleInfo(strFmt("@DocentricAX4:eInvoiceAttachmentSuccessMsg",
+                    fileExecutionInfo.parmReportOutputFilename(),
+                    docPrintReportSettings.parmArchiveContract().parmDocumentId(),
+                    docPrintReportSettings.parmArchiveContract().parmAccountNum(),
+                    filePds.parmSaveToAttachmentsDocuTypeId()));
+            }
+            else
+            {
+                if (fileExecutionInfo.parmSaveToAttachments_AttachmentAlreadyExists())
+                {
+                    DocGlobalHelper::handleError("@DocentricAX4:eInvoiceAttachmentAlreadyExistErrorMsg");
+                }
+                
+                throw Exception::Error;
+            }
+        }
+        catch
+        {
+            success = false;
+            
+            // Inform about the error.
+            DocGlobalHelper::handleError(strFmt("@DocentricAX3:EInvoiceAttachmentFailedToAttach", 
+                docPrintReportSettings.parmArchiveContract().parmDocumentId(), 
+                docPrintReportSettings.parmArchiveContract().parmAccountNum(),
+                filePds.parmSaveToAttachmentsDocuTypeId(),
+                fileExecutionInfo.parmReportOutputFilename()));
+        }
+
+        return success;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAttachmentDocuTypeId_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the document type ID based on Accounts receivable parameters setup.
+    /// Document category is determined using the DocumentAttachmentAttribute class attributes.
+    /// </summary>
+    /// <returns>The document type ID that will be used for saving eAttachment</returns>
+    private DocuTypeId getAttachmentDocuTypeId_DC()
+    {
+        if (!attachmentDocuTypeId)
+        {
+            SalesParameters salesParameters = SalesParameters::find();
+
+            // Get the document attachment class attribute for the current instance.
+            DocumentAttachmentAttribute docAttachmentAttr = this.getDocumentAttachmentAttribute_DC();
+        
+            if (docAttachmentAttr)
+            {
+                // Find and return the document type ID based on the document type.
+                switch (docAttachmentAttr.parmDocumentType())
+                {
+                    // Collection letter.
+                    case PrintMgmtDocumentType::CustCollectionLetter:
+                        attachmentDocuTypeId = salesParameters.EInvoiceAttachmentCollectionDocuType_DC;
+                        break;
+
+                    // Sales invoice, free text invoice or sales credit note
+                    case PrintMgmtDocumentType::SalesOrderInvoice:
+                    case PrintMgmtDocumentType::SalesFreeTextInvoice:
+                        CustInvoiceJour custInvoiceJour = this.parmJournal() as CustInvoiceJour;
+                
+                        // Determine if it's a credit note (invoice amount MST < 0) or a standard invoice and return the result.
+                        attachmentDocuTypeId = (custInvoiceJour.InvoiceAmountMST < 0 ? salesParameters.EInvoiceAttachmentSalesCreditNoteDocuType_DC : salesParameters.EInvoiceAttachmentSalesInvoiceDocuType_DC);
+                        break;
+
+                    // Project invoice or project credit note
+                    case PrintMgmtDocumentType::ProjectInvoice:
+                        ProjInvoiceJour projInvoiceJour = this.parmJournal() as ProjInvoiceJour;
+
+                        // Determine if it's a credit note (invoice amount < 0) or a standard invoice and return the result.
+                        attachmentDocuTypeId = (projInvoiceJour.InvoiceAmount < 0 ? salesParameters.EInvoiceAttachmentProjectCreditNoteDocuType_DC : salesParameters.EInvoiceAttachmentProjectInvoiceDocuType_DC);
+                        break;
+                }
+            }
+
+            // If still not set, use the default document type for the File document type group.
+            if (!attachmentDocuTypeId)
+            {
+                attachmentDocuTypeId = DocuType::typeFile();
+            }
+        }
+
+        return attachmentDocuTypeId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAttachmentFilename_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the filename of the attachment.
+    /// </summary>
+    /// <returns>The filename of the attachment</returns>
+    private str getAttachmentFilename_DC()
+    {
+        if (!attachmentFilename)
+        {
+            str reportFormatName;
+
+            DocumentAttachmentAttribute docAttachmentAttr = this.getDocumentAttachmentAttribute_DC();
+            if (docAttachmentAttr)
+            {
+                PrintMgmtDocumentType printMgmtDocumentType = docAttachmentAttr.parmDocumentType();
+                reportFormatName = PrintMgmtDocType::construct(printMgmtDocumentType).getDefaultReportFormat();
+            }
+            if (!reportFormatName)
+            {
+                // (Should never happen anyway)
+                reportFormatName = innerReportDataContract.parmReportName();
+            }
+
+            attachmentFilename = reportFormatName + DocConstantFile::FileExtensionDelimiter + DocConstantFile::FileExtPdf;
+        }
+
+        return attachmentFilename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDocumentAttachmentAttribute_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the attribute that this class is decorated with.
+    /// </summary>
+    /// <returns>The DocumentAttachmentAttribute class attribute</returns>
+    private DocumentAttachmentAttribute getDocumentAttachmentAttribute_DC()
+    {
+        if (!documentAttachmentAttribute)
+        {
+            documentAttachmentAttribute = new DictClass(classIdGet(this)).getAttribute(classStr(DocumentAttachmentAttribute)) as DocumentAttachmentAttribute;
+        }
+
+        return documentAttachmentAttribute;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isApplicableForDocumentHashNumberAttachment_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the document hash number should be calculated and stored on the attachment
+    /// </summary>
+    /// <returns>True, if the document hash number should be calculated and stored on the attachment</returns>
+    private boolean isApplicableForDocumentHashNumberAttachment_DC()
+    {
+        // Supported since 10.0.18.
+        // Use the private instance method DocumentAttachment.isApplicableForDocumentHashNumberAttachment().
+        SysDictClass sysDictClass = new SysDictClass(classNum(DocumentAttachment));
+        const str METHODNAME_isApplicableForDocumentHashNumberAttachment = 'isApplicableForDocumentHashNumberAttachment';
+        if (sysDictClass.hasObjectMethod(METHODNAME_isApplicableForDocumentHashNumberAttachment))
+        {
+            boolean isApplicableForDocumentHashNumberAttachment = sysDictClass.callObject(METHODNAME_isApplicableForDocumentHashNumberAttachment, this);
+            return isApplicableForDocumentHashNumberAttachment;
+        }
+        
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setFlagsForSavingToJournalAttachments_DC</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the flags for saving to journal attachments.
+    /// </summary>
+    private void setFlagsForSavingToJournalAttachments_DC()
+    {
+        saveWithSsrsWorkaround = false;
+        saveWithDocentric = false;
+        dontSave = false;
+
+        // Check if we eInvoice attachment is enabled and if it can be performed at all.
+        if (!this.validate())
+        {
+            // If validation fails, let the original DocumentAttachment class to handle it.
+            return;
+        }
+
+        boolean isDocentricPds = innerReportDataContract && innerReportDataContract.parmPrintSettings() &&
+                                 // Is Docentric Print destination?
+                                 DocSrsReportRunUtil::isDocentricPrintDestination(innerReportDataContract.parmPrintSettings().printMediumType());
+
+        // Chekc if the selected print destination is a Docentric print destination.
+        if (!isDocentricPds)
+        {
+            // Report is not printed to a Docentric print destination.
+            // We will let the original DocumentAttachment class to proceed as intended.
+            return;
+        }
+
+        if (innerReportDataContract == null || innerReportDataContract.parmReportExecutionInfo() == null ||
+            innerReportDataContract.parmReportExecutionInfo().parmReportExecutionInfo_DC().parmPrintReportSettings().parmReportId() == '')
+        {
+            // Something is wrong with the report execution info data. Proceed as intended.
+            return;
+        }
+
+        DocPrintReportSettings printReportSettings = innerReportDataContract.parmReportExecutionInfo().parmReportExecutionInfo_DC().parmPrintReportSettings();
+        
+        // Check if the selected print destination is Generate DS.
+        if (printReportSettings.parmPrintDestination() == DocPrintDestination::GenerateDataSource)
+        {
+            dontSave = true;
+            return;
+        }
+
+        // Check if Docentric template is used to generate the output document.
+        if (!printReportSettings.printSrsOriginalDesign())
+        {
+            saveWithDocentric = true;
+            return;
+        }
+
+        // Check if the SSRS Report Design is printed in PDF output format.
+        if (printReportSettings.isPrintedReportProvidedAsPdf())
+        {
+            saveWithDocentric = true;
+            return;
+        }
+
+        // So far, we know the following:
+        // 1) Report is printed to a Docentric print destination different than Generate DS.
+        // 2) Report is generated using SSRS Report Design.
+        // 3) Report is not generated in PDF output format.
+        // Here we will let the original DocumentAttachment class to proceed as intended but forcing filling the RDP tables.
+        saveWithSsrsWorkaround = true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

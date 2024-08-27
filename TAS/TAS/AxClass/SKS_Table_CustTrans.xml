@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SKS_Table_CustTrans</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class SKS_Table_CustTrans
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>EH_insert_pre</Name>
+				<Source><![CDATA[
+    [PreHandlerFor(tableStr(CustTrans), tableMethodStr(CustTrans, update))]
+    public static void EH_insert_pre(XppPrePostArgs _args)
+    {
+        CustTrans custTrans;
+        CustTrans custTransCashDisc;
+        CustTable   custTable;
+
+        custTrans = _args.getThis();
+        custtable   =  CustTable::find(custtrans.AccountNum);
+
+        ////Identifying direct debit customer cash discount or pyament transaction for direct debit payment transaction.
+        if ((custTrans.TransType == LedgerTransType::CashDiscount) || (custTrans.TransType == LedgerTransType::Payment))
+        {
+            select * from custTransCashDisc
+            where custTransCashDisc.Voucher == custTrans.LastSettleVoucher;
+
+            if (custTransCashDisc.RecId && CustPaymModeTable::find(custTrans.PaymMode).IsSEPA && SKS_EFT_Setup::find().ModAREFT == NoYes::Yes)
+            {
+                custTrans.SKS_DD_IsDirectDebit = NoYes::Yes;
+                custTrans.DirectDebitMandate = custTransCashDisc.DirectDebitMandate;
+                if(!custTrans.DirectDebitMandate &&  custtable.DefaultDirectDebitMandate)
+                {
+                    custTrans.DirectDebitMandate    =   CustTable.DefaultDirectDebitMandate;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CustTrans_onUpdating</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    [DataEventHandler(tableStr(CustTrans), DataEventType::Updating)]
+    public static void CustTrans_onUpdating(Common sender, DataEventArgs e)
+    {
+        CustTrans           lcustTrans;
+        CustTrans           origCustTrans;
+        SKS_LB_InvoiceMatch lInvoiceMatch;
+        CustTransOpen       lCustTransOpen;
+        recordInsertList    ril;
+        SKS_PP_Setup setup;
+        container companies = CustVendOpenTransManager::findSharedServiceCompanies(curext());
+
+        origCustTrans = sender.orig();
+        lcustTrans = sender;
+        ttsbegin;
+
+        select firstonly crosscompany:companies ModLockbox, ModBR, Recid from setup where setup.ModLockbox == NoYes::Yes || setup.ModBR == NoYes::Yes;
+
+        if(setup)
+        {
+            if(origcustTrans.PaymID != lCustTrans.PaymID)
+            {
+                select forupdate lInvoiceMatch where lInvoiceMatch.CustTransRecId == lcustTrans.recid
+                    && lInvoiceMatch.Direction == sks_lb_matchtypedirection::Forward
+                    && lInvoicematch.MatchType == sks_lb_matchtype::PaymentID;
+
+                if(lInvoiceMatch)
+                {
+                    if(lCustTrans.PaymID == '')
+                    {
+                        delete_from lInvoiceMatch where lInvoiceMatch.CustTransRecId == lcustTrans.recid && lInvoicematch.MatchType == sks_lb_matchtype::PaymentID;
+                    }
+                    else
+                    {
+                        while select forupdate lInvoiceMatch where lInvoiceMatch.CustTransRecId == lcustTrans.recid
+                            && lInvoiceMatch.Direction == sks_lb_matchtypedirection::Forward
+                            && lInvoicematch.MatchType == sks_lb_matchtype::PaymentID
+                        {
+                            lInvoiceMatch.MatchValue = lCustTrans.PaymID;
+                            lInvoiceMatch.update();
+                        }
+
+                        while select forupdate lInvoiceMatch where lInvoiceMatch.CustTransRecId == lcustTrans.recid
+                            && lInvoiceMatch.Direction == sks_lb_matchtypedirection::Reverse
+                            && lInvoicematch.MatchType == sks_lb_matchtype::PaymentID
+                        {
+                            lInvoiceMatch.MatchValue = SKS_PP_Stringformats::reverse_String(lCustTrans.PaymID);
+                            lInvoiceMatch.update();
+                        }
+                    }
+                }
+                else
+                {
+                    ril = new RecordInsertList(lInvoiceMatch.TableId);
+                    while select lCustTransOpen where lCustTransOpen.RefRecId == lcustTrans.recid
+                    {
+                        lInvoiceMatch.MatchType = SKS_LB_MatchType::PaymentID;
+                        lInvoiceMatch.Direction  = SKS_LB_MatchTypeDirection::Reverse;
+                        lInvoiceMatch.MatchValue = SKS_PP_Stringformats::reverse_String(lCustTrans.PaymID);
+                        lInvoiceMatch.CustTransRecId = lCustTrans.RecId;
+                        lInvoiceMatch.CustTransOpenRecId = lCustTransOpen.RecId;
+                        lInvoiceMatch.CustAccount = lCustTransOpen.AccountNum;
+                        lInvoiceMatch.DueDate = lCustTransOpen.DueDate;
+                        lInvoiceMatch.CTOAmountCur = lCustTransOpen.AmountCur;
+                        ril.add(lInvoiceMatch);
+
+                        // Add the forward search information so the lookup can be a Inner Join VS an Outer join
+                        lInvoiceMatch.MatchType = SKS_LB_MatchType::PaymentID;
+                        lInvoiceMatch.Direction  = SKS_LB_MatchTypeDirection::Forward;
+                        lInvoiceMatch.MatchValue = lCustTrans.PaymID;
+                        lInvoiceMatch.CustTransRecId = lCustTrans.RecId;
+                        lInvoiceMatch.CustTransOpenRecId = lCustTransOpen.RecId;
+                        lInvoiceMatch.CustAccount = lCustTransOpen.AccountNum;
+                        lInvoiceMatch.DueDate = lCustTransOpen.DueDate;
+                        lInvoiceMatch.CTOAmountCur = lCustTransOpen.AmountCur;
+                        ril.add(lInvoiceMatch);
+                    }
+                    ril.insertDatabase();
+                }
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
